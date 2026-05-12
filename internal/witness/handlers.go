@@ -1140,9 +1140,11 @@ type DetectZombiePolecatsResult struct {
 // Dedup: Checks for existing cleanup wisps before escalating, preventing
 // infinite escalation loops on subsequent patrol cycles.
 //
-// gt-dsgp: Restart-first policy. For each zombie found, we RESTART the session
-// instead of nuking. This preserves the polecat's worktree and branch, preventing
-// work loss. Nuking only happens via explicit `gt polecat nuke` command.
+// gt-dsgp: Restart-first policy. For each active-work zombie found, we RESTART
+// the session instead of nuking. This preserves the polecat's worktree and
+// branch, preventing work loss. Clean idle polecats can only be auto-nuked when
+// zombie.auto_cleanup is enabled and their idle age exceeds the configured
+// threshold.
 //
 // For each zombie found:
 //   - If polecat has a pending MR: skip (not a zombie, waiting for refinery)
@@ -1206,9 +1208,9 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 
 		if sessionAlive {
 			// gt-s8bq: Idle Polecat Heresy fix. Idle polecats are HEALTHY — they
-			// have no hook_bead, agent_state="idle", and their sandbox is preserved
-			// for reuse. Skip them entirely during patrol. Only report if the
-			// sandbox is dirty (uncommitted changes in idle state).
+			// have no hook_bead and agent_state="idle". Preserve them by default;
+			// auto-clean only when explicitly enabled and safely past threshold.
+			// Always report dirty idle sandboxes for witness review.
 			agentState := ""
 			if snap != nil {
 				agentState = snap.AgentState

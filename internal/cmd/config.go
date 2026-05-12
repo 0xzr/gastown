@@ -649,8 +649,8 @@ Examples:
   gt config set default_agent claude
   gt config set dolt.port 3308
   gt config set scheduler.max_polecats 5
-	gt config set zombie.auto_cleanup true
-	gt config set zombie.idle_threshold 2h
+  gt config set zombie.auto_cleanup true
+  gt config set zombie.idle_threshold 2h
   gt config set maintenance.window 03:00
   gt config set maintenance.interval daily
   gt config set lifecycle.reaper.delete_age 336h
