@@ -2443,6 +2443,29 @@ func (issue issueDetailsJSON) toIssueDetails() *issueDetails {
 	}
 }
 
+func issueToDetails(issue *beads.Issue) *issueDetails {
+	deps := make([]issueDependency, 0, len(issue.Dependencies))
+	for _, dep := range issue.Dependencies {
+		deps = append(deps, issueDependency{
+			ID:             dep.ID,
+			Status:         dep.Status,
+			DependencyType: dep.DependencyType,
+		})
+	}
+
+	return &issueDetails{
+		ID:             issue.ID,
+		Title:          issue.Title,
+		Status:         issue.Status,
+		IssueType:      issue.Type,
+		Assignee:       issue.Assignee,
+		Labels:         issue.Labels,
+		BlockedBy:      issue.BlockedBy,
+		BlockedByCount: issue.BlockedByCount,
+		Dependencies:   deps,
+	}
+}
+
 // getExternalIssueDetails fetches issue details from an external rig database.
 // townBeads: path to town .beads directory
 // rigName: name of the rig (e.g., "claycantrell")
@@ -2509,7 +2532,7 @@ func (d issueDetails) IsBlocked() bool {
 	return false
 }
 
-// getIssueDetailsBatch fetches details for multiple issues in a single bd show call.
+// getIssueDetailsBatch fetches details for multiple issues.
 // Returns a map from issue ID to details. Missing/invalid issues are omitted from the map.
 func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
 	result := make(map[string]*issueDetails)
@@ -2517,39 +2540,20 @@ func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
 		return result
 	}
 
-	// Build args: bd show id1 id2 id3 ... --json
-	args := append([]string{"show"}, issueIDs...)
-	args = append(args, "--json")
-
-	// Run from town root so bd's prefix routing (routes.jsonl) can dispatch
-	// to the correct rig database for cross-rig bead lookups. (GH#2960)
-	townRoot, _ := workspace.FindFromCwdOrError()
-	showCmd := exec.Command("bd", args...)
-	if townRoot != "" {
-		showCmd.Dir = townRoot
-		showCmd.Env = stripEnvKey(os.Environ(), "BEADS_DIR")
-	}
-	var stdout bytes.Buffer
-	showCmd.Stdout = &stdout
-
-	if err := showCmd.Run(); err != nil {
-		// Batch failed - fall back to individual lookups for robustness
-		// This handles cases where some IDs are invalid/missing
-		for _, id := range issueIDs {
-			if details := getIssueDetails(id); details != nil {
-				result[id] = details
-			}
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil || townRoot == "" {
+		if cwd, cwdErr := os.Getwd(); cwdErr == nil {
+			townRoot = cwd
 		}
-		return result
 	}
 
-	var issues []issueDetailsJSON
-	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
-		return result
-	}
-
-	for _, issue := range issues {
-		result[issue.ID] = issue.toIssueDetails()
+	store := beads.New(townRoot)
+	for _, id := range issueIDs {
+		issue, err := store.Show(id)
+		if err != nil {
+			continue
+		}
+		result[issue.ID] = issueToDetails(issue)
 	}
 
 	return result

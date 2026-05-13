@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 func captureConvoyStdoutErr(t *testing.T, fn func() error) (string, error) {
@@ -79,6 +81,69 @@ func makeRoutingTownWorkspace(t *testing.T) (string, string) {
 		expectedWD = resolved
 	}
 	return townRoot, expectedWD
+}
+
+func TestGetIssueDetailsBatch_UsesBeadsShowRouting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows - shell stubs")
+	}
+
+	townRoot, expectedWD := makeRoutingTownWorkspace(t)
+	rigDir := filepath.Join(townRoot, "gemba", "mayor", "rig")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+	routes := `{"prefix":"gm-","path":"gemba/mayor/rig"}` + "\n"
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
+		t.Fatalf("write routes.jsonl: %v", err)
+	}
+	chdirConvoyTest(t, townRoot)
+	t.Setenv("BEADS_DIR", "/wrong/.beads")
+	beads.ResetBdAllowStaleCacheForTest()
+
+	expectedRigDir := filepath.Join(expectedWD, "gemba", "mayor", "rig")
+	expectedBeadsDir := filepath.Join(expectedRigDir, ".beads")
+	scriptBody := fmt.Sprintf(`
+if [ "$1" = "--allow-stale" ]; then
+  if [ "$2" = "version" ]; then
+    exit 0
+  fi
+  shift || true
+fi
+
+case "$1" in
+  show)
+    shift || true
+    if [ "$*" != "gm-done --json" ]; then
+      echo "unexpected show args: $*" >&2
+      exit 1
+    fi
+    if [ "$PWD" != "%s" ]; then
+      echo "expected routed rig dir, got $PWD" >&2
+      exit 1
+    fi
+    if [ "$BEADS_DIR" != "%s" ]; then
+      echo "expected routed BEADS_DIR, got $BEADS_DIR" >&2
+      exit 1
+    fi
+    echo '[{"id":"gm-done","title":"Done bead","status":"closed","issue_type":"task","assignee":"gastown/polecats/test","labels":["gt:task"],"blocked_by_count":0}]'
+    ;;
+  *)
+    echo "unexpected bd args: $*" >&2
+    exit 1
+    ;;
+esac
+`, expectedRigDir, expectedBeadsDir)
+	writeRoutingBdStub(t, scriptBody)
+
+	details := getIssueDetailsBatch([]string{"gm-done"})
+	got := details["gm-done"]
+	if got == nil {
+		t.Fatalf("expected routed issue details, got none")
+	}
+	if got.Status != "closed" || got.Title != "Done bead" || got.IssueType != "task" || got.Assignee != "gastown/polecats/test" {
+		t.Fatalf("unexpected routed details: %+v", got)
+	}
 }
 
 func TestRunConvoyList_UsesTownRootAndStripsBeadsDir(t *testing.T) {
