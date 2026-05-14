@@ -1974,11 +1974,11 @@ case "$cmd" in
     exit 0
     ;;
   create)
-    echo '{"id":"gt-gastown-polecat-rust","title":"gt-gastown-polecat-rust","status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: spawning\nhook_bead: gt-work"}'
+    printf '%%s\n' '{"id":"gt-gastown-polecat-rust","title":"gt-gastown-polecat-rust","status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: spawning\nhook_bead: gt-work"}'
     exit 0
     ;;
   show)
-    echo '[{"id":"gt-gastown-polecat-rust","title":"gt-gastown-polecat-rust","issue_type":"task","labels":["gt:agent"],"status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: working\nhook_bead: gt-work\nactive_mr: gt-mr\ncleanup_status: has_unpushed"}]'
+    printf '%%s\n' '[{"id":"gt-gastown-polecat-rust","title":"gt-gastown-polecat-rust","issue_type":"task","labels":["gt:agent"],"status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: working\nhook_bead: gt-work\nactive_mr: gt-mr\ncleanup_status: has_unpushed"}]'
     exit 0
     ;;
   *)

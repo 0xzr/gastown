@@ -93,7 +93,7 @@ case "$cmd" in
     exit 0
     ;;
   show)
-    echo '[{"id":"gt-gastown-polecat-rust","title":"gt-gastown-polecat-rust","issue_type":"task","labels":["gt:agent"],"status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: idle\nactive_mr: gt-mr"}]'
+    printf '%%s\n' '[{"id":"gt-gastown-polecat-rust","title":"gt-gastown-polecat-rust","issue_type":"task","labels":["gt:agent"],"status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: idle\nactive_mr: gt-mr"}]'
     exit 0
     ;;
   *)
