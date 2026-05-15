@@ -10,7 +10,7 @@ import (
 func TestDeprecatedMergeQueueKeysCheck_Clean(t *testing.T) {
 	townRoot := setupTownWithSettings(t, map[string]interface{}{
 		"merge_queue": map[string]interface{}{
-			"enabled":    true,
+			"enabled":     true,
 			"on_conflict": "assign_back",
 		},
 	})
@@ -44,8 +44,8 @@ func TestDeprecatedMergeQueueKeysCheck_DetectsTargetBranch(t *testing.T) {
 func TestDeprecatedMergeQueueKeysCheck_DetectsIntegrationBranches(t *testing.T) {
 	townRoot := setupTownWithSettings(t, map[string]interface{}{
 		"merge_queue": map[string]interface{}{
-			"enabled":               true,
-			"integration_branches":  true,
+			"enabled":              true,
+			"integration_branches": true,
 		},
 	})
 
@@ -177,6 +177,93 @@ func TestDeprecatedMergeQueueKeysCheck_Fix(t *testing.T) {
 	}
 }
 
+func TestDeprecatedMergeQueueKeysCheck_FixMigratesSettingsValues(t *testing.T) {
+	townRoot := setupTownWithSettings(t, map[string]interface{}{
+		"type":    "rig-settings",
+		"version": 1,
+		"merge_queue": map[string]interface{}{
+			"target_branch":        "develop",
+			"integration_branches": false,
+		},
+	})
+	rigPath := findAllRigs(townRoot)[0]
+	writeJSONFile(t, filepath.Join(rigPath, "config.json"), map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "testrig",
+	})
+
+	check := NewDeprecatedMergeQueueKeysCheck()
+	ctx := &CheckContext{TownRoot: townRoot}
+	if result := check.Run(ctx); result.Status != StatusWarning {
+		t.Fatalf("expected StatusWarning before fix, got %v", result.Status)
+	}
+	if err := check.Fix(ctx); err != nil {
+		t.Fatalf("Fix() error: %v", err)
+	}
+
+	root := readJSONFile(t, filepath.Join(rigPath, "config.json"))
+	if got := jsonString(t, root["default_branch"]); got != "develop" {
+		t.Fatalf("default_branch = %q, want develop", got)
+	}
+	settings := readJSONFile(t, filepath.Join(rigPath, "settings", "config.json"))
+	mq := jsonMap(t, settings["merge_queue"])
+	if _, ok := mq["target_branch"]; ok {
+		t.Fatal("target_branch should be removed")
+	}
+	if _, ok := mq["integration_branches"]; ok {
+		t.Fatal("integration_branches should be removed")
+	}
+	if got := jsonBool(t, mq["integration_branch_polecat_enabled"]); got {
+		t.Fatal("integration_branch_polecat_enabled = true, want false")
+	}
+	if got := jsonBool(t, mq["integration_branch_refinery_enabled"]); got {
+		t.Fatal("integration_branch_refinery_enabled = true, want false")
+	}
+	if result := check.Run(ctx); result.Status != StatusOK {
+		t.Fatalf("expected StatusOK after fix, got %v: %s", result.Status, result.Message)
+	}
+}
+
+func TestDeprecatedMergeQueueKeysCheck_DetectsAndFixesRootConfig(t *testing.T) {
+	townRoot := setupTownMinimal(t)
+	rigPath := findAllRigs(townRoot)[0]
+	writeJSONFile(t, filepath.Join(rigPath, "config.json"), map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "testrig",
+		"merge_queue": map[string]interface{}{
+			"target_branch":        "release",
+			"integration_branches": false,
+		},
+	})
+
+	check := NewDeprecatedMergeQueueKeysCheck()
+	ctx := &CheckContext{TownRoot: townRoot}
+	if result := check.Run(ctx); result.Status != StatusWarning {
+		t.Fatalf("expected StatusWarning before fix, got %v", result.Status)
+	}
+	if err := check.Fix(ctx); err != nil {
+		t.Fatalf("Fix() error: %v", err)
+	}
+
+	root := readJSONFile(t, filepath.Join(rigPath, "config.json"))
+	if got := jsonString(t, root["default_branch"]); got != "release" {
+		t.Fatalf("default_branch = %q, want release", got)
+	}
+	if _, ok := root["merge_queue"]; ok {
+		t.Fatal("empty deprecated merge_queue should be removed from root config")
+	}
+	settings := readJSONFile(t, filepath.Join(rigPath, "settings", "config.json"))
+	mq := jsonMap(t, settings["merge_queue"])
+	if got := jsonBool(t, mq["integration_branch_polecat_enabled"]); got {
+		t.Fatal("integration_branch_polecat_enabled = true, want false")
+	}
+	if got := jsonBool(t, mq["integration_branch_refinery_enabled"]); got {
+		t.Fatal("integration_branch_refinery_enabled = true, want false")
+	}
+}
+
 func TestDeprecatedMergeQueueKeysCheck_MultiRig(t *testing.T) {
 	townRoot := t.TempDir()
 
@@ -271,4 +358,58 @@ func createRigWithSettings(t *testing.T, townRoot, rigName string, settings map[
 	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func writeJSONFile(t *testing.T, path string, value map[string]interface{}) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readJSONFile(t *testing.T, path string) map[string]json.RawMessage {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func jsonMap(t *testing.T, raw json.RawMessage) map[string]json.RawMessage {
+	t.Helper()
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func jsonString(t *testing.T, raw json.RawMessage) string {
+	t.Helper()
+	var result string
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func jsonBool(t *testing.T, raw json.RawMessage) bool {
+	t.Helper()
+	var result bool
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
 }

@@ -1078,8 +1078,10 @@ func warnDeprecatedRigConfigKeys(data []byte, path string) {
 	if mq, ok := raw["merge_queue"]; ok {
 		var mqMap map[string]json.RawMessage
 		if json.Unmarshal(mq, &mqMap) == nil {
-			if _, has := mqMap["target_branch"]; has {
-				fmt.Fprintf(os.Stderr, "WARNING: %s: merge_queue.target_branch is deprecated and ignored — set default_branch instead\n", path)
+			for _, key := range config.DeprecatedMergeQueueKeys {
+				if _, has := mqMap[key]; has {
+					fmt.Fprintf(os.Stderr, "WARNING: %s: merge_queue.%s is deprecated and ignored — run gt doctor --fix\n", path, key)
+				}
 			}
 		}
 	}
