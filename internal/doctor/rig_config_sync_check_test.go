@@ -235,6 +235,10 @@ func TestRigConfigSyncCheck_FixDisablesRigAutoExport(t *testing.T) {
 	if !strings.Contains(string(data), "export.auto: \"false\"\n") {
 		t.Fatalf("config.yaml did not disable export.auto:\n%s", string(data))
 	}
+	result = check.Run(ctx)
+	if result.Status != StatusOK {
+		t.Fatalf("Status after fix = %v, want %v: %s", result.Status, StatusOK, result.Message)
+	}
 }
 
 func TestRigConfigSyncCheck_FixCreatesMissingMetadata(t *testing.T) {

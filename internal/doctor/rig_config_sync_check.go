@@ -83,6 +83,7 @@ func (c *RigConfigSyncCheck) Run(ctx *CheckContext) *CheckResult {
 	c.missingDoltDB = nil
 	c.missingMetadata = nil
 	c.missingPrefixCfg = nil
+	c.missingExportCfg = nil
 	c.dbNameMismatches = nil
 	c.dbCheckErrors = nil
 	var details []string
