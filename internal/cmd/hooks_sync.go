@@ -268,9 +268,8 @@ func syncTarget(target hooks.Target, dryRun bool) (syncResult, error) {
 	_, statErr := os.Stat(target.Path)
 	fileExists := statErr == nil
 
-	// Compare hooks sections and the Claude startup defaults. Existing settings
-	// from older versions may have current hooks but still miss prompt defaults.
-	if fileExists && hooks.HooksEqual(expected, &current.Hooks) && hooks.HasClaudePromptDefaults(current) {
+	// Compare hooks sections
+	if fileExists && hooks.HooksEqual(expected, &current.Hooks) {
 		return syncUnchanged, nil
 	}
 

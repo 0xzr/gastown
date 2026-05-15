@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -108,7 +109,6 @@ func MarshalSettings(s *SettingsJSON) ([]byte, error) {
 	for k, v := range s.Extra {
 		out[k] = v
 	}
-	addClaudePromptDefaults(out)
 
 	// Write known fields back into the map, or delete if zero-valued
 	if s.EditorMode != "" {
@@ -132,70 +132,6 @@ func MarshalSettings(s *SettingsJSON) ([]byte, error) {
 	out["hooks"] = raw
 
 	return json.MarshalIndent(out, "", "  ")
-}
-
-// HasClaudePromptDefaults reports whether settings already contain the Claude
-// startup defaults Gas Town needs for non-interactive agent sessions.
-func HasClaudePromptDefaults(s *SettingsJSON) bool {
-	if s == nil {
-		return false
-	}
-	if !rawBoolEquals(s.Extra, "skipDangerousModePermissionPrompt", true) {
-		return false
-	}
-	if !rawBoolEquals(s.Extra, "hasCompletedOnboarding", true) {
-		return false
-	}
-	if _, ok := s.Extra["theme"]; !ok {
-		return false
-	}
-	permissions := map[string]json.RawMessage{}
-	if raw, ok := s.Extra["permissions"]; !ok || json.Unmarshal(raw, &permissions) != nil {
-		return false
-	}
-	return rawStringEquals(permissions, "defaultMode", "bypassPermissions")
-}
-
-func addClaudePromptDefaults(out map[string]json.RawMessage) {
-	setRaw(out, "skipDangerousModePermissionPrompt", []byte(`true`))
-	setRaw(out, "hasCompletedOnboarding", []byte(`true`))
-	setRawDefault(out, "theme", []byte(`"dark"`))
-
-	permissions := map[string]json.RawMessage{}
-	if raw, ok := out["permissions"]; ok {
-		_ = json.Unmarshal(raw, &permissions)
-	}
-	permissions["defaultMode"] = json.RawMessage(`"bypassPermissions"`)
-	if raw, err := json.Marshal(permissions); err == nil {
-		out["permissions"] = raw
-	}
-}
-
-func setRaw(out map[string]json.RawMessage, key string, value []byte) {
-	out[key] = json.RawMessage(value)
-}
-
-func setRawDefault(out map[string]json.RawMessage, key string, value []byte) {
-	if _, ok := out[key]; ok {
-		return
-	}
-	out[key] = json.RawMessage(value)
-}
-
-func rawBoolEquals(raw map[string]json.RawMessage, key string, want bool) bool {
-	var got bool
-	if value, ok := raw[key]; !ok || json.Unmarshal(value, &got) != nil {
-		return false
-	}
-	return got == want
-}
-
-func rawStringEquals(raw map[string]json.RawMessage, key, want string) bool {
-	var got string
-	if value, ok := raw[key]; !ok || json.Unmarshal(value, &got) != nil {
-		return false
-	}
-	return got == want
 }
 
 // LoadSettings reads and parses a settings.json file, preserving unknown fields.
@@ -269,6 +205,8 @@ func Merge(base, override *HooksConfig) *HooksConfig {
 // context (which degrades quality), the session is replaced with a fresh one.
 // The successor picks up hooked work via SessionStart hook (gt prime --hook).
 func DefaultOverrides() map[string]*HooksConfig {
+	pathSetup := pathSetupCmd()
+
 	return map[string]*HooksConfig{
 		// Polecats: auto-run gt done on session Stop (gas-lob).
 		// Catches the "idle polecat" problem: polecats that finish work but
@@ -282,7 +220,7 @@ func DefaultOverrides() map[string]*HooksConfig {
 					Hooks: []Hook{
 						{
 							Type:    "command",
-							Command: gtCommand("gt tap polecat-stop-check"),
+							Command: hookChain(pathSetup, "gt tap polecat-stop-check"),
 						},
 					},
 				},
@@ -299,7 +237,7 @@ func DefaultOverrides() map[string]*HooksConfig {
 					Hooks: []Hook{
 						{
 							Type:    "command",
-							Command: gtCommand("gt handoff --cycle --reason compaction"),
+							Command: hookChain(pathSetup, "gt handoff --cycle --reason compaction"),
 						},
 					},
 				},
@@ -943,50 +881,52 @@ func ValidTarget(target string) bool {
 }
 
 // DefaultBase returns a sensible default base configuration.
-// This includes resolved gt hook commands that all agents need.
+// This includes PATH setup and gt prime hooks that all agents need.
 func DefaultBase() *HooksConfig {
+	pathSetup := pathSetupCmd()
+
 	return &HooksConfig{
 		PreToolUse: []HookEntry{
 			{
 				Matcher: "Bash(gh pr create*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: gtCommand("gt tap guard pr-workflow"),
+					Command: hookChain(pathSetup, "gt tap guard pr-workflow"),
 				}},
 			},
 			{
 				Matcher: "Bash(git checkout -b*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: gtCommand("gt tap guard pr-workflow"),
+					Command: hookChain(pathSetup, "gt tap guard pr-workflow"),
 				}},
 			},
 			{
 				Matcher: "Bash(git switch -c*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: gtCommand("gt tap guard pr-workflow"),
+					Command: hookChain(pathSetup, "gt tap guard pr-workflow"),
 				}},
 			},
 			{
 				Matcher: "Bash(rm -rf /*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: gtCommand("gt tap guard dangerous-command"),
+					Command: hookChain(pathSetup, "gt tap guard dangerous-command"),
 				}},
 			},
 			{
 				Matcher: "Bash(git push --force*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: gtCommand("gt tap guard dangerous-command"),
+					Command: hookChain(pathSetup, "gt tap guard dangerous-command"),
 				}},
 			},
 			{
 				Matcher: "Bash(git push -f*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: gtCommand("gt tap guard dangerous-command"),
+					Command: hookChain(pathSetup, "gt tap guard dangerous-command"),
 				}},
 			},
 		},
@@ -996,7 +936,7 @@ func DefaultBase() *HooksConfig {
 				Hooks: []Hook{
 					{
 						Type:    "command",
-						Command: gtCommand("gt prime --hook"),
+						Command: hookChain(pathSetup, "gt prime --hook"),
 					},
 				},
 			},
@@ -1007,7 +947,7 @@ func DefaultBase() *HooksConfig {
 				Hooks: []Hook{
 					{
 						Type:    "command",
-						Command: gtCommand("gt prime --hook"),
+						Command: hookChain(pathSetup, "gt prime --hook"),
 					},
 				},
 			},
@@ -1018,7 +958,7 @@ func DefaultBase() *HooksConfig {
 				Hooks: []Hook{
 					{
 						Type:    "command",
-						Command: gtCommand("gt mail check --inject"),
+						Command: hookChain(pathSetup, "gt mail check --inject"),
 					},
 				},
 			},
@@ -1029,7 +969,7 @@ func DefaultBase() *HooksConfig {
 				Hooks: []Hook{
 					{
 						Type:    "command",
-						Command: gtCommand("gt costs record &"),
+						Command: hookChain(pathSetup, "gt costs record &"),
 					},
 				},
 			},
@@ -1107,12 +1047,23 @@ func saveConfig(path string, cfg *HooksConfig) error {
 	return nil
 }
 
-func gtCommand(command string) string {
-	if command == "gt" {
-		return resolveGTBinary()
+// pathSetupCmd returns an OS-appropriate command to add Go and local bin
+// directories to PATH. On Unix this is a bash export; on Windows it
+// prepends to $env:PATH for PowerShell.
+func pathSetupCmd() string {
+	if runtime.GOOS == "windows" {
+		home := os.Getenv("USERPROFILE")
+		return fmt.Sprintf(`$env:PATH="%s\go\bin;%s\.local\bin;$env:PATH"`, home, home)
 	}
-	if strings.HasPrefix(command, "gt ") {
-		return resolveGTBinary() + command[len("gt"):]
+	return `export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH"`
+}
+
+// hookChain joins a path setup command with a gt command using an
+// OS-appropriate separator (&& for bash, ; for PowerShell).
+func hookChain(parts ...string) string {
+	sep := " && "
+	if runtime.GOOS == "windows" {
+		sep = "; "
 	}
-	return command
+	return strings.Join(parts, sep)
 }

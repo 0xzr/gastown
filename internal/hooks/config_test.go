@@ -464,7 +464,7 @@ func TestComputeExpected(t *testing.T) {
 
 // TestComputeExpectedBackfillsSessionStart reproduces gt-y22: on-disk base
 // created before SessionStart was added to DefaultBase. SessionStart should
-// be backfilled from DefaultBase so settings.json files contain startup hooks.
+// be backfilled from DefaultBase so settings.json files contain PATH exports.
 func TestComputeExpectedBackfillsSessionStart(t *testing.T) {
 	tmpDir := t.TempDir()
 	setTestHome(t, tmpDir)
@@ -495,21 +495,17 @@ func TestComputeExpectedBackfillsSessionStart(t *testing.T) {
 		if len(expected.SessionStart) == 0 {
 			t.Errorf("%s: expected SessionStart to be backfilled from DefaultBase, got none", target)
 		}
-		// Verify the generated hook uses a resolved gt command, not the stale
-		// export PATH= marker that causes settings to be treated as out-of-date.
-		hasPrime := false
+		// Verify PATH= is present (the actual doctor check)
+		hasPath := false
 		for _, entry := range expected.SessionStart {
 			for _, hook := range entry.Hooks {
-				if strings.Contains(hook.Command, "export PATH=") {
-					t.Errorf("%s: SessionStart contains stale export PATH marker: %q", target, hook.Command)
-				}
-				if strings.Contains(hook.Command, "prime --hook") {
-					hasPrime = true
+				if strings.Contains(hook.Command, "PATH=") {
+					hasPath = true
 				}
 			}
 		}
-		if !hasPrime {
-			t.Errorf("%s: expected prime --hook in SessionStart hooks", target)
+		if !hasPath {
+			t.Errorf("%s: expected PATH= in SessionStart hooks", target)
 		}
 		// On-disk Stop should be preserved (not overwritten by DefaultBase)
 		if len(expected.Stop) == 0 {
