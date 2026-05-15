@@ -1271,33 +1271,39 @@ func containsPathBoundary(line, path string) bool {
 	return false
 }
 
-// StopIdleMonitors finds and terminates "bd dolt idle-monitor" processes
-// associated with this town. These background processes auto-spawn rogue
-// Dolt servers from per-rig .beads/dolt/ directories when the canonical
-// server is unreachable, creating a race condition during restart.
-func StopIdleMonitors(townRoot string) int {
+// FindIdleMonitorProcesses finds "bd dolt idle-monitor" processes scoped to
+// this town. Matches by town root path in process args, or by the town's
+// configured Dolt port. It is side-effect free so callers can use it for dry-run
+// and shutdown verification without duplicating the matching rules.
+func FindIdleMonitorProcesses(townRoot string) []int {
 	absRoot, _ := filepath.Abs(townRoot)
 	if absRoot == "" {
-		return 0
+		return nil
 	}
 
 	psCmd := exec.Command("ps", "-eo", "pid,args")
 	setProcessGroup(psCmd)
 	output, err := psCmd.Output()
 	if err != nil {
-		return 0
+		return nil
 	}
 
 	config := DefaultConfig(townRoot)
-	portStr := strconv.Itoa(config.Port)
+	return findIdleMonitorProcessesFromPS(string(output), townRoot, absRoot, config.Port)
+}
 
-	stopped := 0
+func findIdleMonitorProcessesFromPS(output, townRoot, absRoot string, port int) []int {
+	portStr := strconv.Itoa(port)
+	var pids []int
 	for _, line := range strings.Split(string(output), "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.Contains(line, "idle-monitor") {
 			continue
 		}
 		if !strings.Contains(line, "dolt") {
+			continue
+		}
+		if strings.Contains(line, "grep") {
 			continue
 		}
 
@@ -1331,7 +1337,18 @@ func StopIdleMonitors(townRoot string) int {
 		if err != nil || pid <= 0 {
 			continue
 		}
+		pids = append(pids, pid)
+	}
+	return pids
+}
 
+// StopIdleMonitors finds and terminates "bd dolt idle-monitor" processes
+// associated with this town. These background processes auto-spawn rogue
+// Dolt servers from per-rig .beads/dolt/ directories when the canonical
+// server is unreachable, creating a race condition during restart.
+func StopIdleMonitors(townRoot string) int {
+	stopped := 0
+	for _, pid := range FindIdleMonitorProcesses(townRoot) {
 		proc, err := os.FindProcess(pid)
 		if err != nil {
 			continue

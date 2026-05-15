@@ -241,6 +241,66 @@ func TestDoltProcessMatchesTownPaths(t *testing.T) {
 	}
 }
 
+func TestContainsPathBoundary(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		path string
+		want bool
+	}{
+		{name: "empty path", line: "/tmp/gt", path: "", want: false},
+		{name: "exact at end", line: "--data-dir /tmp/gt", path: "/tmp/gt", want: true},
+		{name: "path separator", line: "--data-dir /tmp/gt/.dolt-data", path: "/tmp/gt", want: true},
+		{name: "space boundary", line: "/tmp/gt --port 3307", path: "/tmp/gt", want: true},
+		{name: "tab boundary", line: "/tmp/gt\t--port 3307", path: "/tmp/gt", want: true},
+		{name: "reject sibling prefix", line: "/tmp/gt-old --port 3307", path: "/tmp/gt", want: false},
+		{name: "later match after rejected prefix", line: "/tmp/gt-old /tmp/gt/.beads", path: "/tmp/gt", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := containsPathBoundary(tt.line, tt.path)
+			if got != tt.want {
+				t.Fatalf("containsPathBoundary(%q, %q) = %v, want %v", tt.line, tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFindIdleMonitorProcessesFromPS(t *testing.T) {
+	const townRoot = "/tmp/gt"
+	const port = 3307
+	pidLines := []struct {
+		line string
+		want []int
+	}{
+		{line: "101 bd dolt idle-monitor --data-dir /tmp/gt/.beads/dolt", want: []int{101}},
+		{line: "102 bd dolt idle-monitor --data-dir /tmp/gt-old/.beads/dolt", want: nil},
+		{line: "103 bd dolt idle-monitor --port 3307", want: []int{103}},
+		{line: "104 bd dolt idle-monitor -p 3307", want: []int{104}},
+		{line: "105 bd dolt idle-monitor --port=3307", want: []int{105}},
+		{line: "106 bd dolt idle-monitor --port=33070", want: nil},
+		{line: "107 bd idle-monitor --port 3307", want: nil},
+		{line: "108 bd dolt monitor --port 3307", want: nil},
+		{line: "109 grep bd dolt idle-monitor --port 3307", want: nil},
+		{line: "notapid bd dolt idle-monitor --port 3307", want: nil},
+	}
+
+	for _, tt := range pidLines {
+		t.Run(tt.line, func(t *testing.T) {
+			got := findIdleMonitorProcessesFromPS(tt.line, townRoot, townRoot, port)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("got %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
 func TestDoltProcessOwnerPathFromEvidence(t *testing.T) {
 	tests := []struct {
 		name             string
