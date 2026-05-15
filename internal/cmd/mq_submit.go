@@ -232,10 +232,11 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// GH#3032: Resolve HEAD commit SHA for MR dedup.
-	commitSHA, shaErr := g.Rev("HEAD")
+	// GH#3032/wa-skj: Resolve the submitted branch tip for MR dedup and
+	// verification. With --branch this can differ from the checked-out HEAD.
+	commitSHA, shaErr := resolveMQSubmitCommitSHA(g, branch)
 	if shaErr != nil {
-		style.PrintWarning("could not resolve HEAD SHA: %v (falling back to branch-only dedup)", shaErr)
+		style.PrintWarning("could not resolve submitted branch SHA: %v (falling back to branch-only dedup)", shaErr)
 	}
 
 	// Build MR bead title and description
@@ -378,6 +379,10 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func resolveMQSubmitCommitSHA(g *git.Git, branch string) (string, error) {
+	return g.Rev(branch)
 }
 
 // checkMoleculeStepDeps verifies that all prerequisite molecule steps are closed
