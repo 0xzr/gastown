@@ -385,6 +385,10 @@ type PolecatListItem struct {
 	Name           string        `json:"name"`
 	State          polecat.State `json:"state"`
 	Issue          string        `json:"issue,omitempty"`
+	CleanupStatus  string        `json:"cleanup_status,omitempty"`
+	ActiveMR       string        `json:"active_mr,omitempty"`
+	Branch         string        `json:"branch,omitempty"`
+	ReuseStatus    string        `json:"reuse_status,omitempty"`
 	SessionRunning bool          `json:"session_running"`
 	Zombie         bool          `json:"zombie,omitempty"`
 	SessionName    string        `json:"session_name,omitempty"`
@@ -408,6 +412,41 @@ func effectivePolecatState(item PolecatListItem) polecat.State {
 		return polecat.StateStalled
 	}
 	return state
+}
+
+type reuseMRShower interface {
+	Show(issueID string) (*beads.Issue, error)
+}
+
+func activeMRBlocksReuse(bd reuseMRShower, mrID string) bool {
+	if mrID == "" {
+		return false
+	}
+	if bd == nil {
+		return true
+	}
+	mr, err := bd.Show(mrID)
+	if err != nil || mr == nil {
+		return true
+	}
+	return !beads.IssueStatus(mr.Status).IsTerminal()
+}
+
+func polecatReuseStatus(state polecat.State, cleanupStatus, activeMR, branch string, activeMRBlocks bool) string {
+	if state != polecat.StateIdle {
+		return ""
+	}
+	status := polecat.CleanupStatus(cleanupStatus)
+	if cleanupStatus == "" || status == polecat.CleanupUnknown || status.RequiresRecovery() {
+		return "idle-recovery-needed"
+	}
+	if activeMR != "" && activeMRBlocks {
+		return "idle-pr-open"
+	}
+	if strings.HasPrefix(branch, "polecat/") {
+		return "idle-preserved"
+	}
+	return "idle-clean"
 }
 
 // getPolecatManager creates a polecat manager for the given rig.
@@ -454,6 +493,7 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 		polecatGit := git.NewGit(r.Path)
 		mgr := polecat.NewManager(r, polecatGit, t)
 		polecatMgr := polecat.NewSessionManager(t, r)
+		bd := beads.New(r.Path)
 
 		polecats, err := mgr.List()
 		if err != nil {
@@ -465,11 +505,26 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 		knownNames := make(map[string]bool)
 		for _, p := range polecats {
 			running, _ := polecatMgr.IsRunning(p.Name)
+			cleanupStatus := ""
+			activeMR := ""
+			agentBeadID := polecatBeadIDForRig(r, r.Name, p.Name)
+			if _, fields, err := bd.GetAgentBead(agentBeadID); err == nil && fields != nil {
+				cleanupStatus = fields.CleanupStatus
+				activeMR = fields.ActiveMR
+			}
+			state := effectivePolecatState(PolecatListItem{
+				State:          p.State,
+				SessionRunning: running,
+			})
 			allPolecats = append(allPolecats, PolecatListItem{
 				Rig:            r.Name,
 				Name:           p.Name,
-				State:          p.State,
+				State:          state,
 				Issue:          p.Issue,
+				CleanupStatus:  cleanupStatus,
+				ActiveMR:       activeMR,
+				Branch:         p.Branch,
+				ReuseStatus:    polecatReuseStatus(state, cleanupStatus, activeMR, p.Branch, activeMRBlocksReuse(bd, activeMR)),
 				SessionRunning: running,
 			})
 			knownNames[p.Name] = true
@@ -498,10 +553,6 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 	}
 
 	// Output
-	for i := range allPolecats {
-		allPolecats[i].State = effectivePolecatState(allPolecats[i])
-	}
-
 	if polecatListJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -541,6 +592,16 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  %s %s/%s  %s\n", sessionStatus, p.Rig, p.Name, stateStr)
 		if p.Issue != "" {
 			fmt.Printf("    %s\n", style.Dim.Render(p.Issue))
+		}
+		if p.ReuseStatus != "" {
+			details := "reuse: " + p.ReuseStatus
+			if p.CleanupStatus != "" {
+				details += " cleanup=" + p.CleanupStatus
+			}
+			if p.ActiveMR != "" {
+				details += " active_mr=" + p.ActiveMR
+			}
+			fmt.Printf("    %s\n", style.Dim.Render(details))
 		}
 		if p.Zombie && p.SessionName != "" {
 			fmt.Printf("    %s\n", style.Dim.Render("session: "+p.SessionName+" (no worktree)"))
