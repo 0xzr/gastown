@@ -179,6 +179,29 @@ func TestInstallForRole_RoleAgnostic(t *testing.T) {
 	}
 }
 
+func TestOpenCodeTemplateFailureDiagnostics(t *testing.T) {
+	template, err := templateFS.ReadFile("templates/opencode/gastown.js")
+	if err != nil {
+		t.Fatalf("read opencode template: %v", err)
+	}
+	content := string(template)
+	for _, want := range []string{
+		"command: ${cmd}",
+		"exit_code:",
+		"exit code 124",
+		"timeout:",
+		"stdout_tail:",
+		"stderr_tail:",
+		"timeout 10s gt dolt status 2>&1",
+		"dolt_status_tail:",
+		"suggested_recovery:",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("opencode template missing diagnostic field %q", want)
+		}
+	}
+}
+
 func TestInstallForRole_SkipsExisting(t *testing.T) {
 	dir := t.TempDir()
 	hooksPath := filepath.Join(dir, ".claude", "settings.json")
