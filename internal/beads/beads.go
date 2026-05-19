@@ -306,7 +306,7 @@ type CreateOptions struct {
 	Parent      string
 	Actor       string // Who is creating this issue (populates created_by)
 	Ephemeral   bool   // Create as ephemeral (wisp) - not synced to git
-	Rig         string // Target rig database (e.g., "gantry"). When set, routes bd create to the rig's directory via --repo.
+	Rig         string // Target rig database (e.g., "gantry"). When set, binds create to the rig's .beads directory.
 }
 
 // UpdateOptions specifies options for updating an issue.
