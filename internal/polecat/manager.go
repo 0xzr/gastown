@@ -2209,10 +2209,10 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
 }
 
 // Get returns a specific polecat by name.
-// State is derived from beads assignee field + tmux session state:
-// - If an issue is assigned to this polecat: StateWorking
-// - If no issue but tmux session is running: StateWorking (session alive = still working)
-// - If no issue and no tmux session: StateIdle (persistent, ready for reuse)
+// State is derived from active work beads/assignment first, with tmux liveness
+// used only to distinguish working from stalled when work exists. A live session
+// without an active issue is not work; persistent polecats can be idle while the
+// reusable sandbox/session is still present.
 func (m *Manager) Get(name string) (*Polecat, error) {
 	if !m.exists(name) {
 		return nil, ErrPolecatNotFound
@@ -2390,9 +2390,8 @@ func activeWorkBeadsForCleanup(issues []*beads.Issue) []*beads.Issue {
 //  2. Legacy agent hook_bead that still points to a currently hooked bead for this assignee
 //     → working (compatibility fallback during migration)
 //  3. Issue assigned via beads assignee (open/in_progress/hooked) → working
-//  4. Live tmux session → working (session active even if assignment not yet recorded)
-//  5. agent_state=idle with no live session → idle
-//  6. None of the above → idle
+//  4. No active issue → idle, even if a reusable tmux session is still alive
+//  5. Beads query failure + live/dead session → working/stalled fallback
 func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	// Use clonePath which handles both new (polecats/<name>/<rigname>/)
 	// and old (polecats/<name>/) structures
@@ -2483,24 +2482,15 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 		}, nil
 	}
 
-	// Persistent model: has issue = working, otherwise a live tmux session still
-	// means working even if beads state has fallen behind.
+	// Persistent model: only an active issue means working. A live tmux session
+	// without active work is an idle preserved polecat, not working with Issue:none.
 	issueID := ""
 	if issue != nil {
 		issueID = issue.ID
-	} else if running, stale := m.polecatSessionState(name); running && !stale {
-		return &Polecat{
-			Name:      name,
-			Rig:       m.rig.Name,
-			State:     StateWorking,
-			ClonePath: clonePath,
-			Branch:    branchName,
-		}, nil
 	}
 
-	// Persistent polecat model (gt-4ac): only trust agent_state=idle once the
-	// tmux session is gone. This prevents reusing a polecat that still has a live
-	// session when its bead state was cleared early.
+	// Persistent polecat model (gt-4ac): no active work means idle. Reuse logic is
+	// responsible for cleaning up any preserved live session before assignment.
 	state := StateIdle
 	if issueID != "" {
 		state = StateWorking

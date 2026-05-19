@@ -24,12 +24,21 @@ func TestEffectivePolecatState(t *testing.T) {
 		want polecat.State
 	}{
 		{
-			name: "session-running-done-becomes-working",
+			name: "session-running-done-with-issue-becomes-working",
+			item: PolecatListItem{
+				State:          polecat.StateDone,
+				Issue:          "gt-abc",
+				SessionRunning: true,
+			},
+			want: polecat.StateWorking,
+		},
+		{
+			name: "session-running-done-without-issue-stays-done",
 			item: PolecatListItem{
 				State:          polecat.StateDone,
 				SessionRunning: true,
 			},
-			want: polecat.StateWorking,
+			want: polecat.StateDone,
 		},
 		{
 			name: "session-dead-working-becomes-stalled",
@@ -57,9 +66,18 @@ func TestEffectivePolecatState(t *testing.T) {
 			want: polecat.StateIdle,
 		},
 		{
-			name: "idle-session-running-becomes-working",
+			name: "idle-session-running-without-issue-stays-idle",
 			item: PolecatListItem{
 				State:          polecat.StateIdle,
+				SessionRunning: true,
+			},
+			want: polecat.StateIdle,
+		},
+		{
+			name: "idle-session-running-with-issue-becomes-working",
+			item: PolecatListItem{
+				State:          polecat.StateIdle,
+				Issue:          "gt-abc",
 				SessionRunning: true,
 			},
 			want: polecat.StateWorking,

@@ -396,14 +396,14 @@ type PolecatListItem struct {
 }
 
 // effectivePolecatState returns the observable state used by polecat list output.
-// Session liveness is ground truth for working/idle/done transitions. Zombie entries
-// are never auto-rewritten.
+// Active work is ground truth for working; tmux liveness alone is not enough
+// because persistent polecats may keep a reusable live session after completion.
+// Zombie entries are never auto-rewritten.
 func effectivePolecatState(item PolecatListItem) polecat.State {
 	state := item.State
-	// A running session overrides both "done" and "idle" — the polecat is working.
-	// "idle" can be stale when a polecat is reused (cross-rig beads, stale heartbeat,
-	// or beads query timing), and "done" can be stale when gt done didn't complete.
-	if item.SessionRunning && (state == polecat.StateDone || state == polecat.StateIdle) {
+	// A running session only implies working when there is active work attached.
+	// Without an issue, rewriting idle/done to working recreates "Issue: (none)".
+	if item.SessionRunning && item.Issue != "" && (state == polecat.StateDone || state == polecat.StateIdle) {
 		return polecat.StateWorking
 	}
 	// When session is dead but beads still says "working", mark as stalled
