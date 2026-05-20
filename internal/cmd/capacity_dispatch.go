@@ -147,14 +147,18 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 	successfulRigs := make(map[string]bool)
 	// Track polecat names from dispatch results, keyed by context bead ID.
 	polecatNames := make(map[string]string)
+	lastCapacitySnapshot := polecatCapacitySnapshot{Max: maxPolecats}
 	cycle := &capacity.DispatchCycle{
 		AvailableCapacity: func() (int, error) {
-			active := countWorkingPolecats()
-			cap := maxPolecats - active
-			if cap <= 0 {
+			snapshot, err := polecatCapacitySnapshotForTown(townRoot)
+			if err != nil {
+				return 0, err
+			}
+			lastCapacitySnapshot = snapshot
+			if snapshot.Free <= 0 {
 				return 0, nil // No free slots — PlanDispatch treats <= 0 as no capacity
 			}
-			return cap, nil
+			return snapshot.Free, nil
 		},
 		QueryPending: func() ([]capacity.PendingBead, error) {
 			return getReadySlingContexts(townRoot)
@@ -204,6 +208,7 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		},
 		OnFailure: func(b capacity.PendingBead, err error) {
 			var onSuccessErr *capacity.ErrOnSuccessFailed
+			var admissionErr *polecatCapacityAdmissionError
 			if errors.As(err, &onSuccessErr) {
 				// Polecat launched but context close failed — not a true dispatch failure.
 				// Log a distinct warning so operators can distinguish from "polecat never launched".
@@ -223,6 +228,10 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 					// Skip recordDispatchFailure to avoid writing to a closed context.
 					return
 				}
+			} else if errors.As(err, &admissionErr) {
+				fmt.Fprintf(os.Stderr, "%s Capacity full while dispatching %s; leaving context queued: %v\n",
+					style.Dim.Render("○"), b.WorkBeadID, err)
+				return
 			} else {
 				_ = events.LogFeed(events.TypeSchedulerDispatchFailed, actor,
 					events.SchedulerDispatchFailedPayload(b.WorkBeadID, b.TargetRig, err.Error()))
@@ -238,7 +247,7 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		if planErr != nil {
 			return 0, fmt.Errorf("planning dispatch: %w", planErr)
 		}
-		printDryRunPlan(plan, maxPolecats, batchSize)
+		printDryRunPlan(plan, lastCapacitySnapshot, batchSize)
 		return 0, nil
 	}
 
@@ -269,28 +278,28 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		fmt.Printf("\n%s Dispatched %d, failed %d (reason: %s)\n",
 			style.Bold.Render("✓"), report.Dispatched, report.Failed, report.Reason)
 	} else if report.Skipped > 0 {
-		fmt.Printf("\n%s Skipped %d bead(s) — zero capacity (working: %d)\n",
-			style.Dim.Render("○"), report.Skipped, countWorkingPolecats())
+		snapshot, err := polecatCapacitySnapshotForTown(townRoot)
+		if err != nil {
+			snapshot = lastCapacitySnapshot
+		}
+		fmt.Printf("\n%s Skipped %d bead(s) — zero capacity (working: %d recovery_blocked: %d reservations: %d reusable_idle: %d)\n",
+			style.Dim.Render("○"), report.Skipped, snapshot.Working, snapshot.RecoveryBlocked, snapshot.Reservations, snapshot.ReusableIdle)
 	}
 
 	return report.Dispatched, nil
 }
 
 // printDryRunPlan displays a dry-run dispatch plan.
-func printDryRunPlan(plan capacity.DispatchPlan, maxPolecats, batchSize int) {
+func printDryRunPlan(plan capacity.DispatchPlan, snapshot polecatCapacitySnapshot, batchSize int) {
 	if plan.Reason == "none" {
 		fmt.Println("No ready beads scheduled for dispatch")
 		return
 	}
 
-	activePolecats := countActivePolecats()
 	capStr := "unlimited"
-	if maxPolecats > 0 {
-		cap := maxPolecats - activePolecats
-		if cap < 0 {
-			cap = 0
-		}
-		capStr = fmt.Sprintf("%d free of %d", cap, maxPolecats)
+	if snapshot.Max > 0 {
+		capStr = fmt.Sprintf("%d free of %d (working: %d, recovery_blocked: %d, reservations: %d, reusable_idle: %d)",
+			snapshot.Free, snapshot.Max, snapshot.Working, snapshot.RecoveryBlocked, snapshot.Reservations, snapshot.ReusableIdle)
 	}
 
 	totalReady := len(plan.ToDispatch) + plan.Skipped

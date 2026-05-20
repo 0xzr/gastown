@@ -119,15 +119,30 @@ func runSlingFormula(ctx context.Context, args []string) error {
 	if len(args) > 1 {
 		target = args[1]
 	}
+	var admission *polecatAdmissionHandle
+	if !slingDryRun && target != "" {
+		admissionRig := ""
+		if rigName, isRig := IsRigName(target); isRig {
+			admissionRig = rigName
+		}
+		if admissionRig != "" {
+			admission, _, err = acquirePolecatAdmissionFn(townRoot, admissionRig, formulaName, "formula")
+			if err != nil {
+				return err
+			}
+			defer admission.Release()
+		}
+	}
 	resolved, err := resolveTarget(target, ResolveTargetOptions{
-		DryRun:   slingDryRun,
-		Force:    slingForce,
-		Create:   slingCreate,
-		Account:  slingAccount,
-		Agent:    slingAgent,
-		NoBoot:   slingNoBoot,
-		WorkDesc: formulaName,
-		TownRoot: townRoot,
+		DryRun:               slingDryRun,
+		Force:                slingForce,
+		Create:               slingCreate,
+		Account:              slingAccount,
+		Agent:                slingAgent,
+		NoBoot:               slingNoBoot,
+		WorkDesc:             formulaName,
+		TownRoot:             townRoot,
+		SkipPolecatAdmission: admission != nil,
 	})
 	if err != nil {
 		return err
@@ -189,6 +204,16 @@ func runSlingFormula(ctx context.Context, args []string) error {
 		fmt.Printf("%s Formula %s already hooked to %s via %s, no-op\n",
 			style.Dim.Render("○"), formulaName, targetAgent, existing.ID)
 		return nil
+	}
+	if admission == nil && strings.Contains(targetAgent, "/polecats/") {
+		parts := strings.Split(targetAgent, "/")
+		if len(parts) >= 3 {
+			admission, _, err = acquirePolecatAdmissionFn(townRoot, parts[0], formulaName, "formula")
+			if err != nil {
+				return err
+			}
+			defer admission.Release()
+		}
 	}
 
 	// Step 1: Cook the formula (ensures proto exists)

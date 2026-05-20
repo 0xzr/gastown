@@ -2164,6 +2164,12 @@ func (m *Manager) FindIdlePolecat() (*Polecat, error) {
 	return nil, nil
 }
 
+// ReuseDecisionForPolecat exposes the same reuse verdict used by FindIdlePolecat
+// so admission planning cannot drift from the destructive reuse gate.
+func (m *Manager) ReuseDecisionForPolecat(name string, state State) SlotReuseDecision {
+	return m.reuseDecisionForPolecat(name, state)
+}
+
 func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDecision {
 	input := SlotReuseInput{State: state, CleanupStatus: CleanupUnknown}
 	agentID := m.agentBeadID(name)

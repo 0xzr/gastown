@@ -230,6 +230,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 
 	// 3. Spawn polecat (via spawnPolecatForSling)
 	spawnOpts := SlingSpawnOptions{
+		TownRoot:     townRoot,
 		Force:        params.Force,
 		Account:      params.Account,
 		HookBead:     params.BeadID,
