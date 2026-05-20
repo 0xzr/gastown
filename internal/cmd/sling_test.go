@@ -2243,6 +2243,9 @@ func TestCheckCrossRigGuard(t *testing.T) {
 				if !strings.Contains(errMsg, "bd create") {
 					t.Errorf("error should mention bd create, got: %v", err)
 				}
+				if !strings.Contains(errMsg, "--repo") {
+					t.Errorf("error should mention explicit --repo routing, got: %v", err)
+				}
 			}
 		})
 	}
