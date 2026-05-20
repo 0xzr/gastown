@@ -524,6 +524,8 @@ func (b *Beads) Init(prefix string) error {
 // Investigation: dc-1pq8 (forensic report 2026-05-02).
 const bdSubprocessTimeout = 60 * time.Second
 
+const bdReadThrottleTimeout = 5 * time.Second
+
 // resolveBdSubprocessTimeout returns the configured timeout, honoring the
 // GT_BD_TIMEOUT_SEC env var override (must parse as a positive integer).
 func resolveBdSubprocessTimeout() time.Duration {
@@ -556,17 +558,21 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	// causing all JSON parsing to fail. Inject --flat before --allow-stale prepend
 	// (which changes args[0] from "list" to "--allow-stale").
 	args = InjectFlatForListJSON(args)
-	if shouldThrottleBDRead(args) {
-		if unlock, err := b.acquireBDReadThrottle(); err == nil && unlock != nil {
-			defer unlock()
-		}
-	}
 
 	// Conditionally use --allow-stale to prevent failures when db is temporarily stale
 	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
 	beadsDir := b.getResolvedBeadsDir()
 	runEnv := append(b.buildRunEnv(), "BEADS_DIR="+beadsDir)
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
+	if shouldThrottleBDRead(fullArgs) {
+		unlock, err := b.acquireBDReadThrottle(bdReadThrottleTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("bd %s: %w", strings.Join(fullArgs, " "), err)
+		}
+		if unlock != nil {
+			defer unlock()
+		}
+	}
 
 	// Bound the subprocess runtime so a slow Dolt response doesn't leave bd
 	// blocking forever (under memory pressure that invites Jetsam SIGKILL).
@@ -641,7 +647,7 @@ func shouldThrottleBDRead(args []string) bool {
 	return false
 }
 
-func (b *Beads) acquireBDReadThrottle() (func(), error) {
+func (b *Beads) acquireBDReadThrottle(timeout time.Duration) (func(), error) {
 	townRoot := b.getTownRoot()
 	if townRoot == "" {
 		return nil, nil
@@ -650,7 +656,21 @@ func (b *Beads) acquireBDReadThrottle() (func(), error) {
 	if err := os.MkdirAll(lockDir, 0755); err != nil {
 		return nil, err
 	}
-	return gtlock.FlockAcquire(filepath.Join(lockDir, "bd-list-read.flock"))
+	lockPath := filepath.Join(lockDir, "bd-list-read.flock")
+	deadline := time.Now().Add(timeout)
+	for {
+		unlock, ok, err := gtlock.FlockTryAcquire(lockPath)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return unlock, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for bd list read throttle")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // runWithRouting executes a bd command without setting BEADS_DIR, allowing bd's

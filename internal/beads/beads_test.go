@@ -3792,6 +3792,7 @@ func TestShouldThrottleBDRead(t *testing.T) {
 	}{
 		{"list", []string{"list", "--json"}, true},
 		{"list with flags first", []string{"--flat", "list", "--json"}, true},
+		{"list with allow stale first", []string{"--allow-stale", "--flat", "list", "--json"}, true},
 		{"show", []string{"show", "gt-abc"}, false},
 		{"update", []string{"update", "gt-abc", "--status=hooked"}, false},
 		{"empty", nil, false},
