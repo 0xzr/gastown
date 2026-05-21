@@ -30,6 +30,10 @@ func newTestTmux(t *testing.T) *Tmux {
 	return NewTmux()
 }
 
+func isSleepPaneCommand(cmd string) bool {
+	return cmd == "sleep" || cmd == "coreutils"
+}
+
 func TestListSessionsNoServer(t *testing.T) {
 	tm := newTestTmux(t)
 	sessions, err := tm.ListSessions()
@@ -597,7 +601,7 @@ func TestGetPaneCommand_MultiPane(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPaneCommand before split: %v", err)
 	}
-	if cmd != "sleep" {
+	if !isSleepPaneCommand(cmd) {
 		t.Fatalf("expected pane 0 command to be 'sleep', got %q", cmd)
 	}
 
@@ -621,7 +625,7 @@ func TestGetPaneCommand_MultiPane(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPaneCommand after split: %v", err)
 	}
-	if cmd != "sleep" {
+	if !isSleepPaneCommand(cmd) {
 		t.Errorf("after split, GetPaneCommand should return pane 0 command 'sleep', got %q", cmd)
 	}
 

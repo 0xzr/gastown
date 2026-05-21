@@ -106,7 +106,7 @@ func TestNewSessionWithCommand_ExecEnvSuccess(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 	paneCmd, _ := tm.GetPaneCommand(session)
-	if paneCmd != "sleep" {
+	if !isSleepPaneCommand(paneCmd) {
 		t.Errorf("expected pane command 'sleep' (exec replaced shell), got %q", paneCmd)
 	}
 }
