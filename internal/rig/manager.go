@@ -867,20 +867,20 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 		if _, err := os.Stat(mayorRigBeads); err == nil {
 			routePath = opts.Name + "/mayor/rig"
 		}
-			route := beads.Route{
-				Prefix: opts.BeadsPrefix + "-",
-				Path:   routePath,
-			}
-			previousRoute, err := beads.AppendRouteIfPrefixAvailable(m.townRoot, route)
-			if err != nil {
-				return nil, fmt.Errorf("registering rig route: %w", err)
-			}
-			routeRollback = func() {
-				if err := beads.RestoreRouteIfCurrent(m.townRoot, route, previousRoute); err != nil {
-					fmt.Fprintf(os.Stderr, "  Warning: Could not roll back route %s -> %s: %v\n", route.Prefix, route.Path, err)
-				}
+		route := beads.Route{
+			Prefix: opts.BeadsPrefix + "-",
+			Path:   routePath,
+		}
+		previousRoute, err := beads.AppendRouteIfPrefixAvailable(m.townRoot, route)
+		if err != nil {
+			return nil, fmt.Errorf("registering rig route: %w", err)
+		}
+		routeRollback = func() {
+			if err := beads.RestoreRouteIfCurrent(m.townRoot, route, previousRoute); err != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: Could not roll back route %s -> %s: %v\n", route.Prefix, route.Path, err)
 			}
 		}
+	}
 
 	// Create rig-level settings directory (used by gt config for rig overrides)
 	rigSettingsPath := filepath.Join(rigPath, constants.DirSettings)

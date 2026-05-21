@@ -505,6 +505,61 @@ func TestCheckPrefixAvailable_NoRoutes(t *testing.T) {
 	}
 }
 
+func TestAppendRouteIfPrefixAvailable(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := WriteRoutes(beadsDir, []Route{{Prefix: "gt-", Path: "gastown/mayor/rig"}}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	if _, err := AppendRouteIfPrefixAvailable(tmpDir, Route{Prefix: "gt-", Path: "secondrig/mayor/rig"}); err == nil {
+		t.Fatal("AppendRouteIfPrefixAvailable succeeded for different-rig prefix collision")
+	}
+	routes, err := LoadRoutes(beadsDir)
+	if err != nil {
+		t.Fatalf("load routes: %v", err)
+	}
+	if len(routes) != 1 || routes[0].Path != "gastown/mayor/rig" {
+		t.Fatalf("route changed after rejected collision: %#v", routes)
+	}
+
+	previous, err := AppendRouteIfPrefixAvailable(tmpDir, Route{Prefix: "gt-", Path: "gastown"})
+	if err != nil {
+		t.Fatalf("AppendRouteIfPrefixAvailable same rig: %v", err)
+	}
+	if previous == nil || previous.Path != "gastown/mayor/rig" {
+		t.Fatalf("previous route = %#v, want gastown/mayor/rig", previous)
+	}
+	if err := RestoreRouteIfCurrent(tmpDir, Route{Prefix: "gt-", Path: "gastown"}, previous); err != nil {
+		t.Fatalf("restore previous route: %v", err)
+	}
+	routes, err = LoadRoutes(beadsDir)
+	if err != nil {
+		t.Fatalf("load restored routes: %v", err)
+	}
+	if len(routes) != 1 || routes[0].Path != "gastown/mayor/rig" {
+		t.Fatalf("route was not restored: %#v", routes)
+	}
+
+	previous, err = AppendRouteIfPrefixAvailable(tmpDir, Route{Prefix: "cr-", Path: "crucible"})
+	if err != nil {
+		t.Fatalf("AppendRouteIfPrefixAvailable new route: %v", err)
+	}
+	if previous != nil {
+		t.Fatalf("previous route = %#v, want nil for new route", previous)
+	}
+	if err := RestoreRouteIfCurrent(tmpDir, Route{Prefix: "cr-", Path: "crucible"}, previous); err != nil {
+		t.Fatalf("remove new route rollback: %v", err)
+	}
+	routes, err = LoadRoutes(beadsDir)
+	if err != nil {
+		t.Fatalf("load routes after rollback: %v", err)
+	}
+	if len(routes) != 1 || routes[0].Prefix != "gt-" {
+		t.Fatalf("new route was not removed on rollback: %#v", routes)
+	}
+}
+
 func TestAgentBeadIDsWithPrefix(t *testing.T) {
 	tests := []struct {
 		name     string

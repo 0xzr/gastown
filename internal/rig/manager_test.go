@@ -2110,6 +2110,44 @@ func TestAddRig_TrackedBeadsPrefixCollisionDoesNotRewriteRoute(t *testing.T) {
 	}
 }
 
+func TestAddRig_RollsBackRouteWhenRegistrationFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based bd shim not reliable on Windows CI")
+	}
+
+	fakeBDForAddRig(t)
+
+	root, rigsConfig := setupTestTown(t)
+	if err := os.WriteFile(filepath.Join(root, "mayor"), []byte("not a directory\n"), 0644); err != nil {
+		t.Fatalf("write mayor blocker: %v", err)
+	}
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	repoDir := createTestGitRepoForRig(t, "rollbackrepo")
+
+	_, err := manager.AddRig(AddRigOptions{
+		Name:          "rollbackrig",
+		GitURL:        repoDir,
+		BeadsPrefix:   "rb",
+		SkipDoltCheck: true,
+	})
+	if err == nil {
+		t.Fatal("AddRig succeeded, want rigs.json registration failure")
+	}
+	if got := err.Error(); !strings.Contains(got, "registering rig in rigs.json") {
+		t.Fatalf("AddRig error = %q, want rigs.json registration failure", got)
+	}
+
+	routes, err := beads.LoadRoutes(filepath.Join(root, ".beads"))
+	if err != nil {
+		t.Fatalf("load routes: %v", err)
+	}
+	for _, route := range routes {
+		if route.Prefix == "rb-" {
+			t.Fatalf("route was not rolled back after failed add: %#v", routes)
+		}
+	}
+}
+
 func TestAddRig_TrackedBeadsWithoutSyncRemote_NoReinitFlags(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-based bd shim not reliable on Windows CI")
