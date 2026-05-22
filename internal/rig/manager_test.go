@@ -1380,6 +1380,9 @@ func TestAddRig_TrackedBeadsPrefixCollisionDoesNotRewriteRoute(t *testing.T) {
 	if got := err.Error(); !strings.Contains(got, "source repo prefix") || !strings.Contains(got, "already used") {
 		t.Fatalf("AddRig error = %q, want source prefix collision", got)
 	}
+	if got := err.Error(); strings.Contains(got, "use --prefix") {
+		t.Fatalf("AddRig error = %q, should not suggest --prefix for tracked source prefix collision", got)
+	}
 
 	routes, err := beads.LoadRoutes(filepath.Join(root, ".beads"))
 	if err != nil {
