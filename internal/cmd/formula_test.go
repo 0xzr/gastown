@@ -430,6 +430,9 @@ exit 0
 		t.Fatalf("read bd log: %v", err)
 	}
 	logText := string(logBytes)
+	if strings.Contains(logText, "--force") {
+		t.Fatalf("formula creates should not use --force for multi-hyphen IDs:\n%s", logText)
+	}
 	if strings.Contains(logText, "--id=gt-cv-") {
 		t.Fatalf("formula convoy created rig-prefixed convoy in town log:\n%s", logText)
 	}

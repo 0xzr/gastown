@@ -1816,6 +1816,7 @@ func TestCreateStagedConvoy_CleanReady(t *testing.T) {
 		Task("gt-c", "Task C", withRig("gastown")).BlockedBy("gt-b")
 
 	_, logPath := testDAG.Setup(t)
+	t.Setenv("BEADS_DIR", filepath.Join(filepath.Dir(logPath), "poison", ".beads"))
 
 	// Build the ConvoyDAG directly with rigs populated (avoids rigFromBeadID stub).
 	convoyDAG := &ConvoyDAG{Nodes: map[string]*ConvoyDAGNode{
@@ -1865,6 +1866,16 @@ func TestCreateStagedConvoy_CleanReady(t *testing.T) {
 
 	if !strings.Contains(logContent, "create") {
 		t.Errorf("bd.log should contain 'create' command, got:\n%s", logContent)
+	}
+	for _, line := range strings.Split(logContent, "\n") {
+		if strings.Contains(line, "CMD:create") {
+			if strings.Contains(line, "--force") {
+				t.Fatalf("staged convoy create should not use --force for hq-cv-* ID:\n%s", logContent)
+			}
+			if !strings.Contains(line, "BEADS_DIR:"+filepath.Join(filepath.Dir(logPath), ".beads")) {
+				t.Fatalf("staged convoy create should ignore ambient BEADS_DIR and target town beads:\n%s", logContent)
+			}
+		}
 	}
 	if !strings.Contains(logContent, "--status=staged_ready") {
 		t.Errorf("bd.log should contain '--status=staged_ready', got:\n%s", logContent)

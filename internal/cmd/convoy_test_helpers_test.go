@@ -210,7 +210,7 @@ func (d *testDAG) BdStubScript() string {
 
 	var sb strings.Builder
 	sb.WriteString("#!/bin/sh\n")
-	sb.WriteString(`echo "CMD:$*" >> "LOGPATH"` + "\n")
+	sb.WriteString(`echo "CMD:$*|BEADS_DIR:${BEADS_DIR:-}" >> "LOGPATH"` + "\n")
 	sb.WriteString("\n")
 
 	// Collect all args into a single string for flexible matching.
