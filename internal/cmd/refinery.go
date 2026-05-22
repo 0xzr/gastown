@@ -9,9 +9,10 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/mrtarget"
 	"github.com/steveyegge/gastown/internal/refinery"
-	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -652,10 +653,15 @@ func runRefineryUnclaimed(cmd *cobra.Command, args []string) error {
 		if fields == nil {
 			continue
 		}
+		targetResult, targetErr := mrtarget.ValidateReadback(fields.Target, r.DefaultBranch(), nil, false)
+		if targetErr != nil {
+			fmt.Fprintf(os.Stderr, "Skipping MR %s with invalid target: %v\n", issue.ID, targetErr)
+			continue
+		}
 		mr := &refinery.MRInfo{
 			ID:       issue.ID,
 			Branch:   fields.Branch,
-			Target:   fields.Target,
+			Target:   targetResult.Branch,
 			Worker:   fields.Worker,
 			Priority: issue.Priority,
 		}
