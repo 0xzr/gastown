@@ -383,19 +383,19 @@ func init() {
 
 // PolecatListItem represents a polecat in list output.
 type PolecatListItem struct {
-	Rig            string              `json:"rig"`
-	Name           string              `json:"name"`
-	State          polecat.State       `json:"state"`
-	Issue          string              `json:"issue,omitempty"`
-	CleanupStatus  string              `json:"cleanup_status,omitempty"`
-	ActiveMR       string              `json:"active_mr,omitempty"`
-	Branch         string              `json:"branch,omitempty"`
-	Disposition    polecat.Disposition `json:"disposition,omitempty"`
-	DispositionReason string           `json:"disposition_reason,omitempty"`
-	ReuseStatus    string              `json:"reuse_status,omitempty"`
-	SessionRunning bool                `json:"session_running"`
-	Zombie         bool                `json:"zombie,omitempty"`
-	SessionName    string              `json:"session_name,omitempty"`
+	Rig               string              `json:"rig"`
+	Name              string              `json:"name"`
+	State             polecat.State       `json:"state"`
+	Issue             string              `json:"issue,omitempty"`
+	CleanupStatus     string              `json:"cleanup_status,omitempty"`
+	ActiveMR          string              `json:"active_mr,omitempty"`
+	Branch            string              `json:"branch,omitempty"`
+	Disposition       polecat.Disposition `json:"disposition,omitempty"`
+	DispositionReason string              `json:"disposition_reason,omitempty"`
+	ReuseStatus       string              `json:"reuse_status,omitempty"`
+	SessionRunning    bool                `json:"session_running"`
+	Zombie            bool                `json:"zombie,omitempty"`
+	SessionName       string              `json:"session_name,omitempty"`
 }
 
 // effectivePolecatState returns the observable state used by polecat list output.
@@ -571,17 +571,17 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 			resolved := observedPolecatDisposition(state, fields, hookBead, activeMRBlocks, p.ClonePath)
 			disposition := resolved.Disposition
 			allPolecats = append(allPolecats, PolecatListItem{
-				Rig:            r.Name,
-				Name:           p.Name,
-				State:          state,
-				Issue:          p.Issue,
-				CleanupStatus:  cleanupStatus,
-				ActiveMR:       activeMR,
-				Branch:         p.Branch,
-				Disposition:    disposition,
+				Rig:               r.Name,
+				Name:              p.Name,
+				State:             state,
+				Issue:             p.Issue,
+				CleanupStatus:     cleanupStatus,
+				ActiveMR:          activeMR,
+				Branch:            p.Branch,
+				Disposition:       disposition,
 				DispositionReason: resolved.Reason,
-				ReuseStatus:    polecatReuseStatusForDisposition(state, p.Branch, disposition),
-				SessionRunning: running,
+				ReuseStatus:       polecatReuseStatusForDisposition(state, p.Branch, disposition),
+				SessionRunning:    running,
 			})
 			knownNames[p.Name] = true
 		}
@@ -758,25 +758,25 @@ func runPolecatRemove(cmd *cobra.Command, args []string) error {
 
 // PolecatStatus represents detailed polecat status for JSON output.
 type PolecatStatus struct {
-	Rig                   string                `json:"rig"`
-	Name                  string                `json:"name"`
-	State                 polecat.State         `json:"state"`
-	Issue                 string                `json:"issue,omitempty"`
-	ClonePath             string                `json:"clone_path"`
-	Branch                string                `json:"branch"`
-	CleanupStatus         string                `json:"cleanup_status,omitempty"`
-	ActiveMR              string                `json:"active_mr,omitempty"`
-	Disposition           polecat.Disposition   `json:"disposition,omitempty"`
-	DispositionReason     string                `json:"disposition_reason,omitempty"`
-	ReuseStatus           string                `json:"reuse_status,omitempty"`
-	SlotOpenEligible      bool                  `json:"slot_open_eligible"`
-	CountsAgainstCapacity bool                  `json:"counts_against_capacity"`
-	SessionRunning        bool                  `json:"session_running"`
-	SessionID             string                `json:"session_id,omitempty"`
-	Attached              bool                  `json:"attached,omitempty"`
-	Windows               int                   `json:"windows,omitempty"`
-	CreatedAt             string                `json:"created_at,omitempty"`
-	LastActivity          string                `json:"last_activity,omitempty"`
+	Rig                   string              `json:"rig"`
+	Name                  string              `json:"name"`
+	State                 polecat.State       `json:"state"`
+	Issue                 string              `json:"issue,omitempty"`
+	ClonePath             string              `json:"clone_path"`
+	Branch                string              `json:"branch"`
+	CleanupStatus         string              `json:"cleanup_status,omitempty"`
+	ActiveMR              string              `json:"active_mr,omitempty"`
+	Disposition           polecat.Disposition `json:"disposition,omitempty"`
+	DispositionReason     string              `json:"disposition_reason,omitempty"`
+	ReuseStatus           string              `json:"reuse_status,omitempty"`
+	SlotOpenEligible      bool                `json:"slot_open_eligible"`
+	CountsAgainstCapacity bool                `json:"counts_against_capacity"`
+	SessionRunning        bool                `json:"session_running"`
+	SessionID             string              `json:"session_id,omitempty"`
+	Attached              bool                `json:"attached,omitempty"`
+	Windows               int                 `json:"windows,omitempty"`
+	CreatedAt             string              `json:"created_at,omitempty"`
+	LastActivity          string              `json:"last_activity,omitempty"`
 }
 
 func runPolecatStatus(cmd *cobra.Command, args []string) error {

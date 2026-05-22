@@ -144,12 +144,12 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 
 	if schedulerStatusJSON {
 		out := struct {
-			Paused         bool               `json:"paused"`
-			PausedBy       string             `json:"paused_by,omitempty"`
-			ScheduledTotal int                `json:"queued_total"`
-			ScheduledReady int                `json:"queued_ready"`
-			ActivePolecats int                `json:"active_polecats"`
-			LastDispatchAt string             `json:"last_dispatch_at,omitempty"`
+			Paused         bool                `json:"paused"`
+			PausedBy       string              `json:"paused_by,omitempty"`
+			ScheduledTotal int                 `json:"queued_total"`
+			ScheduledReady int                 `json:"queued_ready"`
+			ActivePolecats int                 `json:"active_polecats"`
+			LastDispatchAt string              `json:"last_dispatch_at,omitempty"`
 			Beads          []scheduledBeadInfo `json:"beads"`
 		}{
 			Paused:         state.Paused,

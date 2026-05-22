@@ -119,7 +119,7 @@ func TestActiveMRBlocksReuse(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "missing MR blocks conservatively",
+			name: "missing MR does not block reuse",
 			mrID: "mr-1",
 			bd:   fakeReuseMRShower{},
 			want: false,
@@ -177,6 +177,13 @@ func TestPolecatReuseStatusForDisposition(t *testing.T) {
 				t.Fatalf("polecatReuseStatusForDisposition() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestObservedPolecatDispositionMissingAgentUsesCleanFallback(t *testing.T) {
+	got := observedPolecatDisposition(polecat.StateIdle, nil, "", false, "")
+	if got.Disposition != polecat.DispositionAvailableClean {
+		t.Fatalf("observedPolecatDisposition() = %q (%s), want %q", got.Disposition, got.Reason, polecat.DispositionAvailableClean)
 	}
 }
 
