@@ -1675,7 +1675,7 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 	if err != nil {
 		return nil, err
 	}
-	if (current.State == StateWorking || current.State == StateStalled) && current.Issue == "" {
+	if (current.State == StateWorking || current.State == StateStalled || current.State == StateReviewNeeded) && current.Issue == "" {
 		current = &Polecat{
 			Name:      current.Name,
 			Rig:       current.Rig,
