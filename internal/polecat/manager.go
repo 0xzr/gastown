@@ -2165,11 +2165,12 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
 	_, fields, err := m.agentBeads().GetAgentBead(agentID)
 	if err != nil {
 		input.GitCheckFailed = true
-	}
-	if err == nil && fields != nil {
+	} else if fields == nil {
+		input.CleanupStatus = CleanupClean
+	} else {
 		input.HookBead = fields.HookBead
 		input.ActiveMR = fields.ActiveMR
-		input.ActiveMRBlocks = fields.ActiveMR != ""
+		input.ActiveMRBlocks = ActiveMRBlocksReuse(m.beads, fields.ActiveMR)
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
 		if fields.CleanupStatus != "" {

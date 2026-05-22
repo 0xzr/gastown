@@ -283,7 +283,7 @@ func printDryRunPlan(plan capacity.DispatchPlan, maxPolecats, batchSize int) {
 		return
 	}
 
-	activePolecats := countActivePolecats()
+	activePolecats := countWorkingPolecats()
 	capStr := "unlimited"
 	if maxPolecats > 0 {
 		cap := maxPolecats - activePolecats

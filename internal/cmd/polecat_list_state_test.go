@@ -122,7 +122,7 @@ func TestActiveMRBlocksReuse(t *testing.T) {
 			name: "missing MR blocks conservatively",
 			mrID: "mr-1",
 			bd:   fakeReuseMRShower{},
-			want: true,
+			want: false,
 		},
 	}
 
@@ -130,6 +130,51 @@ func TestActiveMRBlocksReuse(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := activeMRBlocksReuse(tt.bd, tt.mrID); got != tt.want {
 				t.Fatalf("activeMRBlocksReuse() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPolecatReuseStatusForDisposition(t *testing.T) {
+	tests := []struct {
+		name        string
+		state       polecat.State
+		branch      string
+		disposition polecat.Disposition
+		want        string
+	}{
+		{
+			name:        "working has no reuse status even when clean",
+			state:       polecat.StateWorking,
+			disposition: polecat.DispositionAvailableClean,
+			want:        "",
+		},
+		{
+			name:        "blocked unknown is recovery needed",
+			state:       polecat.StateIdle,
+			disposition: polecat.DispositionBlockedUnknown,
+			want:        "idle-recovery-needed",
+		},
+		{
+			name:        "submitted preserved is pr open",
+			state:       polecat.StateIdle,
+			disposition: polecat.DispositionSubmittedPreserved,
+			want:        "idle-pr-open",
+		},
+		{
+			name:        "available polecat branch is preserved",
+			state:       polecat.StateIdle,
+			branch:      "polecat/nux/old",
+			disposition: polecat.DispositionAvailableClean,
+			want:        "idle-preserved",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := polecatReuseStatusForDisposition(tt.state, tt.branch, tt.disposition)
+			if got != tt.want {
+				t.Fatalf("polecatReuseStatusForDisposition() = %q, want %q", got, tt.want)
 			}
 		})
 	}

@@ -832,12 +832,14 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 	}
 	prefix := beads.GetPrefixForRig(townRoot, rigName)
 	agentID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
-	_, fields, err := beads.New(beads.ResolveBeadsDir(workDir)).ForAgentBead().GetAgentBead(agentID)
+	agentBD := beads.New(beads.ResolveBeadsDir(workDir)).ForAgentBead()
+	mrBD := beads.New(workDir)
+	_, fields, err := agentBD.GetAgentBead(agentID)
 	input := polecat.SlotReuseInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupUnknown, GitCheckFailed: err != nil || fields == nil}
 	if fields != nil {
 		input.HookBead = fields.HookBead
 		input.ActiveMR = fields.ActiveMR
-		input.ActiveMRBlocks = fields.ActiveMR != ""
+		input.ActiveMRBlocks = polecat.ActiveMRBlocksReuse(mrBD, fields.ActiveMR)
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
 		if fields.CleanupStatus != "" {
@@ -2144,6 +2146,17 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 				_ = t.NudgeSession(mayorSession, mayorMsg)
 			}
 		}
+		return
+	}
+
+	if payload.MRFailed {
+		resolved := polecat.ResolveWorkstateDisposition(polecat.WorkstateInput{
+			State:         polecat.StateIdle,
+			CleanupStatus: polecat.CleanupClean,
+			MRFailed:      true,
+		})
+		discovery.Action = fmt.Sprintf("completion-blocked disposition=%s reason=%s (branch=%s issue=%s)",
+			resolved.Disposition, resolved.Reason, payload.Branch, payload.IssueID)
 		return
 	}
 

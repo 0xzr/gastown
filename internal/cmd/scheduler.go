@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	gtpolecat "github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -139,7 +140,7 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 
 	scheduled := listScheduledBeads(townRoot)
 
-	activePolecats := countActivePolecats()
+	activePolecats := countWorkingPolecats()
 
 	if schedulerStatusJSON {
 		out := struct {
@@ -491,10 +492,8 @@ func countActivePolecats() int {
 	return count
 }
 
-// countWorkingPolecats counts polecat sessions that are actively working.
-// A polecat is "working" if its agent bead has a non-null hook_bead.
-// Idle polecats (completed work, hook_bead=null) don't count toward capacity
-// since they're available for re-sling under the persistent polecat model.
+// countWorkingPolecats counts polecat sessions that still consume scheduler
+// capacity according to the canonical workstate disposition.
 func countWorkingPolecats() int {
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
@@ -508,6 +507,7 @@ func countWorkingPolecats() int {
 	}
 
 	bd := beads.New(townRoot)
+	agentBD := bd.ForAgentBead()
 	count := 0
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
@@ -518,25 +518,32 @@ func countWorkingPolecats() int {
 			continue
 		}
 
-		// Check if this polecat has hooked work
 		prefix := identity.Prefix
 		if prefix == "" {
 			prefix = session.PrefixFor(identity.Rig)
 		}
 		agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, identity.Rig, identity.Name)
-		issue, err := bd.Show(agentBeadID)
-		if err != nil || issue == nil {
-			// Agent bead missing or unreachable — skip instead of counting
-			// as working. Dolt-down case (all lookups fail → count=0) is
-			// safe because polecat_spawn.go gates on Dolt health.
+		agentIssue, fields, err := agentBD.GetAgentBead(agentBeadID)
+		if err != nil {
+			// Unreadable agent metadata fails closed for capacity.
+			count++
 			continue
 		}
 
-		fields := beads.ParseAgentFields(issue.Description)
-		if fields.HookBead == "" {
-			continue // Idle — don't count toward cap
+		state := gtpolecat.StateIdle
+		activeMR := ""
+		if fields != nil {
+			activeMR = fields.ActiveMR
 		}
-		count++
+		if fields != nil && (fields.HookBead != "" || fields.AgentState == string(beads.AgentStateWorking) || fields.AgentState == string(beads.AgentStateSpawning)) {
+			state = gtpolecat.StateWorking
+		}
+		activeMRBlocks := activeMRBlocksReuse(bd, activeMR)
+		clonePath := filepath.Join(townRoot, identity.Rig, "polecats", identity.Name, identity.Rig)
+		resolved := observedPolecatDisposition(state, fields, agentHookBead(agentIssue, fields), activeMRBlocks, clonePath)
+		if resolved.Disposition.CountsAgainstCapacity() {
+			count++
+		}
 	}
 	return count
 }

@@ -391,6 +391,7 @@ type PolecatListItem struct {
 	ActiveMR       string              `json:"active_mr,omitempty"`
 	Branch         string              `json:"branch,omitempty"`
 	Disposition    polecat.Disposition `json:"disposition,omitempty"`
+	DispositionReason string           `json:"disposition_reason,omitempty"`
 	ReuseStatus    string              `json:"reuse_status,omitempty"`
 	SessionRunning bool                `json:"session_running"`
 	Zombie         bool                `json:"zombie,omitempty"`
@@ -422,24 +423,13 @@ type reuseMRShower interface {
 }
 
 func activeMRBlocksReuse(bd reuseMRShower, mrID string) bool {
-	if mrID == "" {
-		return false
-	}
-	if bd == nil {
-		return true
-	}
-	mr, err := bd.Show(mrID)
-	if err != nil || mr == nil {
-		return true
-	}
-	return !beads.IssueStatus(mr.Status).IsTerminal()
+	return polecat.ActiveMRBlocksReuse(bd, mrID)
 }
 
-func polecatReuseStatus(state polecat.State, cleanupStatus, activeMR, branch string, activeMRBlocks bool) string {
+func polecatReuseStatusForDisposition(state polecat.State, branch string, disposition polecat.Disposition) string {
 	if state != polecat.StateIdle {
 		return ""
 	}
-	disposition := polecatListDisposition(state, cleanupStatus, activeMR, activeMRBlocks)
 	switch disposition {
 	case polecat.DispositionRecoverLocal, polecat.DispositionReconcileMetadata, polecat.DispositionBlockedUnknown:
 		return "idle-recovery-needed"
@@ -455,6 +445,10 @@ func polecatReuseStatus(state polecat.State, cleanupStatus, activeMR, branch str
 	return "idle-clean"
 }
 
+func polecatReuseStatus(state polecat.State, cleanupStatus, activeMR, branch string, activeMRBlocks bool) string {
+	return polecatReuseStatusForDisposition(state, branch, polecatListDisposition(state, cleanupStatus, activeMR, activeMRBlocks))
+}
+
 func polecatListDisposition(state polecat.State, cleanupStatus, activeMR string, activeMRBlocks bool) polecat.Disposition {
 	resolved := polecat.ResolveWorkstateDisposition(polecat.WorkstateInput{
 		State:          state,
@@ -463,6 +457,42 @@ func polecatListDisposition(state polecat.State, cleanupStatus, activeMR string,
 		ActiveMRBlocks: activeMRBlocks,
 	})
 	return resolved.Disposition
+}
+
+func applyGitEvidenceToWorkstate(input *polecat.WorkstateInput, clonePath string) {
+	if clonePath == "" {
+		return
+	}
+	g := git.NewGit(clonePath)
+	branch, branchErr := g.CurrentBranch()
+	if branchErr != nil {
+		input.GitCheckFailed = true
+	}
+	if status, err := g.CheckUncommittedWork(); err == nil {
+		input.GitDirty = !status.CleanExcludingRuntime()
+		input.StashCount = status.StashCount
+		input.UnpushedCommits = status.UnpushedCommits
+	} else {
+		input.GitCheckFailed = true
+	}
+	if branch != "" {
+		if pushed, unpushed, err := g.BranchPushedToRemote(branch, "origin"); err == nil {
+			if !pushed && unpushed > input.UnpushedCommits {
+				input.UnpushedCommits = unpushed
+			}
+		} else {
+			input.GitCheckFailed = true
+		}
+	}
+}
+
+func observedPolecatDisposition(state polecat.State, fields *beads.AgentFields, hookBead string, activeMRBlocks bool, clonePath string) polecat.WorkstateDisposition {
+	input := polecat.WorkstateInputFromAgentFields(state, hookBead, fields, activeMRBlocks)
+	if fields == nil {
+		input.CleanupStatus = polecat.CleanupClean
+	}
+	applyGitEvidenceToWorkstate(&input, clonePath)
+	return polecat.ResolveWorkstateDisposition(input)
 }
 
 // getPolecatManager creates a polecat manager for the given rig.
@@ -523,8 +553,12 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 			running, _ := polecatMgr.IsRunning(p.Name)
 			cleanupStatus := ""
 			activeMR := ""
+			var agentIssue *beads.Issue
+			var fields *beads.AgentFields
 			agentBeadID := polecatBeadIDForRig(r, r.Name, p.Name)
-			if _, fields, err := bd.GetAgentBead(agentBeadID); err == nil && fields != nil {
+			if issue, agentFields, err := bd.GetAgentBead(agentBeadID); err == nil && agentFields != nil {
+				agentIssue = issue
+				fields = agentFields
 				cleanupStatus = fields.CleanupStatus
 				activeMR = fields.ActiveMR
 			}
@@ -533,7 +567,9 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 				SessionRunning: running,
 			})
 			activeMRBlocks := activeMRBlocksReuse(bd, activeMR)
-			disposition := polecatListDisposition(state, cleanupStatus, activeMR, activeMRBlocks)
+			hookBead := agentHookBead(agentIssue, fields)
+			resolved := observedPolecatDisposition(state, fields, hookBead, activeMRBlocks, p.ClonePath)
+			disposition := resolved.Disposition
 			allPolecats = append(allPolecats, PolecatListItem{
 				Rig:            r.Name,
 				Name:           p.Name,
@@ -543,7 +579,8 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 				ActiveMR:       activeMR,
 				Branch:         p.Branch,
 				Disposition:    disposition,
-				ReuseStatus:    polecatReuseStatus(state, cleanupStatus, activeMR, p.Branch, activeMRBlocks),
+				DispositionReason: resolved.Reason,
+				ReuseStatus:    polecatReuseStatusForDisposition(state, p.Branch, disposition),
 				SessionRunning: running,
 			})
 			knownNames[p.Name] = true
@@ -721,18 +758,25 @@ func runPolecatRemove(cmd *cobra.Command, args []string) error {
 
 // PolecatStatus represents detailed polecat status for JSON output.
 type PolecatStatus struct {
-	Rig            string        `json:"rig"`
-	Name           string        `json:"name"`
-	State          polecat.State `json:"state"`
-	Issue          string        `json:"issue,omitempty"`
-	ClonePath      string        `json:"clone_path"`
-	Branch         string        `json:"branch"`
-	SessionRunning bool          `json:"session_running"`
-	SessionID      string        `json:"session_id,omitempty"`
-	Attached       bool          `json:"attached,omitempty"`
-	Windows        int           `json:"windows,omitempty"`
-	CreatedAt      string        `json:"created_at,omitempty"`
-	LastActivity   string        `json:"last_activity,omitempty"`
+	Rig                   string                `json:"rig"`
+	Name                  string                `json:"name"`
+	State                 polecat.State         `json:"state"`
+	Issue                 string                `json:"issue,omitempty"`
+	ClonePath             string                `json:"clone_path"`
+	Branch                string                `json:"branch"`
+	CleanupStatus         string                `json:"cleanup_status,omitempty"`
+	ActiveMR              string                `json:"active_mr,omitempty"`
+	Disposition           polecat.Disposition   `json:"disposition,omitempty"`
+	DispositionReason     string                `json:"disposition_reason,omitempty"`
+	ReuseStatus           string                `json:"reuse_status,omitempty"`
+	SlotOpenEligible      bool                  `json:"slot_open_eligible"`
+	CountsAgainstCapacity bool                  `json:"counts_against_capacity"`
+	SessionRunning        bool                  `json:"session_running"`
+	SessionID             string                `json:"session_id,omitempty"`
+	Attached              bool                  `json:"attached,omitempty"`
+	Windows               int                   `json:"windows,omitempty"`
+	CreatedAt             string                `json:"created_at,omitempty"`
+	LastActivity          string                `json:"last_activity,omitempty"`
 }
 
 func runPolecatStatus(cmd *cobra.Command, args []string) error {
@@ -764,19 +808,40 @@ func runPolecatStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	bd := beads.New(r.Path)
+	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
+	agentIssue, fields, _ := bd.GetAgentBead(agentBeadID)
+	cleanupStatus := ""
+	activeMR := ""
+	if fields != nil {
+		cleanupStatus = fields.CleanupStatus
+		activeMR = fields.ActiveMR
+	}
+	effectiveState := effectivePolecatState(PolecatListItem{State: p.State, SessionRunning: sessInfo.Running})
+	activeMRBlocks := activeMRBlocksReuse(bd, activeMR)
+	resolved := observedPolecatDisposition(effectiveState, fields, agentHookBead(agentIssue, fields), activeMRBlocks, p.ClonePath)
+	disposition := resolved.Disposition
+
 	// JSON output
 	if polecatStatusJSON {
 		status := PolecatStatus{
-			Rig:            rigName,
-			Name:           polecatName,
-			State:          p.State,
-			Issue:          p.Issue,
-			ClonePath:      p.ClonePath,
-			Branch:         p.Branch,
-			SessionRunning: sessInfo.Running,
-			SessionID:      sessInfo.SessionID,
-			Attached:       sessInfo.Attached,
-			Windows:        sessInfo.Windows,
+			Rig:                   rigName,
+			Name:                  polecatName,
+			State:                 effectiveState,
+			Issue:                 p.Issue,
+			ClonePath:             p.ClonePath,
+			Branch:                p.Branch,
+			CleanupStatus:         cleanupStatus,
+			ActiveMR:              activeMR,
+			Disposition:           disposition,
+			DispositionReason:     resolved.Reason,
+			ReuseStatus:           polecatReuseStatusForDisposition(effectiveState, p.Branch, disposition),
+			SlotOpenEligible:      disposition.SlotOpenEligible(),
+			CountsAgainstCapacity: disposition.CountsAgainstCapacity(),
+			SessionRunning:        sessInfo.Running,
+			SessionID:             sessInfo.SessionID,
+			Attached:              sessInfo.Attached,
+			Windows:               sessInfo.Windows,
 		}
 		if !sessInfo.Created.IsZero() {
 			status.CreatedAt = sessInfo.Created.Format("2006-01-02 15:04:05")
@@ -793,8 +858,8 @@ func runPolecatStatus(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s\n\n", style.Bold.Render(fmt.Sprintf("Polecat: %s/%s", rigName, polecatName)))
 
 	// State with color
-	stateStr := string(p.State)
-	switch p.State {
+	stateStr := string(effectiveState)
+	switch effectiveState {
 	case polecat.StateWorking:
 		stateStr = style.Info.Render(stateStr)
 	case polecat.StateStuck:
@@ -807,6 +872,16 @@ func runPolecatStatus(cmd *cobra.Command, args []string) error {
 		stateStr = style.Dim.Render(stateStr)
 	}
 	fmt.Printf("  State:         %s\n", stateStr)
+	fmt.Printf("  Disposition:   %s\n", disposition)
+	if reuseStatus := polecatReuseStatusForDisposition(effectiveState, p.Branch, disposition); reuseStatus != "" {
+		fmt.Printf("  Reuse:         %s\n", reuseStatus)
+	}
+	if cleanupStatus != "" {
+		fmt.Printf("  Cleanup:       %s\n", cleanupStatus)
+	}
+	if activeMR != "" {
+		fmt.Printf("  Active MR:     %s\n", activeMR)
+	}
 
 	// Issue
 	if p.Issue != "" {
@@ -1111,26 +1186,22 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	if err != nil || fields == nil {
 		// No agent bead or no cleanup_status - fall back to git check
 		// This handles polecats that haven't self-reported yet
-		gitState, gitErr := getGitState(p.ClonePath)
-		if gitErr != nil {
+		input := polecat.WorkstateInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupClean}
+		applyGitEvidenceToWorkstate(&input, p.ClonePath)
+		resolved := polecat.ResolveWorkstateDisposition(input)
+		status.CleanupStatus = polecat.CleanupClean
+		if input.GitCheckFailed {
 			status.CleanupStatus = polecat.CleanupUnknown
-			status.applyDisposition(polecat.DispositionBlockedUnknown)
-			status.Blockers = append(status.Blockers, fmt.Sprintf("git_state=unknown path=%s: %v", p.ClonePath, gitErr))
-		} else if gitState.Clean {
-			status.CleanupStatus = polecat.CleanupClean
-			status.applyDisposition(polecat.DispositionAvailableClean)
-		} else if gitState.UnpushedCommits > 0 {
-			status.CleanupStatus = polecat.CleanupUnpushed
-			status.applyDisposition(polecat.DispositionRecoverLocal)
-			status.Blockers = append(status.Blockers, fmt.Sprintf("git_state=has_unpushed unpushed_commits=%d", gitState.UnpushedCommits))
-		} else if gitState.StashCount > 0 {
-			status.CleanupStatus = polecat.CleanupStash
-			status.applyDisposition(polecat.DispositionRecoverLocal)
-			status.Blockers = append(status.Blockers, fmt.Sprintf("git_state=has_stash stash_count=%d", gitState.StashCount))
-		} else {
+		} else if input.GitDirty {
 			status.CleanupStatus = polecat.CleanupUncommitted
-			status.applyDisposition(polecat.DispositionRecoverLocal)
-			status.Blockers = append(status.Blockers, fmt.Sprintf("git_state=has_uncommitted uncommitted_files=%d", len(gitState.UncommittedFiles)))
+		} else if input.StashCount > 0 {
+			status.CleanupStatus = polecat.CleanupStash
+		} else if input.UnpushedCommits > 0 {
+			status.CleanupStatus = polecat.CleanupUnpushed
+		}
+		status.applyDisposition(resolved.Disposition)
+		if blocker := workstateBlockerForInput(p.ClonePath, input); blocker != "" {
+			status.Blockers = append(status.Blockers, blocker)
 		}
 	} else {
 		// Use cleanup_status from agent bead
@@ -1178,19 +1249,17 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 				activeMRBlocks = true
 			}
 		}
+		input := polecat.WorkstateInputFromAgentFields(polecat.StateIdle, hookBead, fields, activeMRBlocks)
+		applyGitEvidenceToWorkstate(&input, p.ClonePath)
 		if len(status.Blockers) > 0 {
 			status.applyDisposition(dispositionForRecoveryBlockers(status.Blockers))
 		} else {
-			resolved := polecat.ResolveWorkstateDisposition(polecat.WorkstateInput{
-				State:          polecat.StateIdle,
-				HookBead:       hookBead,
-				CleanupStatus:  effectiveCleanupStatus,
-				ActiveMR:       fields.ActiveMR,
-				ActiveMRBlocks: activeMRBlocks,
-				PushFailed:     fields.PushFailed,
-				MRFailed:       fields.MRFailed,
-			})
+			input.CleanupStatus = effectiveCleanupStatus
+			resolved := polecat.ResolveWorkstateDisposition(input)
 			status.applyDisposition(resolved.Disposition)
+			if blocker := workstateBlockerForInput(p.ClonePath, input); blocker != "" {
+				status.Blockers = append(status.Blockers, blocker)
+			}
 		}
 	}
 
@@ -1346,6 +1415,22 @@ func recoveryGitStateBlocker(worktreePath string, gitState *GitState, gitErr err
 		return fmt.Sprintf("git_state=has_stash stash_count=%d", gitState.StashCount)
 	}
 	return fmt.Sprintf("git_state=has_uncommitted uncommitted_files=%d", len(gitState.UncommittedFiles))
+}
+
+func workstateBlockerForInput(worktreePath string, input polecat.WorkstateInput) string {
+	if input.GitCheckFailed {
+		return fmt.Sprintf("git_state=unknown path=%s", worktreePath)
+	}
+	if input.GitDirty {
+		return "git_state=has_uncommitted"
+	}
+	if input.StashCount > 0 {
+		return fmt.Sprintf("git_state=has_stash stash_count=%d", input.StashCount)
+	}
+	if input.UnpushedCommits > 0 {
+		return fmt.Sprintf("git_state=has_unpushed unpushed_commits=%d", input.UnpushedCommits)
+	}
+	return ""
 }
 
 func activeMRBlocker(bd issueShower, mrID string) string {

@@ -134,6 +134,25 @@ func TestHandlePolecatDoneFromBead_NilFields(t *testing.T) {
 	}
 }
 
+func TestProcessDiscoveredCompletion_MRFailedUsesCanonicalDisposition(t *testing.T) {
+	t.Parallel()
+	discovery := &CompletionDiscovery{}
+	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", &PolecatDonePayload{
+		PolecatName: "nux",
+		Exit:        string(ExitTypeCompleted),
+		IssueID:     "gt-work",
+		Branch:      "polecat/nux/gt-work",
+		MRFailed:    true,
+	}, discovery)
+
+	if !strings.Contains(discovery.Action, "disposition=submit-required") {
+		t.Fatalf("Action = %q, want canonical submit-required disposition", discovery.Action)
+	}
+	if discovery.WispCreated != "" {
+		t.Fatalf("WispCreated = %q, want none", discovery.WispCreated)
+	}
+}
+
 func TestHandlePolecatDoneFromBead_PhaseComplete(t *testing.T) {
 	t.Parallel()
 	fields := &beads.AgentFields{
