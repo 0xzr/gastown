@@ -3477,3 +3477,80 @@ exit /b 0
 	}
 	// Any other error (e.g., no polecat to spawn) is acceptable — the guard is what we're testing.
 }
+
+func TestSlingDeferredAutoResolvedBatchRoutesToScheduler(t *testing.T) {
+	townRoot := t.TempDir()
+
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test","version":2}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	rigsJSON := `{"version":1,"rigs":{"testrig":{"git_url":"file:///dev/null","beads":{"prefix":"gt"}}}}`
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
+		t.Fatalf("write rigs.json: %v", err)
+	}
+	settingsDir := filepath.Join(townRoot, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatalf("mkdir settings: %v", err)
+	}
+	settingsJSON := `{"version":1,"scheduler":{"max_polecats":10,"batch_size":3}}`
+	if err := os.WriteFile(config.TownSettingsPath(townRoot), []byte(settingsJSON), 0644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	routes := `{"prefix":"gt-","path":"testrig/mayor/rig"}` + "\n"
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
+		t.Fatalf("write routes.jsonl: %v", err)
+	}
+	rigDir := filepath.Join(townRoot, "testrig", "mayor", "rig")
+	if err := os.MkdirAll(rigDir, 0755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(rigDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	prevDryRun := slingDryRun
+	prevHookRaw := slingHookRawBead
+	t.Cleanup(func() {
+		slingDryRun = prevDryRun
+		slingHookRawBead = prevHookRaw
+	})
+	slingDryRun = true
+	slingHookRawBead = true
+	t.Setenv(EnvGTRole, "mayor")
+	t.Setenv("GT_POLECAT", "")
+
+	for _, tt := range []struct {
+		name string
+		args []string
+	}{
+		{name: "two bead", args: []string{"gt-one", "gt-two"}},
+		{name: "multi bead", args: []string{"gt-three", "gt-four", "gt-five"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			out := captureStdout(t, func() {
+				if err := runSling(nil, tt.args); err != nil {
+					t.Fatalf("runSling(%v): %v", tt.args, err)
+				}
+			})
+			if strings.Contains(out, "Batch slinging") {
+				t.Fatalf("deferred auto-resolved batch bypassed scheduler:\n%s", out)
+			}
+			if !strings.Contains(out, "Would schedule") {
+				t.Fatalf("deferred auto-resolved batch should schedule, got:\n%s", out)
+			}
+		})
+	}
+}

@@ -360,6 +360,41 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 	}
 }
 
+// TestSchedulerDeferredAutoResolvedBatchSling verifies that deferred dispatch
+// enqueues auto-resolved task batches instead of bypassing the scheduler and
+// spawning polecats directly.
+func TestSchedulerDeferredAutoResolvedBatchSling(t *testing.T) {
+	hqPath, rigPath, gtBinary, env := setupSchedulerIntegrationTown(t)
+
+	bead1 := createTestBead(t, rigPath, "Auto-resolved batch one")
+	bead2 := createTestBead(t, rigPath, "Auto-resolved batch two")
+	bead3 := createTestBead(t, rigPath, "Auto-resolved batch three")
+	bead4 := createTestBead(t, rigPath, "Auto-resolved batch four")
+	bead5 := createTestBead(t, rigPath, "Auto-resolved batch five")
+
+	out := runGTCmdOutput(t, gtBinary, hqPath, env, "sling", bead1, bead2, "--hook-raw-bead")
+	if strings.Contains(out, "Batch slinging") {
+		t.Fatalf("two-bead deferred auto-resolve bypassed scheduler:\n%s", out)
+	}
+	if !hasSlingContext(t, hqPath, bead1) || !hasSlingContext(t, hqPath, bead2) {
+		t.Fatalf("two-bead deferred auto-resolve should enqueue both beads; output:\n%s", out)
+	}
+
+	out = runGTCmdOutput(t, gtBinary, hqPath, env, "sling", bead3, bead4, bead5, "--hook-raw-bead")
+	if strings.Contains(out, "Batch slinging") {
+		t.Fatalf("multi-bead deferred auto-resolve bypassed scheduler:\n%s", out)
+	}
+	if !hasSlingContext(t, hqPath, bead3) || !hasSlingContext(t, hqPath, bead4) || !hasSlingContext(t, hqPath, bead5) {
+		t.Fatalf("multi-bead deferred auto-resolve should enqueue all beads; output:\n%s", out)
+	}
+
+	status := getSchedulerStatus(t, gtBinary, hqPath, env)
+	total := int(status["queued_total"].(float64))
+	if total != 5 {
+		t.Errorf("queued_total = %d, want 5", total)
+	}
+}
+
 // TestSchedulerBlockedStatusReporting verifies that scheduler list correctly reports
 // blocked:true/false and scheduler status reports correct queued_ready count.
 func TestSchedulerBlockedStatusReporting(t *testing.T) {

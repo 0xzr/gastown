@@ -11,11 +11,16 @@ func TestResolveWorkstateDisposition(t *testing.T) {
 	}{
 		{name: "available clean", in: base, want: DispositionAvailableClean},
 		{name: "active work", in: WorkstateInput{State: StateWorking, CleanupStatus: CleanupClean}, want: DispositionActiveWork},
+		{name: "active assigned hooked", in: WorkstateInput{State: StateWorking, HookBead: "gt-work", CleanupStatus: CleanupClean}, want: DispositionActiveWork},
+		{name: "pinned only", in: WorkstateInput{State: StateIdle, HookBead: "gt-pinned", CleanupStatus: CleanupClean}, want: DispositionReconcileMetadata},
+		{name: "stale pinned", in: WorkstateInput{State: StateIdle, HookBead: "gt-stale", CleanupStatus: CleanupClean}, want: DispositionReconcileMetadata},
 		{name: "submitted preserved active mr", in: WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, ActiveMR: "mr-1", ActiveMRBlocks: true}, want: DispositionSubmittedPreserved},
 		{name: "submit required", in: WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, HasSubmittableWork: true}, want: DispositionSubmitRequired},
 		{name: "recover local cleanup", in: WorkstateInput{State: StateIdle, CleanupStatus: CleanupUnpushed}, want: DispositionRecoverLocal},
+		{name: "recovery blocked dirty", in: WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, GitDirty: true}, want: DispositionRecoverLocal},
 		{name: "reconcile metadata", in: WorkstateInput{State: StateIdle, HookBead: "gt-work", CleanupStatus: CleanupClean}, want: DispositionReconcileMetadata},
 		{name: "blocked unknown", in: WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, GitCheckFailed: true}, want: DispositionBlockedUnknown},
+		{name: "orphan session unknown", in: WorkstateInput{State: StateZombie, CleanupStatus: CleanupClean}, want: DispositionBlockedUnknown},
 	}
 
 	for _, tt := range tests {

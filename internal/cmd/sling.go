@@ -365,6 +365,9 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			if err != nil {
 				return err
 			}
+			if deferred {
+				return runBatchSchedule(args, rigName, townRoot)
+			}
 			return runBatchSling(args, rigName, townBeadsDir)
 		}
 	}
@@ -480,6 +483,13 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 				Ralph:        slingRalph,
 			})
 		}
+		if allBeadIDs(args) {
+			rigName, err := resolveRigFromBeadIDs(args, filepath.Dir(townBeadsDir))
+			if err != nil {
+				return err
+			}
+			return runBatchSchedule(args, rigName, townRoot)
+		}
 		// Dog targets (deacon/dogs, deacon/dogs/<name>, dog:, dog:<name>) fall through
 		// to direct dispatch: dogs are a self-managed pool owned by the Deacon, not rig
 		// polecat slots, and therefore don't participate in the capacity scheduler.
@@ -551,6 +561,9 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			rigName, err := resolveRigFromBeadIDs(args, filepath.Dir(townBeadsDir))
 			if err != nil {
 				return err
+			}
+			if deferred {
+				return runBatchSchedule(args, rigName, townRoot)
 			}
 			return runBatchSling(args, rigName, townBeadsDir)
 		}
