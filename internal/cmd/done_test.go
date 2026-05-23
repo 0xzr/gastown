@@ -923,6 +923,21 @@ func TestReviewOnlyBlocksCommitSubmission(t *testing.T) {
 	}
 }
 
+func TestUnverifiedSafetyFieldsBlockCommitSubmission(t *testing.T) {
+	if !shouldBlockUnverifiedSafetyFields("gt-abc", errors.New("dolt unavailable"), 1) {
+		t.Fatal("commits must not be submitted when no_merge/review_only fields cannot be verified")
+	}
+	if shouldBlockUnverifiedSafetyFields("gt-abc", errors.New("dolt unavailable"), 0) {
+		t.Fatal("zero-commit completion should not use the commit submission block")
+	}
+	if shouldBlockUnverifiedSafetyFields("gt-abc", nil, 1) {
+		t.Fatal("verified safety fields should not block commit submission")
+	}
+	if shouldBlockUnverifiedSafetyFields("", errors.New("dolt unavailable"), 1) {
+		t.Fatal("unknown issue id cannot verify source issue safety fields")
+	}
+}
+
 // TestConvoyMergeStrategyNotification verifies that the merge strategy
 // is included in the witness notification body when set to non-default values.
 func TestConvoyMergeStrategyNotification(t *testing.T) {

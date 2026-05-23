@@ -90,6 +90,10 @@ func shouldBlockReviewOnlySubmission(fields *beads.AttachmentFields, aheadCount 
 	return fields != nil && fields.ReviewOnly && aheadCount > 0
 }
 
+func shouldBlockUnverifiedSafetyFields(issueID string, loadErr error, aheadCount int) bool {
+	return issueID != "" && loadErr != nil && aheadCount > 0
+}
+
 func shouldUseDirectMergeStrategy(roleIsPolecat bool, mergeStrategy string) bool {
 	return mergeStrategy == "direct" && !roleIsPolecat
 }
@@ -540,6 +544,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Must be checked before the zero-commit guard below (GH#2496, gt-kvf).
 		var sourceIssueForNoMerge *beads.Issue
 		var attachmentFields *beads.AttachmentFields
+		var attachmentFieldsErr error
 		isNoMergeTask := false
 		if issueID != "" {
 			noMergeBd := beads.New(cwd)
@@ -549,6 +554,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				if attachmentFields != nil && (attachmentFields.NoMerge || attachmentFields.ReviewOnly) {
 					isNoMergeTask = true
 				}
+			} else {
+				attachmentFieldsErr = showErr
 			}
 		}
 
@@ -651,6 +658,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 			// Skip straight to witness notification (no MR needed)
 			goto notifyWitness
+		}
+
+		if shouldBlockUnverifiedSafetyFields(issueID, attachmentFieldsErr, aheadCount) {
+			return fmt.Errorf("cannot verify no_merge/review_only safety fields for issue %s before submitting commits: %w", issueID, attachmentFieldsErr)
 		}
 
 		if shouldBlockReviewOnlySubmission(attachmentFields, aheadCount) {
