@@ -1175,7 +1175,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	if polecatCheckRecoveryReconcileCleanup {
-		reconcileCleanupStatusIfSafe(&status, agentBd, agentBeadID, p, fields)
+		reconcileCleanupStatusIfSafe(&status, bd, agentBeadID, p, fields)
 	}
 
 	// JSON output
