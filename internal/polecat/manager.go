@@ -2169,8 +2169,19 @@ func (m *Manager) ReuseDecisionForPolecat(name string, state State) SlotReuseDec
 	return m.reuseDecisionForPolecat(name, state)
 }
 
+// WorkstateDispositionForPolecat exposes the canonical lifecycle disposition
+// used by reuse, recovery, list, witness, and scheduler capacity projections.
+func (m *Manager) WorkstateDispositionForPolecat(name string, state State, issue string) WorkstateDisposition {
+	return DecideWorkstate(m.workstateInputForPolecat(name, state, issue))
+}
+
 func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDecision {
-	input := SlotReuseInput{State: state, CleanupStatus: CleanupUnknown}
+	d := m.WorkstateDispositionForPolecat(name, state, "")
+	return SlotReuseDecision{Reusable: d.Reusable, Reason: d.Reason}
+}
+
+func (m *Manager) workstateInputForPolecat(name string, state State, issue string) WorkstateInput {
+	input := WorkstateInput{State: state, CleanupStatus: CleanupUnknown}
 	agentID := m.agentBeadID(name)
 	_, fields, err := m.agentBeads().GetAgentBead(agentID)
 	if err != nil {
@@ -2180,6 +2191,8 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
 		input.HookBead = fields.HookBead
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
+		input.ActiveMR = fields.ActiveMR
+		input.ActiveMRBlocker = m.activeMRBlocker(fields.ActiveMR)
 		if fields.CleanupStatus != "" {
 			input.CleanupStatus = CleanupStatus(fields.CleanupStatus)
 		}
@@ -2215,7 +2228,108 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
 	if input.CleanupStatus == CleanupUnknown && !input.GitCheckFailed && !input.GitDirty && input.StashCount == 0 && input.UnpushedCommits == 0 {
 		input.CleanupStatus = CleanupClean
 	}
-	return DecideSlotReuse(input)
+	input.MQCheckRequired = input.Branch != ""
+	input.HasSubmittableWork = hasSubmittableWorkForWorkstate(clonePath)
+	input.AssignedBeadTerminal = m.assignedBeadTerminal(issue)
+	input.MQNotRequired = m.mqNotRequiredSource(issue)
+	if input.MQCheckRequired && input.HasSubmittableWork && !input.AssignedBeadTerminal && !input.MQNotRequired {
+		mr, err := m.beads.FindMRForBranchAny(input.Branch)
+		if err != nil {
+			input.MQLookupFailed = true
+		} else {
+			input.MRSubmitted = mr != nil
+		}
+	}
+	return input
+}
+
+func (m *Manager) activeMRBlocker(mrID string) string {
+	if mrID == "" {
+		return ""
+	}
+	mr, err := m.beads.Show(mrID)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return ""
+		}
+		return fmt.Sprintf("active_mr=%s status=lookup_error: %v", mrID, err)
+	}
+	if mr == nil || beads.IssueStatus(mr.Status).IsTerminal() {
+		return ""
+	}
+	return fmt.Sprintf("active_mr=%s status=%s", mrID, mr.Status)
+}
+
+func (m *Manager) assignedBeadTerminal(issueID string) bool {
+	if issueID == "" {
+		return false
+	}
+	issue, err := m.beads.Show(issueID)
+	return err == nil && issue != nil && beads.IssueStatus(issue.Status).IsTerminal()
+}
+
+func (m *Manager) mqNotRequiredSource(issueID string) bool {
+	if issueID == "" {
+		return false
+	}
+	issue, err := m.beads.Show(issueID)
+	if err != nil || issue == nil {
+		return false
+	}
+	attachment := beads.ParseAttachmentFields(issue)
+	if attachment == nil {
+		return false
+	}
+	return attachment.NoMerge || attachment.ReviewOnly || strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local")
+}
+
+func hasSubmittableWorkForWorkstate(worktreePath string) bool {
+	ref, err := workstateComparisonRef(worktreePath)
+	if err != nil {
+		return false
+	}
+	count, err := countPatchUniqueCommitsForWorkstate(worktreePath, ref)
+	return err == nil && count > 0
+}
+
+func workstateComparisonRef(worktreePath string) (string, error) {
+	upstreamCmd := exec.Command("git", "rev-parse", "--abbrev-ref", "@{u}")
+	upstreamCmd.Dir = worktreePath
+	if output, err := upstreamCmd.Output(); err == nil {
+		upstream := strings.TrimSpace(string(output))
+		upstreamBranch := strings.TrimPrefix(upstream, "origin/")
+		if upstream != "" && isWorkstateRecoveryBaseBranch(upstreamBranch) {
+			return upstream, nil
+		}
+	}
+	for _, ref := range []string{"origin/main", "origin/master"} {
+		verifyCmd := exec.Command("git", "rev-parse", "--verify", "--quiet", ref)
+		verifyCmd.Dir = worktreePath
+		if err := verifyCmd.Run(); err == nil {
+			return ref, nil
+		}
+	}
+	return "", fmt.Errorf("no recovery base ref")
+}
+
+func isWorkstateRecoveryBaseBranch(branch string) bool {
+	return branch == "main" || branch == "master" || strings.HasPrefix(branch, "integration/")
+}
+
+func countPatchUniqueCommitsForWorkstate(worktreePath, baseRef string) (int, error) {
+	cherryCmd := exec.Command("git", "cherry", baseRef, "HEAD")
+	cherryCmd.Dir = worktreePath
+	output, err := cherryCmd.Output()
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "+") {
+			count++
+		}
+	}
+	return count, nil
 }
 
 // Get returns a specific polecat by name.
