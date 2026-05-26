@@ -1729,15 +1729,19 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 
 	for _, p := range targets {
 		if polecatNukeDryRun {
-			fmt.Printf("Would nuke %s/%s:\n", p.rigName, p.polecatName)
+			blocked := checkPolecatSafety(p).Blocked
+			if blocked {
+				fmt.Printf("Would refuse to nuke %s/%s without --force:\n", p.rigName, p.polecatName)
+				dryRunBlocked++
+			} else {
+				fmt.Printf("Would nuke %s/%s:\n", p.rigName, p.polecatName)
+			}
 			fmt.Printf("  - Kill session: gt-%s-%s\n", p.rigName, p.polecatName)
 			fmt.Printf("  - Delete worktree: %s/polecats/%s\n", p.r.Path, p.polecatName)
 			fmt.Printf("  - Delete branch (if exists)\n")
 			fmt.Printf("  - Reset agent bead: %s\n", polecatBeadIDForRig(p.r, p.rigName, p.polecatName))
 
-			if displayDryRunSafetyCheck(p) {
-				dryRunBlocked++
-			}
+			displayDryRunSafetyCheck(p)
 			fmt.Println()
 			continue
 		}

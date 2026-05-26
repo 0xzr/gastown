@@ -105,6 +105,9 @@ func checkPolecatSafety(target polecatTarget) *SafetyCheckResult {
 
 	// Get polecat info for branch name
 	polecatInfo, infoErr := target.mgr.Get(target.polecatName)
+	if infoErr != nil || polecatInfo == nil {
+		result.Reasons = append(result.Reasons, "cannot check git state")
+	}
 
 	// Check 1: Unpushed commits via cleanup_status or git state
 	bd := beads.New(target.r.Path)

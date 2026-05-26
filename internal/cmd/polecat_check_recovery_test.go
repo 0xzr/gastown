@@ -11,6 +11,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/rig"
 )
 
 // fakeMRFinder is a test stub for the mrFinder interface used by applyMQCheck.
@@ -610,6 +611,18 @@ func TestDryRunNukeSummary(t *testing.T) {
 				t.Errorf("dryRunNukeSummary() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCheckPolecatSafetyBlocksUnknownGitState(t *testing.T) {
+	mgr := polecat.NewManager(&rig.Rig{Name: "gastown", Path: t.TempDir()}, nil, nil)
+	result := checkPolecatSafety(polecatTarget{rigName: "gastown", polecatName: "missing", mgr: mgr})
+
+	if !result.Blocked {
+		t.Fatal("missing polecat info should block nuke safety checks")
+	}
+	if len(result.Reasons) != 1 || result.Reasons[0] != "cannot check git state" {
+		t.Fatalf("reasons = %v, want [cannot check git state]", result.Reasons)
 	}
 }
 
