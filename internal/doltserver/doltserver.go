@@ -2721,7 +2721,7 @@ func EnsureRigIssuePrefix(townRoot, rigName string, serverMode bool) error {
 		}()
 	}
 
-	store, err := openRigStoreFromConfig(ctx, beadsDir, rigName)
+	store, err := openRigStoreFromConfig(ctx, townRoot, beadsDir, rigName)
 	if err != nil {
 		return fmt.Errorf("opening beads database: %w", err)
 	}
@@ -2735,14 +2735,14 @@ func EnsureRigIssuePrefix(townRoot, rigName string, serverMode bool) error {
 
 var beadsOpenEnvMu sync.Mutex
 
-func openRigStoreFromConfig(ctx context.Context, beadsDir, rigName string) (beadssdk.Storage, error) {
+func openRigStoreFromConfig(ctx context.Context, townRoot, beadsDir, rigName string) (beadssdk.Storage, error) {
 	// bd's public config loader lets BEADS_DOLT_* env override metadata.json.
 	// Polecat/rig processes often carry those env vars for their current database,
 	// so scope them to the database/server being initialized here.
 	beadsOpenEnvMu.Lock()
 	defer beadsOpenEnvMu.Unlock()
 
-	gtConfig := DefaultConfig(townRootForBeadsDir(beadsDir))
+	gtConfig := DefaultConfig(townRoot)
 	overrides := map[string]string{
 		"BEADS_DOLT_SERVER_DATABASE": rigName,
 		"BEADS_DOLT_SERVER_HOST":     gtConfig.EffectiveHost(),
@@ -2772,20 +2772,6 @@ func openRigStoreFromConfig(ctx context.Context, beadsDir, rigName string) (bead
 	}()
 
 	return beadssdk.OpenFromConfig(ctx, beadsDir)
-}
-
-func townRootForBeadsDir(beadsDir string) string {
-	if strings.HasSuffix(beadsDir, filepath.Join("mayor", "rig", ".beads")) {
-		return filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(beadsDir))))
-	}
-	if filepath.Base(beadsDir) == ".beads" {
-		parent := filepath.Dir(beadsDir)
-		if filepath.Base(parent) == "rig" && filepath.Base(filepath.Dir(parent)) == "mayor" {
-			return filepath.Dir(filepath.Dir(filepath.Dir(parent)))
-		}
-		return filepath.Dir(parent)
-	}
-	return filepath.Dir(beadsDir)
 }
 
 func issuePrefixForRigInit(townRoot, rigName string) string {
