@@ -240,12 +240,16 @@ func (c *CheckMisclassifiedWisps) purgeRigBatch(ctx *CheckContext, workDir, rigN
 		},
 		{
 			table: "wisp_dependencies",
-			query: fmt.Sprintf("INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) SELECT d.issue_id, d.depends_on_id, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d WHERE d.issue_id IN (%s)", idList),
+			query: buildMisclassifiedWispDependenciesCopyQuery(idList, false),
 		},
 	}
 	for _, aux := range auxCopies {
 		if bdTableExistsDoctor(workDir, aux.table) {
-			_ = execBdSQLWrite(workDir, aux.query) // Best-effort
+			if aux.table == "wisp_dependencies" {
+				_ = copyMisclassifiedWispDependencies(workDir, idList) // Best-effort
+			} else {
+				_ = execBdSQLWrite(workDir, aux.query) // Best-effort
+			}
 		}
 	}
 
@@ -273,6 +277,23 @@ func (c *CheckMisclassifiedWisps) purgeRigBatch(ctx *CheckContext, workDir, rigN
 	}
 
 	return nil
+}
+
+func copyMisclassifiedWispDependencies(workDir, idList string) error {
+	err := execBdSQLWrite(workDir, buildMisclassifiedWispDependenciesCopyQuery(idList, false))
+	if err == nil || !beads.IsDependencyTargetColumnError(err) {
+		return err
+	}
+	return execBdSQLWrite(workDir, buildMisclassifiedWispDependenciesCopyQuery(idList, true))
+}
+
+func buildMisclassifiedWispDependenciesCopyQuery(idList string, splitTarget bool) string {
+	return fmt.Sprintf(
+		"INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) "+
+			"SELECT d.issue_id, %s, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d WHERE d.issue_id IN (%s)",
+		beads.DependencyTargetExpr("d", splitTarget),
+		idList,
+	)
 }
 
 // bdTableExistsDoctor checks if a table exists by attempting to query it.

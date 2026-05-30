@@ -87,6 +87,28 @@ func TestRunIgnoresJSONLWhenDoltUnavailable(t *testing.T) {
 	}
 }
 
+func TestBuildMisclassifiedWispDependenciesCopyQueryUsesSplitTargetSchema(t *testing.T) {
+	query := buildMisclassifiedWispDependenciesCopyQuery("'gt-wisp-1'", true)
+
+	if !strings.Contains(query, "COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external)") {
+		t.Fatalf("split-schema query did not use dependency target COALESCE: %s", query)
+	}
+	if strings.Contains(query, "d.depends_on_id") {
+		t.Fatalf("split-schema query still selects legacy target column: %s", query)
+	}
+	if !strings.Contains(query, "WHERE d.issue_id IN ('gt-wisp-1')") {
+		t.Fatalf("split-schema query lost id filter: %s", query)
+	}
+}
+
+func TestBuildMisclassifiedWispDependenciesCopyQueryUsesLegacyTargetSchema(t *testing.T) {
+	query := buildMisclassifiedWispDependenciesCopyQuery("'gt-wisp-1'", false)
+
+	if !strings.Contains(query, "SELECT d.issue_id, d.depends_on_id, d.type") {
+		t.Fatalf("legacy query did not select depends_on_id: %s", query)
+	}
+}
+
 // TestGetRigPathForPrefix_RoutesResolution verifies that GetRigPathForPrefix
 // correctly resolves rig paths from routes.jsonl. This is critical for the
 // misclassified-wisps check which uses database names (e.g., "sw") to look up
