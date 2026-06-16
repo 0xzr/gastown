@@ -3020,6 +3020,29 @@ func TestBeadFieldModeUpdateCanClearStaleRalphMode(t *testing.T) {
 	}
 }
 
+func TestStoreFieldsInBeadFormulaSetsAttachedAt(t *testing.T) {
+	t.Setenv("GT_TEST_ATTACHED_MOLECULE_LOG", filepath.Join(t.TempDir(), "mol.log"))
+	logPath := os.Getenv("GT_TEST_ATTACHED_MOLECULE_LOG")
+
+	if err := storeFieldsInBead("gt-test123", beadFieldUpdates{
+		AttachedFormula: "mol-dog-reaper",
+	}); err != nil {
+		t.Fatalf("storeFieldsInBead: %v", err)
+	}
+
+	body, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	fields := beads.ParseAttachmentFields(&beads.Issue{Description: string(body)})
+	if fields == nil || fields.AttachedFormula != "mol-dog-reaper" || fields.AttachedAt == "" {
+		t.Fatalf("formula attachment fields = %#v, want formula and attached_at", fields)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, fields.AttachedAt); err != nil {
+		t.Fatalf("attached_at %q is not RFC3339Nano: %v", fields.AttachedAt, err)
+	}
+}
+
 // TestSlingIdempotentNoOp verifies that slinging a bead to the same target
 // it's already assigned to returns a no-op instead of an error.
 func TestSlingIdempotentNoOp(t *testing.T) {

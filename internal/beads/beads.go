@@ -967,21 +967,21 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	clauses := []string{"ephemeral=true"}
 
 	if opts.Label != "" {
-		clauses = append(clauses, "label="+opts.Label)
+		clauses = append(clauses, "label="+quoteBDQueryValue(opts.Label))
 	} else if opts.Type != "" {
-		clauses = append(clauses, "label=gt:"+opts.Type)
+		clauses = append(clauses, "label="+quoteBDQueryValue("gt:"+opts.Type))
 	}
 	if opts.Status != "" && opts.Status != "all" {
-		clauses = append(clauses, "status="+opts.Status)
+		clauses = append(clauses, "status="+quoteBDQueryValue(opts.Status))
 	}
 	if opts.Priority >= 0 {
 		clauses = append(clauses, fmt.Sprintf("priority=%d", opts.Priority))
 	}
 	if opts.Parent != "" {
-		clauses = append(clauses, "parent="+opts.Parent)
+		clauses = append(clauses, "parent="+quoteBDQueryValue(opts.Parent))
 	}
 	if opts.Assignee != "" {
-		clauses = append(clauses, "assignee="+opts.Assignee)
+		clauses = append(clauses, "assignee="+quoteBDQueryValue(opts.Assignee))
 	}
 
 	queryExpr := strings.Join(clauses, " AND ")
@@ -992,6 +992,9 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	}
 	if opts.Limit > 0 {
 		args = append(args, fmt.Sprintf("--limit=%d", opts.Limit))
+	} else {
+		// Match List's no-truncation default; bd query otherwise silently caps at 50.
+		args = append(args, "--limit=0")
 	}
 
 	out, err := b.run(args...)
@@ -1009,6 +1012,10 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	}
 
 	return issues, nil
+}
+
+func quoteBDQueryValue(value string) string {
+	return strconv.Quote(value)
 }
 
 // stripStdoutWarnings removes warning/diagnostic lines that bd may emit to stdout.

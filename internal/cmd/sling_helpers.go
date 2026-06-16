@@ -552,12 +552,12 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	}
 	if updates.AttachedMolecule != "" {
 		fields.AttachedMolecule = updates.AttachedMolecule
-		if fields.AttachedAt == "" {
-			fields.AttachedAt = time.Now().UTC().Format(time.RFC3339)
-		}
 	}
 	if updates.AttachedFormula != "" {
 		fields.AttachedFormula = updates.AttachedFormula
+	}
+	if (updates.AttachedMolecule != "" || updates.AttachedFormula != "") && fields.AttachedAt == "" {
+		fields.AttachedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 	if updates.NoMerge {
 		fields.NoMerge = true

@@ -534,6 +534,65 @@ func TestManager_AssignWork_notFound(t *testing.T) {
 	}
 }
 
+func TestManager_AssignWorkIfIdle_success(t *testing.T) {
+	m, _ := testManager(t)
+
+	now := time.Now()
+	state := &DogState{
+		Name:       "alpha",
+		State:      StateIdle,
+		LastActive: now,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	setupDogWithState(t, m, "alpha", state)
+
+	assigned, err := m.AssignWorkIfIdle("alpha", "mol-dog-reaper")
+	if err != nil {
+		t.Fatalf("AssignWorkIfIdle() error = %v", err)
+	}
+	if assigned.State != StateWorking {
+		t.Errorf("State = %q, want %q", assigned.State, StateWorking)
+	}
+	if assigned.Work != "mol-dog-reaper" {
+		t.Errorf("Work = %q, want mol-dog-reaper", assigned.Work)
+	}
+	if assigned.WorkStartedAt.IsZero() {
+		t.Fatal("WorkStartedAt should be set")
+	}
+}
+
+func TestManager_AssignWorkIfIdle_workingDog(t *testing.T) {
+	m, _ := testManager(t)
+
+	now := time.Now()
+	state := &DogState{
+		Name:       "alpha",
+		State:      StateWorking,
+		Work:       "existing-work",
+		LastActive: now,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	setupDogWithState(t, m, "alpha", state)
+
+	assigned, err := m.AssignWorkIfIdle("alpha", "mol-dog-reaper")
+	if err != ErrDogWorking {
+		t.Fatalf("AssignWorkIfIdle() error = %v, want ErrDogWorking", err)
+	}
+	if assigned != nil {
+		t.Fatalf("AssignWorkIfIdle() assigned = %#v, want nil", assigned)
+	}
+
+	dog, err := m.Get("alpha")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if dog.Work != "existing-work" {
+		t.Errorf("Work = %q, want existing-work", dog.Work)
+	}
+}
+
 // =============================================================================
 // ClearWork Tests
 // =============================================================================
@@ -577,6 +636,140 @@ func TestManager_ClearWork_notFound(t *testing.T) {
 	err := m.ClearWork("nonexistent")
 	if err != ErrDogNotFound {
 		t.Errorf("ClearWork() error = %v, want ErrDogNotFound", err)
+	}
+}
+
+func TestManager_ClearWorkIfMatches_success(t *testing.T) {
+	m, _ := testManager(t)
+
+	now := time.Now()
+	state := &DogState{
+		Name:          "alpha",
+		State:         StateWorking,
+		Work:          "mol-dog-reaper",
+		WorkStartedAt: now.Add(-time.Minute),
+		LastActive:    now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	setupDogWithState(t, m, "alpha", state)
+
+	cleared, err := m.ClearWorkIfMatches("alpha", "mol-dog-reaper", state.WorkStartedAt)
+	if err != nil {
+		t.Fatalf("ClearWorkIfMatches() error = %v", err)
+	}
+	if !cleared {
+		t.Fatal("ClearWorkIfMatches() cleared = false, want true")
+	}
+
+	dog, err := m.Get("alpha")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if dog.State != StateIdle {
+		t.Errorf("State = %q, want %q", dog.State, StateIdle)
+	}
+	if dog.Work != "" {
+		t.Errorf("Work = %q, want empty", dog.Work)
+	}
+	if !dog.WorkStartedAt.IsZero() {
+		t.Errorf("WorkStartedAt = %v, want zero", dog.WorkStartedAt)
+	}
+}
+
+func TestManager_ClearWorkIfMatches_mismatchNoOp(t *testing.T) {
+	m, _ := testManager(t)
+
+	now := time.Now().Truncate(time.Second)
+	workStarted := now.Add(-time.Minute)
+	state := &DogState{
+		Name:          "alpha",
+		State:         StateWorking,
+		Work:          "other-work",
+		WorkStartedAt: workStarted,
+		LastActive:    now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	setupDogWithState(t, m, "alpha", state)
+
+	cleared, err := m.ClearWorkIfMatches("alpha", "mol-dog-reaper", workStarted)
+	if err != nil {
+		t.Fatalf("ClearWorkIfMatches() error = %v", err)
+	}
+	if cleared {
+		t.Fatal("ClearWorkIfMatches() cleared = true, want false")
+	}
+
+	dog, err := m.Get("alpha")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if dog.State != StateWorking {
+		t.Errorf("State = %q, want %q", dog.State, StateWorking)
+	}
+	if dog.Work != "other-work" {
+		t.Errorf("Work = %q, want other-work", dog.Work)
+	}
+	if !dog.WorkStartedAt.Equal(workStarted) {
+		t.Errorf("WorkStartedAt = %v, want %v", dog.WorkStartedAt, workStarted)
+	}
+	if !dog.LastActive.Equal(now) {
+		t.Errorf("LastActive = %v, want %v", dog.LastActive, now)
+	}
+}
+
+func TestManager_ClearWorkIfMatches_sameWorkDifferentTimestampNoOp(t *testing.T) {
+	m, _ := testManager(t)
+
+	now := time.Now().Truncate(time.Second)
+	workStarted := now.Add(-time.Minute)
+	state := &DogState{
+		Name:          "alpha",
+		State:         StateWorking,
+		Work:          "mol-dog-reaper",
+		WorkStartedAt: workStarted,
+		LastActive:    now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	setupDogWithState(t, m, "alpha", state)
+
+	cleared, err := m.ClearWorkIfMatches("alpha", "mol-dog-reaper", workStarted.Add(time.Second))
+	if err != nil {
+		t.Fatalf("ClearWorkIfMatches() error = %v", err)
+	}
+	if cleared {
+		t.Fatal("ClearWorkIfMatches() cleared = true, want false")
+	}
+
+	dog, err := m.Get("alpha")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if dog.State != StateWorking {
+		t.Errorf("State = %q, want %q", dog.State, StateWorking)
+	}
+	if dog.Work != "mol-dog-reaper" {
+		t.Errorf("Work = %q, want mol-dog-reaper", dog.Work)
+	}
+	if !dog.WorkStartedAt.Equal(workStarted) {
+		t.Errorf("WorkStartedAt = %v, want %v", dog.WorkStartedAt, workStarted)
+	}
+}
+
+func TestManager_ClearWorkIfMatches_notFound(t *testing.T) {
+	m, root := testManager(t)
+
+	cleared, err := m.ClearWorkIfMatches("nonexistent", "mol-dog-reaper", time.Now())
+	if err != ErrDogNotFound {
+		t.Fatalf("ClearWorkIfMatches() error = %v, want ErrDogNotFound", err)
+	}
+	if cleared {
+		t.Fatal("ClearWorkIfMatches() cleared = true, want false")
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "deacon", "dogs", "nonexistent")); !os.IsNotExist(statErr) {
+		t.Fatalf("ClearWorkIfMatches() created dog dir unexpectedly: %v", statErr)
 	}
 }
 

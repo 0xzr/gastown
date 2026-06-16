@@ -1,8 +1,15 @@
 package daemon
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 func TestWispReaperInterval(t *testing.T) {
@@ -71,5 +78,43 @@ func TestDefaultReaperIntervalIsOneHour(t *testing.T) {
 	// Verify the default changed from 30m to 1h per issue gt-caf7.
 	if defaultWispReaperInterval != 1*time.Hour {
 		t.Errorf("expected default interval 1h, got %v", defaultWispReaperInterval)
+	}
+}
+
+func TestDispatchReaperDogUsesDogPoolSling(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock")
+	}
+
+	townRoot := t.TempDir()
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "gt-args.log")
+	fakeGT := filepath.Join(binDir, "gt")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > %q\n", logPath)
+	if err := os.WriteFile(fakeGT, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake gt: %v", err)
+	}
+
+	d := &Daemon{
+		config: &Config{TownRoot: townRoot},
+		gtPath: fakeGT,
+	}
+	if err := d.dispatchReaperDog(map[string]string{"max_age": "1h"}); err != nil {
+		t.Fatalf("dispatchReaperDog() error = %v", err)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read gt args log: %v", err)
+	}
+	args := strings.Split(strings.TrimSpace(string(data)), "\n")
+	wantPrefix := []string{"sling", constants.MolDogReaper, "deacon/dogs"}
+	if len(args) < len(wantPrefix) {
+		t.Fatalf("gt args = %v, want prefix %v", args, wantPrefix)
+	}
+	for i, want := range wantPrefix {
+		if args[i] != want {
+			t.Fatalf("gt arg %d = %q, want %q (all args: %v)", i, args[i], want, args)
+		}
 	}
 }

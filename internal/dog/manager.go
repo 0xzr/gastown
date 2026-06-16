@@ -11,11 +11,11 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
-	"github.com/steveyegge/gastown/internal/atomicfile"
 )
 
 // Common errors
@@ -371,6 +371,42 @@ func (m *Manager) AssignWork(name, work string) error {
 	return m.saveState(name, state)
 }
 
+// AssignWorkIfIdle assigns work only if the dog is still idle, returning the
+// saved state so callers can later perform exact compare-and-clear cleanup.
+func (m *Manager) AssignWorkIfIdle(name, work string) (*DogState, error) {
+	if err := validateDogName(name); err != nil {
+		return nil, err
+	}
+	if !m.exists(name) {
+		return nil, ErrDogNotFound
+	}
+
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	state, err := m.loadState(name)
+	if err != nil {
+		return nil, fmt.Errorf("loading state: %w", err)
+	}
+	if state.State != StateIdle {
+		return nil, ErrDogWorking
+	}
+
+	state.State = StateWorking
+	state.Work = work
+	state.WorkStartedAt = time.Now()
+	state.LastActive = time.Now()
+	state.UpdatedAt = time.Now()
+
+	if err := m.saveState(name, state); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
 // ClearWork clears a dog's work assignment and sets it to idle.
 func (m *Manager) ClearWork(name string) error {
 	if err := validateDogName(name); err != nil {
@@ -399,6 +435,40 @@ func (m *Manager) ClearWork(name string) error {
 	state.UpdatedAt = time.Now()
 
 	return m.saveState(name, state)
+}
+
+// ClearWorkIfMatches clears a dog's work assignment only if it still matches
+// the expected work and assignment timestamp. The compare-and-clear happens
+// under the dog lock so failed dispatch cleanup cannot erase a newer assignment.
+func (m *Manager) ClearWorkIfMatches(name, expectedWork string, expectedStartedAt time.Time) (bool, error) {
+	if err := validateDogName(name); err != nil {
+		return false, err
+	}
+	if !m.exists(name) {
+		return false, ErrDogNotFound
+	}
+
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	state, err := m.loadState(name)
+	if err != nil {
+		return false, fmt.Errorf("loading state: %w", err)
+	}
+	if state.Work != expectedWork || !state.WorkStartedAt.Equal(expectedStartedAt) {
+		return false, nil
+	}
+
+	state.State = StateIdle
+	state.Work = ""
+	state.WorkStartedAt = time.Time{}
+	state.LastActive = time.Now()
+	state.UpdatedAt = time.Now()
+
+	return true, m.saveState(name, state)
 }
 
 // Refresh recreates all worktrees for a dog with fresh branches.
