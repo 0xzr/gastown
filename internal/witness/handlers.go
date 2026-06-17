@@ -928,7 +928,7 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 	} else if status, ok := schedulerOpenAfterSlot(result); ok {
 		notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType, status)
 		return
-	} else if result.Before.Capacity.Max > 0 && (result.Before.Paused || result.Before.Capacity.Free <= 0) {
+	} else if status := schedulerStatusAfterSlot(result); status.Capacity.Max > 0 && (status.Paused || status.Capacity.Free <= 0) {
 		return
 	}
 
@@ -960,11 +960,16 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 }
 
 func schedulerOpenAfterSlot(result slotOpenSchedulerResult) (slotOpenSchedulerStatus, bool) {
+	status := schedulerStatusAfterSlot(result)
+	return status, !status.Paused && status.Capacity.Max > 0 && status.Capacity.Free > 0 && status.QueuedReady == 0
+}
+
+func schedulerStatusAfterSlot(result slotOpenSchedulerResult) slotOpenSchedulerStatus {
 	status := result.Before
 	if result.Ran {
 		status = result.After
 	}
-	return status, !status.Paused && status.Capacity.Max > 0 && status.Capacity.Free > 0 && status.QueuedReady == 0
+	return status
 }
 
 func notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType string, status slotOpenSchedulerStatus) {
