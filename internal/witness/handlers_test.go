@@ -18,7 +18,13 @@ import (
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
-func TestNotifyMayorSlotOpen_BlocksNonCompletedExit(t *testing.T) {
+type testMayorEvent struct {
+	Type    string            `json:"type"`
+	Payload map[string]string `json:"payload"`
+}
+
+func setupSlotOpenTestTown(t *testing.T) (string, string) {
+	t.Helper()
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
 		t.Fatal(err)
@@ -30,32 +36,164 @@ func TestNotifyMayorSlotOpen_BlocksNonCompletedExit(t *testing.T) {
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		t.Fatal(err)
 	}
+	return townRoot, workDir
+}
+
+func readMayorEvents(t *testing.T, townRoot string) []testMayorEvent {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(townRoot, "events", "mayor", "*.event"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := make([]testMayorEvent, 0, len(paths))
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var event testMayorEvent
+		if err := json.Unmarshal(data, &event); err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
+func TestNotifyMayorSlotOpen_BlocksNonCompletedExit(t *testing.T) {
+	townRoot, workDir := setupSlotOpenTestTown(t)
 
 	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeDeferred))
 
-	events, err := filepath.Glob(filepath.Join(townRoot, "events", "mayor", "*.event"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	events := readMayorEvents(t, townRoot)
 	if len(events) != 1 {
 		t.Fatalf("events = %v, want one SLOT_BLOCKED event", events)
 	}
-	data, err := os.ReadFile(events[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	var event struct {
-		Type    string            `json:"type"`
-		Payload map[string]string `json:"payload"`
-	}
-	if err := json.Unmarshal(data, &event); err != nil {
-		t.Fatal(err)
-	}
+	event := events[0]
 	if event.Type != "SLOT_BLOCKED" {
 		t.Fatalf("event type = %q, want SLOT_BLOCKED", event.Type)
 	}
 	if event.Payload["reason"] != "exit-deferred" {
 		t.Fatalf("reason = %q, want exit-deferred", event.Payload["reason"])
+	}
+}
+
+func TestNotifyMayorSlotOpen_SchedulerDispatchSuppressesMayor(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	townRoot, workDir := setupSlotOpenTestTown(t)
+
+	prevRecovery := slotOpenRecoveryCheck
+	prevDecision := slotOpenDecisionForNotify
+	prevScheduler := runSchedulerForSlotOpen
+	t.Cleanup(func() {
+		slotOpenRecoveryCheck = prevRecovery
+		slotOpenDecisionForNotify = prevDecision
+		runSchedulerForSlotOpen = prevScheduler
+	})
+
+	slotOpenRecoveryCheck = func(workDir, rigName, polecatName string) (string, error) {
+		return `{"verdict":"SAFE_TO_NUKE"}`, nil
+	}
+	slotOpenDecisionForNotify = func(workDir, townRoot, rigName, polecatName, exitType string) polecat.SlotReuseDecision {
+		return polecat.SlotReuseDecision{Reusable: true}
+	}
+	called := false
+	runSchedulerForSlotOpen = func(gotTownRoot string) (slotOpenSchedulerResult, error) {
+		called = true
+		if gotTownRoot != townRoot {
+			t.Fatalf("townRoot = %q, want %q", gotTownRoot, townRoot)
+		}
+		return slotOpenSchedulerResult{Dispatched: 1}, nil
+	}
+
+	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted))
+
+	if !called {
+		t.Fatal("scheduler trigger was not called")
+	}
+	if events := readMayorEvents(t, townRoot); len(events) != 0 {
+		t.Fatalf("events = %+v, want none when scheduler dispatches", events)
+	}
+}
+
+func TestNotifyMayorSlotOpen_EmitsSchedulerOpenWhenQueueEmpty(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	townRoot, workDir := setupSlotOpenTestTown(t)
+
+	prevRecovery := slotOpenRecoveryCheck
+	prevDecision := slotOpenDecisionForNotify
+	prevScheduler := runSchedulerForSlotOpen
+	t.Cleanup(func() {
+		slotOpenRecoveryCheck = prevRecovery
+		slotOpenDecisionForNotify = prevDecision
+		runSchedulerForSlotOpen = prevScheduler
+	})
+
+	slotOpenRecoveryCheck = func(workDir, rigName, polecatName string) (string, error) {
+		return `{"verdict":"SAFE_TO_NUKE"}`, nil
+	}
+	slotOpenDecisionForNotify = func(workDir, townRoot, rigName, polecatName, exitType string) polecat.SlotReuseDecision {
+		return polecat.SlotReuseDecision{Reusable: true}
+	}
+	runSchedulerForSlotOpen = func(gotTownRoot string) (slotOpenSchedulerResult, error) {
+		var result slotOpenSchedulerResult
+		result.Before.Capacity.Max = 10
+		result.Before.Capacity.Free = 2
+		result.Before.QueuedReady = 0
+		return result, nil
+	}
+
+	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted))
+
+	events := readMayorEvents(t, townRoot)
+	if len(events) != 1 {
+		t.Fatalf("events = %+v, want one SCHEDULER_OPEN event", events)
+	}
+	if events[0].Type != "SCHEDULER_OPEN" {
+		t.Fatalf("event type = %q, want SCHEDULER_OPEN", events[0].Type)
+	}
+	if events[0].Payload["capacity_free"] != "2" {
+		t.Fatalf("capacity_free = %q, want 2", events[0].Payload["capacity_free"])
+	}
+}
+
+func TestNotifyMayorSlotOpen_QueuedReadyWithoutDispatchFallsBack(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	townRoot, workDir := setupSlotOpenTestTown(t)
+
+	prevRecovery := slotOpenRecoveryCheck
+	prevDecision := slotOpenDecisionForNotify
+	prevScheduler := runSchedulerForSlotOpen
+	t.Cleanup(func() {
+		slotOpenRecoveryCheck = prevRecovery
+		slotOpenDecisionForNotify = prevDecision
+		runSchedulerForSlotOpen = prevScheduler
+	})
+
+	slotOpenRecoveryCheck = func(workDir, rigName, polecatName string) (string, error) {
+		return `{"verdict":"SAFE_TO_NUKE"}`, nil
+	}
+	slotOpenDecisionForNotify = func(workDir, townRoot, rigName, polecatName, exitType string) polecat.SlotReuseDecision {
+		return polecat.SlotReuseDecision{Reusable: true}
+	}
+	runSchedulerForSlotOpen = func(gotTownRoot string) (slotOpenSchedulerResult, error) {
+		var result slotOpenSchedulerResult
+		result.Before.Capacity.Max = 10
+		result.Before.Capacity.Free = 1
+		result.Before.QueuedReady = 1
+		result.After = result.Before
+		result.Ran = true
+		return result, nil
+	}
+
+	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted))
+
+	events := readMayorEvents(t, townRoot)
+	if len(events) != 1 {
+		t.Fatalf("events = %+v, want one fallback SLOT_OPEN event", events)
+	}
+	if events[0].Type != "SLOT_OPEN" {
+		t.Fatalf("event type = %q, want SLOT_OPEN", events[0].Type)
 	}
 }
 

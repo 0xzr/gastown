@@ -418,6 +418,46 @@ func TestSchedulerBlockedStatusReporting(t *testing.T) {
 	if ready != 1 {
 		t.Errorf("queued_ready = %d, want 1", ready)
 	}
+
+	// Close the blocker and verify the already-queued work becomes ready without
+	// creating a new sling context.
+	closeCmd := exec.Command("bd", "close", blockerID)
+	closeCmd.Dir = rigPath
+	closeCmd.Env = env
+	if out, err := closeCmd.CombinedOutput(); err != nil {
+		t.Fatalf("bd close blocker %s failed: %v\n%s", blockerID, err, out)
+	}
+
+	listed = getSchedulerList(t, gtBinary, hqPath, env)
+	foundBlocked = false
+	for _, item := range listed {
+		id, _ := item["id"].(string)
+		blocked, _ := item["blocked"].(bool)
+		if id == blockedID {
+			foundBlocked = true
+			if blocked {
+				t.Errorf("bead %s should become ready after blocker closes", blockedID)
+			}
+		}
+	}
+	if !foundBlocked {
+		t.Fatalf("unblocked queued bead %s not found in scheduler list", blockedID)
+	}
+
+	status = getSchedulerStatus(t, gtBinary, hqPath, env)
+	total = int(status["queued_total"].(float64))
+	ready = int(status["queued_ready"].(float64))
+	if total != 2 {
+		t.Errorf("queued_total after unblock = %d, want 2", total)
+	}
+	if ready != 2 {
+		t.Errorf("queued_ready after unblock = %d, want 2", ready)
+	}
+
+	out := runGTCmdOutput(t, gtBinary, hqPath, env, "scheduler", "run", "--dry-run")
+	if !strings.Contains(out, blockedID) {
+		t.Errorf("dry-run dispatch should include newly unblocked bead %s\noutput: %s", blockedID, out)
+	}
 }
 
 // TestSchedulerSlingDryRun verifies that gt sling deferred dispatch (max_polecats > 0) --dry-run

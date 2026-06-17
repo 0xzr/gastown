@@ -92,29 +92,13 @@ func (b *Beads) FindOpenSlingContext(workBeadID string) (*Issue, *capacity.Sling
 
 // ListOpenSlingContexts returns all open sling context beads.
 func (b *Beads) ListOpenSlingContexts() ([]*Issue, error) {
-	out, err := b.run("list",
-		"--label="+capacity.LabelSlingContext,
-		"--status=open",
-		"--json",
-		"--limit=0",
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	// Handle empty output or non-JSON responses.
-	// bd list --json may return plain text like "No issues found." instead
-	// of an empty JSON array when there are no results.
-	if len(out) == 0 || !isJSONBytes(out) {
-		return nil, nil
-	}
-
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing sling context list: %w", err)
-	}
-
-	return issues, nil
+	return b.List(ListOptions{
+		Status:    "open",
+		Label:     capacity.LabelSlingContext,
+		Priority:  -1,
+		Limit:     0,
+		Ephemeral: true,
+	})
 }
 
 // CloseSlingContext closes a sling context bead with a reason.

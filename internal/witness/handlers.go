@@ -2,6 +2,7 @@ package witness
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -752,6 +753,91 @@ var slotOpenRecoveryCheck = func(workDir, rigName, polecatName string) (string, 
 	return util.ExecWithOutput(workDir, "gt", "polecat", "check-recovery", rigName+"/"+polecatName, "--json", "--reconcile-cleanup")
 }
 
+type slotOpenSchedulerStatus struct {
+	Paused      bool `json:"paused"`
+	QueuedReady int  `json:"queued_ready"`
+	Capacity    struct {
+		Max  int `json:"max"`
+		Free int `json:"free"`
+	} `json:"capacity"`
+}
+
+type slotOpenSchedulerResult struct {
+	Before     slotOpenSchedulerStatus
+	After      slotOpenSchedulerStatus
+	Ran        bool
+	Dispatched int
+	Output     string
+}
+
+var runSchedulerForSlotOpen = defaultRunSchedulerForSlotOpen
+var slotOpenDecisionForNotify = slotOpenDecision
+
+func defaultRunSchedulerForSlotOpen(townRoot string) (slotOpenSchedulerResult, error) {
+	var result slotOpenSchedulerResult
+
+	before, err := readSchedulerStatusForSlotOpen(townRoot)
+	if err != nil {
+		return result, err
+	}
+	result.Before = before
+
+	if before.Paused || before.Capacity.Max <= 0 || before.Capacity.Free <= 0 || before.QueuedReady == 0 {
+		return result, nil
+	}
+
+	output, err := runGTForSlotOpen(townRoot, "scheduler", "run", "--batch", strconv.Itoa(before.Capacity.Free))
+	result.Ran = true
+	result.Output = output
+	if err != nil {
+		return result, err
+	}
+
+	after, err := readSchedulerStatusForSlotOpen(townRoot)
+	if err != nil {
+		return result, err
+	}
+	result.After = after
+	if before.QueuedReady > after.QueuedReady {
+		result.Dispatched = before.QueuedReady - after.QueuedReady
+	}
+	return result, nil
+}
+
+func readSchedulerStatusForSlotOpen(townRoot string) (slotOpenSchedulerStatus, error) {
+	var status slotOpenSchedulerStatus
+	output, err := runGTForSlotOpen(townRoot, "scheduler", "status", "--json")
+	if err != nil {
+		return status, err
+	}
+	jsonOutput := strings.TrimSpace(output)
+	if idx := strings.Index(jsonOutput, "{"); idx > 0 {
+		jsonOutput = jsonOutput[idx:]
+	}
+	if err := json.Unmarshal([]byte(jsonOutput), &status); err != nil {
+		return status, fmt.Errorf("parse scheduler status: %w", err)
+	}
+	return status, nil
+}
+
+func runGTForSlotOpen(townRoot string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "gt", args...)
+	cmd.Dir = townRoot
+	cmd.Env = append(beads.BuildMutationRoutingBDEnv(os.Environ(), filepath.Join(townRoot, ".beads")), "GT_DAEMON=1")
+	out, err := cmd.CombinedOutput()
+	output := string(out)
+	if ctx.Err() == context.DeadlineExceeded {
+		return output, fmt.Errorf("gt %s timed out after 5m", strings.Join(args, " "))
+	}
+	if err != nil {
+		return output, fmt.Errorf("gt %s failed: %w (output: %s)", strings.Join(args, " "), err, strings.TrimSpace(output))
+	}
+	return output, nil
+}
+
 func shouldNotifyMayorSlotOpen(workDir, rigName, polecatName string) (bool, string) {
 	output, err := slotOpenRecoveryCheck(workDir, rigName, polecatName)
 	if err != nil {
@@ -790,7 +876,7 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 		return
 	}
 	if exitType != string(ExitTypeCompleted) {
-		decision := slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType)
+		decision := slotOpenDecisionForNotify(workDir, townRoot, rigName, polecatName, exitType)
 		if !decision.Reusable {
 			_, _ = channelevents.EmitToTown(townRoot, "mayor", "SLOT_BLOCKED", []string{
 				"source=witness",
@@ -806,7 +892,7 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 		fmt.Fprintf(os.Stderr, "witness: suppressing SLOT_OPEN for %s/%s: %s\n", rigName, polecatName, reason)
 		return
 	}
-	decision := slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType)
+	decision := slotOpenDecisionForNotify(workDir, townRoot, rigName, polecatName, exitType)
 	if !decision.Reusable {
 		_, _ = channelevents.EmitToTown(townRoot, "mayor", "SLOT_BLOCKED", []string{
 			"source=witness",
@@ -815,6 +901,16 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 			"exit=" + exitType,
 			"reason=" + decision.Reason,
 		})
+		return
+	}
+	if result, err := runSchedulerForSlotOpen(townRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "witness: SLOT_OPEN scheduler trigger failed for %s/%s: %v\n", rigName, polecatName, err)
+	} else if result.Dispatched > 0 {
+		return
+	} else if schedulerOpenAfterSlot(result) {
+		notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType, result)
+		return
+	} else if result.Before.Capacity.Max > 0 && (result.Before.Paused || result.Before.Capacity.Free <= 0) {
 		return
 	}
 
@@ -841,6 +937,35 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 	subject := fmt.Sprintf("SLOT_OPEN: %s/%s completed (exit=%s)", rigName, polecatName, exitType)
 	body := fmt.Sprintf("Polecat %s/%s finished (exit=%s). Slot available for next bead.", rigName, polecatName, exitType)
 	cmd := exec.Command("gt", "mail", "send", "mayor/", "-s", subject, "-m", body)
+	cmd.Dir = townRoot
+	_ = cmd.Run()
+}
+
+func schedulerOpenAfterSlot(result slotOpenSchedulerResult) bool {
+	return !result.Before.Paused && result.Before.Capacity.Max > 0 && result.Before.Capacity.Free > 0 && result.Before.QueuedReady == 0
+}
+
+func notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType string, result slotOpenSchedulerResult) {
+	_, _ = channelevents.EmitToTown(townRoot, "mayor", "SCHEDULER_OPEN", []string{
+		"source=witness",
+		"rig=" + rigName,
+		"polecat=" + polecatName,
+		"exit=" + exitType,
+		"capacity_free=" + strconv.Itoa(result.Before.Capacity.Free),
+		"queued_ready=" + strconv.Itoa(result.Before.QueuedReady),
+	})
+
+	mayorSession := session.MayorSessionName()
+	t := tmux.NewTmux()
+	msg := fmt.Sprintf("SCHEDULER_OPEN: %s/%s completed (exit=%s); scheduler has capacity but no eligible queued beads remain.", rigName, polecatName, exitType)
+	if running, err := t.HasSession(mayorSession); err == nil && running {
+		if err := t.NudgeSession(mayorSession, msg); err == nil {
+			return
+		}
+	}
+
+	subject := fmt.Sprintf("SCHEDULER_OPEN: %s/%s completed (exit=%s)", rigName, polecatName, exitType)
+	cmd := exec.Command("gt", "mail", "send", "mayor/", "-s", subject, "-m", msg)
 	cmd.Dir = townRoot
 	_ = cmd.Run()
 }
