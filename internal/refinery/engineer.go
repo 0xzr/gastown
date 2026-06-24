@@ -174,6 +174,17 @@ type MergeQueueConfig struct {
 	// Nil defaults to false (no review required).
 	RequireReview *bool `json:"require_review,omitempty"`
 
+	// DegradedQuorumEnabled allows a merge to proceed when some reviewers are
+	// unavailable or produce no verdict, provided enough independent PASS reviews
+	// exist. When enabled, missing reviewers are recorded as audit obligations
+	// rather than blocking the merge indefinitely. Nil defaults to false.
+	DegradedQuorumEnabled *bool `json:"degraded_quorum_enabled,omitempty"`
+
+	// ReviewQuorumMin is the minimum number of independent PASS reviews required
+	// to satisfy degraded quorum. Only used when DegradedQuorumEnabled is true.
+	// Zero defaults to 1.
+	ReviewQuorumMin int `json:"review_quorum_min,omitempty"`
+
 	// Batch holds configuration for the batch-then-bisect merge queue.
 	// When nil or MaxBatchSize <= 1, batching is disabled and MRs process sequentially.
 	Batch *BatchConfig `json:"batch,omitempty"`
@@ -339,21 +350,23 @@ func (e *Engineer) LoadConfig() error {
 	// Parse merge_queue section into our config struct
 	// We need special handling for poll_interval (string -> Duration)
 	var mqRaw struct {
-		Enabled              *bool                     `json:"enabled"`
-		OnConflict           *string                   `json:"on_conflict"`
-		RunTests             *bool                     `json:"run_tests"`
-		TestCommand          *string                   `json:"test_command"`
-		DeleteMergedBranches *bool                     `json:"delete_merged_branches"`
-		RetryFlakyTests      *int                      `json:"retry_flaky_tests"`
-		PollInterval         *string                   `json:"poll_interval"`
-		MaxConcurrent        *int                      `json:"max_concurrent"`
-		StaleClaimTimeout    *string                   `json:"stale_claim_timeout"`
-		Gates                map[string]*gateConfigRaw `json:"gates"`
-		GatesParallel        *bool                     `json:"gates_parallel"`
-		AutoPush             *bool                     `json:"auto_push"`
-		MergeStrategy        *string                   `json:"merge_strategy"`
-		VCSProvider          *string                   `json:"vcs_provider"`
-		RequireReview        *bool                     `json:"require_review"`
+		Enabled               *bool                     `json:"enabled"`
+		OnConflict            *string                   `json:"on_conflict"`
+		RunTests              *bool                     `json:"run_tests"`
+		TestCommand           *string                   `json:"test_command"`
+		DeleteMergedBranches  *bool                     `json:"delete_merged_branches"`
+		RetryFlakyTests       *int                      `json:"retry_flaky_tests"`
+		PollInterval          *string                   `json:"poll_interval"`
+		MaxConcurrent         *int                      `json:"max_concurrent"`
+		StaleClaimTimeout     *string                   `json:"stale_claim_timeout"`
+		Gates                 map[string]*gateConfigRaw `json:"gates"`
+		GatesParallel         *bool                     `json:"gates_parallel"`
+		AutoPush              *bool                     `json:"auto_push"`
+		MergeStrategy         *string                   `json:"merge_strategy"`
+		VCSProvider           *string                   `json:"vcs_provider"`
+		RequireReview         *bool                     `json:"require_review"`
+		DegradedQuorumEnabled *bool                     `json:"degraded_quorum_enabled"`
+		ReviewQuorumMin       *int                      `json:"review_quorum_min"`
 	}
 
 	if err := json.Unmarshal(rawConfig.MergeQueue, &mqRaw); err != nil {
@@ -441,6 +454,12 @@ func (e *Engineer) LoadConfig() error {
 	if mqRaw.RequireReview != nil {
 		e.config.RequireReview = mqRaw.RequireReview
 	}
+	if mqRaw.DegradedQuorumEnabled != nil {
+		e.config.DegradedQuorumEnabled = mqRaw.DegradedQuorumEnabled
+	}
+	if mqRaw.ReviewQuorumMin != nil {
+		e.config.ReviewQuorumMin = *mqRaw.ReviewQuorumMin
+	}
 
 	// Initialize the PR provider when merge_strategy=pr.
 	if e.config.MergeStrategy == "pr" {
@@ -494,10 +513,19 @@ type ProcessResult struct {
 	BranchNotFound bool // Source branch no longer exists (e.g. cleaned up after cherry-pick)
 	NoMerge        bool // Source issue has no_merge flag — intentionally blocked, not a failure
 	NeedsApproval  bool // PR exists but lacks required approving review (merge_strategy=pr)
+
+	// DegradedQuorum is true when the merge proceeded under the explicit degraded
+	// quorum rule: some reviewers were unavailable/no-verdict, but enough
+	// independent PASS reviews existed and an audit obligation was recorded.
+	DegradedQuorum bool
+
+	// AuditBead is the ID of a follow-up audit task recorded for degraded-quorum
+	// or reviewer-unavailability cases.
+	AuditBead string
 }
 
 // doMerge performs the actual git merge operation.
-func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue string, skipGates ...bool) ProcessResult {
+func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue string, mr *MRInfo, skipGates ...bool) ProcessResult {
 	// GH#2778: Check no_merge flag on source issue before merging. The polecat
 	// normally skips MR creation when no_merge is set, but if an MR is created
 	// manually (e.g., gh pr create) the refinery would otherwise auto-merge it.
@@ -623,7 +651,7 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	// protection/restriction rules and preserves the PR audit trail.
 	// The VCS provider (GitHub, Bitbucket) is selected via vcs_provider config.
 	if e.config.MergeStrategy == "pr" {
-		return e.doMergePR(ctx, branch, target)
+		return e.doMergePR(ctx, branch, target, mr)
 	}
 
 	// Step 5: Perform the actual merge using squash merge
@@ -754,7 +782,7 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 // Called from doMerge after quality gates have passed.
 //
 //nolint:unparam // ctx is reserved for future use when git methods accept context
-func (e *Engineer) doMergePR(ctx context.Context, branch, target string) ProcessResult {
+func (e *Engineer) doMergePR(ctx context.Context, branch, target string, mr *MRInfo) ProcessResult {
 	_ = ctx
 	provider := e.config.VCSProvider
 	if provider == "" {
@@ -785,28 +813,63 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Found PR #%d for branch %s\n", prNumber, branch)
 
-	// Step PR.2: Check approval status if require_review is enabled
+	// Step PR.2: Evaluate reviewers if require_review is enabled.
 	requireReview := e.config.RequireReview != nil && *e.config.RequireReview
 	if requireReview {
-		approved, err := e.prProvider.IsPRApproved(prNumber)
+		ev, err := e.prProvider.GetReviewEvaluation(prNumber)
 		if err != nil {
 			return ProcessResult{
 				Success: false,
-				Error:   fmt.Sprintf("failed to check PR #%d approval status: %v", prNumber, err),
+				Error:   fmt.Sprintf("failed to evaluate reviewers for PR #%d: %v", prNumber, err),
 			}
 		}
-		if !approved {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d awaiting human approval — deferring merge\n", prNumber)
+
+		rule := e.degradedQuorumRule()
+		ev = EvaluateWithRule(ev, rule)
+
+		switch ev.State {
+		case ReviewStatePass:
+			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has approving review\n", prNumber)
+		case ReviewStateFail:
+			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d rejected by reviewer(s): %s\n", prNumber, ev.Error)
+			return ProcessResult{
+				Success:     false,
+				TestsFailed: true, // Reuse the test-failure path for reviewer rejection.
+				Error:       fmt.Sprintf("PR #%d reviewer rejection: %s", prNumber, ev.Error),
+			}
+		case ReviewStateDegradedQuorum:
+			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d proceeding under degraded quorum: %s\n", prNumber, ev.Error)
+			var auditBead string
+			if mr != nil {
+				auditBead, err = e.recordReviewerAuditBead(mr, ev)
+				if err != nil {
+					_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to record reviewer audit bead: %v\n", err)
+				} else {
+					_, _ = fmt.Fprintf(e.output, "[Engineer] Recorded reviewer audit bead: %s\n", auditBead)
+				}
+			}
+			return e.finishPRMerge(prNumber, branch, target, true, auditBead)
+		default:
+			// NO_VERDICT or UNAVAILABLE: keep MR in queue for retry rather than failing.
+			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d awaiting reviewer verdict (%s) — deferring merge\n", prNumber, ev.State)
 			return ProcessResult{
 				Success:       false,
 				NeedsApproval: true,
-				Error:         fmt.Sprintf("PR #%d requires approving review before merge", prNumber),
+				Error:         fmt.Sprintf("PR #%d reviewer state %s: %s", prNumber, ev.State, ev.Error),
 			}
 		}
-		_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has approving review\n", prNumber)
 	}
 
-	// Step PR.3: Merge via VCS provider API using squash merge
+	return e.finishPRMerge(prNumber, branch, target, false, "")
+}
+
+// finishPRMerge performs the actual PR merge and syncs local state.
+func (e *Engineer) finishPRMerge(prNumber int, branch, target string, degradedQuorum bool, auditBead string) ProcessResult {
+	provider := e.config.VCSProvider
+	if provider == "" {
+		provider = "github"
+	}
+
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Merging PR #%d via %s API (squash)...\n", prNumber, provider)
 	mergeCommit, err := e.prProvider.MergePR(prNumber, "squash")
 	if err != nil {
@@ -837,9 +900,77 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Successfully merged PR #%d: %s\n", prNumber, shortSHA(mergeCommit))
 	return ProcessResult{
-		Success:     true,
-		MergeCommit: mergeCommit,
+		Success:        true,
+		MergeCommit:    mergeCommit,
+		DegradedQuorum: degradedQuorum,
+		AuditBead:      auditBead,
 	}
+}
+
+// degradedQuorumRule builds the degraded-quorum rule from merge queue config.
+func (e *Engineer) degradedQuorumRule() DegradedQuorumRule {
+	rule := DegradedQuorumRule{
+		Enabled: e.config.DegradedQuorumEnabled != nil && *e.config.DegradedQuorumEnabled,
+	}
+	if rule.Enabled {
+		rule.MinPassReviews = e.config.ReviewQuorumMin
+	}
+	return rule
+}
+
+// EvaluateWithRule re-evaluates a provider-level review evaluation using the
+// configured degraded-quorum rule. Providers return a raw classification;
+// this applies the rig's explicit quorum settings.
+func EvaluateWithRule(ev *ReviewEvaluation, rule DegradedQuorumRule) *ReviewEvaluation {
+	if ev == nil {
+		return nil
+	}
+	result := EvaluateReviews(ev.Results, rule)
+	return &result
+}
+
+// recordReviewerAuditBead creates a follow-up audit task for reviewers that
+// were unavailable or produced no verdict during a degraded-quorum merge.
+func (e *Engineer) recordReviewerAuditBead(mr *MRInfo, ev *ReviewEvaluation) (string, error) {
+	if mr == nil || ev == nil || len(ev.AuditReviewers) == 0 {
+		return "", nil
+	}
+
+	description := fmt.Sprintf(`Reviewer audit obligation for degraded-quorum merge
+
+## Metadata
+- MR: %s
+- Branch: %s
+- Source issue: %s
+- Review state: %s
+- Audit reviewers: %s
+- Pass reviews: %d
+
+## Notes
+These reviewers were unavailable or produced no verdict during the merge.
+The merge proceeded under explicit degraded-quorum configuration.
+Verify whether a retroactive review is needed and close this task when audited.`,
+		mr.ID,
+		mr.Branch,
+		mr.SourceIssue,
+		ev.State,
+		strings.Join(ev.AuditReviewers, ", "),
+		ev.PassCount,
+	)
+
+	task, err := e.beads.Create(beads.CreateOptions{
+		Title:       fmt.Sprintf("Reviewer audit: %s", mr.ID),
+		Labels:      []string{"gt:audit", "gt:task"},
+		Priority:    mr.Priority,
+		Description: description,
+		Actor:       e.rig.Name + "/refinery",
+		Rig:         e.rig.Name,
+	})
+	if err != nil {
+		return "", fmt.Errorf("creating reviewer audit bead: %w", err)
+	}
+
+	return task.ID, nil
 }
 
 func (e *Engineer) acquireMainPushSlot(ctx context.Context) (string, error) {
@@ -1161,7 +1292,7 @@ func (e *Engineer) ProcessMRInfo(ctx context.Context, mr *MRInfo) ProcessResult 
 	}
 
 	// Use the shared merge logic
-	return e.doMerge(ctx, mr.Branch, mr.Target, mr.SourceIssue, skipGates)
+	return e.doMerge(ctx, mr.Branch, mr.Target, mr.SourceIssue, mr, skipGates)
 }
 
 // HandleMRInfoSuccess handles a successful merge from MRInfo.
@@ -1213,6 +1344,12 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 		closeReason := fmt.Sprintf("Merged in %s", mr.ID)
 		if result.MergeCommit != "" {
 			closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, result.MergeCommit)
+		}
+		if result.DegradedQuorum {
+			closeReason = fmt.Sprintf("%s\nreview_state: degraded_quorum", closeReason)
+			if result.AuditBead != "" {
+				closeReason = fmt.Sprintf("%s\naudit_bead: %s", closeReason, result.AuditBead)
+			}
 		}
 		if err := e.beads.ForceCloseWithReason(closeReason, mr.SourceIssue); err != nil {
 			// Check if already closed (by polecat's gt done) — that's fine

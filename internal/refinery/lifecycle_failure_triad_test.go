@@ -46,6 +46,22 @@ func (m *mockPRProvider) MergePR(prNumber int, method string) (string, error) {
 	return "", m.mergeErr
 }
 
+func (m *mockPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation, error) {
+	if m.approved {
+		return &ReviewEvaluation{
+			State:     ReviewStatePass,
+			Results:   []ReviewerResult{{Reviewer: "mock", Verdict: ReviewerVerdictPass}},
+			PassCount: 1,
+		}, nil
+	}
+	return &ReviewEvaluation{
+		State:          ReviewStateNoVerdict,
+		Results:        []ReviewerResult{{Reviewer: "mock", Verdict: ReviewerVerdictNoVerdict}},
+		NoVerdictCount: 1,
+		Error:          "no verdict",
+	}, nil
+}
+
 func TestHqTry2_StackedBranchTipOnly_MergesWithoutContainmentGuard(t *testing.T) {
 	// GT 1.2.0 characterization (hq-try2): a stacked tip branch whose history
 	// includes an unmerged base branch is accepted and merged into main. The
@@ -76,7 +92,7 @@ func TestHqTry2_StackedBranchTipOnly_MergesWithoutContainmentGuard(t *testing.T)
 	run(t, workDir, "git", "commit", "-m", "feat: tip branch change (hq-try2)")
 	run(t, workDir, "git", "checkout", "main")
 
-	result := e.doMerge(context.Background(), "feature/hq-try2-tip", "main", "gt-hq-try2")
+	result := e.doMerge(context.Background(), "feature/hq-try2-tip", "main", "gt-hq-try2", nil)
 	if !result.Success {
 		t.Fatalf("expected stacked tip branch to merge successfully under GT 1.2.0, got: %s", result.Error)
 	}
@@ -121,7 +137,7 @@ func TestHq6sdu_LocalMergeWithoutPush_ReportedAsShipped(t *testing.T) {
 		t.Fatalf("get origin/main tip before merge: %v", err)
 	}
 
-	result := e.doMerge(context.Background(), "feature/hq-6sdu", "main", "gt-hq-6sdu")
+	result := e.doMerge(context.Background(), "feature/hq-6sdu", "main", "gt-hq-6sdu", nil)
 	if !result.Success {
 		t.Fatalf("expected local merge to report success under GT 1.2.0, got: %s", result.Error)
 	}
@@ -170,7 +186,7 @@ func TestHq6af_NoVerdictReviewer_BlocksMergeAsApprovalMissing(t *testing.T) {
 
 	createFeatureBranch(t, workDir, "feature/hq-6af", "feature.txt", "feature content")
 
-	result := e.doMerge(context.Background(), "feature/hq-6af", "main", "gt-hq-6af")
+	result := e.doMerge(context.Background(), "feature/hq-6af", "main", "gt-hq-6af", nil)
 	if result.Success {
 		t.Fatal("expected no-verdict reviewer to block merge under GT 1.2.0")
 	}

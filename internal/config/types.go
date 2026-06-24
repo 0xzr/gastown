@@ -1351,6 +1351,17 @@ type MergeQueueConfig struct {
 	// Nil defaults to false (no review required).
 	RequireReview *bool `json:"require_review,omitempty"`
 
+	// DegradedQuorumEnabled allows a merge to proceed when some reviewers are
+	// unavailable or produce no verdict, provided enough independent PASS reviews
+	// exist. When enabled, missing reviewers are recorded as audit obligations
+	// rather than blocking the merge indefinitely. Nil defaults to false.
+	DegradedQuorumEnabled *bool `json:"degraded_quorum_enabled,omitempty"`
+
+	// ReviewQuorumMin is the minimum number of independent PASS reviews required
+	// to satisfy degraded quorum. Only used when DegradedQuorumEnabled is true.
+	// Zero defaults to 1.
+	ReviewQuorumMin int `json:"review_quorum_min,omitempty"`
+
 	// OnConflict specifies conflict resolution strategy: "assign_back" or "auto_rebase".
 	OnConflict string `json:"on_conflict"`
 
@@ -1470,6 +1481,24 @@ func (c *MergeQueueConfig) IsRequireReviewEnabled() bool {
 		return false
 	}
 	return *c.RequireReview
+}
+
+// IsDegradedQuorumEnabled returns whether degraded-quorum reviewer handling is
+// enabled. Nil-safe, defaults to false.
+func (c *MergeQueueConfig) IsDegradedQuorumEnabled() bool {
+	if c.DegradedQuorumEnabled == nil {
+		return false
+	}
+	return *c.DegradedQuorumEnabled
+}
+
+// GetReviewQuorumMin returns the minimum PASS reviews required for degraded
+// quorum. Defaults to 1.
+func (c *MergeQueueConfig) GetReviewQuorumMin() int {
+	if c.ReviewQuorumMin <= 0 {
+		return 1
+	}
+	return c.ReviewQuorumMin
 }
 
 // GetReviewDepth returns the configured review depth.

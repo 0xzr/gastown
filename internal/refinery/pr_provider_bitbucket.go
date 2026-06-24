@@ -38,6 +38,56 @@ func (p *bitbucketPRProvider) IsPRApproved(prNumber int) (bool, error) {
 	return p.git.IsBitbucketPRApproved(p.workspace, p.repoSlug, prNumber)
 }
 
+func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation, error) {
+	participants, err := p.git.GetBitbucketPRParticipants(p.workspace, p.repoSlug, prNumber)
+	if err != nil {
+		return &ReviewEvaluation{
+			State:            ReviewStateUnavailable,
+			Results:          []ReviewerResult{{Reviewer: "bitbucket", Verdict: ReviewerVerdictUnavailable, Evidence: err.Error()}},
+			UnavailableCount: 1,
+			Error:            err.Error(),
+		}, nil
+	}
+
+	if len(participants) == 0 {
+		return &ReviewEvaluation{
+			State:          ReviewStateNoVerdict,
+			Results:        []ReviewerResult{{Reviewer: "bitbucket", Verdict: ReviewerVerdictNoVerdict, Evidence: "no participants"}},
+			NoVerdictCount: 1,
+			Error:          "no participants",
+		}, nil
+	}
+
+	results := make([]ReviewerResult, 0, len(participants))
+	for _, participant := range participants {
+		result := ReviewerResult{Reviewer: participant.User}
+		if participant.Role == "REVIEWER" && participant.Approved {
+			result.Verdict = ReviewerVerdictPass
+		} else if participant.Role == "REVIEWER" {
+			// Bitbucket participants API does not expose CHANGES_REQUESTED state;
+			// a non-approving reviewer is treated as no-verdict, not a blocker.
+			result.Verdict = ReviewerVerdictNoVerdict
+			result.Evidence = "reviewer has not approved"
+		} else {
+			// Non-reviewer participants do not count as reviewers.
+			continue
+		}
+		results = append(results, result)
+	}
+
+	if len(results) == 0 {
+		return &ReviewEvaluation{
+			State:          ReviewStateNoVerdict,
+			Results:        []ReviewerResult{{Reviewer: "bitbucket", Verdict: ReviewerVerdictNoVerdict, Evidence: "no reviewers"}},
+			NoVerdictCount: 1,
+			Error:          "no reviewers",
+		}, nil
+	}
+
+	ev := EvaluateReviews(results, DegradedQuorumRule{})
+	return &ev, nil
+}
+
 func (p *bitbucketPRProvider) MergePR(prNumber int, method string) (string, error) {
 	// Map generic merge methods to Bitbucket strategy names.
 	bbStrategy := method

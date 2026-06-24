@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Refinery degraded-quorum reviewer semantics** — reviewer probes that return
+  no verdict or are unavailable are no longer classified as a content `FAIL`.
+  Parsed `FAIL` with concrete blockers still rejects. When
+  `merge_queue.degraded_quorum_enabled` is true and enough independent `PASS`
+  reviews exist, the merge proceeds and records a follow-up audit bead for the
+  missing reviewers. See `docs/refinery-review-semantics.md`.
+
 ## [1.2.1] - 2026-06-06
 
 ### Fixed

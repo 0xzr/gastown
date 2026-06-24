@@ -9,6 +9,11 @@ type PRProvider interface {
 	// IsPRApproved checks whether a PR has at least one approving review.
 	IsPRApproved(prNumber int) (bool, error)
 
+	// GetReviewEvaluation returns classified per-reviewer results for the PR.
+	// Implementations should distinguish explicit approval, explicit rejection
+	// with blockers, no-verdict/no-output, and provider/reviewer unavailability.
+	GetReviewEvaluation(prNumber int) (*ReviewEvaluation, error)
+
 	// MergePR merges a PR using the specified method (e.g., "squash", "merge", "rebase").
 	// Returns the merge commit SHA on success (if available).
 	MergePR(prNumber int, method string) (string, error)

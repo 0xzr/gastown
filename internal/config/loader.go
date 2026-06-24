@@ -387,6 +387,12 @@ func MergeSettingsCommand(repo, local *MergeQueueConfig) *MergeQueueConfig {
 		if local.RequireReview != nil {
 			result.RequireReview = local.RequireReview
 		}
+		if local.DegradedQuorumEnabled != nil {
+			result.DegradedQuorumEnabled = local.DegradedQuorumEnabled
+		}
+		if local.ReviewQuorumMin > 0 {
+			result.ReviewQuorumMin = local.ReviewQuorumMin
+		}
 	}
 	return result
 }

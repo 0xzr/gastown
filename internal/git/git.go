@@ -1463,6 +1463,13 @@ func (g *Git) FindPRNumber(branch string) (int, error) {
 	return prs[0].Number, nil
 }
 
+// PRReview captures a single GitHub review state.
+type PRReview struct {
+	Reviewer string `json:"reviewer"`
+	State    string `json:"state"`
+	Body     string `json:"body,omitempty"`
+}
+
 // IsPRApproved checks whether a GitHub PR has at least one approving review.
 // Returns true if approved, false if not (or on error).
 func (g *Git) IsPRApproved(prNumber int) (bool, error) {
@@ -1481,6 +1488,56 @@ func (g *Git) IsPRApproved(prNumber int) (bool, error) {
 	}
 	// APPROVED is the GitHub review decision when at least one approving review exists
 	return result.ReviewDecision == "APPROVED", nil
+}
+
+// GetPRReviews returns per-reviewer GitHub review states for a PR.
+// Requires the gh CLI. Returns an empty slice if there are no reviews.
+func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviews")
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh pr view reviews failed: %w", err)
+	}
+	var result struct {
+		Reviews []struct {
+			Author struct {
+				Login string `json:"login"`
+			} `json:"author"`
+			State string `json:"state"`
+			Body  string `json:"body"`
+		} `json:"reviews"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse gh pr reviews output: %w", err)
+	}
+	reviews := make([]PRReview, 0, len(result.Reviews))
+	for _, r := range result.Reviews {
+		reviews = append(reviews, PRReview{
+			Reviewer: r.Author.Login,
+			State:    r.State,
+			Body:     r.Body,
+		})
+	}
+	return reviews, nil
+}
+
+// GetPRReviewDecision returns the overall GitHub review decision for a PR.
+// Known values: APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, "".
+func (g *Git) GetPRReviewDecision(prNumber int) (string, error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision")
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("gh pr view reviewDecision failed: %w", err)
+	}
+	var result struct {
+		ReviewDecision string `json:"reviewDecision"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
+		return "", fmt.Errorf("failed to parse gh pr reviewDecision output: %w", err)
+	}
+	return result.ReviewDecision, nil
 }
 
 // GhPrMerge merges a GitHub PR using the gh CLI, respecting branch protection rules.
@@ -1539,11 +1596,32 @@ func (g *Git) FindBitbucketPRNumber(workspace, repoSlug, branch string) (int, er
 	return resp.Values[0].ID, nil
 }
 
+// BitbucketParticipant captures a single Bitbucket PR participant.
+type BitbucketParticipant struct {
+	User     string `json:"user"`
+	Role     string `json:"role"`
+	Approved bool   `json:"approved"`
+}
+
 // IsBitbucketPRApproved checks whether a Bitbucket PR has at least one approving reviewer.
 func (g *Git) IsBitbucketPRApproved(workspace, repoSlug string, prID int) (bool, error) {
+	participants, err := g.GetBitbucketPRParticipants(workspace, repoSlug, prID)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range participants {
+		if p.Role == "REVIEWER" && p.Approved {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// GetBitbucketPRParticipants returns all participants for a Bitbucket PR.
+func (g *Git) GetBitbucketPRParticipants(workspace, repoSlug string, prID int) ([]BitbucketParticipant, error) {
 	token := os.Getenv("BITBUCKET_TOKEN")
 	if token == "" {
-		return false, fmt.Errorf("BITBUCKET_TOKEN is required for Bitbucket PR operations")
+		return nil, fmt.Errorf("BITBUCKET_TOKEN is required for Bitbucket PR operations")
 	}
 	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d",
 		workspace, repoSlug, prID)
@@ -1551,23 +1629,38 @@ func (g *Git) IsBitbucketPRApproved(workspace, repoSlug string, prID int) (bool,
 	cmd.Dir = g.workDir
 	out, err := cmd.Output()
 	if err != nil {
-		return false, fmt.Errorf("bitbucket API request failed: %w", err)
+		return nil, fmt.Errorf("bitbucket API request failed: %w", err)
 	}
 	var pr struct {
 		Participants []struct {
+			User struct {
+				DisplayName string `json:"display_name"`
+				Nickname    string `json:"nickname"`
+				UUID        string `json:"uuid"`
+			} `json:"user"`
 			Role     string `json:"role"`
 			Approved bool   `json:"approved"`
 		} `json:"participants"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(out), &pr); err != nil {
-		return false, fmt.Errorf("failed to parse Bitbucket response: %w", err)
+		return nil, fmt.Errorf("failed to parse Bitbucket response: %w", err)
 	}
+	participants := make([]BitbucketParticipant, 0, len(pr.Participants))
 	for _, p := range pr.Participants {
-		if p.Role == "REVIEWER" && p.Approved {
-			return true, nil
+		name := p.User.Nickname
+		if name == "" {
+			name = p.User.DisplayName
 		}
+		if name == "" {
+			name = p.User.UUID
+		}
+		participants = append(participants, BitbucketParticipant{
+			User:     name,
+			Role:     p.Role,
+			Approved: p.Approved,
+		})
 	}
-	return false, nil
+	return participants, nil
 }
 
 // BitbucketPRMerge merges a Bitbucket PR via the REST API.

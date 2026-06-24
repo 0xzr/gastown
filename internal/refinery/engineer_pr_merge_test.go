@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
-	gitpkg "github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 )
 
@@ -51,9 +50,9 @@ func TestEngineer_LoadConfig_MergeStrategyDefault(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	config := map[string]interface{}{
-		"type":    "rig",
-		"version": 1,
-		"name":    "test-rig",
+		"type":        "rig",
+		"version":     1,
+		"name":        "test-rig",
 		"merge_queue": map[string]interface{}{},
 	}
 
@@ -87,7 +86,7 @@ func TestDoMerge_PRStrategy_RoutesToPRPath(t *testing.T) {
 	// Create a feature branch
 	createFeatureBranch(t, workDir, "feat/test-pr", "test.txt", "hello")
 
-	result := e.doMerge(context.Background(), "feat/test-pr", "main", "gt-test")
+	result := e.doMerge(context.Background(), "feat/test-pr", "main", "gt-test", nil)
 
 	if result.Success {
 		t.Error("expected failure (no GitHub PR exists)")
@@ -107,7 +106,7 @@ func TestDoMerge_DirectStrategy_SkipsPRPath(t *testing.T) {
 
 	createFeatureBranch(t, workDir, "feat/test-direct", "test.txt", "hello")
 
-	result := e.doMerge(context.Background(), "feat/test-direct", "main", "gt-test")
+	result := e.doMerge(context.Background(), "feat/test-direct", "main", "gt-test", nil)
 
 	// Should succeed with direct merge
 	if !result.Success {
@@ -127,7 +126,7 @@ func TestDoMergePR_NoPR_ReturnsError(t *testing.T) {
 
 	createFeatureBranch(t, workDir, "feat/no-pr", "test.txt", "hello")
 
-	result := e.doMergePR(context.Background(), "feat/no-pr", "main")
+	result := e.doMergePR(context.Background(), "feat/no-pr", "main", nil)
 
 	if result.Success {
 		t.Error("expected failure when no PR exists")
@@ -194,12 +193,155 @@ func TestHandleMRInfoFailure_NeedsApproval_StaysInQueue(t *testing.T) {
 	}
 }
 
-func TestDoMergePR_RequireReview_NoApproval(t *testing.T) {
-	// When require_review is true and the PR is not approved,
-	// doMergePR should return NeedsApproval=true.
-	// This test is tricky since it requires gh CLI — skip if not available.
-	if _, err := gitpkg.NewGit(t.TempDir()).FindPRNumber("nonexistent"); err != nil {
-		// gh CLI not available or not authenticated — test the config path only
-		t.Skip("gh CLI not available for PR approval testing")
+type reviewerMockPRProvider struct {
+	findPRNumber        func(branch string) (int, error)
+	isPRApproved        func(prNumber int) (bool, error)
+	getReviewEvaluation func(prNumber int) (*ReviewEvaluation, error)
+	mergePR             func(prNumber int, method string) (string, error)
+}
+
+func (m *reviewerMockPRProvider) FindPRNumber(branch string) (int, error) {
+	return m.findPRNumber(branch)
+}
+
+func (m *reviewerMockPRProvider) IsPRApproved(prNumber int) (bool, error) {
+	return m.isPRApproved(prNumber)
+}
+
+func (m *reviewerMockPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation, error) {
+	return m.getReviewEvaluation(prNumber)
+}
+
+func (m *reviewerMockPRProvider) MergePR(prNumber int, method string) (string, error) {
+	return m.mergePR(prNumber, method)
+}
+
+func TestDoMergePR_NoVerdict_NotTreatedAsFail(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = "pr"
+	e.config.RequireReview = boolPtr(true)
+
+	createFeatureBranch(t, workDir, "feat/no-verdict", "test.txt", "hello")
+
+	e.prProvider = &reviewerMockPRProvider{
+		findPRNumber: func(string) (int, error) { return 42, nil },
+		isPRApproved: func(int) (bool, error) { return false, nil },
+		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
+			return &ReviewEvaluation{
+				State:          ReviewStateNoVerdict,
+				Results:        []ReviewerResult{{Reviewer: "github", Verdict: ReviewerVerdictNoVerdict, Evidence: "no reviews"}},
+				NoVerdictCount: 1,
+				Error:          "no reviews",
+			}, nil
+		},
+		mergePR: nil,
+	}
+
+	result := e.doMergePR(context.Background(), "feat/no-verdict", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+
+	if !result.NeedsApproval {
+		t.Errorf("expected NeedsApproval for no-verdict, got %+v", result)
+	}
+	if result.TestsFailed {
+		t.Error("no-verdict must not set TestsFailed")
+	}
+	if result.Success {
+		t.Error("expected failure while waiting for verdict")
+	}
+}
+
+func TestDoMergePR_ParsedFail_Rejects(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = "pr"
+	e.config.RequireReview = boolPtr(true)
+
+	createFeatureBranch(t, workDir, "feat/fail", "test.txt", "hello")
+
+	e.prProvider = &reviewerMockPRProvider{
+		findPRNumber: func(string) (int, error) { return 42, nil },
+		isPRApproved: func(int) (bool, error) { return false, nil },
+		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
+			return &ReviewEvaluation{
+				State:     ReviewStateFail,
+				Results:   []ReviewerResult{{Reviewer: "reviewer", Verdict: ReviewerVerdictFail, Blockers: []string{"race condition"}}},
+				FailCount: 1,
+				Error:     "reviewer rejection",
+			}, nil
+		},
+		mergePR: nil,
+	}
+
+	result := e.doMergePR(context.Background(), "feat/fail", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+
+	if result.Success || result.NeedsApproval {
+		t.Errorf("expected hard failure, got %+v", result)
+	}
+	if !result.TestsFailed {
+		t.Error("expected parsed FAIL to set TestsFailed so the failure is actionable")
+	}
+	if !strings.Contains(result.Error, "race condition") {
+		t.Errorf("expected error to include reviewer evidence, got %s", result.Error)
+	}
+}
+
+func TestDoMergePR_DegradedQuorum_ProceedsAndCreatesAudit(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = "pr"
+	e.config.RequireReview = boolPtr(true)
+	e.config.DegradedQuorumEnabled = boolPtr(true)
+	e.config.ReviewQuorumMin = 1
+
+	createFeatureBranch(t, workDir, "feat/degraded", "test.txt", "hello")
+
+	mergeCalled := false
+	e.prProvider = &reviewerMockPRProvider{
+		findPRNumber: func(string) (int, error) { return 42, nil },
+		isPRApproved: func(int) (bool, error) { return true, nil },
+		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
+			return &ReviewEvaluation{
+				State: ReviewStateDegradedQuorum,
+				Results: []ReviewerResult{
+					{Reviewer: "alice", Verdict: ReviewerVerdictPass},
+					{Reviewer: "bob", Verdict: ReviewerVerdictUnavailable},
+				},
+				PassCount:        1,
+				UnavailableCount: 1,
+				AuditReviewers:   []string{"bob"},
+				Error:            "degraded quorum: 1 PASS, 1 audit",
+			}, nil
+		},
+		mergePR: func(int, string) (string, error) {
+			mergeCalled = true
+			// Simulate the provider landing the PR by squash-merging locally and pushing.
+			if err := g.Checkout("main"); err != nil {
+				return "", err
+			}
+			if err := g.MergeSquash("feat/degraded", "feat: add test.txt"); err != nil {
+				return "", err
+			}
+			sha, err := g.Rev("HEAD")
+			if err != nil {
+				return "", err
+			}
+			if err := g.Push("origin", "main", false); err != nil {
+				return "", err
+			}
+			return sha, nil
+		},
+	}
+
+	result := e.doMergePR(context.Background(), "feat/degraded", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+
+	if !result.Success {
+		t.Errorf("expected success under degraded quorum, got %+v", result)
+	}
+	if !result.DegradedQuorum {
+		t.Error("expected DegradedQuorum flag on result")
+	}
+	if !mergeCalled {
+		t.Error("expected MergePR to be called")
 	}
 }

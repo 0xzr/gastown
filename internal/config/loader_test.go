@@ -554,6 +554,22 @@ func TestMergeSettingsCommand(t *testing.T) {
 			t.Errorf("expected 'local-test', got %q", result.TestCommand)
 		}
 	})
+
+	t.Run("local overrides degraded-quorum settings", func(t *testing.T) {
+		t.Parallel()
+		repo := &MergeQueueConfig{RequireReview: boolPtr(true), ReviewQuorumMin: 2}
+		local := &MergeQueueConfig{DegradedQuorumEnabled: boolPtr(true), ReviewQuorumMin: 1}
+		result := MergeSettingsCommand(repo, local)
+		if result.RequireReview == nil || !*result.RequireReview {
+			t.Error("expected repo RequireReview to be preserved")
+		}
+		if result.DegradedQuorumEnabled == nil || !*result.DegradedQuorumEnabled {
+			t.Error("expected local DegradedQuorumEnabled to override")
+		}
+		if result.ReviewQuorumMin != 1 {
+			t.Errorf("expected ReviewQuorumMin 1, got %d", result.ReviewQuorumMin)
+		}
+	})
 }
 
 func TestMayorConfigRoundTrip(t *testing.T) {
