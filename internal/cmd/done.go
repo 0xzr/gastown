@@ -87,6 +87,27 @@ func doneContaminationBaseRef(defaultBranch, explicitTarget string) string {
 	return "origin/" + targetBranch
 }
 
+// isValidMergeTarget reports whether a resolved MR target branch is safe to
+// submit. It rejects targets that collapse to the rig name, which would
+// produce an MR advertising "<rig>/<rig>" (hq-faz). A target equal to its own
+// rig name is never a real branch someone merges into. Empty targets are
+// invalid; callers fall back to the default branch instead.
+func isValidMergeTarget(target, rigName string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
+	}
+	// Strip a leading origin/ so "origin/<rig>" is caught too.
+	trimmed := strings.TrimPrefix(target, "origin/")
+	if trimmed == "" {
+		return false
+	}
+	if rigName != "" && (target == rigName || trimmed == rigName) {
+		return false
+	}
+	return true
+}
+
 func shouldSyncIdlePolecatWorktree(exitType, mergeStrategy string, pushFailed, mrFailed, syncSafe bool) bool {
 	if exitType != ExitCompleted || pushFailed || mrFailed || !syncSafe {
 		return false
@@ -1180,6 +1201,23 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					target = autoTarget
 				}
 			}
+		}
+
+		// Guard (hq-faz): the MR target must never resolve to the rig name
+		// itself. A malformed formula_vars base_branch, a stale restored hook,
+		// or a misparsed integration branch can yield the rig name as the
+		// target, producing an MR that advertises "<rig>/<rig>" and confuses
+		// the refinery. Reject it and fall back to the configured default
+		// branch with a warning rather than submitting a malformed MR. The
+		// explicit --issue / restored hook is still honored for issue
+		// attribution; only an invalid *target* is rejected here.
+		if !isValidMergeTarget(target, rigName) {
+			style.PrintWarning("resolved MR target %q is not a valid merge target (matches rig name %q) — falling back to %s", target, rigName, defaultBranch)
+			if explicitTarget {
+				style.PrintWarning("the --target flag produced an invalid target; verify your base branch before resubmitting")
+			}
+			target = defaultBranch
+			explicitTarget = false
 		}
 
 		// Get source issue for priority inheritance

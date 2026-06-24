@@ -44,6 +44,12 @@ type AgentFields struct {
 	ActiveMR          string // Currently active merge request bead ID (for traceability)
 	NotificationLevel string // DND mode: verbose, normal, muted (default: normal)
 	Mode              string // Execution mode: "" (normal) or "ralph" (Ralph Wiggum loop)
+	// AssignedAgent is the runtime agent this polecat was started with
+	// (e.g., "claude", "codex", "gemini"). Persisted on session start so a
+	// subsequent gt session start/restart preserves the assignment instead of
+	// reverting to the rig default (hq-juu / hq-t7t). An explicit --agent
+	// override or escalation rotation still wins over this persisted value.
+	AssignedAgent string
 	// Note: RoleBead field removed - role definitions are now config-based.
 	// See internal/config/roles/*.toml and config-based-roles.md.
 
@@ -114,6 +120,9 @@ func FormatAgentDescription(title string, fields *AgentFields) string {
 	if fields.Mode != "" {
 		lines = append(lines, fmt.Sprintf("mode: %s", fields.Mode))
 	}
+	if fields.AssignedAgent != "" {
+		lines = append(lines, fmt.Sprintf("assigned_agent: %s", fields.AssignedAgent))
+	}
 
 	// Completion metadata fields (gt-x7t9)
 	if fields.ExitType != "" {
@@ -179,6 +188,8 @@ func ParseAgentFields(description string) *AgentFields {
 			fields.NotificationLevel = value
 		case "mode":
 			fields.Mode = value
+		case "assigned_agent":
+			fields.AssignedAgent = value
 		// Completion metadata fields (gt-x7t9)
 		case "exit_type":
 			fields.ExitType = value
@@ -370,6 +381,7 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 	fields.ActiveMR = ""      // Clear active_mr
 	fields.CleanupStatus = "" // Clear cleanup_status
 	fields.Mode = ""          // Clear Ralph-mode threshold marker
+	fields.AssignedAgent = "" // Clear persisted agent; next start re-derives it
 	fields.AgentState = string(AgentStateNuked)
 	// Clear completion metadata (gt-x7t9)
 	fields.ExitType = ""
@@ -418,6 +430,7 @@ type AgentFieldUpdates struct {
 	ActiveMR          *string
 	NotificationLevel *string
 	Mode              *string
+	AssignedAgent     *string // Persisted runtime agent for session-restart model preservation (hq-juu / hq-t7t)
 	HookBead          *string // Clear hook_bead on completion (gt-qbh)
 	// Completion metadata fields (gt-x7t9)
 	ExitType        *string
@@ -477,6 +490,9 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 	if updates.Mode != nil {
 		fields.Mode = *updates.Mode
 	}
+	if updates.AssignedAgent != nil {
+		fields.AssignedAgent = *updates.AssignedAgent
+	}
 	if updates.HookBead != nil {
 		fields.HookBead = *updates.HookBead
 	}
@@ -519,6 +535,14 @@ func (b *Beads) UpdateAgentCleanupStatus(id string, cleanupStatus string) error 
 // Pass empty string to clear the field (e.g., after merge completes).
 func (b *Beads) UpdateAgentActiveMR(id string, activeMR string) error {
 	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{ActiveMR: &activeMR})
+}
+
+// UpdateAgentAssignedAgent persists the runtime agent a polecat session was
+// started with, so gt session start/restart can preserve the assignment
+// instead of reverting to the rig default (hq-juu / hq-t7t). Pass empty string
+// to clear it (e.g., when the slot is reset for reuse).
+func (b *Beads) UpdateAgentAssignedAgent(id string, agent string) error {
+	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{AssignedAgent: &agent})
 }
 
 // UpdateAgentNotificationLevel updates the notification_level field in an agent bead.

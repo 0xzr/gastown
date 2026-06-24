@@ -338,6 +338,39 @@ func (m *SessionManager) polecatSlot(polecat string) int {
 	return slot
 }
 
+// agentBeadIDForSession returns the agent bead ID for a polecat, mirroring
+// Manager.agentBeadID. Used to read/persist the assigned_agent field for
+// model preservation across session restart (hq-juu / hq-t7t).
+func (m *SessionManager) agentBeadIDForSession(polecat string) string {
+	townRoot := filepath.Dir(m.rig.Path)
+	prefix := beads.GetPrefixForRig(townRoot, m.rig.Name)
+	return beads.PolecatBeadIDWithPrefix(prefix, m.rig.Name, polecat)
+}
+
+// readPersistedAssignedAgent returns the runtime agent previously persisted for
+// this polecat, or "" if none (fresh slot or lookup failure). Best-effort and
+// non-fatal: a read failure must not block session start.
+func (m *SessionManager) readPersistedAssignedAgent(polecat string) string {
+	agentID := m.agentBeadIDForSession(polecat)
+	bd := beads.New(m.rig.Path).ForAgentBead()
+	_, fields, err := bd.GetAgentBead(agentID)
+	if err != nil || fields == nil {
+		return ""
+	}
+	return strings.TrimSpace(fields.AssignedAgent)
+}
+
+// persistAssignedAgent stores the runtime agent this session is running so the
+// next gt session start/restart can restore it (hq-juu / hq-t7t). Best-effort:
+// a write failure only warns so session creation is not blocked.
+func (m *SessionManager) persistAssignedAgent(polecat, agent string) {
+	agentID := m.agentBeadIDForSession(polecat)
+	bd := beads.New(m.rig.Path).ForAgentBead()
+	if err := bd.UpdateAgentAssignedAgent(agentID, agent); err != nil {
+		debugSession(fmt.Sprintf("persist assigned_agent=%s for %s", agent, polecat), err)
+	}
+}
+
 // Start creates and starts a new session for a polecat.
 func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	if !m.hasPolecat(polecat) {
@@ -398,15 +431,45 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// session, timing out instead of using Codex's delay-based readiness.
 	townRoot := filepath.Dir(m.rig.Path)
 	var runtimeConfig *config.RuntimeConfig
-	if opts.Agent != "" {
-		rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, opts.Agent)
-		if err != nil {
-			return fmt.Errorf("resolving agent config for %s: %w", opts.Agent, err)
+	// effectiveAgent is the agent this session will actually run, accounting
+	// for model preservation on start/restart (hq-juu / hq-t7t). Priority:
+	// explicit --agent override > previously persisted assigned_agent > rig/town
+	// default. Without this, gt session restart reverts a codex/gemini polecat
+	// to the rig default (claude), silently changing the assigned model.
+	effectiveAgent := opts.Agent
+	if effectiveAgent == "" {
+		if persisted := m.readPersistedAssignedAgent(polecat); persisted != "" {
+			effectiveAgent = persisted
 		}
-		runtimeConfig = rc
+	}
+	if effectiveAgent != "" {
+		rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, effectiveAgent)
+		if err != nil {
+			// An invalid persisted agent must not wedge session start: fall back
+			// to the default role agent and warn so the operator can fix it.
+			if opts.Agent != "" {
+				return fmt.Errorf("resolving agent config for %s: %w", effectiveAgent, err)
+			}
+			style.PrintWarning("persisted assigned_agent %q could not be resolved, falling back to default: %v", effectiveAgent, err)
+			effectiveAgent = ""
+			runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
+		} else {
+			runtimeConfig = rc
+		}
 	} else {
 		runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
 	}
+
+	// Persist the agent this session is running so the next start/restart can
+	// restore it. Best-effort: a write failure must not block session creation.
+	// opts.Agent (explicit override/escalation rotation) wins over the prior
+	// persisted value — that is how an escalation path intentionally rotates
+	// the model.
+	resolvedAgent := effectiveAgent
+	if resolvedAgent == "" {
+		resolvedAgent = runtimeConfig.ResolvedAgent
+	}
+	m.persistAssignedAgent(polecat, resolvedAgent)
 
 	// Ensure runtime settings exist in the shared polecats parent directory.
 	// Settings are passed to Claude Code via --settings flag.
@@ -446,7 +509,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 			Issue:       opts.Issue,
 			Topic:       "assigned",
 			SessionName: sessionID,
-		}, m.rig.Path, beacon, opts.Agent)
+		}, m.rig.Path, beacon, resolvedAgent)
 		if err != nil {
 			return fmt.Errorf("building startup command: %w", err)
 		}
@@ -473,7 +536,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		AgentName:        polecat,
 		TownRoot:         townRoot,
 		RuntimeConfigDir: opts.RuntimeConfigDir,
-		Agent:            opts.Agent,
+		Agent:            resolvedAgent,
 		SessionName:      sessionID,
 	})
 	// AgentEnv already sets GT_ROLE, GT_RIG, GT_POLECAT, BD_ACTOR,

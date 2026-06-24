@@ -24,6 +24,12 @@ type ActiveMRInput struct {
 // ActiveMRAssessment is the shared active_mr classification used by recovery,
 // reuse, and witness paths. Pending is fail-closed: lookup/source uncertainty
 // remains blocking unless the stale MR and terminal source are both proven.
+//
+// The exception is a terminal MR closed for rework (rejected, conflict, or
+// superseded): such an MR is no longer live in the merge queue, so the slot
+// must be recyclable for rework even though the source issue stays open
+// (hq-yyz / hq-6na). Reconcilable signals that a stale active_mr can be
+// safely cleared so capacity is not blocked by dead merge-queue work.
 type ActiveMRAssessment struct {
 	ActiveMR       string
 	Pending        bool
@@ -32,6 +38,8 @@ type ActiveMRAssessment struct {
 	SourceIssue    string
 	SourceTerminal bool
 	Stale          bool
+	CloseReason    string
+	Reconcilable   bool
 }
 
 // AssessActiveMR returns whether active_mr still represents work pending in the
@@ -71,8 +79,27 @@ func AssessActiveMR(reader IssueReader, in ActiveMRInput) ActiveMRAssessment {
 func assessStaleActiveMR(reader IssueReader, in ActiveMRInput, result ActiveMRAssessment, mrStatus string, mr *beads.Issue) ActiveMRAssessment {
 	result.MRStatus = mrStatus
 	result.Stale = true
+	closeReason := mrCloseReason(mr)
+	result.CloseReason = closeReason
 	sourceIssue := sourceIssueForActiveMR(in.SourceIssueHint, mr)
 	result.SourceIssue = sourceIssue
+
+	// A terminal MR closed for rework (rejected, conflict, or superseded) is no
+	// longer live in the merge queue. Its source issue stays open on purpose so
+	// the polecat can redo the work, but that open source must not keep the slot
+	// blocked on a dead MR (hq-yyz / hq-6na). The active_mr is reconcilable:
+	// safe to clear once git state confirms no live work is at risk.
+	if isReworkCloseReason(closeReason) {
+		result.Reconcilable = true
+		if in.RequireGitSafe && !in.GitSafe {
+			result.Reason = fmt.Sprintf("active_mr=%s status=%s close_reason=%s source_issue=%s git_state=unsafe", result.ActiveMR, mrStatus, closeReason, sourceIssue)
+			return result
+		}
+		result.Pending = false
+		result.Reason = ""
+		return result
+	}
+
 	terminal, reason := terminalSourceIssue(reader, sourceIssue)
 	result.SourceTerminal = terminal
 	if !terminal {
@@ -86,6 +113,31 @@ func assessStaleActiveMR(reader IssueReader, in ActiveMRInput, result ActiveMRAs
 	result.Pending = false
 	result.Reason = ""
 	return result
+}
+
+// mrCloseReason extracts the close_reason from a terminal MR bead's description,
+// falling back to the bead's own close metadata when MR fields are absent.
+func mrCloseReason(mr *beads.Issue) string {
+	if mr == nil {
+		return ""
+	}
+	if fields := beads.ParseMRFields(mr); fields != nil && fields.CloseReason != "" {
+		return fields.CloseReason
+	}
+	return ""
+}
+
+// isReworkCloseReason reports whether a close reason means the MR died short of
+// a durable merge and the source issue is expected to stay open for rework.
+// "merged" is NOT a rework reason: PostMerge closes the source, so source
+// terminality is the correct gate for merged MRs.
+func isReworkCloseReason(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "rejected", "conflict", "superseded":
+		return true
+	default:
+		return false
+	}
 }
 
 func sourceIssueForActiveMR(hint string, mr *beads.Issue) string {

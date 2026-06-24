@@ -869,6 +869,11 @@ type GitState struct {
 	UnpreservedPatchCount int      `json:"unpreserved_patch_count"`
 	StashCount            int      `json:"stash_count"`                  // Current-branch stashes: per-polecat risk.
 	SharedStashCount      int      `json:"shared_stash_count,omitempty"` // Other branch stashes visible through the shared repo.
+	// RemoteSourceBranchMissing is set when the exact pushed source branch no
+	// longer exists on the remote (common after post-merge cleanup). When the
+	// local branch tip is preserved this is a warning, not a permanent capacity
+	// blocker (hq-4do).
+	RemoteSourceBranchMissing bool `json:"remote_source_branch_missing,omitempty"`
 }
 
 func runPolecatGitState(cmd *cobra.Command, args []string) error {
@@ -977,6 +982,7 @@ func getGitStateWithTargets(worktreePath string, targets []string) (*GitState, e
 	if preservation, preserveErr := worktreeGit.BranchPreservationStatus(branch, "origin", targets); preserveErr == nil {
 		state.ComparisonBase = preservation.ComparisonBase
 		state.UnpreservedPatchCount = preservation.UnpreservedPatchCount
+		state.RemoteSourceBranchMissing = preservation.RemoteSourceBranchMissing
 		if preservation.UnpreservedPatchCount > 0 {
 			state.UnpushedCommits = preservation.UnpreservedPatchCount
 			state.Clean = false
@@ -1014,6 +1020,9 @@ type RecoveryStatus struct {
 	Diagnostics          []string              `json:"diagnostics,omitempty"`
 	RecoveryActions      []string              `json:"recovery_actions,omitempty"`
 	Reconciled           bool                  `json:"reconciled,omitempty"`
+	// activeMRAssessment carries the live-MQ-vs-stale-metadata classification
+	// so the reconcile path can clear a dead active_mr without re-querying.
+	activeMRAssessment polecat.ActiveMRAssessment
 }
 
 func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
@@ -1117,6 +1126,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 				RequireGitSafe:  true,
 				GitSafe:         gitSafe,
 			})
+			status.activeMRAssessment = activeMRAssessment
 			if status.Issue == "" && activeMRAssessment.SourceIssue != "" {
 				status.Issue = activeMRAssessment.SourceIssue
 			}
@@ -1150,8 +1160,23 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	disposition := polecat.DecideWorkstate(input)
 	applyWorkstateDispositionToRecoveryStatus(&status, disposition)
 
+	// hq-4do: a missing remote source branch after a post-merge cleanup is a
+	// warning, not a silent permanent blocker. The local branch tip still
+	// holds the commits (branch-tip preservation happens at removal), so flag
+	// the condition and point at the recovery action instead of leaving the
+	// slot stuck with no explanation. This does not auto-nuke: it documents the
+	// reconcilable state so a witness/operator can clear it after verifying the
+	// tip is preserved.
+	if gitState != nil && gitState.RemoteSourceBranchMissing {
+		status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("remote_source_branch_missing=true branch=%s unpreserved_patches=%d local_tip=preserved", p.Branch, gitState.UnpreservedPatchCount))
+		if gitState.UnpreservedPatchCount > 0 && len(status.RecoveryActions) == 0 {
+			status.RecoveryActions = append(status.RecoveryActions, "remote source branch deleted post-merge; verify local branch tip is pushed, then reconcile with check-recovery --reconcile-cleanup")
+		}
+	}
+
 	if polecatCheckRecoveryReconcileCleanup {
 		reconcileCleanupStatusIfSafe(&status, bd, agentBeadID, p, fields)
+		reconcileActiveMRIfSafe(&status, bd, agentBeadID, fields)
 	}
 
 	// JSON output
@@ -1389,6 +1414,42 @@ func cleanupStatusReconcileCandidate(status *RecoveryStatus, p *polecat.Polecat,
 		return previous, false
 	}
 	return previous, true
+}
+
+// activeMRClearer is the subset of beads used to clear a stale active_mr.
+type activeMRClearer interface {
+	UpdateAgentActiveMR(id string, activeMR string) error
+}
+
+// reconcileActiveMRIfSafe clears a stale active_mr pointing at a terminal MR
+// closed for rework (rejected/conflict/superseded). Such an MR is no longer
+// live in the merge queue, so keeping it blocks capacity forever (hq-yyz /
+// hq-6na). The clear is gated on the live assessment proving the MR is stale
+// and reconcilable, and on git state being safe (no live work at risk). A
+// missing remote branch after branch-tip preservation is not a blocker here:
+// the assessment already required git-safe when RequireGitSafe was set.
+func reconcileActiveMRIfSafe(status *RecoveryStatus, clearer activeMRClearer, agentBeadID string, fields *beads.AgentFields) {
+	if status == nil || fields == nil {
+		return
+	}
+	assessment := status.activeMRAssessment
+	if !assessment.Stale || !assessment.Reconcilable || assessment.Pending {
+		return
+	}
+	if assessment.ActiveMR == "" {
+		return
+	}
+	if clearer == nil {
+		status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("active_mr_reconcile_skipped reason=updater_unavailable active_mr=%s", assessment.ActiveMR))
+		return
+	}
+	if err := clearer.UpdateAgentActiveMR(agentBeadID, ""); err != nil {
+		status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("active_mr_reconcile_failed active_mr=%s: %v", assessment.ActiveMR, err))
+		return
+	}
+	status.ActiveMR = ""
+	status.Reconciled = true
+	status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("reconciled_active_mr=cleared previous=%s mr_status=%s close_reason=%s source_issue=%s", assessment.ActiveMR, assessment.MRStatus, assessment.CloseReason, assessment.SourceIssue))
 }
 
 func agentSourceIssueHint(currentIssue string, fields *beads.AgentFields) string {

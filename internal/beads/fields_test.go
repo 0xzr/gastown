@@ -627,6 +627,38 @@ func TestParseAgentFields_WithCompletionMetadata(t *testing.T) {
 	}
 }
 
+// TestParseAgentFields_AssignedAgentRoundTrip covers hq-juu / hq-t7t: the
+// assigned_agent field must round-trip through format/parse so a session
+// start/restart can restore the persisted model assignment.
+func TestParseAgentFields_AssignedAgentRoundTrip(t *testing.T) {
+	original := &AgentFields{
+		RoleType:      "polecat",
+		Rig:           "gastown",
+		AgentState:    "working",
+		AssignedAgent: "codex",
+	}
+	formatted := FormatAgentDescription("Polecat nux", original)
+	parsed := ParseAgentFields(formatted)
+	if parsed == nil {
+		t.Fatal("round-trip parse returned nil")
+	}
+	if parsed.AssignedAgent != "codex" {
+		t.Errorf("AssignedAgent = %q, want %q", parsed.AssignedAgent, "codex")
+	}
+
+	// Absence round-trips as empty, not as the literal "null".
+	none := &AgentFields{RoleType: "polecat", Rig: "gastown", AgentState: "idle"}
+	if parsed := ParseAgentFields(FormatAgentDescription("Polecat nux", none)); parsed.AssignedAgent != "" {
+		t.Errorf("AssignedAgent = %q, want empty when unset", parsed.AssignedAgent)
+	}
+
+	// Explicit description parse (as written by FormatAgentDescription).
+	desc := "role_type: polecat\nrig: gastown\nagent_state: working\nassigned_agent: gemini"
+	if parsed := ParseAgentFields(desc); parsed.AssignedAgent != "gemini" {
+		t.Errorf("AssignedAgent = %q, want %q", parsed.AssignedAgent, "gemini")
+	}
+}
+
 // --- Convoy watcher tests ---
 
 func TestConvoyFieldsWatchersRoundTrip(t *testing.T) {

@@ -3218,3 +3218,69 @@ func TestBranchPushedToRemote_NoPushURL(t *testing.T) {
 		t.Errorf("BranchPushedToRemote unpushed = %d, want >= 1", unpushed)
 	}
 }
+
+// TestBranchPreservationStatus_RemoteSourceBranchMissing covers hq-4do: when a
+// post-merge cleanup deletes the remote source branch, BranchPreservationStatus
+// must flag RemoteSourceBranchMissing so callers can warn instead of silently
+// treating the slot as a permanent capacity blocker.
+func TestBranchPreservationStatus_RemoteSourceBranchMissing(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	// Create and push a feature branch with one commit ahead of main.
+	featureBranch := "polecat/feature-hq4do"
+	checkoutCmd := exec.Command("git", "checkout", "-b", featureBranch)
+	checkoutCmd.Dir = localDir
+	if err := checkoutCmd.Run(); err != nil {
+		t.Fatalf("git checkout -b %s: %v", featureBranch, err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "feature.txt"), []byte("feature\n"), 0644); err != nil {
+		t.Fatalf("write feature: %v", err)
+	}
+	for _, args := range [][]string{
+		{"git", "add", "feature.txt"},
+		{"git", "commit", "-m", "feature work"},
+		{"git", "push", "-u", "origin", featureBranch},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = localDir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("%s: %v", args, err)
+		}
+	}
+
+	// While the remote feature branch exists, it is NOT reported missing.
+	pres, err := g.BranchPreservationStatus(featureBranch, "origin", []string{mainBranch})
+	if err != nil {
+		t.Fatalf("BranchPreservationStatus (branch present): %v", err)
+	}
+	if pres.RemoteSourceBranchMissing {
+		t.Fatal("RemoteSourceBranchMissing = true, want false while remote branch exists")
+	}
+
+	// Simulate post-merge cleanup: delete the remote branch and prune.
+	for _, args := range [][]string{
+		{"git", "push", "origin", "--delete", featureBranch},
+		{"git", "fetch", "--prune", "origin"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = localDir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("%s: %v", args, err)
+		}
+	}
+
+	// After deletion, the exact remote source branch is gone -> flagged missing.
+	pres, err = g.BranchPreservationStatus(featureBranch, "origin", []string{mainBranch})
+	if err != nil {
+		t.Fatalf("BranchPreservationStatus (branch deleted): %v", err)
+	}
+	if !pres.RemoteSourceBranchMissing {
+		t.Fatal("RemoteSourceBranchMissing = false, want true after remote branch deletion (hq-4do)")
+	}
+	// The feature commit is still unpreserved against main (not merged), so the
+	// local tip is the only copy — callers preserve it before reconciling.
+	if pres.UnpreservedPatchCount == 0 {
+		t.Error("UnpreservedPatchCount = 0, want > 0 (feature work not on main)")
+	}
+}
