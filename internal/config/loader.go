@@ -1635,6 +1635,20 @@ func hasExplicitNonClaudeOverride(role string, townSettings *TownSettings, rigSe
 	return false
 }
 
+func hasExplicitRoleAgentInSettings(role string, townSettings *TownSettings, rigSettings *RigSettings) bool {
+	if rigSettings != nil && rigSettings.RoleAgents != nil {
+		if agentName, ok := rigSettings.RoleAgents[role]; ok && agentName != "" {
+			return true
+		}
+	}
+	if townSettings != nil && townSettings.RoleAgents != nil {
+		if agentName, ok := townSettings.RoleAgents[role]; ok && agentName != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func resolveRoleAgentConfigCore(role, townRoot, rigPath string) *RuntimeConfig {
 	// Load rig settings (may be nil for town-level roles like mayor/deacon)
 	var rigSettings *RigSettings
@@ -1658,10 +1672,12 @@ func resolveRoleAgentConfigCore(role, townRoot, rigPath string) *RuntimeConfig {
 		_ = LoadRigAgentRegistry(RigAgentRegistryPath(rigPath))
 	}
 
-	// Dogs default to Haiku (cheap infrastructure workers), but respect
-	// explicit non-Claude overrides (e.g., RoleAgents["dog"] = "opencode").
+	// Dogs default to Haiku (cheap infrastructure workers), but any explicit
+	// role_agents.dog mapping must win. Some Claude-compatible providers use
+	// the claude command with a settings file (for example umans-flash-role);
+	// treating those as plain Claude silently drops the provider settings.
 	if role == "dog" {
-		if hasExplicitNonClaudeOverride(role, townSettings, rigSettings) {
+		if hasExplicitRoleAgentInSettings(role, townSettings, rigSettings) || hasExplicitNonClaudeOverride(role, townSettings, rigSettings) {
 			// Fall through to normal resolution below
 		} else {
 			return claudeHaikuPreset()
