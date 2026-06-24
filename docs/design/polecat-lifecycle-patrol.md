@@ -51,7 +51,7 @@ hard constraint.
 |---------|--------------|-------------|
 | Step completion | Polecat | `bd close <step>` then `gt handoff` for next step |
 | Context filling | Claude Code | Auto-compaction; PreCompact hook saves state |
-| Crash/timeout | Infrastructure | Witness detects, respawns session |
+| Crash/timeout | Infrastructure | Witness detects, respawns session via the durable scoped restart runner (`gt-scoped-restart-runner.sh`) after a dry-run proves a safe same-model candidate |
 | `gt done` | Polecat | Final step; submit to MQ, go idle (sandbox preserved) |
 
 ### 2.4 State Continuity

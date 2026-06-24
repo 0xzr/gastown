@@ -59,16 +59,49 @@ Returns one of:
 
 **CRITICAL: Do NOT auto-nuke polecats with unpushed work.**
 
-Escalate to Mayor:
-```bash
-gt mail send mayor/ -s "RECOVERY_NEEDED {{RIG}}/<polecat>" -m "Cleanup Status: has_unpushed
-Branch: <branch-name>
-Issue: <issue-id>
-Detected: $(date -Iseconds)
+First, use the durable scoped restart runner to see if the lane is a safe
+same-polecat, same-model restart candidate:
 
-This polecat has unpushed work that will be lost if nuked.
-Please coordinate recovery before authorizing cleanup."
+```bash
+/home/ubuntu/gastown-spike/dropin/gt-scoped-restart-runner.sh --rig {{RIG}}
 ```
+
+This is report-only by default. It verifies:
+
+- Session is stopped or absent
+- Source bead is `hooked` or `in_progress`
+- `gt polecat check-recovery` says `NEEDS_RECOVERY` with `safe_to_nuke=false`
+- Recovery reasons are in the allowlist
+- No open MQ match, no live gate/build/test process on the target
+- No fresh live-touch unless the lane is a runner-proven clean/committed dead
+  lane (no session, no process, no open MQ, no dirty WIP)
+- Model assignment file exists and post-start `gt model-status` can verify the
+  same assigned model
+- Attempt budget has not been exhausted
+
+If the runner reports an eligible stable candidate, you may run the supervised
+fix:
+
+```bash
+/home/ubuntu/gastown-spike/dropin/gt-scoped-restart-runner.sh \
+  --rig {{RIG}} --target {{RIG}}/<polecat> --fix --max-fixes 1
+```
+
+After the fix, the runner itself verifies that the live model matches the
+assigned model before sending the resume nudge. If model verification fails,
+the runner refuses with actionable evidence; do **not** retry the same model
+yourself. Escalate to Mayor.
+
+Only escalate to Mayor when:
+
+- The runner is missing, errors, or rejects the state
+- The assigned model has failed three times (runner exits 75)
+- The lane does not match any allowlisted recovery class
+- You are unsure whether the lane is refinery-owned
+
+When escalating, include the runner's exact rejection reason, the dry-run
+output, `gt model-status`, `gt polecat check-recovery {{RIG}}/<polecat> --json`,
+and `gt mq list {{RIG}} --json` evidence.
 
 Only use `--force` after Mayor authorizes or confirms work is unrecoverable.
 
