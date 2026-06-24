@@ -52,3 +52,10 @@ dolt.idle-timeout: "0"
 export.auto: "false"
 
 sync.remote: "git+https://github.com/steveyegge/gastown.git"
+
+routing.mode: "explicit"
+
+dolt.server: "127.0.0.1"
+
+dolt.port: 3307
+storage.backend: dolt
