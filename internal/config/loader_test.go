@@ -1676,6 +1676,45 @@ func TestBuildAgentStartupCommand_DogUsesRoleAgents(t *testing.T) {
 	}
 }
 
+func TestBuildAgentStartupCommand_DogUsesClaudeCompatibleRoleAgentOverride(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+
+	settingsPath := filepath.Join(townRoot, "umans-kimi.settings.json")
+	townSettings := NewTownSettings()
+	townSettings.DefaultAgent = "claude-opus"
+	townSettings.Agents = map[string]*RuntimeConfig{
+		"claude-opus": {
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions", "--model", "opus"},
+		},
+		"umans-flash-role": {
+			Command: "claude",
+			Args:    []string{"--settings", settingsPath, "--model", "umans-flash", "--dangerously-skip-permissions"},
+		},
+	}
+	townSettings.RoleAgents = map[string]string{
+		"dog": "umans-flash-role",
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	cmd := BuildAgentStartupCommand("dog", "", townRoot, "", "")
+	if !strings.Contains(cmd, "GT_ROLE=dog") {
+		t.Fatalf("expected GT_ROLE=dog in command, got: %q", cmd)
+	}
+	if !strings.Contains(cmd, "--settings "+settingsPath) {
+		t.Fatalf("expected umans settings from role_agents[dog], got: %q", cmd)
+	}
+	if !strings.Contains(cmd, "--model umans-flash") {
+		t.Fatalf("expected --model umans-flash from role_agents[dog], got: %q", cmd)
+	}
+	if strings.Contains(cmd, "--model haiku") {
+		t.Fatalf("did not expect plain Haiku fallback when role_agents[dog] is explicit, got: %q", cmd)
+	}
+}
+
 func TestValidateAgentConfig(t *testing.T) {
 	t.Parallel()
 
