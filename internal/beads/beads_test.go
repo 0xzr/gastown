@@ -1492,6 +1492,37 @@ close_reason: merged`,
 			},
 		},
 		{
+			// gastown-cet.2.3 / hq-try2 / hq-6sdu: terminal-state and
+			// publication fields round-trip through ParseMRFields.
+			name: "terminal_state and publication fields (gastown-cet.2.3)",
+			issue: &Issue{
+				Description: `branch: polecat/quartz/gt-abc
+target: main
+source_issue: gt-abc
+terminal_state: published
+published_commit: 7b076fc1f00e0e0e0e0e0e0e0e0e0e0e0e0e0e0e
+published_remote: origin
+published_at: 2026-06-24T17:30:00Z
+stacked_branch: true
+stacked_at: 2026-06-24T17:25:00Z
+stacked_commit_sha: b5a6a81600000000000000000000000000000000
+stacked_commits: 3`,
+			},
+			wantFields: &MRFields{
+				Branch:           "polecat/quartz/gt-abc",
+				Target:           "main",
+				SourceIssue:      "gt-abc",
+				TerminalState:    "published",
+				PublishedCommit:  "7b076fc1f00e0e0e0e0e0e0e0e0e0e0e0e0e0e0e",
+				PublishedRemote:  "origin",
+				PublishedAt:      "2026-06-24T17:30:00Z",
+				StackedBranch:    true,
+				StackedAt:        "2026-06-24T17:25:00Z",
+				StackedCommitSHA: "b5a6a81600000000000000000000000000000000",
+				StackedCommits:   3,
+			},
+		},
+		{
 			name: "partial fields",
 			issue: &Issue{
 				Description: `branch: polecat/Toast/gt-abc

@@ -68,6 +68,7 @@ var (
 	donePreVerified   bool
 	doneTarget        string
 	doneSkipVerify    bool
+	doneAllowStacked  bool
 )
 
 // Valid exit types for gt done
@@ -109,6 +110,7 @@ func init() {
 	doneCmd.Flags().BoolVar(&donePreVerified, "pre-verified", false, "Mark MR as pre-verified (polecat ran gates after rebasing onto target)")
 	doneCmd.Flags().StringVar(&doneTarget, "target", "", "Explicit MR target branch (overrides formula_vars and auto-detection)")
 	doneCmd.Flags().BoolVar(&doneSkipVerify, "skip-verify", false, "Skip verified-push checks for audit/test-only completion (recorded on bead)")
+	doneCmd.Flags().BoolVar(&doneAllowStacked, "allow-stacked-branch", false, "Audit-only escape hatch: skip the stacked-branch guard. Required when intentionally packaging a multi-commit branch as one MR (e.g. squash-ready branches). Use sparingly and document the reason.")
 
 	rootCmd.AddCommand(doneCmd)
 }
@@ -1202,6 +1204,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// commits to the same branch after a gate failure. The commit SHA
 		// distinguishes genuinely new submissions from idempotent retries.
 		commitSHA, _ = g.Rev("HEAD")
+
+		// gastown-cet.2.3 / hq-try2: refuse to package a stacked branch as
+		// a single-commit MR. The refinery cherry-picks the tip commit_sha
+		// only, so a multi-commit branch would be silently truncated and
+		// the MR would conflict against the partial diff. Fail fast with
+		// actionable remediation unless the caller explicitly opts out via
+		// --allow-stacked-branch (audit-only escape hatch for non-code
+		// closes, e.g. doc-only branches that genuinely want one MR per
+		// logical change set).
+		if !doneAllowStacked {
+			if stackedErr := checkStackedBranchForSubmit(g, branch, target); stackedErr != nil {
+				return stackedErr
+			}
+		}
 
 		// Resume: skip MR creation if already completed in a previous run (gt-aufru).
 		// Mirrors the push checkpoint pattern above. Without this, every retry

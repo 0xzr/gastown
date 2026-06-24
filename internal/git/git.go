@@ -2150,6 +2150,36 @@ func (g *Git) IsAncestor(ancestor, descendant string) (bool, error) {
 	return true, nil
 }
 
+// MergeBase returns the merge-base commit SHA between two refs. This is the
+// best common ancestor — the tip of the branch's history that is also on
+// the other ref. Used by stacked-branch detection (gastown-cet.2.3): a
+// branch with more than one commit ahead of its merge-base with the target
+// is "stacked" because the refinery cherry-picks a single commit_sha and
+// would silently drop the earlier commits in the stack (hq-try2).
+func (g *Git) MergeBase(refA, refB string) (string, error) {
+	out, err := g.run("merge-base", refA, refB)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// CommitsAheadOf returns the number of commits that branch has ahead of the
+// given base SHA. This is the same shape as CommitsAhead but operates on
+// already-resolved SHAs and uses rev-list directly so the result matches
+// the count used by stacked-branch detection. Pass merge-base as base.
+func (g *Git) CommitsAheadOf(baseSHA, branch string) (int, error) {
+	out, err := g.run("rev-list", "--count", baseSHA+".."+branch)
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	if _, scanErr := fmt.Sscanf(strings.TrimSpace(out), "%d", &n); scanErr != nil {
+		return 0, fmt.Errorf("parse commit count %q: %w", out, scanErr)
+	}
+	return n, nil
+}
+
 // Cherry runs `git cherry <upstream> <head>` to list commits on head that are
 // not yet on upstream, comparing by patch-id. Each output line is prefixed with
 // "+ " (patch not on upstream) or "- " (patch already applied upstream, e.g.

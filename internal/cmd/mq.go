@@ -18,13 +18,14 @@ import (
 // MQ command flags
 var (
 	// Submit flags
-	mqSubmitBranch    string
-	mqSubmitIssue     string
-	mqSubmitEpic      string
-	mqSubmitPriority  int
-	mqSubmitNoCleanup bool
-	mqSubmitSkipDeps  bool
-	mqSubmitResubmit  bool
+	mqSubmitBranch       string
+	mqSubmitIssue        string
+	mqSubmitEpic         string
+	mqSubmitPriority     int
+	mqSubmitNoCleanup    bool
+	mqSubmitSkipDeps     bool
+	mqSubmitResubmit     bool
+	mqSubmitAllowStacked bool
 
 	// Retry flags
 	mqRetryNow bool
@@ -35,12 +36,12 @@ var (
 	mqRejectStdin  bool // Read reason from stdin
 
 	// List command flags
-	mqListReady   bool
-	mqListStatus  string
-	mqListWorker  string
-	mqListEpic    string
-	mqListJSON    bool
-	mqListVerify  bool
+	mqListReady  bool
+	mqListStatus string
+	mqListWorker string
+	mqListEpic   string
+	mqListJSON   bool
+	mqListVerify bool
 
 	// Status command flags
 	mqStatusJSON bool
@@ -312,6 +313,7 @@ func init() {
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitNoCleanup, "no-cleanup", false, "Don't auto-cleanup after submit (for polecats)")
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitSkipDeps, "skip-deps", false, "Skip molecule step dependency check")
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitResubmit, "resubmit", false, "Resubmit after a fix (skips dependency check)")
+	mqSubmitCmd.Flags().BoolVar(&mqSubmitAllowStacked, "allow-stacked-branch", false, "Audit-only escape hatch: skip the stacked-branch guard. Required when intentionally packaging a multi-commit branch (e.g. after a squash that should land as one MR). Use sparingly and document the reason.")
 
 	// Retry flags
 	mqRetryCmd.Flags().BoolVar(&mqRetryNow, "now", false, "Immediately process instead of waiting for refinery loop")
