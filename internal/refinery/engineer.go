@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -84,6 +85,16 @@ type GateConfig struct {
 	// Post-squash gates run after the squash merge on the combined result,
 	// before pushing. On post-squash failure, the merge is reset.
 	Phase GatePhase `json:"phase"`
+
+	// SurfaceScope controls whether failures outside the MR's touched surface
+	// can be ignored. Values:
+	//   - "disabled" (default): any failure fails the gate.
+	//   - "go-packages": Go test/build failures are accepted when every
+	//     failing package is outside the set of Go packages touched by the
+	//     branch (or stack) being merged.
+	// When empty, the scope is inferred from the command: "go test ./..."
+	// and "go build ./..." style commands default to "go-packages".
+	SurfaceScope string `json:"surface_scope,omitempty"`
 }
 
 // GateResult holds the outcome of a single gate execution.
@@ -92,7 +103,23 @@ type GateResult struct {
 	Success bool
 	Error   string
 	Elapsed time.Duration
+	// Output is the combined stdout/stderr of the gate command. It is kept
+	// even on failure so scoped gates can inspect the failure surface.
+	Output string
 }
+
+// gateSurface defines the git range whose changed packages are considered
+// "touched" by the MR (or stack of MRs) under test.
+type gateSurface struct {
+	base string
+	head string
+}
+
+// SurfaceScope values for GateConfig.SurfaceScope.
+const (
+	SurfaceScopeDisabled    = "disabled"
+	SurfaceScopeGoPackages  = "go-packages"
+)
 
 // MergeQueueConfig holds configuration for the merge queue processor.
 //
@@ -279,6 +306,11 @@ type Engineer struct {
 	mergeSlotRelease      func(holder string) error
 	mergeSlotMaxRetries   int           // Max retries for slot acquisition (0 = no retry)
 	mergeSlotRetryBackoff time.Duration // Initial backoff between retries
+
+	// surface is the git range whose changed packages define the "touched
+	// surface" for scoped gate acceptance. It is set before gates run and
+	// cleared afterward.
+	surface *gateSurface
 }
 
 // NewEngineer creates a new Engineer for the given rig.
@@ -436,6 +468,7 @@ func (e *Engineer) LoadConfig() error {
 			default:
 				return fmt.Errorf("gate %q has invalid phase %q: must be \"pre-merge\" or \"post-squash\"", name, raw.Phase)
 			}
+			gc.SurfaceScope = raw.SurfaceScope
 			e.config.Gates[name] = gc
 		}
 	}
@@ -492,9 +525,10 @@ func (e *Engineer) initPRProvider() error {
 // gateConfigRaw is the JSON-friendly representation of a gate config
 // with timeout as a string duration.
 type gateConfigRaw struct {
-	Cmd     string `json:"cmd"`
-	Timeout string `json:"timeout"`
-	Phase   string `json:"phase"`
+	Cmd          string `json:"cmd"`
+	Timeout      string `json:"timeout"`
+	Phase        string `json:"phase"`
+	SurfaceScope string `json:"surface_scope,omitempty"`
 }
 
 // Config returns the current merge queue configuration.
@@ -554,6 +588,12 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 			Error:          fmt.Sprintf("branch %s not found locally", branch),
 		}
 	}
+
+	// Set the gate surface to the MR's changed range. This lets scoped gates
+	// accept failures in packages that the branch does not touch. The surface
+	// is restored at the end of doMerge.
+	e.surface = &gateSurface{base: target, head: branch}
+	defer func() { e.surface = nil }()
 
 	// Step 2: Checkout the target branch
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Checking out target branch %s...\n", target)
@@ -1119,12 +1159,20 @@ func (e *Engineer) runGate(ctx context.Context, name string, gate *GateConfig) G
 
 	err := cmd.Run()
 	elapsed := time.Since(start)
+	output := strings.TrimSpace(stdout.String())
+	if stderrStr := strings.TrimSpace(stderr.String()); stderrStr != "" {
+		if output != "" {
+			output += "\n"
+		}
+		output += stderrStr
+	}
 
 	if err == nil {
 		return GateResult{
 			Name:    name,
 			Success: true,
 			Elapsed: elapsed,
+			Output:  output,
 		}
 	}
 
@@ -1132,20 +1180,160 @@ func (e *Engineer) runGate(ctx context.Context, name string, gate *GateConfig) G
 	if gateCtx.Err() == context.DeadlineExceeded {
 		errMsg = fmt.Sprintf("timed out after %v", gate.Timeout)
 	}
-	if stderrStr := strings.TrimSpace(stderr.String()); stderrStr != "" {
-		// Cap stderr to avoid huge error messages
-		if len(stderrStr) > 500 {
-			stderrStr = stderrStr[:500] + "..."
-		}
-		errMsg = fmt.Sprintf("%s: %s", errMsg, stderrStr)
-	}
 
-	return GateResult{
+	result := GateResult{
 		Name:    name,
 		Success: false,
 		Error:   errMsg,
 		Elapsed: elapsed,
+		Output:  output,
 	}
+
+	// Surface-scoped acceptance: if all failures are outside the changed
+	// surface, treat the gate as having passed.
+	if e.surfaceAcceptsFailure(gate, result) {
+		result.Success = true
+		result.Error = ""
+
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Gate %q: failures limited to packages outside the changed surface; treating as passed\n", name)
+	} else {
+		if output != "" {
+			// Cap error message to avoid huge failure strings
+			cap := output
+			if len(cap) > 500 {
+				cap = cap[:500] + "..."
+			}
+			result.Error = fmt.Sprintf("%s: %s", result.Error, cap)
+		}
+	}
+
+	return result
+}
+
+// surfaceScope returns the effective surface scope for a gate. Empty config
+// defaults to "go-packages" for full-workspace Go test/build commands; all
+// other commands default to "disabled".
+func (e *Engineer) surfaceScope(gate *GateConfig) string {
+	if gate.SurfaceScope != "" {
+		return gate.SurfaceScope
+	}
+	cmd := strings.ToLower(gate.Cmd)
+	if (strings.Contains(cmd, "go test") || strings.Contains(cmd, "go build")) && strings.Contains(cmd, "./...") {
+		return SurfaceScopeGoPackages
+	}
+	return SurfaceScopeDisabled
+}
+
+// surfaceAcceptsFailure decides whether a failed gate can be accepted because
+// its failures are limited to the packages outside the changed surface.
+func (e *Engineer) surfaceAcceptsFailure(gate *GateConfig, result GateResult) bool {
+	if result.Success {
+		return false
+	}
+	if e.surface == nil {
+		return false
+	}
+	scope := e.surfaceScope(gate)
+	if scope != SurfaceScopeGoPackages {
+		return false
+	}
+
+	changed, err := e.changedGoPackages(e.surface.base, e.surface.head)
+	if err != nil || len(changed) == 0 {
+		return false
+	}
+
+	failed := parseGoFailingPackages(result.Output)
+	if len(failed) == 0 {
+		// We couldn't identify the failing packages, so we can't safely
+		// classify the failure as unrelated.
+		return false
+	}
+
+	for pkg := range failed {
+		if _, ok := changed[pkg]; ok {
+			return false
+		}
+	}
+	return true
+}
+
+// changedGoPackages returns the set of Go package import paths touched between
+// two refs. It uses the module path declared in go.mod plus the directory of
+// each changed .go file.
+func (e *Engineer) changedGoPackages(base, head string) (map[string]struct{}, error) {
+	files, err := e.git.DiffNameOnly(base, head)
+	if err != nil {
+		return nil, err
+	}
+	module := e.modulePath()
+	if module == "" {
+		return nil, fmt.Errorf("could not determine module path from go.mod")
+	}
+	pkgs := make(map[string]struct{})
+	for _, f := range files {
+		if !strings.HasSuffix(f, ".go") {
+			continue
+		}
+		dir := filepath.Dir(f)
+		if dir == "." {
+			dir = ""
+		}
+		pkgs[goPackagePath(module, dir)] = struct{}{}
+	}
+	return pkgs, nil
+}
+
+// modulePath reads the module directive from go.mod.
+func (e *Engineer) modulePath() string {
+	data, err := os.ReadFile(filepath.Join(e.workDir, "go.mod"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "//") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "module" {
+			return fields[1]
+		}
+	}
+	return ""
+}
+
+// goPackagePath joins a module path with a relative directory to form an
+// import path.
+func goPackagePath(module, relDir string) string {
+	relDir = filepath.ToSlash(relDir)
+	if relDir == "." || relDir == "" {
+		return module
+	}
+	return module + "/" + relDir
+}
+
+var goFailingPackageRe = regexp.MustCompile(`(?m)^(?:FAIL|#)[ \t]+(\S+)`)
+
+// parseGoFailingPackages extracts package import paths that Go reported as
+// failing from test or build output. It recognizes lines like:
+//
+//	FAIL example.com/mod/pkg
+//	# example.com/mod/pkg
+//
+// Lines that are just "FAIL" with no following package are ignored.
+func parseGoFailingPackages(output string) map[string]struct{} {
+	pkgs := make(map[string]struct{})
+	for _, m := range goFailingPackageRe.FindAllStringSubmatch(output, -1) {
+		pkg := m[1]
+		// Strip a trailing colon that sometimes appears on build error lines.
+		pkg = strings.TrimSuffix(pkg, ":")
+		if pkg == "" {
+			continue
+		}
+		pkgs[pkg] = struct{}{}
+	}
+	return pkgs
 }
 
 // runGates executes all pre-merge gates (backward-compatible entry point).

@@ -214,6 +214,11 @@ func (e *Engineer) ProcessBatch(ctx context.Context, batch []*MRInfo, target str
 
 	_, _ = fmt.Fprintf(e.output, "[Batch] Processing batch of %d MRs targeting %s\n", len(batch), target)
 
+	// Set the gate surface to the full stack (target..HEAD) so scoped gates can
+	// accept failures outside all MRs in the batch.
+	e.surface = &gateSurface{base: target, head: "HEAD"}
+	defer func() { e.surface = nil }()
+
 	// Step 1: Build the stack
 	stacked, conflicts, err := e.BuildRebaseStack(ctx, batch, target)
 	if err != nil {
