@@ -1170,43 +1170,16 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 	}
 
 	// Build environment with explicit BEADS_DIR to prevent bd from
-	// finding a parent directory's .beads/ database
-	env := os.Environ()
-	filteredEnv := make([]string, 0, len(env)+2)
-	for _, e := range env {
-		if !strings.HasPrefix(e, "BEADS_DIR=") && !strings.HasPrefix(e, "BEADS_DB=") && !strings.HasPrefix(e, "BEADS_DOLT_SERVER_DATABASE=") {
-			filteredEnv = append(filteredEnv, e)
-		}
-	}
-	filteredEnv = append(filteredEnv, "BEADS_DIR="+beadsDir)
+	// finding a parent directory's .beads/ database. BuildPinnedBDEnv also
+	// suppresses bd JSONL export/import side effects (BEADS_NO_AUTO_IMPORT=1,
+	// BD_EXPORT_AUTO=false, etc.) so bd init does not re-import stale JSONL
+	// exports from non-canonical rig clones.
+	filteredEnv := beads.BuildPinnedBDEnv(os.Environ(), beadsDir)
 	if rigName != "" {
+		// metadata.json does not exist yet (bd init creates it), so override
+		// with the canonical rig database name explicitly.
+		filteredEnv = beads.StripEnvKey(filteredEnv, "BEADS_DOLT_SERVER_DATABASE")
 		filteredEnv = append(filteredEnv, "BEADS_DOLT_SERVER_DATABASE="+rigName)
-	}
-
-	// Ensure BEADS_DOLT_PORT and BEADS_DOLT_SERVER_HOST are set when their GT_
-	// counterparts are present, so that bd subprocesses connect to the correct
-	// Dolt server (especially in tests or when the server is remote).
-	var gtDoltPort, gtDoltHost string
-	hasBDP, hasBDH := false, false
-	for _, e := range filteredEnv {
-		if strings.HasPrefix(e, "GT_DOLT_PORT=") {
-			gtDoltPort = strings.TrimPrefix(e, "GT_DOLT_PORT=")
-		}
-		if strings.HasPrefix(e, "GT_DOLT_HOST=") {
-			gtDoltHost = strings.TrimPrefix(e, "GT_DOLT_HOST=")
-		}
-		if strings.HasPrefix(e, "BEADS_DOLT_PORT=") {
-			hasBDP = true
-		}
-		if strings.HasPrefix(e, "BEADS_DOLT_SERVER_HOST=") {
-			hasBDH = true
-		}
-	}
-	if gtDoltPort != "" && !hasBDP {
-		filteredEnv = append(filteredEnv, "BEADS_DOLT_PORT="+gtDoltPort)
-	}
-	if gtDoltHost != "" && !hasBDH {
-		filteredEnv = append(filteredEnv, "BEADS_DOLT_SERVER_HOST="+gtDoltHost)
 	}
 
 	// Run bd init if available (Dolt is the only backend since bd v0.51.0).

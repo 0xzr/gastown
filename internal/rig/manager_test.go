@@ -786,6 +786,47 @@ exit 0
 	}
 }
 
+func TestInitBeadsSuppressesJSONLAutoImport(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake bd arg/env logging is shell-specific")
+	}
+
+	rigPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rigPath, "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	cmdLog := filepath.Join(t.TempDir(), "bd-cmds.log")
+	script := `#!/usr/bin/env bash
+set -e
+printf 'args=%s no_auto_import=%s export_auto=%s backup=%s\n' "$*" "${BEADS_NO_AUTO_IMPORT:-<unset>}" "${BD_EXPORT_AUTO:-<unset>}" "${BD_BACKUP_ENABLED:-<unset>}" >> "$BD_CMD_LOG"
+exit 0
+`
+	binDir := writeFakeBD(t, script, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_CMD_LOG", cmdLog)
+
+	manager := &Manager{}
+	if err := manager.InitBeads(rigPath, "gt", "my_project"); err != nil {
+		t.Fatalf("InitBeads: %v", err)
+	}
+
+	logData, err := os.ReadFile(cmdLog)
+	if err != nil {
+		t.Fatalf("reading command log: %v", err)
+	}
+	cmds := string(logData)
+	if !strings.Contains(cmds, "no_auto_import=1") {
+		t.Fatalf("bd init did not receive BEADS_NO_AUTO_IMPORT=1; log:\n%s", cmds)
+	}
+	if !strings.Contains(cmds, "export_auto=false") {
+		t.Fatalf("bd init did not receive BD_EXPORT_AUTO=false; log:\n%s", cmds)
+	}
+	if !strings.Contains(cmds, "backup=false") {
+		t.Fatalf("bd init did not receive BD_BACKUP_ENABLED=false; log:\n%s", cmds)
+	}
+}
+
 func TestInitAgentBeadsUsesRigBeadsDir(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake bd stub is not compatible with multiline descriptions on Windows")

@@ -345,10 +345,10 @@ func ensureDatabaseInitialized(beadsDir string) error {
 	cmd := exec.Command("bd", initArgs...)
 	cmd.Dir = parentDir
 	util.SetDetachedProcessGroup(cmd)
-	initEnv := append(stripEnvPrefixes(os.Environ(), "BEADS_DIR=", "BEADS_DB=", "BEADS_DOLT_SERVER_DATABASE="), "BEADS_DIR="+beadsDir)
-	if dbEnv := DatabaseEnv(beadsDir); dbEnv != "" {
-		initEnv = append(initEnv, dbEnv)
-	}
+	// BuildPinnedBDEnv pins BEADS_DIR, strips stale target selectors, and suppresses
+	// bd side effects (BEADS_NO_AUTO_IMPORT, BD_EXPORT_AUTO, etc.) so bd init does
+	// not re-import stale JSONL exports from non-canonical rig clones.
+	initEnv := BuildPinnedBDEnv(os.Environ(), beadsDir)
 	cmd.Env = initEnv
 	if output, err := cmd.CombinedOutput(); err != nil {
 		// Handle "already initialized" gracefully, matching install.go behavior.
@@ -367,12 +367,8 @@ func ensureDatabaseInitialized(beadsDir string) error {
 		pfxCmd := exec.Command("bd", "config", "set", "issue_prefix", prefix)
 		pfxCmd.Dir = parentDir
 		util.SetDetachedProcessGroup(pfxCmd)
-		pfxEnv := append(stripEnvPrefixes(os.Environ(), "BEADS_DIR=", "BEADS_DB=", "BEADS_DOLT_SERVER_DATABASE="), "BEADS_DIR="+beadsDir)
-		if dbEnv := DatabaseEnv(beadsDir); dbEnv != "" {
-			pfxEnv = append(pfxEnv, dbEnv)
-		}
-		pfxCmd.Env = pfxEnv
-		_, _ = pfxCmd.CombinedOutput() // Best effort — crash prevention guard
+		pfxCmd.Env = BuildPinnedBDEnv(os.Environ(), beadsDir) // suppresses side effects, pins target
+		_, _ = pfxCmd.CombinedOutput()                        // Best effort — crash prevention guard
 	}
 
 	// Run bd migrate to ensure the wisps table and auxiliary tables exist.
@@ -382,10 +378,7 @@ func ensureDatabaseInitialized(beadsDir string) error {
 	// After bd init --server, the Dolt SQL server may need time to register
 	// the new database in its catalog. Retry once after a short delay if the
 	// first migrate attempt fails (GH#1769).
-	migrateEnv := append(stripEnvPrefixes(os.Environ(), "BEADS_DIR=", "BEADS_DB=", "BEADS_DOLT_SERVER_DATABASE="), "BEADS_DIR="+beadsDir)
-	if dbEnv := DatabaseEnv(beadsDir); dbEnv != "" {
-		migrateEnv = append(migrateEnv, dbEnv)
-	}
+	migrateEnv := BuildPinnedBDEnv(os.Environ(), beadsDir) // suppresses side effects, pins target
 	migrateCmd := exec.Command("bd", "migrate", "--yes")
 	migrateCmd.Dir = parentDir
 	migrateCmd.Env = migrateEnv

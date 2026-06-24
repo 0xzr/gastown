@@ -763,6 +763,62 @@ func TestEnsureDatabaseInitialized(t *testing.T) {
 	})
 }
 
+func TestEnsureDatabaseInitializedSuppressesJSONLSideEffects(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake bd env logging is shell-specific")
+	}
+
+	logPath := filepath.Join(t.TempDir(), "bd-env.log")
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+printf 'no_auto_import=%s export_auto=%s backup=%s beads_dir=%s\n' "${BEADS_NO_AUTO_IMPORT:-<unset>}" "${BD_EXPORT_AUTO:-<unset>}" "${BD_BACKUP_ENABLED:-<unset>}" "${BEADS_DIR:-<unset>}" >> "` + logPath + `"
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+case "$cmd" in
+  init)
+    mkdir -p "${BEADS_DIR:-$(pwd)/.beads}/dolt"
+    exit 0
+    ;;
+  config|migrate)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	os.MkdirAll(beadsDir, 0755)
+
+	if err := ensureDatabaseInitialized(beadsDir); err != nil {
+		t.Fatalf("ensureDatabaseInitialized: %v", err)
+	}
+
+	logOutput := readMockBDLog(t, logPath)
+	if !strings.Contains(logOutput, "no_auto_import=1") {
+		t.Fatalf("bd init did not receive BEADS_NO_AUTO_IMPORT=1; log:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "export_auto=false") {
+		t.Fatalf("bd init did not receive BD_EXPORT_AUTO=false; log:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "backup=false") {
+		t.Fatalf("bd init did not receive BD_BACKUP_ENABLED=false; log:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "beads_dir="+beadsDir) {
+		t.Fatalf("bd init did not receive correct BEADS_DIR; log:\n%s", logOutput)
+	}
+}
+
 func mustReadFile(t *testing.T, path string) []byte {
 	t.Helper()
 

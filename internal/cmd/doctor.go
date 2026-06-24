@@ -203,6 +203,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewIdleTimeoutCheck()) // Verify dolt.idle-timeout: "0" for all rigs
 	d.Register(doctor.NewRoutesCheck())
 	d.Register(doctor.NewRigRoutesJSONLCheck())
+	d.Register(doctor.NewStaleJSONLExportCheck())
 	d.Register(doctor.NewRoutingModeCheck())
 	d.Register(doctor.NewMalformedSessionNameCheck())
 	d.Register(doctor.NewOrphanSessionCheck())
