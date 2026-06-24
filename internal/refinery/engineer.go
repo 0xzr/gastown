@@ -1103,6 +1103,7 @@ func (e *Engineer) runTests(ctx context.Context) ProcessResult {
 		cmd := exec.CommandContext(ctx, "sh", "-c", e.config.TestCommand) //nolint:gosec // G204: TestCommand is from trusted rig config
 		util.SetDetachedProcessGroup(cmd)
 		cmd.Dir = e.workDir
+		cmd.Env = util.GateCommandEnv() // ensure Go toolchain is on PATH for test subprocesses
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
@@ -1153,6 +1154,7 @@ func (e *Engineer) runGate(ctx context.Context, name string, gate *GateConfig) G
 	cmd := exec.CommandContext(gateCtx, "sh", "-c", gate.Cmd) //nolint:gosec // G204: Gate commands are from trusted rig config
 	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = e.workDir
+	cmd.Env = util.GateCommandEnv() // ensure Go toolchain is on PATH for gate subprocesses
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

@@ -272,7 +272,16 @@ func (d *Daemon) runCommandOnWorktree(ctx context.Context, rigName, workDir, lab
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", command) //nolint:gosec // G204: command is from trusted rig config
 	cmd.Dir = workDir
-	cmd.Env = append(os.Environ(), "CI=true") // Signal test environment
+	// Start from the gate env so the Go toolchain is on PATH when the daemon
+	// session lacks `go` (see util.GateCommandEnv). GateCommandEnv returns nil
+	// when `go` is already on PATH (meaning "inherit unchanged"); in that case
+	// fall back to os.Environ() so CI=true can be appended without wiping the
+	// inherited environment.
+	env := util.GateCommandEnv()
+	if env == nil {
+		env = os.Environ()
+	}
+	cmd.Env = append(env, "CI=true") // Signal test environment
 	util.SetDetachedProcessGroup(cmd)
 
 	output, err := cmd.CombinedOutput()

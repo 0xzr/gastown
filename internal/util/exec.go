@@ -3,7 +3,9 @@ package util
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -61,4 +63,100 @@ func ExecRun(workDir, cmd string, args ...string) error {
 	}
 
 	return nil
+}
+
+// goToolchainPathEntries returns bin directories that provide a Go toolchain,
+// discovered from the locations operators use when the process was not launched
+// from a login shell (so its PATH lacks `go`).
+//
+// Gas Town agents (refinery, daemon patrols) run as background sessions whose
+// PATH does not contain the Go binary even when one is installed. Gate commands
+// (e.g. "go test ./...", "make build") then fail with "go: not found" before any
+// branch code runs — a toolchain failure, not a branch failure. Prepending
+// these entries lets gates find `go` regardless of how the session launched.
+//
+// Locations checked (existing directories with a `go` binary only):
+//   - $GOROOT/bin (explicit override, if GOROOT is set)
+//   - $HOME/go-toolchain/go/bin (this host's toolchain install location)
+//   - /usr/local/go/bin (standard tarball install location)
+//
+// Order is deliberate: operator-set GOROOT wins, then the host toolchain, then
+// the conventional system install location.
+func goToolchainPathEntries() []string {
+	var entries []string
+	seen := make(map[string]bool)
+
+	add := func(dir string) {
+		if dir == "" {
+			return
+		}
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			abs = dir
+		}
+		if seen[abs] {
+			return
+		}
+		// Only prepend directories that actually contain a `go` binary, so an
+		// absent install location cannot shadow the inherited PATH.
+		goBin := filepath.Join(abs, "go")
+		if info, err := os.Stat(goBin); err != nil || info.IsDir() {
+			return
+		}
+		seen[abs] = true
+		entries = append(entries, abs)
+	}
+
+	if root := os.Getenv("GOROOT"); root != "" {
+		add(filepath.Join(root, "bin"))
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		add(filepath.Join(home, "go-toolchain", "go", "bin"))
+	}
+	add("/usr/local/go/bin")
+
+	return entries
+}
+
+// GateCommandEnv returns the environment for a gate/test subprocess. When `go`
+// is already resolvable on the inherited PATH the environment is unchanged;
+// otherwise Go toolchain bin directories are prepended to PATH so that Go-based
+// gates ("go test ./...", "make build") run instead of failing with "go: not
+// found".
+//
+// Returns nil to signal "use the parent environment unchanged" (os/exec's
+// default when cmd.Env is nil), which avoids a needless copy in the common case.
+// This is the shared source of truth used by both the refinery's gate/test
+// execution and the daemon's main-branch test patrol.
+func GateCommandEnv() []string {
+	if _, err := exec.LookPath("go"); err == nil {
+		return nil // `go` already on PATH — nothing to fix
+	}
+
+	entries := goToolchainPathEntries()
+	if len(entries) == 0 {
+		return nil // no toolchain found anywhere; let the gate report its own error
+	}
+
+	path := os.Getenv("PATH")
+	prefix := strings.Join(entries, string(os.PathListSeparator))
+	if path == "" {
+		path = prefix
+	} else {
+		path = prefix + string(os.PathListSeparator) + path
+	}
+
+	env := os.Environ()
+	foundPath := false
+	for i, kv := range env {
+		if strings.HasPrefix(kv, "PATH=") {
+			env[i] = "PATH=" + path
+			foundPath = true
+			break
+		}
+	}
+	if !foundPath {
+		env = append(env, "PATH="+path)
+	}
+	return env
 }
