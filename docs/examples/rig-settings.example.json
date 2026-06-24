@@ -38,9 +38,9 @@
         "setup_command": "",
         "typecheck_command": "",
         "gates": {
-            "lint": {"cmd": "golangci-lint run ./...", "timeout": "2m"},
-            "test": {"cmd": "go test ./...", "timeout": "5m"},
-            "build-check": {"cmd": "go build ./...", "timeout": "2m", "phase": "post-squash"}
+            "lint": {"cmd": "golangci-lint run ./...", "timeout": "2m", "surface_scope": "disabled"},
+            "test": {"cmd": "go test ./...", "timeout": "5m", "surface_scope": "go-packages"},
+            "build-check": {"cmd": "go build ./...", "timeout": "2m", "phase": "post-squash", "surface_scope": "go-packages"}
         },
         "delete_merged_branches": true,
         "retry_flaky_tests": 1,
