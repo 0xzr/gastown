@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -142,9 +141,9 @@ func runConsult(cmd *cobra.Command, args []string) error {
 	// where bd show renders it.
 	title := truncateForBeadTitle(req.Question)
 	beadsClient := beads.New(beads.ResolveBeadsDir(townRoot))
-	fields := &consultBeadFields{
-		Request:       req,
-		State:         consult.StateOpen,
+	fields := &beads.ConsultFields{
+		Request: req,
+		State:   consult.StateOpen,
 	}
 	beadID, err := beadsClient.CreateConsultBead(title, fields)
 	if err != nil {
@@ -258,7 +257,7 @@ func runConsultList(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("Consult packets (%d):\n\n", len(issues))
 	for _, issue := range issues {
-		req, _ := parseConsultRequest(issue)
+		req, _ := beads.ParseConsultFields(issue.Description)
 		emoji := "📝"
 		switch req.TriggerClass {
 		case consult.TriggerMergePolicy:
@@ -477,7 +476,7 @@ func runConsultClose(cmd *cobra.Command, args []string) error {
 
 	mirrored := false
 	if req != nil && req.RelatedBead != "" {
-		if err := mirrorConsultResultOntoSource(req.RelatedBead, resp, closer, consultReason, consultID); err != nil {
+		if err := bd.MirrorConsultResultOnSource(req.RelatedBead, resp, closer, consultReason, consultID); err != nil {
 			style.PrintWarning("consult closed but mirroring onto %s failed: %v", req.RelatedBead, err)
 		} else {
 			mirrored = true
@@ -510,76 +509,9 @@ func runConsultClose(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// mirrorConsultResultOntoSource writes a compact notes entry onto the
-// source bead so the source bead carries the consulted model's decision in
-// its own audit trail. It is intentionally best-effort: a missing source
-// bead is reported but does not fail the close.
-func mirrorConsultResultOntoSource(relatedBead string, resp *consult.Response, closer, reason, consultID string) error {
-	if strings.TrimSpace(relatedBead) == "" {
-		return nil
-	}
-	if resp == nil || resp.DecidedBy == "" {
-		// No answer was recorded; just stamp the close metadata.
-		note := fmt.Sprintf("consult_close: %s closed_by=%s reason=%s",
-			consultID, closer, reason)
-		return appendNotesToBead(relatedBead, note)
-	}
-	confidence := resp.Confidence
-	if confidence == "" {
-		confidence = "unspecified"
-	}
-	decision := resp.Decision
-	if decision == "" {
-		decision = "(none recorded)"
-	}
-	note := fmt.Sprintf(
-		"consult_decision: %s consulted_model=%s decision=%s confidence=%s rationale=%s consult_bead=%s closed_by=%s reason=%s",
-		consultID, resp.DecidedBy, decision, confidence, oneLine(resp.Rationale), consultID, closer, reason)
-	return appendNotesToBead(relatedBead, note)
-}
-
-// appendNotesToBead appends a line to the bead's notes via bd update. It
-// preserves existing notes by reading them first, then re-writing with the
-// new line appended. The bd update --notes flag replaces the entire notes
-// field, which is why we have to do a read-modify-write.
-func appendNotesToBead(beadID, newLine string) error {
-	if strings.TrimSpace(beadID) == "" || strings.TrimSpace(newLine) == "" {
-		return nil
-	}
-	// Use bd directly via the shell rather than threading a Beads client
-	// through here; the cmd package already has a beads.New on hand via
-	// runConsult* and this function is invoked after those.
-	//
-	// We use exec.Command directly with bd because Beads.Update() takes a
-	// UpdateOptions struct that does not expose "append"; the helper here
-	// keeps the operation focused.
-	bd := beads.New(beads.ResolveBeadsDir(""))
-	// First read current notes.
-	out, err := bd.Run("show", beadID, "--json")
-	if err != nil {
-		return fmt.Errorf("reading source bead %s: %w", beadID, err)
-	}
-	var items []struct {
-		Notes string `json:"notes"`
-	}
-	if err := json.Unmarshal(out, &items); err != nil {
-		return fmt.Errorf("parsing source bead %s: %w", beadID, err)
-	}
-	current := ""
-	if len(items) > 0 {
-		current = items[0].Notes
-	}
-	merged := current
-	if merged != "" && !strings.HasSuffix(merged, "\n") {
-		merged += "\n"
-	}
-	merged += newLine
-	if err := bd.Run("update", beadID, "--notes="+merged); err != nil {
-		return fmt.Errorf("updating source bead %s: %w", beadID, err)
-	}
-	return nil
-}
-
+// formatConsultMailBody renders a consult packet as a mail body for the
+// consulted model's mailbox. Kept here (not in the beads package) because
+// the body shape is a presentation concern, not a data concern.
 func formatConsultMailBody(req *consult.Request) string {
 	if req == nil {
 		return ""
@@ -621,22 +553,6 @@ func formatConsultMailBody(req *consult.Request) string {
 	return strings.Join(lines, "\n")
 }
 
-// consultBeadFields carries the structured fields written into the
-// consult bead's description. The description is rendered with
-// consult.FormatRequestDescription; the rest of the bookkeeping lives
-// here so we do not depend on the package's private types.
-type consultBeadFields struct {
-	Request *consult.Request
-	State   consult.DecisionState
-}
-
-// consultRender renders the consult bead description as a single string.
-// Kept here (rather than re-exported from the package) so the cmd layer
-// owns presentation and the package owns types.
-func consultRender(title string, fields *consultBeadFields) string {
-	return consult.FormatRequestDescription(title, fields.Request)
-}
-
 func truncateForBeadTitle(s string) string {
 	const max = 120
 	s = strings.TrimSpace(s)
@@ -658,68 +574,6 @@ func emptyDash(s string) string {
 		return "-"
 	}
 	return s
-}
-
-// parseConsultRequest re-renders the issue description into a Request.
-// It is the read-side counterpart to FormatRequestDescription and is
-// only used by the consult list/show commands.
-func parseConsultRequest(issue *beads.Issue) (*consult.Request, error) {
-	if issue == nil {
-		return nil, errors.New("parseConsultRequest: nil issue")
-	}
-	req := &consult.Request{}
-	for _, line := range strings.Split(issue.Description, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		colonIdx := strings.Index(line, ":")
-		if colonIdx == -1 {
-			continue
-		}
-		key := strings.TrimSpace(line[:colonIdx])
-		value := strings.TrimSpace(line[colonIdx+1:])
-		if value == "null" {
-			value = ""
-		}
-		switch strings.ToLower(key) {
-		case "trigger_class":
-			req.TriggerClass = consult.TriggerClass(value)
-		case "requested_model":
-			req.RequestedModel = consult.RequestedModel(value)
-		case "question":
-			req.Question = value
-		case "current_decision":
-			req.CurrentDecision = value
-		case "context_refs":
-			if value != "" {
-				req.ContextRefs = splitCSV(value)
-			}
-		case "asked_by":
-			req.AskedBy = value
-		case "asked_at":
-			req.AskedAt = value
-		case "related_bead":
-			req.RelatedBead = value
-		case "fingerprint":
-			req.Fingerprint = value
-		case "bead_id":
-			req.BeadID = value
-		}
-	}
-	return req, nil
-}
-
-func splitCSV(s string) []string {
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
 }
 
 func mirrorSummary(resp *consult.Response) string {

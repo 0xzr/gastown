@@ -1,7 +1,7 @@
 // Package consult implements the Mayor's durable consult/escalation path to
 // stronger models (Codex, Opus) for high-risk decisions.
 //
-// Background
+// # Background
 //
 // The Mayor is the cross-rig coordinator in Gas Town. Its day-to-day dispatch
 // must stay lightweight (sling work, file escalations). However, certain
@@ -20,7 +20,7 @@
 // gt mail to one of two configurable addresses (Codex and Opus), and the
 // packet is closed with a decision that is mirrored back onto the source bead.
 //
-// Same-failure loop detection
+// # Same-failure loop detection
 //
 // The `LoopDetector` watches for repeated identical fingerprints in either
 // the escalation log or the consult log. When a fingerprint fires

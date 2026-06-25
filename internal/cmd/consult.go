@@ -6,25 +6,25 @@ import (
 
 // consult command flags.
 var (
-	consultTrigger       string
-	consultModel         string
-	consultRelatedBead   string
-	consultFingerprint   string
-	consultContextRefs   []string
-	consultOptions       []string
-	consultCurrent       string
-	consultAskedBy       string
-	consultStdin         bool
-	consultReason        string
-	consultDecisionBy    string
-	consultDecision      string
-	consultRationale     string
-	consultConfidence    string
-	consultListJSON      bool
-	consultListAll       bool
-	consultShowJSON      bool
-	consultCloseJSON     bool
-	consultDryRun        bool
+	consultTrigger     string
+	consultModel       string
+	consultRelatedBead string
+	consultFingerprint string
+	consultContextRefs []string
+	consultOptions     []string
+	consultCurrent     string
+	consultAskedBy     string
+	consultStdin       bool
+	consultReason      string
+	consultDecisionBy  string
+	consultDecision    string
+	consultRationale   string
+	consultConfidence  string
+	consultListJSON    bool
+	consultListAll     bool
+	consultShowJSON    bool
+	consultCloseJSON   bool
+	consultDryRun      bool
 )
 
 var consultCmd = &cobra.Command{
