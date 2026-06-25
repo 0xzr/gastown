@@ -163,6 +163,14 @@ func SaveDecisions(townRoot string, state *DecisionsState) error {
 // The caller must call unlock to release the lock.
 func loadAndLock(townRoot string) (state *DecisionsState, unlock func(), err error) {
 	path := DecisionsFile(townRoot)
+
+	// Ensure the directory exists before acquiring the flock: OpenFile on the
+	// .flock path fails with ENOENT if the parent dir is absent. This matters
+	// on first-ever use, when mayor/ has not been created yet.
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return nil, nil, fmt.Errorf("creating mayor decisions directory: %w", err)
+	}
+
 	unlock, flockErr := lock.FlockAcquire(path + ".flock")
 	if flockErr != nil {
 		return nil, nil, fmt.Errorf("acquiring decisions lock: %w", flockErr)
@@ -189,11 +197,57 @@ func (s *DecisionsState) ActiveDecision(beadID string) (*Decision, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	beadID = strings.TrimSpace(beadID)
-	if beadID == "" {
+	latest := s.latestLocked(beadID)
+	if latest == nil {
+		return nil, ErrDecisionNotFound
+	}
+	if latest.Type.BlocksRework() {
+		return latest, nil
+	}
+	// resume or other non-blocking decision: treat as no active blocker.
+	return nil, ErrDecisionNotFound
+}
+
+// PriorBlockingDecision returns the most recent blocking (defer/hold/park)
+// decision recorded for a bead, regardless of whether it was later overridden
+// by a resume. It is used to report whether a resume actually overrode a prior
+// block. Returns ErrDecisionNotFound when no blocking decision was ever recorded.
+func (s *DecisionsState) PriorBlockingDecision(beadID string) (*Decision, error) {
+	if s == nil {
 		return nil, ErrDecisionNotFound
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var latest *Decision
+	for _, d := range s.Decisions {
+		if d == nil {
+			continue
+		}
+		if strings.TrimSpace(d.BeadID) != beadID {
+			continue
+		}
+		if !d.Type.BlocksRework() {
+			continue
+		}
+		if latest == nil || d.Timestamp.After(latest.Timestamp) {
+			latest = d
+		}
+	}
+	if latest == nil {
+		return nil, ErrDecisionNotFound
+	}
+	return latest, nil
+}
+
+// latestLocked returns the most recent decision for a bead without acquiring
+// the mutex. The caller must hold s.mu.
+func (s *DecisionsState) latestLocked(beadID string) *Decision {
+	beadID = strings.TrimSpace(beadID)
+	if beadID == "" {
+		return nil
+	}
 	var latest *Decision
 	for _, d := range s.Decisions {
 		if d == nil {
@@ -208,15 +262,7 @@ func (s *DecisionsState) ActiveDecision(beadID string) (*Decision, error) {
 			latest = d
 		}
 	}
-
-	if latest == nil {
-		return nil, ErrDecisionNotFound
-	}
-	if latest.Type.BlocksRework() {
-		return latest, nil
-	}
-	// resume or other non-blocking decision: treat as no active blocker.
-	return nil, ErrDecisionNotFound
+	return latest
 }
 
 // RecordDecision records a new explicit Mayor decision and persists the state.

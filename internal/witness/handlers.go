@@ -490,6 +490,14 @@ func handleMergedCleanupStatus(_, _, polecatName, cleanupStatus, wispID string, 
 
 // HandleMergeFailed processes a MERGE_FAILED message from the Refinery.
 // Notifies the polecat that their merge was rejected and rework is needed.
+//
+// Binding Mayor decision precedence (gastown-cet.7 / hq-12zq): before nudging
+// the polecat to rework, the source bead's durable Mayor decision is checked.
+// An active DEFER/HOLD/PARK converts automated NEEDS_REWORK handling into
+// HOLD/await-Mayor: the rework nudge is suppressed, the conflict is surfaced
+// to the Mayor with both inputs, and the polecat/branch are left untouched. A
+// newer explicit RESUME override allows the nudge to proceed. Without an issue
+// ID in the payload there is no decision key, so the guard is skipped.
 func HandleMergeFailed(workDir, rigName string, msg *mail.Message, router *mail.Router) *HandlerResult {
 	result := &HandlerResult{
 		MessageID:    msg.ID,
@@ -501,6 +509,24 @@ func HandleMergeFailed(workDir, rigName string, msg *mail.Message, router *mail.
 	if err != nil {
 		result.Error = fmt.Errorf("parsing MERGE_FAILED: %w", err)
 		return result
+	}
+
+	// Mayor decision precedence: an explicit DEFER/HOLD/PARK on the source bead
+	// must prevent the automated rework nudge (the hq-12zq failure mode). The
+	// rework the Refinery requests may be exactly the scope the Mayor forbade.
+	if payload.IssueID != "" {
+		trRoot, trErr := workspace.Find(workDir)
+		if trErr != nil || trRoot == "" {
+			trRoot = workDir
+		}
+		if decision, dErr := activeMayorDecisionForBead(trRoot, payload.IssueID); dErr == nil && decision != nil {
+			notifyMayorOfReworkBlocked(trRoot, rigName, payload.IssueID, payload.PolecatName,
+				"merge_failed", 0, decision, router)
+			result.Handled = true
+			result.Action = fmt.Sprintf("rework nudge for %s held: Mayor %s decision active on %s (not nudged)",
+				payload.PolecatName, decision.Type, payload.IssueID)
+			return result
+		}
 	}
 
 	// Nudge the polecat about the failure instead of sending permanent mail.

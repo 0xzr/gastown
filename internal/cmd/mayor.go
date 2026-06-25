@@ -44,6 +44,81 @@ var (
 	mayorStatusRunning bool
 )
 
+var mayorDecisionCmd = &cobra.Command{
+	Use:   "decision",
+	Short: "Record or inspect an explicit Mayor decision about a source bead",
+	Long: `Record an explicit Mayor decision that governs automated rework handling
+for a source bead.
+
+Decisions are durable and binding: an active defer/hold/park prevents the
+rework router (witness resetAbandonedBead and HandleMergeFailed) from spawning
+or nudging a polecat for that bead. The conflict is surfaced to the Mayor. A
+newer explicit resume overrides a prior block and allows rework to resume.
+
+This implements Mayor decision precedence (gastown-cet.7 / hq-12zq): explicit
+DEFER/HOLD/PARK must defeat automated NEEDS_REWORK routing that would otherwise
+bounce pressure onto work the operator deprioritized.
+
+Decision state lives at <town-root>/mayor/decisions.json and is append-only for
+auditability; the most recent decision per bead is the active one.`,
+}
+
+var mayorDecisionDeferCmd = &cobra.Command{
+	Use:   "defer <bead-id>",
+	Short: "Record a DEFER decision (block automated rework)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runMayorDecisionRecord(args[0], mayor.DecisionDefer)
+	},
+}
+
+var mayorDecisionHoldCmd = &cobra.Command{
+	Use:   "hold <bead-id>",
+	Short: "Record a HOLD decision (block automated rework, await Mayor input)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runMayorDecisionRecord(args[0], mayor.DecisionHold)
+	},
+}
+
+var mayorDecisionParkCmd = &cobra.Command{
+	Use:   "park <bead-id>",
+	Short: "Record a PARK decision (block automated rework indefinitely)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runMayorDecisionRecord(args[0], mayor.DecisionPark)
+	},
+}
+
+var mayorDecisionResumeCmd = &cobra.Command{
+	Use:   "resume <bead-id>",
+	Short: "Override a prior defer/hold/park and allow rework to resume",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runMayorDecisionRecord(args[0], mayor.DecisionResume)
+	},
+}
+
+var mayorDecisionShowCmd = &cobra.Command{
+	Use:     "show <bead-id>",
+	Aliases: []string{"get"},
+	Short:   "Show the active Mayor decision for a source bead",
+	Args:    cobra.ExactArgs(1),
+	RunE:    runMayorDecisionShow,
+}
+
+var mayorDecisionListCmd = &cobra.Command{
+	Use:     "list",
+	Aliases: []string{"ls"},
+	Short:   "List all recorded Mayor decisions",
+	RunE:    runMayorDecisionList,
+}
+
+var (
+	mayorDecisionReason string
+	mayorDecisionMayor  string
+)
+
 var mayorStartCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Start the Mayor session",
@@ -132,6 +207,19 @@ func init() {
 	mayorAcpCmd.Flags().StringVar(&acpRigOverride, "rig", "", "Rig name (overrides GT_RIG env)")
 	mayorAcpCmd.Flags().StringVar(&acpTownRootOverride, "town", "", "Town root directory (overrides GT_TOWN_ROOT env)")
 	mayorAcpCmd.Flags().StringVar(&mayorAgentOverride, "agent", "", "Agent alias to run (overrides town default)")
+
+	// gt mayor decision <defer|hold|park|resume|show|list> <bead-id>
+	mayorCmd.AddCommand(mayorDecisionCmd)
+	mayorDecisionCmd.AddCommand(mayorDecisionDeferCmd)
+	mayorDecisionCmd.AddCommand(mayorDecisionHoldCmd)
+	mayorDecisionCmd.AddCommand(mayorDecisionParkCmd)
+	mayorDecisionCmd.AddCommand(mayorDecisionResumeCmd)
+	mayorDecisionCmd.AddCommand(mayorDecisionShowCmd)
+	mayorDecisionCmd.AddCommand(mayorDecisionListCmd)
+	for _, c := range []*cobra.Command{mayorDecisionDeferCmd, mayorDecisionHoldCmd, mayorDecisionParkCmd, mayorDecisionResumeCmd} {
+		c.Flags().StringVar(&mayorDecisionReason, "reason", "", "Human-readable explanation recorded with the decision")
+		c.Flags().StringVar(&mayorDecisionMayor, "mayor", "", "Mayor actor identifier (defaults to git user or $USER)")
+	}
 
 	rootCmd.AddCommand(mayorCmd)
 }
@@ -484,4 +572,124 @@ func runMayorAcp(cmd *cobra.Command, args []string) error {
 
 	mgr := mayor.NewManager(townRoot)
 	return mgr.StartACP(ctx, mayorAgentOverride, rigName)
+}
+
+// resolveMayorActor returns the --mayor override or a sensible default identity
+// (GT_POLECAT env, then USER env, then "mayor").
+func resolveMayorActor() string {
+	if mayorDecisionMayor != "" {
+		return mayorDecisionMayor
+	}
+	if p := os.Getenv("GT_POLECAT"); p != "" {
+		return p
+	}
+	if u := os.Getenv("USER"); u != "" {
+		return u
+	}
+	return "mayor"
+}
+
+// runMayorDecisionRecord records an explicit Mayor decision for a source bead.
+func runMayorDecisionRecord(beadID string, decisionType mayor.DecisionType) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	d, err := mayor.RecordDecision(townRoot, beadID, resolveMayorActor(), decisionType, mayorDecisionReason)
+	if err != nil {
+		return err
+	}
+
+	if decisionType.BlocksRework() {
+		fmt.Printf("%s Recorded %s decision on %s (automated rework is now blocked)\n",
+			style.Bold.Render("✓"), decisionType, beadID)
+	} else {
+		// resume: report whether it actually overrode an existing block.
+		state, lerr := mayor.LoadDecisions(townRoot)
+		priorBlocked := false
+		if lerr == nil && state != nil {
+			if _, derr := state.PriorBlockingDecision(beadID); derr == nil {
+				priorBlocked = true
+			}
+		}
+		if priorBlocked {
+			fmt.Printf("%s Recorded %s decision on %s (prior block overridden; automated rework may resume)\n",
+				style.Bold.Render("✓"), decisionType, beadID)
+		} else {
+			fmt.Printf("%s Recorded %s decision on %s (no prior block to override)\n",
+				style.Bold.Render("✓"), decisionType, beadID)
+		}
+	}
+	fmt.Printf("  Mayor: %s\n", d.MayorID)
+	if d.Reason != "" {
+		fmt.Printf("  Reason: %s\n", d.Reason)
+	}
+	fmt.Printf("  Recorded: %s\n", d.Timestamp.Format(time.RFC3339))
+	return nil
+}
+
+// runMayorDecisionShow prints the active Mayor decision for a source bead.
+func runMayorDecisionShow(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	state, err := mayor.LoadDecisions(townRoot)
+	if err != nil {
+		return fmt.Errorf("loading mayor decisions: %w", err)
+	}
+
+	d, err := state.ActiveDecision(args[0])
+	if err != nil {
+		fmt.Printf("No active Mayor decision for %s (automated rework is unblocked)\n", args[0])
+		return nil
+	}
+
+	fmt.Printf("Bead: %s\n", d.BeadID)
+	fmt.Printf("Decision: %s\n", d.Type)
+	if d.MayorID != "" {
+		fmt.Printf("Mayor: %s\n", d.MayorID)
+	}
+	if d.Reason != "" {
+		fmt.Printf("Reason: %s\n", d.Reason)
+	}
+	fmt.Printf("Recorded: %s\n", d.Timestamp.Format(time.RFC3339))
+	if d.Type.BlocksRework() {
+		fmt.Printf("Effect: automated rework is BLOCKED for this bead\n")
+	} else {
+		fmt.Printf("Effect: automated rework is unblocked (resume)\n")
+	}
+	return nil
+}
+
+// runMayorDecisionList lists all recorded Mayor decisions.
+func runMayorDecisionList(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	state, err := mayor.LoadDecisions(townRoot)
+	if err != nil {
+		return fmt.Errorf("loading mayor decisions: %w", err)
+	}
+	if len(state.Decisions) == 0 {
+		fmt.Println("No Mayor decisions recorded.")
+		return nil
+	}
+
+	fmt.Printf("%-20s %-8s %-20s %s\n", "BEAD", "TYPE", "MAYOR", "RECORDED")
+	for _, d := range state.Decisions {
+		if d == nil {
+			continue
+		}
+		mayorID := d.MayorID
+		if mayorID == "" {
+			mayorID = "-"
+		}
+		fmt.Printf("%-20s %-8s %-20s %s\n", d.BeadID, d.Type, mayorID, d.Timestamp.Format(time.RFC3339))
+	}
+	return nil
 }
