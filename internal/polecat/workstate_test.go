@@ -103,7 +103,7 @@ func TestDecideWorkstateLiveSignals(t *testing.T) {
 			name:              "no liveness data preserves conservative not-idle fallback",
 			in:                WorkstateInput{State: StateStalled, HookBead: "gastown-cet.9"},
 			wantVerdict:       WorkstateVerdictNeedsRecovery,
-			wantReason:        "not-idle",
+			wantReason:        "no-liveness-data",
 			wantNeedsRecovery: true,
 			wantConfidence:    WorkstateConfidenceLow,
 		},

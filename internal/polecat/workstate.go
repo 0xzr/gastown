@@ -232,9 +232,10 @@ func decideNonIdleWorkstate(in WorkstateInput) WorkstateDisposition {
 			d.Confidence = WorkstateConfidenceHigh
 			d.Signals = append([]string{stateSignal}, allSignals(in)...)
 			if !hasAnyLiveSignal(in) {
-				// No liveness data at all: fall back to the previous coarse reason
-				// so callers see a stable classifier output during rollout.
-				d.Reason = "not-idle"
+				// No liveness data at all: low-confidence fallback. This used to
+				// share the coarse "not-idle" reason, but a distinct reason makes
+				// the no-data path observable to operators and dashboards.
+				d.Reason = "no-liveness-data"
 				d.Confidence = WorkstateConfidenceLow
 			}
 		}
