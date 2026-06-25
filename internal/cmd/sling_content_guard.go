@@ -18,7 +18,6 @@ var formulaTargetRole = map[string]string{
 var roleContentIndicators = map[string][]string{
 	"deacon": {
 		"gt deacon",
-		"gt patrol",
 		"--agent-bead hq-deacon",
 		"deacon session",
 		"deacon patrol",
