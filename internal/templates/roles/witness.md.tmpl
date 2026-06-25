@@ -254,6 +254,42 @@ patrols (30s base, exponential backoff to 15m max).
 
 **Handoff command:** `{{ cmd }} handoff -s "Witness cycle" -m "Completed N patrols, no incidents"`
 
+### GLM-Safe Context Budget (apply when Witness runs on umans-glm-5.2)
+
+The Witness compaction path was changed from `gt prime --hook` to
+`{{ cmd }} handoff --cycle --reason compaction --yes` *because* umans-glm-5.2
+has a smaller effective context window and degrades before the hard limit —
+re-priming the same fat session kept the accumulated context and caused the
+stalls that motivated the change. The lessons below are the GLM-safe context
+budget rules; they apply whenever this role is routed to GLM.
+
+1. **Small prompts, bounded tool output.** Do not dump full `gt peek` output,
+   full patrol scans, or full bead dumps into a prompt. Extract polecat name,
+   state, and the one-line action needed. Full output lives at its source;
+   you do not need it resident.
+
+2. **Nudge, never mail, for routine status.** `{{ cmd }} nudge` is ephemeral
+   and free; every `{{ cmd }} mail send` is a permanent Dolt commit that also
+   bloats the recipient's (and your) context. Health checks and status pings
+   are nudges. Only mail when the message must survive session death.
+
+3. **Durable notes before compaction.** If a patrol produces a decision or
+   finding that the next session needs (recovery choice, nudge count, a
+   stuck polecat's history), write it to the bead (`bd update --notes`) or
+   `state.json` *before* the loop-or-exit handoff. The handoff packet is
+   bounded: state + next action, not a transcript replay.
+
+4. **Rework = fresh session, not append.** When a polecat returns a
+   rejected/rework item, the rework runs in a fresh session with a bounded
+   packet (the rejection, the diff, the remediation) — never appended to the
+   polecat's long-lived session. This is the `GT_MQ_REWORK_BOUNCE` pattern;
+   appending is the failure mode behind the GLM mid-rework stalls.
+
+5. **Cycle early on the heuristic, not late.** The 15-loop / extraordinary-action
+   heuristic is the Claude/Codex ceiling. Under GLM, treat it as a *maximum* —
+   if you notice latency drift or repeated re-reading, hand off sooner. A
+   cheap fresh session beats a fat stalled one.
+
 ---
 
 ## Handoff (Wisp-Based)

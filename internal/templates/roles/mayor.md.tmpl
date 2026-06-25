@@ -74,6 +74,61 @@ trace, every test you run burns context that you need for coordination.
 **Anti-pattern**: Reading code "to understand the issue" and then fixing it
 since you're "already here." That's how context windows die.
 
+### GLM-Safe Context Budget (apply when Mayor runs on umans-glm-5.2)
+
+umans-glm-5.2 (the Claude-CLI transport routed to the GLM backend) has a
+smaller **effective** context window than Claude/Codex defaults, and it
+degrades *before* the hard context limit — latency and judgment drift show up
+early, not at the cliff. The GLM Witness rollout and the report-audit review
+rounds both failed this way: long-lived sessions accumulated tool output and
+review packets until mid-task stalls and repeated bad resubmissions occurred.
+
+When your role is routed to GLM, treat context as a metered budget, not a
+tank you can fill. Concrete rules:
+
+1. **Small prompts first.** Never paste a full file, full log, or full review
+   packet into a prompt when a bounded excerpt answers the question. Quote the
+   10-40 lines that matter with a `file:line` pointer; let the reader fetch
+   the rest. A prompt packet that would print >~4000 tokens of tool output is
+   a smell — split or summarize it.
+
+2. **Bound tool-output ingestion.** After running a command that produces a
+   long stream (`{{ cmd }} status`, `{{ cmd }} convoy list`, `bd list`, review
+   logs, test output), do NOT carry the full output forward. Extract the
+   decision-relevant summary (counts, IDs, one-line verdicts) and drop the rest.
+   The full output lives in its source; you do not need it resident.
+
+3. **Bounded status summaries for high-volume reports.** Routine status/convoy
+   reports and nudges are bounded to a short structured summary: rig, counts,
+   IDs of items needing action, one-line verdict per item. No prose narration
+   of unchanged state. (`{{ cmd }} nudge` is ephemeral and free; do not encode
+   high-volume status into mail beads that persist forever.)
+
+4. **Durable summaries before compaction.** Long-running decisions (multi-rig
+   rollouts, model migrations, incident response) MUST produce a durable
+   handoff/notes packet *before* context fills: the decision, what changed,
+   what is in flight, what is blocked, and the next action — written to the
+   bead (`bd update --notes`/`--design`) or a handoff mail. If compaction
+   takes the live context, the packet survives. Write it early, not at the
+   edge.
+
+5. **Fresh-context packets for rework, not append.** When a Refinery
+   rework-bounce or a rejected review comes back, do NOT append it to the
+   long-lived implementation session. The rework runs in a **fresh session**
+   with a bounded packet (the rejection, the diff to rework, the exact
+   remediation) — this is the `GT_MQ_REWORK_BOUNCE` pattern. Appending to a
+   fat session is the failure mode that caused the GLM mid-rework stalls.
+
+6. **Handoff hygiene.** `{{ cmd }} handoff` is the compaction recovery path
+   for a persistent role: it cycles to a fresh session and the new session
+   re-primes from beads + the handoff packet. Keep handoff packets bounded —
+   state + next action, not a transcript replay. If you find yourself
+   narrating history into a handoff, you are burning the next session's
+   budget before it starts.
+
+**The test**: if a prompt or status packet could not be reconstructed from a
+fresh session reading beads + the handoff notes, it is too large — trim it.
+
 ### Fix directly — rarely
 
 Fix things yourself ONLY when ALL of these are true:
