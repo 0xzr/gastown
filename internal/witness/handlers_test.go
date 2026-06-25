@@ -14,6 +14,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -1553,6 +1554,102 @@ func TestResetAbandonedBead_ResetsWhenWorkNotOnMain(t *testing.T) {
 	}
 	if !foundUpdate {
 		t.Errorf("expected bd update --status=open to be called, got calls: %v", mock.calls)
+	}
+}
+
+func TestResetAbandonedBead_MayorDecisionBlocksReset(t *testing.T) {
+	// Not parallel: overrides package-level verifyCommitOnMain and
+	// activeMayorDecisionForBead.
+	// Gastown-cet.7 / hq-12zq: an active Mayor DEFER/HOLD/PARK on the source
+	// bead must prevent the witness from resetting it for re-dispatch. The bead
+	// is NOT reset, NO polecat is spawned, and the conflict is surfaced.
+	oldVerify := verifyCommitOnMain
+	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
+		return false, nil // work NOT on main, so we reach the decision guard
+	}
+	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	oldDecision := activeMayorDecisionForBead
+	activeMayorDecisionForBead = func(townRoot, beadID string) (*mayor.Decision, error) {
+		return &mayor.Decision{
+			BeadID: beadID,
+			Type:   mayor.DecisionPark,
+			Reason: "parked by Mayor",
+		}, nil
+	}
+	t.Cleanup(func() { activeMayorDecisionForBead = oldDecision })
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) >= 1 && args[0] == "show" {
+				return `[{"status":"in_progress"}]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	tmpDir := t.TempDir()
+	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work999", "alpha", nil)
+	if result {
+		t.Error("resetAbandonedBead should return false when a Mayor decision blocks rework")
+	}
+
+	// The bead must NOT be reset to open and must NOT be closed.
+	for _, call := range mock.calls {
+		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
+			t.Errorf("bead should not be reset to open under Mayor block, got call: %s", call)
+		}
+		if strings.Contains(call, "close") {
+			t.Errorf("bead should not be closed under Mayor block, got call: %s", call)
+		}
+	}
+}
+
+func TestResetAbandonedBead_NoMayorDecisionResetsNormally(t *testing.T) {
+	// Not parallel: overrides package-level verifyCommitOnMain and
+	// activeMayorDecisionForBead.
+	// Without an active Mayor decision, the normal reset path runs.
+	oldVerify := verifyCommitOnMain
+	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
+		return false, nil
+	}
+	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	oldDecision := activeMayorDecisionForBead
+	activeMayorDecisionForBead = func(townRoot, beadID string) (*mayor.Decision, error) {
+		return nil, nil // no active decision
+	}
+	t.Cleanup(func() { activeMayorDecisionForBead = oldDecision })
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) >= 1 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	tmpDir := t.TempDir()
+	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
+	if !result {
+		t.Error("resetAbandonedBead should return true when no Mayor decision is active")
+	}
+
+	var foundUpdate bool
+	for _, call := range mock.calls {
+		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
+			foundUpdate = true
+		}
+	}
+	if !foundUpdate {
+		t.Errorf("expected bd update --status=open without Mayor decision, got calls: %v", mock.calls)
 	}
 }
 
