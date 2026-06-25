@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -2876,17 +2877,46 @@ record an explicit override: gt mayor decision resume %s`,
 	return subject, body
 }
 
+// ReworkBlockedSender is the minimal mail surface notifyMayorOfReworkBlocked
+// needs to deliver a REWORK_DEFERRED message. *mail.Router satisfies this
+// in production; the live dry-run (gastown-fvy) injects a capture sender so
+// it can observe emit-vs-suppress without polluting the Mayor inbox.
+type ReworkBlockedSender interface {
+	Send(msg *mail.Message) error
+}
+
+// senderIsLive returns true when sender is non-nil AND its underlying value
+// is not a typed-nil pointer. Go's interface nil-check returns true for a
+// typed-nil pointer (e.g., `var r *mail.Router = nil` passed as a
+// ReworkBlockedSender), which would otherwise panic inside Send. Callers
+// that pass an arbitrary `*mail.Router` rely on this guard to fall back to
+// the nudge path instead of crashing (gastown-fvy regression defense).
+func senderIsLive(sender ReworkBlockedSender) bool {
+	if sender == nil {
+		return false
+	}
+	// Type-assert the concrete type. If the dynamic value is nil, the
+	// assertion to the concrete pointer yields a typed nil; reflect on it
+	// to distinguish from a live pointer.
+	v := reflect.ValueOf(sender)
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+		return !v.IsNil()
+	}
+	return true
+}
+
 // notifyMayorOfReworkBlocked surfaces a conflict between an active Mayor decision
 // (DEFER/HOLD/PARK) and an automated rework request to the Mayor. Both inputs are
 // included: the decision and the rework context (bead, polecat, status, threshold).
-// If router is nil, falls back to stderr logging and a direct nudge when possible.
+// If sender is nil, falls back to stderr logging and a direct nudge when possible.
 //
 // The (rig, bead, polecat, decision, source status) tuple is deduped/throttled
 // (gastown-cet.11): the first occurrence is emitted immediately, identical
 // repeats inside the throttle window are suppressed and counted, and a rollup
 // is emitted when the window elapses. Any change to the tuple emits
 // immediately. Suppressed counts are logged to stderr so evidence is not lost.
-func notifyMayorOfReworkBlocked(townRoot, rigName, hookBead, polecatName, beadStatus string, maxRespawns int, decision *mayor.Decision, router *mail.Router) {
+func notifyMayorOfReworkBlocked(townRoot, rigName, hookBead, polecatName, beadStatus string, maxRespawns int, decision *mayor.Decision, sender ReworkBlockedSender) {
 	if decision == nil {
 		// Defensive: callers already guard on decision != nil, but a nil here
 		// would dereference below. Log and skip.
@@ -2912,7 +2942,7 @@ func notifyMayorOfReworkBlocked(townRoot, rigName, hookBead, polecatName, beadSt
 
 	subject, body := formatReworkDeferredNotification(td, throttleWindow, rigName, hookBead, polecatName, beadStatus, maxRespawns, decision)
 
-	if router != nil {
+	if senderIsLive(sender) {
 		msg := &mail.Message{
 			From:     fmt.Sprintf("%s/witness", rigName),
 			To:       "mayor/",
@@ -2920,14 +2950,14 @@ func notifyMayorOfReworkBlocked(townRoot, rigName, hookBead, polecatName, beadSt
 			Priority: mail.PriorityHigh,
 			Body:     body,
 		}
-		if err := router.Send(msg); err != nil {
+		if err := sender.Send(msg); err != nil {
 			fmt.Fprintf(os.Stderr, "witness: failed to send %s mail for %s: %v, attempting nudge fallback\n", subject, hookBead, err)
 		} else {
 			return
 		}
 	}
 
-	// Nudge fallback when router is nil or mail failed.
+	// Nudge fallback when sender is nil, typed-nil, or mail failed.
 	t := tmux.NewTmux()
 	nudgeMsg := fmt.Sprintf("%s: bead=%s polecat=%s/%s status=%s mayor_decision=%s reason=%q",
 		subject, hookBead, rigName, polecatName, beadStatus, decision.Type, decision.Reason)
