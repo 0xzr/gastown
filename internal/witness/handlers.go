@@ -2815,9 +2815,59 @@ var activeMayorDecisionForBead = func(townRoot, beadID string) (*mayor.Decision,
 // (DEFER/HOLD/PARK) and an automated rework request to the Mayor. Both inputs are
 // included: the decision and the rework context (bead, polecat, status, threshold).
 // If router is nil, falls back to stderr logging and a direct nudge when possible.
+//
+// The (rig, bead, polecat, decision, source status) tuple is deduped/throttled
+// (gastown-cet.11): the first occurrence is emitted immediately, identical
+// repeats inside the throttle window are suppressed and counted, and a rollup
+// is emitted when the window elapses. Any change to the tuple emits
+// immediately. Suppressed counts are logged to stderr so evidence is not lost.
 func notifyMayorOfReworkBlocked(townRoot, rigName, hookBead, polecatName, beadStatus string, maxRespawns int, decision *mayor.Decision, router *mail.Router) {
+	if decision == nil {
+		// Defensive: callers already guard on decision != nil, but a nil here
+		// would dereference below. Log and skip.
+		fmt.Fprintf(os.Stderr, "witness: notifyMayorOfReworkBlocked called with nil decision for %s\n", hookBead)
+		return
+	}
+
+	throttleWindow := config.LoadOperationalConfig(townRoot).GetWitnessConfig().ReworkDeferredThrottleWindowD()
+	td := EvaluateReworkDeferred(townRoot, rigName, hookBead, polecatName, beadStatus, decision.Reason, decision.Type, throttleWindow)
+
+	if td.Action == ActionSuppress {
+		// Suppressed: log so the operator can see the count, but do not spam
+		// the Mayor. FirstSuppressedAt/SuppressedCount are in td.Record.
+		fmt.Fprintf(os.Stderr,
+			"witness: REWORK_DEFERRED suppressed for %s/%s bead=%s (suppressed_count=%d first_suppressed_at=%s window=%s)\n",
+			rigName, polecatName, hookBead,
+			td.Record.SuppressedCount,
+			td.Record.FirstSuppressedAt.Format(time.RFC3339),
+			throttleWindow,
+		)
+		return
+	}
+
 	subject := fmt.Sprintf("REWORK_DEFERRED %s (Mayor %s decision blocks rework)", hookBead, decision.Type)
-	body := fmt.Sprintf(`Automated rework for bead %s was blocked by an active Mayor decision.
+	if td.Action == ActionRollup {
+		subject = fmt.Sprintf("REWORK_DEFERRED %s (Mayor %s decision blocks rework, %d suppressed)",
+			hookBead, decision.Type, td.Record.SuppressedCount)
+	}
+
+	bodyPrefix := ""
+	if td.Action == ActionRollup {
+		// The rollup body makes the suppressed count visible so the Mayor can
+		// see the prior flood even though the prior individual messages were
+		// dropped.
+		suppressedWindow := ""
+		if !td.Record.FirstEmittedAt.IsZero() {
+			suppressedWindow = fmt.Sprintf(" (covers %s → %s)",
+				td.Record.FirstEmittedAt.Format(time.RFC3339),
+				reworkDeferredNow().UTC().Format(time.RFC3339))
+		}
+		bodyPrefix = fmt.Sprintf(`This is a rollup of %d identical REWORK_DEFERRED notices that were suppressed inside the %s throttle window%s.
+
+`, td.Record.SuppressedCount, throttleWindow, suppressedWindow)
+	}
+
+	body := bodyPrefix + fmt.Sprintf(`Automated rework for bead %s was blocked by an active Mayor decision.
 
 Mayor Decision
 ==============

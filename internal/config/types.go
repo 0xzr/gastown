@@ -499,6 +499,14 @@ type WitnessThresholds struct {
 	// possibly stuck at startup (e.g., auth 401 blocking initialization, default "5m").
 	// The witness exposes the signal; patrol formula decides whether to escalate.
 	HeartbeatStartupGrace string `json:"heartbeat_startup_grace,omitempty"`
+
+	// ReworkDeferredThrottleWindow is the minimum interval between repeated
+	// REWORK_DEFERRED mail messages for the same (rig, bead, polecat, decision,
+	// source status) tuple (default "1h"). Identical repeats inside the window
+	// are suppressed and counted; the next emit after the window is a rollup.
+	// The first occurrence and any change in the tuple emits immediately.
+	// (gastown-cet.11)
+	ReworkDeferredThrottleWindow string `json:"rework_deferred_throttle_window,omitempty"`
 }
 
 // DefaultOperationalConfig returns an OperationalConfig with all defaults.
