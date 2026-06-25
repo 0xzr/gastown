@@ -8,6 +8,17 @@ const (
 	WorkstateVerdictPendingMR     = "PENDING_MR"
 	WorkstateVerdictNeedsRecovery = "NEEDS_RECOVERY"
 	WorkstateVerdictNeedsMQSubmit = "NEEDS_MQ_SUBMIT"
+
+	// WorkstateConfidenceHigh is used when the classifier has direct live signals
+	// (session running, heartbeat fresh, process alive, active hook) agreeing on a
+	// verdict. It should not be emitted when liveness data is missing entirely.
+	WorkstateConfidenceHigh = "high"
+	// WorkstateConfidenceMedium is used when the verdict relies on persisted state
+	// or partial liveness data. Callers should still act, but may want to re-check.
+	WorkstateConfidenceMedium = "medium"
+	// WorkstateConfidenceLow is used when the classifier has conflicting or
+	// missing signals and falls back to conservative State-based behavior.
+	WorkstateConfidenceLow = "low"
 )
 
 // WorkstateInput contains the lifecycle, git, and merge-queue facts needed to
@@ -35,6 +46,14 @@ type WorkstateInput struct {
 	AssignedBeadTerminal           bool
 	MRSubmitted                    bool
 	MQLookupFailed                 bool
+	// SessionRunning is true when the tmux session for this polecat currently exists.
+	SessionRunning bool `json:"session_running,omitempty"`
+	// HeartbeatFresh is true when the polecat heartbeat file exists and is fresh.
+	HeartbeatFresh bool `json:"heartbeat_fresh,omitempty"`
+	// HeartbeatExists is true when a heartbeat file exists for this polecat.
+	HeartbeatExists bool `json:"heartbeat_exists,omitempty"`
+	// ProcessAlive is true when the session's agent process is confirmed alive.
+	ProcessAlive bool `json:"process_alive,omitempty"`
 }
 
 // WorkstateDisposition is the canonical polecat lifecycle decision. It is pure
@@ -51,23 +70,18 @@ type WorkstateDisposition struct {
 	CountsTowardCapacity bool     `json:"counts_toward_capacity"`
 	ReuseStatus          string   `json:"reuse_status,omitempty"`
 	Blockers             []string `json:"blockers,omitempty"`
+	// Confidence is "high", "medium", or "low" and reflects how much direct
+	// liveness evidence supported the verdict. Added for gastown-cet.9.
+	Confidence string `json:"confidence,omitempty"`
+	// Signals lists the liveness predicates that triggered the verdict. It is
+	// empty for idle-path decisions that do not depend on live-session signals.
+	Signals []string `json:"signals,omitempty"`
 }
 
 // DecideWorkstate returns the canonical disposition for a polecat.
 func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	if in.State != StateIdle {
-		verdict := WorkstateVerdictNeedsRecovery
-		needsRecovery := true
-		if in.State == StateWorking {
-			verdict = WorkstateVerdictWorking
-			needsRecovery = false
-		}
-		return WorkstateDisposition{
-			Verdict:              verdict,
-			Reason:               "not-idle",
-			NeedsRecovery:        needsRecovery,
-			CountsTowardCapacity: true,
-		}
+		return decideNonIdleWorkstate(in)
 	}
 
 	d := WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke}
@@ -167,6 +181,126 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		d.ReuseStatus = "idle-clean"
 	}
 	return d
+}
+
+// decideNonIdleWorkstate classifies a polecat whose persisted State is not idle.
+// It uses live session/heartbeat/process signals to disambiguate a genuinely
+// working agent from a dead or stale one. A live, hooked polecat is WORKING
+// regardless of whether its persisted state happens to say stalled/done/etc.
+// A non-idle polecat without live evidence stays in recovery.
+func decideNonIdleWorkstate(in WorkstateInput) WorkstateDisposition {
+	d := WorkstateDisposition{CountsTowardCapacity: true}
+	stateSignal := "state=" + string(in.State)
+	live := isPolecatLive(in)
+	hooked := in.HookBead != ""
+
+	switch in.State {
+	case StateWorking:
+		d.Verdict = WorkstateVerdictWorking
+		d.Reason = "working"
+		d.Signals = []string{stateSignal}
+		if live {
+			d.Confidence = WorkstateConfidenceHigh
+			d.Signals = append(d.Signals, liveSignals(in)...)
+		} else if hasAnyLiveSignal(in) {
+			d.Confidence = WorkstateConfidenceMedium
+			d.Signals = append(d.Signals, allSignals(in)...)
+		} else {
+			d.Confidence = WorkstateConfidenceMedium
+		}
+	default:
+		if live && hooked {
+			// Live session + active hook = working even if persisted state is
+			// review-needed, stalled, done, etc. This is the gastown-cet.9 fix.
+			d.Verdict = WorkstateVerdictWorking
+			d.Reason = "live-hooked"
+			d.Confidence = WorkstateConfidenceHigh
+			d.Signals = append([]string{stateSignal}, liveSignals(in)...)
+			d.Signals = append(d.Signals, "hook_active")
+		} else if live {
+			// Session is live but there is no active hook. The agent is up and
+			// may be between assignments; do not treat it as a recovery case.
+			d.Verdict = WorkstateVerdictWorking
+			d.Reason = "live-review"
+			d.Confidence = WorkstateConfidenceMedium
+			d.Signals = append([]string{stateSignal}, liveSignals(in)...)
+		} else {
+			d.Verdict = WorkstateVerdictNeedsRecovery
+			d.Reason = "stale-session"
+			d.NeedsRecovery = true
+			d.ReuseStatus = "idle-recovery-needed"
+			d.Confidence = WorkstateConfidenceHigh
+			d.Signals = append([]string{stateSignal}, allSignals(in)...)
+			if !hasAnyLiveSignal(in) {
+				// No liveness data at all: fall back to the previous coarse reason
+				// so callers see a stable classifier output during rollout.
+				d.Reason = "not-idle"
+				d.Confidence = WorkstateConfidenceLow
+			}
+		}
+	}
+	return d
+}
+
+// isPolecatLive returns true when direct liveness evidence confirms the agent
+// process is alive. ProcessAlive already incorporates heartbeat freshness when
+// a heartbeat file exists (isSessionProcessDead), so an alive process implies a
+// fresh heartbeat or a pre-heartbeat session.
+func isPolecatLive(in WorkstateInput) bool {
+	return in.ProcessAlive || (in.SessionRunning && in.HeartbeatFresh)
+}
+
+// hasAnyLiveSignal returns true if any liveness predicate was supplied.
+func hasAnyLiveSignal(in WorkstateInput) bool {
+	return in.SessionRunning || in.HeartbeatFresh || in.ProcessAlive || in.HeartbeatExists
+}
+
+// liveSignals returns the signal strings for conditions that are true.
+func liveSignals(in WorkstateInput) []string {
+	return signalList(in, true)
+}
+
+// allSignals returns every liveness signal with its boolean value.
+func allSignals(in WorkstateInput) []string {
+	return signalList(in, false)
+}
+
+func signalList(in WorkstateInput, onlyTrue bool) []string {
+	var signals []string
+	add := func(name string, value bool) {
+		if onlyTrue && !value {
+			return
+		}
+		signals = append(signals, name+"="+boolString(value))
+	}
+	add("session_running", in.SessionRunning)
+	add("heartbeat_exists", in.HeartbeatExists)
+	add("heartbeat_fresh", in.HeartbeatFresh)
+	add("process_alive", in.ProcessAlive)
+	return signals
+}
+
+func boolString(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+// CanIgnoreStaleCleanupStatus returns true when a dirty persisted
+// cleanup_status is older than the direct predicates proving no work is at risk.
+// The status remains unsafe globally; callers must opt into this reconciliation
+// path only after gathering live git, hook, work, and active-MR facts.
+func CanIgnoreStaleCleanupStatus(status CleanupStatus, workTerminal, hookSafe, activeMRSafe, gitSafe bool) bool {
+	if !workTerminal || !hookSafe || !activeMRSafe || !gitSafe {
+		return false
+	}
+	switch status {
+	case CleanupUncommitted, CleanupStash, CleanupUnpushed:
+		return true
+	default:
+		return false
+	}
 }
 
 func itoa(n int) string {

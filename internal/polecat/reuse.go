@@ -30,6 +30,11 @@ type SlotReuseInput struct {
 	AssignedBeadTerminal bool
 	MRSubmitted          bool
 	MQLookupFailed       bool
+	// Live-session signals. See WorkstateInput for documentation.
+	SessionRunning  bool
+	HeartbeatFresh  bool
+	HeartbeatExists bool
+	ProcessAlive    bool
 }
 
 // SlotReuseDecision explains whether a polecat can be reused and why not.
@@ -63,6 +68,10 @@ func DecideSlotReuse(in SlotReuseInput) SlotReuseDecision {
 		AssignedBeadTerminal: in.AssignedBeadTerminal,
 		MRSubmitted:          in.MRSubmitted,
 		MQLookupFailed:       in.MQLookupFailed,
+		SessionRunning:       in.SessionRunning,
+		HeartbeatFresh:       in.HeartbeatFresh,
+		HeartbeatExists:      in.HeartbeatExists,
+		ProcessAlive:         in.ProcessAlive,
 	})
 	return SlotReuseDecision{Reusable: d.Reusable, Reason: d.Reason}
 }

@@ -10,7 +10,7 @@ func TestDecideSlotReuse(t *testing.T) {
 		want   string
 	}{
 		{name: "clean idle", want: "reusable"},
-		{name: "working", mutate: func(in *SlotReuseInput) { in.State = StateWorking }, want: "not-idle"},
+		{name: "working", mutate: func(in *SlotReuseInput) { in.State = StateWorking }, want: "working"},
 		{name: "hook", mutate: func(in *SlotReuseInput) { in.HookBead = "gt-work" }, want: "hook-still-set"},
 		{name: "push failed", mutate: func(in *SlotReuseInput) { in.PushFailed = true }, want: "push-failed"},
 		{name: "mr failed", mutate: func(in *SlotReuseInput) { in.MRFailed = true }, want: "mr-failed"},

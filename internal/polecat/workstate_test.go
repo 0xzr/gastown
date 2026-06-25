@@ -41,7 +41,7 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 		{
 			name: "working counts as working capacity",
 			in:   WorkstateInput{State: StateWorking, CleanupStatus: CleanupClean},
-			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "not-idle", NeedsRecovery: false, CountsTowardCapacity: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "working", NeedsRecovery: false, CountsTowardCapacity: true},
 		},
 	}
 
@@ -50,6 +50,100 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			got := DecideWorkstate(tt.in)
 			if got.Verdict != tt.want.Verdict || got.Reason != tt.want.Reason || got.Reusable != tt.want.Reusable || got.SafeToNuke != tt.want.SafeToNuke || got.NeedsRecovery != tt.want.NeedsRecovery || got.NeedsMQSubmit != tt.want.NeedsMQSubmit || got.MQStatus != tt.want.MQStatus || got.CountsTowardCapacity != tt.want.CountsTowardCapacity || got.ReuseStatus != tt.want.ReuseStatus {
 				t.Fatalf("DecideWorkstate() = %+v, want fields %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDecideWorkstateLiveSignals(t *testing.T) {
+	tests := []struct {
+		name                 string
+		in                   WorkstateInput
+		wantVerdict          string
+		wantReason           string
+		wantNeedsRecovery    bool
+		wantConfidence       string
+		wantSignalSubstrings []string
+	}{
+		{
+			name:                 "gastown-cet.9 regression: stalled but live and hooked is WORKING",
+			in:                   WorkstateInput{State: StateStalled, HookBead: "gastown-cet.9", SessionRunning: true, HeartbeatExists: true, HeartbeatFresh: true, ProcessAlive: true},
+			wantVerdict:          WorkstateVerdictWorking,
+			wantReason:           "live-hooked",
+			wantNeedsRecovery:    false,
+			wantConfidence:       WorkstateConfidenceHigh,
+			wantSignalSubstrings: []string{"state=stalled", "session_running=true", "process_alive=true", "hook_active"},
+		},
+		{
+			name:              "live hooked polecat in review-needed is WORKING",
+			in:                WorkstateInput{State: StateReviewNeeded, HookBead: "gastown-cet.9", SessionRunning: true, HeartbeatExists: true, HeartbeatFresh: true, ProcessAlive: true},
+			wantVerdict:       WorkstateVerdictWorking,
+			wantReason:        "live-hooked",
+			wantNeedsRecovery: false,
+			wantConfidence:    WorkstateConfidenceHigh,
+		},
+		{
+			name:              "live session without hook is not recovery",
+			in:                WorkstateInput{State: StateReviewNeeded, SessionRunning: true, HeartbeatExists: true, HeartbeatFresh: true, ProcessAlive: true},
+			wantVerdict:       WorkstateVerdictWorking,
+			wantReason:        "live-review",
+			wantNeedsRecovery: false,
+			wantConfidence:    WorkstateConfidenceMedium,
+		},
+		{
+			name:                 "dead session with hook needs recovery",
+			in:                   WorkstateInput{State: StateStalled, HookBead: "gastown-cet.9", SessionRunning: false, HeartbeatExists: true, HeartbeatFresh: false, ProcessAlive: false},
+			wantVerdict:          WorkstateVerdictNeedsRecovery,
+			wantReason:           "stale-session",
+			wantNeedsRecovery:    true,
+			wantConfidence:       WorkstateConfidenceHigh,
+			wantSignalSubstrings: []string{"state=stalled", "heartbeat_fresh=false", "process_alive=false"},
+		},
+		{
+			name:              "no liveness data preserves conservative not-idle fallback",
+			in:                WorkstateInput{State: StateStalled, HookBead: "gastown-cet.9"},
+			wantVerdict:       WorkstateVerdictNeedsRecovery,
+			wantReason:        "not-idle",
+			wantNeedsRecovery: true,
+			wantConfidence:    WorkstateConfidenceLow,
+		},
+		{
+			name:                 "working with live signals has high confidence",
+			in:                   WorkstateInput{State: StateWorking, SessionRunning: true, HeartbeatExists: true, HeartbeatFresh: true, ProcessAlive: true},
+			wantVerdict:          WorkstateVerdictWorking,
+			wantReason:           "working",
+			wantNeedsRecovery:    false,
+			wantConfidence:       WorkstateConfidenceHigh,
+			wantSignalSubstrings: []string{"state=working", "session_running=true"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DecideWorkstate(tt.in)
+			if got.Verdict != tt.wantVerdict {
+				t.Errorf("Verdict = %q, want %q", got.Verdict, tt.wantVerdict)
+			}
+			if got.Reason != tt.wantReason {
+				t.Errorf("Reason = %q, want %q", got.Reason, tt.wantReason)
+			}
+			if got.NeedsRecovery != tt.wantNeedsRecovery {
+				t.Errorf("NeedsRecovery = %v, want %v", got.NeedsRecovery, tt.wantNeedsRecovery)
+			}
+			if got.Confidence != tt.wantConfidence {
+				t.Errorf("Confidence = %q, want %q", got.Confidence, tt.wantConfidence)
+			}
+			for _, substr := range tt.wantSignalSubstrings {
+				found := false
+				for _, s := range got.Signals {
+					if s == substr {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("Signals = %v, missing %q", got.Signals, substr)
+				}
 			}
 		})
 	}

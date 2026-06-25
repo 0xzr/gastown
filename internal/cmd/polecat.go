@@ -1013,6 +1013,13 @@ type RecoveryStatus struct {
 	Blockers             []string              `json:"blockers,omitempty"`
 	Diagnostics          []string              `json:"diagnostics,omitempty"`
 	Reconciled           bool                  `json:"reconciled,omitempty"`
+	// Confidence reflects how much direct liveness evidence supported the verdict.
+	Confidence string `json:"confidence,omitempty"`
+	// Signals lists the liveness predicates that triggered the verdict.
+	Signals []string `json:"signals,omitempty"`
+	// activeMRAssessment carries the live-MQ-vs-stale-metadata classification
+	// so the reconcile path can clear a dead active_mr without re-querying.
+	activeMRAssessment polecat.ActiveMRAssessment
 }
 
 func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
@@ -1049,6 +1056,21 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	workTerminal := beadTerminal
 	targetRefs := recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch)
 	input := polecat.WorkstateInput{State: p.State, CleanupStatus: polecat.CleanupUnknown, Branch: p.Branch}
+
+	// Gather live session/heartbeat/process signals independently of the
+	// persisted State. A live, hooked polecat should be WORKING even if its
+	// State column happens to be stalled, review-needed, etc. (gastown-cet.9).
+	if running, heartbeatFresh, heartbeatExists, processAlive, livenessErr := mgr.LivenessSignals(polecatName); livenessErr == nil {
+		input.SessionRunning = running
+		input.HeartbeatFresh = heartbeatFresh
+		input.HeartbeatExists = heartbeatExists
+		input.ProcessAlive = processAlive
+		status.Diagnostics = append(status.Diagnostics,
+			fmt.Sprintf("liveness: session_running=%v heartbeat_fresh=%v heartbeat_exists=%v process_alive=%v", running, heartbeatFresh, heartbeatExists, processAlive))
+	} else {
+		status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("liveness_error: %v", livenessErr))
+	}
+
 	var gitState *GitState
 	var gitErr error
 	gitStateLoaded := false
@@ -1263,6 +1285,9 @@ func applyWorkstateDispositionToRecoveryStatus(status *RecoveryStatus, dispositi
 	status.ReuseStatus = disposition.ReuseStatus
 	status.MQStatus = disposition.MQStatus
 	status.Blockers = disposition.Blockers
+	status.RecoveryActions = recoveryActionsForBlockers(disposition.Blockers)
+	status.Confidence = disposition.Confidence
+	status.Signals = disposition.Signals
 }
 
 type issueShower interface {
