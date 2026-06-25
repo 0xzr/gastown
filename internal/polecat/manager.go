@@ -2744,6 +2744,32 @@ func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {
 	return true, NewSessionManager(m.tmux, m.rig).isSessionStale(sessionName)
 }
 
+// LivenessSignals returns direct session/heartbeat/process evidence for a polecat.
+// These signals are intentionally independent of the polecat's persisted State so
+// callers can distinguish a live agent from a stale State value (gastown-cet.9).
+func (m *Manager) LivenessSignals(name string) (sessionRunning, heartbeatFresh, heartbeatExists, processAlive bool, err error) {
+	if m.tmux == nil {
+		return false, false, false, false, nil
+	}
+
+	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
+	sessionRunning, herr := m.tmux.HasSession(sessionName)
+	if herr != nil {
+		sessionRunning = false
+	}
+
+	townRoot := filepath.Dir(m.rig.Path)
+	stale, exists := IsSessionHeartbeatStale(townRoot, sessionName)
+	heartbeatExists = exists
+	heartbeatFresh = exists && !stale
+
+	// isSessionProcessDead returns true when it can confirm the process is dead.
+	// A false result means either alive or unable to determine; treat as alive.
+	processAlive = !isSessionProcessDead(m.tmux, sessionName, townRoot)
+
+	return sessionRunning, heartbeatFresh, heartbeatExists, processAlive, nil
+}
+
 func isCurrentHookedIssueForAssignee(issue *beads.Issue, assignee string) bool {
 	return issue != nil &&
 		issue.Status == beads.StatusHooked &&
