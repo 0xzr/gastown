@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `merge_queue.degraded_quorum_enabled` is true and enough independent `PASS`
   reviews exist, the merge proceeds and records a follow-up audit bead for the
   missing reviewers. See `docs/refinery-review-semantics.md`.
+- **Fleet-fill model-mix chooser** — `internal/fleet/mix.go` provides a pure
+  `ChooseAgent(caps, counts, healthy, idx)` that reconciles live lane counts
+  (summed town-wide, including legacy lanes on other rigs) against per-model
+  caps before picking the next dispatch model. Regression tests in
+  `internal/fleet/mix_test.go` cover the gastown-1l8 acceptance scenario:
+  live 1 Kimi + 1 M3 + 4 ready tasks must produce cap-consistent picks and
+  not exceed any model's cap. External dropin scripts that wrap this behavior
+  (e.g. `gt-model-mix-maintainer.py`) can adopt this algorithm as the
+  canonical chooser. Witness scope clarified in
+  `WITNESS_SCOPED_RESTART_RECOVERY_POLICY.md` ("Town-wide ready dispatch is
+  not Witness scope").
 
 ## [1.2.1] - 2026-06-06
 

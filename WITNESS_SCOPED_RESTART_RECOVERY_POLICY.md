@@ -301,3 +301,27 @@ hardcoding the polybot rig. The runner remains report-only by default.
 Witness may run report-only dry-runs immediately. `--fix --max-fixes 1` requires
 a supervised canary against a real eligible stuck lane. Record canary outcomes
 in the source bead notes.
+
+## Town-wide ready dispatch is not Witness scope
+
+Witness handles **polecat lifecycle** for its own rig: restart-recovery,
+needs-recovery triage, merge-queue saturation detection. It does **not**
+choose new ready beads across the town or reconcile the model mix fleet-wide.
+
+Town-wide fleet fill lives one layer up:
+
+- **Mayor** owns town-wide state, escalation, and durable cross-rig routing.
+- **`gt scheduler run`** dispatches queued sling-context beads under
+  `scheduler.max_polecats` capacity; queued work preserves explicit `--agent`
+  assignments recorded in the sling-context fields.
+- **External dropins** (e.g. `gt-model-mix-maintainer.py`,
+  `gt-mayor-autonudge.sh`) wrap the town-wide fleet fill when a strict
+  per-model cap is required; they reconcile live lane counts *town-wide*
+  before picking the next model. See `internal/fleet/mix.go` for the
+  canonical choose-agent algorithm and its regression tests.
+
+Witness must not run `gt sling`, dispatch new work across rigs, or alter the
+model mix. If a town-wide ready work + free capacity condition persists and
+the autonudge has not surfaced it, Witness should escalate to Mayor with the
+diagnostics (`gt scheduler status --json`, `gt polecat list --all --json`)
+rather than attempt dispatch itself.
