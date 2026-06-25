@@ -1,8 +1,11 @@
 package daemon
 
 import (
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -202,5 +205,107 @@ func TestIsGitWorktree(t *testing.T) {
 	}
 	if !isGitWorktree(fileGit) {
 		t.Error(".git file (linked worktree) should count as worktree")
+	}
+}
+
+// checkpointTestRepo creates a temporary git repository with an initial commit
+// on a branch named "main" and a remote "origin" pointing to a bare repo.
+func checkpointTestRepo(t *testing.T) (workDir string, polecatName string) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	polecatName = "opal"
+	bareDir := filepath.Join(tmpDir, "origin.git")
+	workDir = filepath.Join(tmpDir, "work")
+
+	runCheckpointCmd(t, tmpDir, "git", "init", "--bare", "--initial-branch=main", bareDir)
+	runCheckpointCmd(t, tmpDir, "git", "clone", bareDir, workDir)
+	runCheckpointCmd(t, workDir, "git", "config", "user.email", "test@test.com")
+	runCheckpointCmd(t, workDir, "git", "config", "user.name", "Test")
+	runCheckpointCmd(t, workDir, "git", "checkout", "-b", "main")
+	checkpointWriteFile(t, workDir, "README.md", "# Test\n")
+	runCheckpointCmd(t, workDir, "git", "add", ".")
+	runCheckpointCmd(t, workDir, "git", "commit", "-m", "initial commit")
+	runCheckpointCmd(t, workDir, "git", "push", "-u", "origin", "main")
+	return workDir, polecatName
+}
+
+func runCheckpointCmd(t *testing.T, dir string, name string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("command %s %v failed: %v\n%s", name, args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func checkpointWriteFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkpointHeadBranch(t *testing.T, workDir string) string {
+	t.Helper()
+	return runCheckpointCmd(t, workDir, "git", "rev-parse", "--abbrev-ref", "HEAD")
+}
+
+func checkpointHeadMessage(t *testing.T, workDir string) string {
+	t.Helper()
+	return runCheckpointCmd(t, workDir, "git", "log", "-1", "--format=%s")
+}
+
+func TestCheckpointWorktree_OnDefaultBranch_LandsOnWIPBranch(t *testing.T) {
+	workDir, polecatName := checkpointTestRepo(t)
+
+	d := &Daemon{logger: log.New(os.Stdout, "", 0)}
+
+	// Dirty the worktree while on main.
+	checkpointWriteFile(t, workDir, "feature.go", "package main\n")
+
+	if got := checkpointHeadBranch(t, workDir); got != "main" {
+		t.Fatalf("expected to start on main, got %q", got)
+	}
+
+	if !d.checkpointWorktree(workDir, "gastown", polecatName) {
+		t.Fatal("expected checkpoint to be created")
+	}
+
+	// The checkpoint must have moved to wip/<polecat>.
+	if got := checkpointHeadBranch(t, workDir); got != "wip/opal" {
+		t.Errorf("expected branch wip/opal, got %q", got)
+	}
+	if msg := checkpointHeadMessage(t, workDir); msg != "WIP: checkpoint (auto)" {
+		t.Errorf("expected WIP checkpoint message, got %q", msg)
+	}
+
+	// main must remain clean (no WIP commit on it).
+	runCheckpointCmd(t, workDir, "git", "checkout", "main")
+	if msg := checkpointHeadMessage(t, workDir); msg != "initial commit" {
+		t.Errorf("main was polluted by WIP commit; got message %q", msg)
+	}
+}
+
+func TestCheckpointWorktree_OnFeatureBranch_KeepsCurrentBranch(t *testing.T) {
+	workDir, polecatName := checkpointTestRepo(t)
+
+	d := &Daemon{logger: log.New(os.Stdout, "", 0)}
+
+	// Create and switch to a feature branch.
+	runCheckpointCmd(t, workDir, "git", "checkout", "-b", "polecat/opal/gastown-vi6@test")
+	checkpointWriteFile(t, workDir, "feature.go", "package main\n")
+
+	if !d.checkpointWorktree(workDir, "gastown", polecatName) {
+		t.Fatal("expected checkpoint to be created")
+	}
+
+	// The checkpoint should stay on the existing feature branch.
+	if got := checkpointHeadBranch(t, workDir); got != "polecat/opal/gastown-vi6@test" {
+		t.Errorf("expected to stay on feature branch, got %q", got)
+	}
+	if msg := checkpointHeadMessage(t, workDir); msg != "WIP: checkpoint (auto)" {
+		t.Errorf("expected WIP checkpoint message, got %q", msg)
 	}
 }

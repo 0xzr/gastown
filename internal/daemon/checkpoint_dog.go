@@ -48,6 +48,11 @@ var runtimeExcludeDirs = []string{
 	"__pycache__/",
 }
 
+// wipBranchPrefix is the local ref namespace used when a polecat's worktree
+// is on the default branch. Auto-checkpoints must never land on the default
+// branch, so we commit to wip/<polecat> instead.
+const wipBranchPrefix = "wip/"
+
 // runCheckpointDog auto-commits WIP changes in active polecat worktrees.
 // This protects against data loss when sessions crash or hit context limits.
 //
@@ -133,6 +138,79 @@ func (d *Daemon) checkpointRigPolecats(rigName string) (int, int) {
 	return scanned, checkpointed
 }
 
+// checkpointDefaultBranch resolves the repository's default branch, preferring
+// the remote's HEAD and falling back to main/master. Returns "" when no
+// default branch can be determined (e.g., a test repo with no origin).
+func checkpointDefaultBranch(workDir string) string {
+	if out, err := runGitCmd(workDir, "symbolic-ref", "refs/remotes/origin/HEAD"); err == nil && out != "" {
+		parts := strings.Split(out, "/")
+		if len(parts) > 0 {
+			return parts[len(parts)-1]
+		}
+	}
+	for _, candidate := range []string{"main", "master"} {
+		if _, err := runGitCmd(workDir, "rev-parse", "--verify", "origin/"+candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// checkpointCurrentBranch returns the current branch name, or "" if it cannot
+// be resolved (e.g., detached HEAD without a branch name).
+func checkpointCurrentBranch(workDir string) string {
+	out, err := runGitCmd(workDir, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+// checkpointWIPBranchName returns the feature branch used for auto-checkpoints
+// when the polecat is on the default branch.
+func checkpointWIPBranchName(polecatName string) string {
+	return wipBranchPrefix + polecatName
+}
+
+// isProtectedCheckpointBranch reports whether branch is the repository default
+// branch on which WIP checkpoints are forbidden.
+func isProtectedCheckpointBranch(workDir, branch string) bool {
+	if branch == "" {
+		return false
+	}
+	defaultBranch := checkpointDefaultBranch(workDir)
+	return defaultBranch != "" && branch == defaultBranch
+}
+
+// ensureCheckpointBranch returns the branch that should receive the WIP
+// checkpoint. If the worktree is on the default branch, it creates/resets and
+// switches to wip/<polecatName> so the checkpoint cannot land on main. If the
+// worktree is already on a feature branch, that branch is returned unchanged.
+func (d *Daemon) ensureCheckpointBranch(workDir, polecatName string) (string, error) {
+	current := checkpointCurrentBranch(workDir)
+	if current == "" {
+		return "", fmt.Errorf("could not determine current branch")
+	}
+	if !isProtectedCheckpointBranch(workDir, current) {
+		return current, nil
+	}
+
+	defaultBranch := checkpointDefaultBranch(workDir)
+	if defaultBranch == "" {
+		return "", fmt.Errorf("could not determine default branch")
+	}
+
+	wip := checkpointWIPBranchName(polecatName)
+	// Create or reset the WIP branch to the current default branch tip and
+	// switch to it. Using -B keeps the staged changes intact while guaranteeing
+	// the branch is at the same commit as the default branch, so the checkout
+	// cannot conflict with the worktree contents.
+	if _, err := runGitCmd(workDir, "checkout", "-B", wip, defaultBranch); err != nil {
+		return "", fmt.Errorf("checkout -B %s %s: %w", wip, defaultBranch, err)
+	}
+	return wip, nil
+}
+
 // checkpointWorktree creates a WIP checkpoint commit for a single worktree.
 // Returns true if a checkpoint was created.
 func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
@@ -179,13 +257,22 @@ func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 		return false
 	}
 
+	// Never commit a WIP checkpoint directly to the default branch. If the
+	// polecat is on main (or master), move to a dedicated wip/<polecat>
+	// feature branch first.
+	commitBranch, err := d.ensureCheckpointBranch(workDir, polecatName)
+	if err != nil {
+		d.logger.Printf("checkpoint_dog: refusing to commit on default branch in %s/%s: %v", rigName, polecatName, err)
+		return false
+	}
+
 	// Commit the checkpoint
 	if _, err := runGitCmd(workDir, "commit", "-m", "WIP: checkpoint (auto)"); err != nil {
 		d.logger.Printf("checkpoint_dog: git commit failed in %s/%s: %v", rigName, polecatName, err)
 		return false
 	}
 
-	d.logger.Printf("checkpoint_dog: created WIP checkpoint in %s/%s", rigName, polecatName)
+	d.logger.Printf("checkpoint_dog: created WIP checkpoint in %s/%s on branch %s", rigName, polecatName, commitBranch)
 	return true
 }
 

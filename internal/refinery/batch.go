@@ -149,6 +149,22 @@ func (e *Engineer) BuildRebaseStack(ctx context.Context, batch []*MRInfo, target
 
 		// Squash-merge this MR onto the stack
 		msg := e.getMergeMessage(mr)
+		if isWIPCommitMessage(msg) {
+			_, _ = fmt.Fprintf(e.output, "[Batch] MR %s: rejected WIP commit message %q, removing from batch\n", mr.ID, strings.TrimSpace(msg))
+			conflicts = append(conflicts, mr)
+
+			// Reset to base and rebuild stack without this MR
+			if resetErr := e.git.ResetHard(baseSHA); resetErr != nil {
+				return nil, nil, fmt.Errorf("reset after WIP convention check: %w", resetErr)
+			}
+			for _, prev := range stacked {
+				prevMsg := e.getMergeMessage(prev)
+				if rebuildErr := e.git.MergeSquash(prev.Branch, prevMsg); rebuildErr != nil {
+					return nil, nil, fmt.Errorf("rebuild stack for %s: %w", prev.ID, rebuildErr)
+				}
+			}
+			continue
+		}
 		if mergeErr := e.git.MergeSquash(mr.Branch, msg); mergeErr != nil {
 			_, _ = fmt.Fprintf(e.output, "[Batch] MR %s: merge failed: %v, removing from batch\n", mr.ID, mergeErr)
 			conflicts = append(conflicts, mr)
@@ -308,6 +324,10 @@ func (e *Engineer) processSingleMR(ctx context.Context, mr *MRInfo, target strin
 	} else if processResult.BranchNotFound {
 		// Branch not found on remote — escalate to mayor via HandleMRInfoFailure (gas-556).
 		e.HandleMRInfoFailure(mr, processResult)
+		result.Conflicts = []*MRInfo{mr}
+	} else if processResult.ConventionFailed {
+		// Convention check failed (e.g., WIP commit message). Treat as a queue
+		// conflict so the MR is removed from the ready queue without polluting main.
 		result.Conflicts = []*MRInfo{mr}
 	} else if processResult.NoMerge {
 		// Source issue has no_merge flag — intentionally blocked. Dequeue silently.

@@ -117,8 +117,8 @@ type gateSurface struct {
 
 // SurfaceScope values for GateConfig.SurfaceScope.
 const (
-	SurfaceScopeDisabled    = "disabled"
-	SurfaceScopeGoPackages  = "go-packages"
+	SurfaceScopeDisabled   = "disabled"
+	SurfaceScopeGoPackages = "go-packages"
 )
 
 // MergeQueueConfig holds configuration for the merge queue processor.
@@ -565,6 +565,26 @@ type ProcessResult struct {
 	// AuditBead is the ID of a follow-up audit task recorded for degraded-quorum
 	// or reviewer-unavailability cases.
 	AuditBead string
+
+	// ConventionFailed is true when the branch's commit message violates the
+	// repo convention (e.g., starts with "WIP:"). It is treated as a queue
+	// conflict rather than a build/test failure so the MR is removed from the
+	// ready queue without polluting the target branch.
+	ConventionFailed bool
+}
+
+// isWIPCommitMessage reports whether a commit message is a work-in-progress
+// checkpoint marker. Such commits must never be squash-merged to the default
+// branch; they should live only on feature branches until the agent replaces
+// them with a conventional commit.
+func isWIPCommitMessage(msg string) bool {
+	first := strings.TrimSpace(msg)
+	if idx := strings.IndexAny(first, "\r\n"); idx >= 0 {
+		first = first[:idx]
+	}
+	first = strings.TrimSpace(first)
+	upper := strings.ToUpper(first)
+	return strings.HasPrefix(upper, "WIP:") || strings.HasPrefix(upper, "WIP ")
 }
 
 // doMerge performs the actual git merge operation.
@@ -715,6 +735,20 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 		}
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not get original commit message: %v\n", err)
 	}
+
+	// Convention check: WIP checkpoint commits are not allowed to land on the
+	// default branch. The checkpoint_dog should keep them on feature branches,
+	// but if one reaches the merge queue we reject it here rather than polluting
+	// the target branch's history.
+	if isWIPCommitMessage(originalMsg) {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Rejecting %s: commit message %q starts with WIP — WIP commits may not land on %s\n", branch, strings.TrimSpace(originalMsg), target)
+		return ProcessResult{
+			Success:          false,
+			ConventionFailed: true,
+			Error:            fmt.Sprintf("convention check failed: WIP commit message on %s may not be merged to %s", branch, target),
+		}
+	}
+
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Squash merging with message: %s\n", strings.TrimSpace(originalMsg))
 	if err := e.git.MergeSquash(branch, originalMsg); err != nil {
 		// ZFC: Use git's porcelain output to detect conflicts instead of parsing stderr.

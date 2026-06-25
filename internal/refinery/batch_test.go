@@ -69,6 +69,16 @@ func createConflictingBranch(t *testing.T, workDir, branchName, filename, conten
 	run(t, workDir, "git", "checkout", "main")
 }
 
+// createWIPBranch creates a branch whose HEAD commit has a WIP checkpoint message.
+func createWIPBranch(t *testing.T, workDir, branchName, filename, content string) {
+	t.Helper()
+	run(t, workDir, "git", "checkout", "-b", branchName, "main")
+	writeFile(t, workDir, filename, content)
+	run(t, workDir, "git", "add", ".")
+	run(t, workDir, "git", "commit", "-m", "WIP: checkpoint (auto)")
+	run(t, workDir, "git", "checkout", "main")
+}
+
 func run(t *testing.T, dir string, name string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command(name, args...)
@@ -395,6 +405,34 @@ func TestProcessBatch_SingleMR_Success(t *testing.T) {
 	}
 	if result.MergeCommit == "" {
 		t.Error("expected merge commit SHA")
+	}
+}
+
+func TestProcessBatch_SingleMR_WIPCommitRejected(t *testing.T) {
+	workDir, g, cleanup := testGitRepo(t)
+	defer cleanup()
+
+	createWIPBranch(t, workDir, "wip-feature", "a.txt", "hello a\n")
+
+	e := newTestEngineer(t, workDir, g)
+	batch := []*MRInfo{makeMR("mr-wip", "wip-feature", "main")}
+
+	result := e.ProcessBatch(context.Background(), batch, "main", DefaultBatchConfig())
+	if result.Error != nil {
+		t.Fatalf("unexpected batch error: %v", result.Error)
+	}
+	if len(result.Merged) != 0 {
+		t.Errorf("expected 0 merged WIP MRs, got %d", len(result.Merged))
+	}
+	if len(result.Conflicts) != 1 || result.Conflicts[0].ID != "mr-wip" {
+		t.Errorf("expected mr-wip in conflicts, got %v", stackedIDs(result.Conflicts))
+	}
+
+	// main must remain clean (no WIP commit on it).
+	run(t, workDir, "git", "checkout", "main")
+	msg := run(t, workDir, "git", "log", "-1", "--format=%s")
+	if msg != "initial commit" {
+		t.Errorf("main was polluted by WIP commit; got message %q", msg)
 	}
 }
 
