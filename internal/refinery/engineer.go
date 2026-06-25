@@ -571,6 +571,14 @@ type ProcessResult struct {
 	// conflict rather than a build/test failure so the MR is removed from the
 	// ready queue without polluting the target branch.
 	ConventionFailed bool
+
+	// PublishedCommit is the SHA that has been verified to be reachable from the
+	// configured upstream (e.g., origin/main). It is set only when the refinery
+	// itself performed the push and verified it; for local-only merges
+	// (auto_push=false) or file-remote merges where upstream did not advance,
+	// this field remains empty. Consumers (HandleMRInfoSuccess) use it to decide
+	// whether the source bead may be closed.
+	PublishedCommit string
 }
 
 // isWIPCommitMessage reports whether a commit message is a work-in-progress
@@ -853,10 +861,18 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	}
 
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Successfully merged: %s\n", shortSHA(mergeCommit))
-	return ProcessResult{
+
+	result := ProcessResult{
 		Success:     true,
 		MergeCommit: mergeCommit,
 	}
+	// If auto_push was enabled and the push was verified, the merge commit is
+	// durably published to the configured upstream. Record that so the source
+	// bead close path can distinguish published merges from local-only merges.
+	if e.config.AutoPush {
+		result.PublishedCommit = mergeCommit
+	}
+	return result
 }
 
 // doMergePR handles merging via the VCS provider's PR merge API (merge_strategy=pr).
@@ -984,10 +1000,11 @@ func (e *Engineer) finishPRMerge(prNumber int, branch, target string, degradedQu
 
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Successfully merged PR #%d: %s\n", prNumber, shortSHA(mergeCommit))
 	return ProcessResult{
-		Success:        true,
-		MergeCommit:    mergeCommit,
-		DegradedQuorum: degradedQuorum,
-		AuditBead:      auditBead,
+		Success:         true,
+		MergeCommit:     mergeCommit,
+		DegradedQuorum:  degradedQuorum,
+		AuditBead:       auditBead,
+		PublishedCommit: mergeCommit,
 	}
 }
 
@@ -1542,23 +1559,42 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Released merge slot\n")
 	}
 
-	// Update and close the MR bead
+	// Update and close the MR bead. Track whether the merged state is safe to
+	// report as shipped, which determines whether the source bead may be closed
+	// (hq-6sdu). A merge is published only when the refinery itself verified the
+	// commit on the configured upstream.
+	canCloseSource := false
+	var updatedMRBead *beads.Issue
 	if mr.ID != "" {
 		// Fetch the MR bead to update its fields
 		mrBead, err := e.beads.Show(mr.ID)
 		if err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to fetch MR bead %s: %v\n", mr.ID, err)
 		} else {
-			// Update MR with merge_commit SHA and close_reason
+			// Update MR with merge_commit SHA, close_reason, and publication state.
 			mrFields := beads.ParseMRFields(mrBead)
 			if mrFields == nil {
 				mrFields = &beads.MRFields{}
 			}
 			mrFields.MergeCommit = result.MergeCommit
 			mrFields.CloseReason = "merged"
+			if result.PublishedCommit != "" {
+				mrFields.PublishedCommit = result.PublishedCommit
+				mrFields.PublishedRemote = "origin"
+				mrFields.PublishedAt = time.Now().UTC().Format(time.RFC3339)
+				mrFields.TerminalState = beads.MRTerminalPublished
+			} else {
+				mrFields.TerminalState = beads.MRTerminalMergedLocalNotPublished
+			}
 			newDesc := beads.SetMRFields(mrBead, mrFields)
 			if err := e.beads.Update(mr.ID, beads.UpdateOptions{Description: &newDesc}); err != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to update MR %s with merge commit: %v\n", mr.ID, err)
+			} else {
+				// Keep the in-memory representation in sync with what we wrote so
+				// classification below is authoritative even if a subsequent Show
+				// returns --allow-stale data.
+				mrBead.Description = newDesc
+				updatedMRBead = mrBead
 			}
 		}
 
@@ -1567,6 +1603,13 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close MR %s: %v\n", mr.ID, err)
 		} else {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Closed MR bead: %s\n", mr.ID)
+			// Classify using the in-memory updated bead to avoid races with
+			// --allow-stale reads from Dolt immediately after a write.
+			if updatedMRBead != nil {
+				closedMR := *updatedMRBead
+				closedMR.Status = "closed"
+				canCloseSource = beads.CanCloseSourceBead(&closedMR)
+			}
 		}
 	}
 
@@ -1575,25 +1618,29 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 	// may have an attached molecule (wisp) whose open steps would block a
 	// normal close. This matches how gt done handles closures.
 	if mr.SourceIssue != "" {
-		closeReason := fmt.Sprintf("Merged in %s", mr.ID)
-		if result.MergeCommit != "" {
-			closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, result.MergeCommit)
-		}
-		if result.DegradedQuorum {
-			closeReason = fmt.Sprintf("%s\nreview_state: degraded_quorum", closeReason)
-			if result.AuditBead != "" {
-				closeReason = fmt.Sprintf("%s\naudit_bead: %s", closeReason, result.AuditBead)
-			}
-		}
-		if err := e.beads.ForceCloseWithReason(closeReason, mr.SourceIssue); err != nil {
-			// Check if already closed (by polecat's gt done) — that's fine
-			if issue, showErr := e.beads.Show(mr.SourceIssue); showErr == nil && beads.IssueStatus(issue.Status).IsTerminal() {
-				_, _ = fmt.Fprintf(e.output, "[Engineer] Source issue already closed: %s\n", mr.SourceIssue)
-			} else {
-				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close source issue %s: %v\n", mr.SourceIssue, err)
-			}
+		if !canCloseSource {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Merge not yet published — leaving source issue open: %s\n", mr.SourceIssue)
 		} else {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Closed source issue: %s\n", mr.SourceIssue)
+			closeReason := fmt.Sprintf("Merged in %s", mr.ID)
+			if result.MergeCommit != "" {
+				closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, result.MergeCommit)
+			}
+			if result.DegradedQuorum {
+				closeReason = fmt.Sprintf("%s\nreview_state: degraded_quorum", closeReason)
+				if result.AuditBead != "" {
+					closeReason = fmt.Sprintf("%s\naudit_bead: %s", closeReason, result.AuditBead)
+				}
+			}
+			if err := e.beads.ForceCloseWithReason(closeReason, mr.SourceIssue); err != nil {
+				// Check if already closed (by polecat's gt done) — that's fine
+				if issue, showErr := e.beads.Show(mr.SourceIssue); showErr == nil && beads.IssueStatus(issue.Status).IsTerminal() {
+					_, _ = fmt.Fprintf(e.output, "[Engineer] Source issue already closed: %s\n", mr.SourceIssue)
+				} else {
+					_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close source issue %s: %v\n", mr.SourceIssue, err)
+				}
+			} else {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Closed source issue: %s\n", mr.SourceIssue)
+			}
 		}
 	}
 
