@@ -476,3 +476,222 @@ func TestCloseConsultBead_AllowsOpen(t *testing.T) {
 		t.Fatalf("CloseConsultBead on open consult: %v", err)
 	}
 }
+
+// statefulStubBd installs a bd stub on PATH that emulates just enough of the
+// real bd for the close-race regression tests:
+//
+//   - "show <id> --json": returns the consult bead whose description is the
+//     current contents of descPath (initial: initialDesc), so successive
+//     CloseConsultBead calls observe the description as the prior call wrote it.
+//   - "update <id> --body-file=- ...": reads the new description from stdin and
+//     persists it to descPath (the state the next show reflects).
+//   - "close <id> ...": fails (exit 1, stderr "simulated close failure") on the
+//     first close attempt and succeeds (exit 0) on every subsequent one,
+//     emulating a transient bd close failure (network blip / lock / Dolt retry)
+//     followed by recovery.
+//
+// Other invocations (e.g. the --allow-stale version probe) exit 0 with minimal
+// output so capability detection and JSON parsing succeed.
+func statefulStubBd(t *testing.T, descPath, initialDesc string) {
+	t.Helper()
+	installStatefulStubBd(t, descPath, initialDesc, stubCloseFailsFirst)
+}
+
+// failingUpdateStubBd is like statefulStubBd but the close always succeeds;
+// instead the "update" subcommand fails on the first call and succeeds
+// thereafter. Used to verify the close-first ordering survives a failed
+// description Update after a successful close (bd close is idempotent, so the
+// retry re-closes as a no-op and the second Update advances the state).
+func failingUpdateStubBd(t *testing.T, descPath, initialDesc string) {
+	t.Helper()
+	installStatefulStubBd(t, descPath, initialDesc, stubUpdateFailsFirst)
+}
+
+type stubFailMode int
+
+const (
+	stubCloseFailsFirst stubFailMode = iota
+	stubUpdateFailsFirst
+)
+
+// installStatefulStubBd writes the stub script. The failMode selects which
+// subcommand fails once then succeeds thereafter.
+func installStatefulStubBd(t *testing.T, descPath, initialDesc string, mode stubFailMode) {
+	t.Helper()
+	if err := os.WriteFile(descPath, []byte(initialDesc), 0644); err != nil {
+		t.Fatalf("write initial stub desc: %v", err)
+	}
+	closeFail := "0"
+	updateFail := "0"
+	if mode == stubCloseFailsFirst {
+		closeFail = "1"
+	} else {
+		updateFail = "1"
+	}
+	stubScript := `#!/bin/sh
+# Drain stdin (used by --body-file=-) to a temp file so update can persist it.
+stdin_tmp="$(mktemp)"
+cat > "$stdin_tmp"
+
+# First non-flag arg is the subcommand (skip --allow-stale injected by harness).
+sub=""
+for a in "$@"; do
+  case "$a" in
+    --*) continue ;;
+    *) sub="$a"; break ;;
+  esac
+done
+
+case "$sub" in
+  version)
+    echo "bd stub 1.0"
+    exit 0
+    ;;
+  show)
+    # jq -Rs . reads the description file and emits a JSON string literal
+    # (with surrounding quotes), correctly escaping every special character.
+    quoted="$(jq -Rs . < ` + descPath + `)"
+    printf '%s\n' '[{"id":"gt-stub","title":"q","status":"open","priority":2,"type":"task","labels":["gt:consult"],"description":'"$quoted"'}]'
+    exit 0
+    ;;
+  update)
+    count="` + descPath + `.updcount"
+    n=0
+    if [ -f "$count" ]; then n="$(cat "$count")"; fi
+    n=$((n + 1))
+    echo "$n" > "$count"
+    if [ "` + updateFail + `" = "1" ] && [ "$n" -eq 1 ]; then
+      echo "simulated update failure" 1>&2
+      exit 1
+    fi
+    cp "$stdin_tmp" ` + descPath + `
+    echo '{"id":"gt-stub","title":"q","status":"open","priority":2,"type":"task","labels":["gt:consult"]}'
+    exit 0
+    ;;
+  close)
+    count="` + descPath + `.closecount"
+    n=0
+    if [ -f "$count" ]; then n="$(cat "$count")"; fi
+    n=$((n + 1))
+    echo "$n" > "$count"
+    if [ "` + closeFail + `" = "1" ] && [ "$n" -eq 1 ]; then
+      echo "simulated close failure" 1>&2
+      exit 1
+    fi
+    echo "closed"
+    exit 0
+    ;;
+  *)
+    echo '{"id":"gt-stub","title":"q","status":"open","priority":2,"type":"task","labels":["gt:consult"]}'
+    exit 0
+    ;;
+esac
+`
+	stubDir := t.TempDir()
+	stubPath := filepath.Join(stubDir, "bd")
+	if err := os.WriteFile(stubPath, []byte(stubScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ResetBdAllowStaleCacheForTest()
+}
+
+// TestCloseConsultBead_CloseFailThenRetrySucceeds is the regression test for
+// gastown-f6w (shard-E finding, commit 6faf2e93): CloseConsultBead previously
+// persisted state=closed into the description BEFORE running bd close. When bd
+// close failed, the description already recorded state=closed, so a retry hit
+// the "already closed" state guard and was rejected — leaving the consult
+// permanently open.
+//
+// With the close-first-then-update ordering, a failed close does not advance
+// the description state, so a retry reaches the close path again and succeeds.
+func TestCloseConsultBead_CloseFailThenRetrySucceeds(t *testing.T) {
+	descPath := filepath.Join(t.TempDir(), "desc.txt")
+	statefulStubBd(t, descPath, renderConsultDesc(consult.StateOpen))
+
+	b := New(t.TempDir())
+
+	// First close attempt: bd close fails. CloseConsultBead must surface the
+	// error AND must NOT have advanced the description to state=closed.
+	firstErr := b.CloseConsultBead("gt-stub", "mayor", "acted", nil)
+	if firstErr == nil {
+		t.Fatalf("first CloseConsultBead: expected error from simulated close failure, got nil")
+	}
+	if !strings.Contains(firstErr.Error(), "close") && !strings.Contains(firstErr.Error(), "simulated") {
+		t.Errorf("first CloseConsultBead error should reflect close failure, got %v", firstErr)
+	}
+
+	// The description must still be open: the failed close must not have written
+	// state=closed (the race that left consults permanently stuck).
+	descAfterFirstFail, err := os.ReadFile(descPath)
+	if err != nil {
+		t.Fatalf("read desc after first failure: %v", err)
+	}
+	if !strings.Contains(string(descAfterFirstFail), "state: open") {
+		t.Fatalf("after a failed close the description must still be open, got:\n%s", string(descAfterFirstFail))
+	}
+
+	// Second close attempt (the retry): bd close now succeeds and the
+	// description is advanced to state=closed. This is the path that was
+	// previously rejected by the "already closed" guard.
+	if err := b.CloseConsultBead("gt-stub", "mayor", "acted", nil); err != nil {
+		t.Fatalf("retry CloseConsultBead after a prior close failure: expected success, got %v", err)
+	}
+
+	// Verify the description was advanced to closed by the successful retry.
+	descAfterRetry, err := os.ReadFile(descPath)
+	if err != nil {
+		t.Fatalf("read desc after retry: %v", err)
+	}
+	if !strings.Contains(string(descAfterRetry), "state: closed") {
+		t.Errorf("after a successful retry the description must record state=closed, got:\n%s", string(descAfterRetry))
+	}
+}
+
+// TestCloseConsultBead_UpdateFailsAfterCloseSuccessKeepsRetryable verifies the
+// other half of the close-first ordering: when bd close succeeds but the
+// subsequent description Update fails, a retry must still succeed (bd close is
+// idempotent, so re-closing is a no-op and the second Update advances the
+// state). This guards against regressing the ordering back to update-first,
+// where a failed Update after a successful close would leave the bead closed in
+// bd's status but missing the state=closed metadata — and a naive re-add of a
+// state guard would then reject the retry.
+func TestCloseConsultBead_UpdateFailsAfterCloseSuccessKeepsRetryable(t *testing.T) {
+	descPath := filepath.Join(t.TempDir(), "desc.txt")
+	// A stub whose update fails on the first call and succeeds thereafter; the
+	// close always succeeds (so the only first-attempt failure is the Update).
+	failingUpdateStubBd(t, descPath, renderConsultDesc(consult.StateOpen))
+
+	b := New(t.TempDir())
+
+	// First attempt: close succeeds, Update fails.
+	firstErr := b.CloseConsultBead("gt-stub", "mayor", "acted", nil)
+	if firstErr == nil {
+		t.Fatalf("first CloseConsultBead: expected Update failure, got nil")
+	}
+
+	// The description must NOT have advanced to closed: the failed Update left
+	// the prior (open) description in place.
+	descAfterFirst, err := os.ReadFile(descPath)
+	if err != nil {
+		t.Fatalf("read desc after first failure: %v", err)
+	}
+	if !strings.Contains(string(descAfterFirst), "state: open") {
+		t.Fatalf("after a failed Update the description must still be open, got:\n%s", string(descAfterFirst))
+	}
+
+	// Retry must succeed even though the prior close already landed (bd close is
+	// idempotent, so the re-close is a no-op and the second Update advances the
+	// state).
+	if err := b.CloseConsultBead("gt-stub", "mayor", "acted", nil); err != nil {
+		t.Fatalf("retry CloseConsultBead after prior Update failure: expected success, got %v", err)
+	}
+
+	descAfterRetry, err := os.ReadFile(descPath)
+	if err != nil {
+		t.Fatalf("read desc after retry: %v", err)
+	}
+	if !strings.Contains(string(descAfterRetry), "state: closed") {
+		t.Errorf("after a successful retry the description must record state=closed, got:\n%s", string(descAfterRetry))
+	}
+}

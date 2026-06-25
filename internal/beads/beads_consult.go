@@ -334,6 +334,16 @@ func (b *Beads) RecordConsultAnswer(id string, resp *consult.Response) error {
 // re-closed (re-closing would overwrite the original closer/reason and, via
 // the mirrored note, append a second close record to the source bead). An
 // open or answered consult may be closed.
+//
+// Ordering: the bd close is issued BEFORE the description is rewritten to
+// state=closed. If the close fails (network blip, lock contention, Dolt
+// retry) the description still records a non-closed state, so a retry of
+// CloseConsultBead passes the state guard and reaches the close path again
+// instead of being rejected as "already closed" (which would leave the
+// consult permanently open). bd close is idempotent — re-closing a bead the
+// close already succeeded on returns no error — so re-running close on the
+// retry (when the earlier close succeeded but the subsequent Update failed)
+// also converges cleanly.
 func (b *Beads) CloseConsultBead(id, closedBy, closedReason string, resp *consult.Response) error {
 	issue, err := b.GetConsultBeadIssue(id)
 	if err != nil {
@@ -346,6 +356,12 @@ func (b *Beads) CloseConsultBead(id, closedBy, closedReason string, resp *consul
 	if fields.State == consult.StateClosed {
 		return fmt.Errorf("consult %s: already closed", id)
 	}
+	target := b.forIssueID(id)
+	if _, err := target.run("close", id, "--reason="+closedReason); err != nil {
+		// Close failed: do NOT advance the description state. Leave the
+		// bead open/answered so a retry reaches this path again.
+		return err
+	}
 	fields.State = consult.StateClosed
 	fields.ClosedBy = closedBy
 	fields.ClosedReason = closedReason
@@ -357,15 +373,10 @@ func (b *Beads) CloseConsultBead(id, closedBy, closedReason string, resp *consul
 		fields.Confidence = resp.Confidence
 	}
 	description := FormatConsultDescription(issue.Title, fields)
-	target := b.forIssueID(id)
-	if err := target.Update(id, UpdateOptions{
+	return target.Update(id, UpdateOptions{
 		Description: &description,
 		AddLabels:   []string{"consult:closed", "resolved"},
-	}); err != nil {
-		return err
-	}
-	_, err = target.run("close", id, "--reason="+closedReason)
-	return err
+	})
 }
 
 // MirrorConsultResultOnSource writes a compact consult_decision notes line
