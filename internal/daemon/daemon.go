@@ -134,6 +134,13 @@ type Daemon struct {
 	// mayorCriticalMailLastNotified throttles repeated critical-mail alerts.
 	mayorCriticalMailLastNotified time.Time
 
+	// startedAt is when this daemon process started. Heartbeats on disk with
+	// a timestamp older than startedAt are treated as from-before-resume, so
+	// their staleness is an artifact of daemon downtime rather than evidence
+	// of a stuck Mayor. Set in Run().
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	startedAt time.Time
+
 	// witnessZombieCount tracks consecutive patrol cycles where the Witness
 	// heartbeat is missing OR the supervisor signals the Witness should be
 	// restarted (saturated + stalled). A count >= 3 triggers a supervised
@@ -507,6 +514,7 @@ func (d *Daemon) Run() (err error) {
 		PID:       os.Getpid(),
 		StartedAt: time.Now(),
 	}
+	d.startedAt = state.StartedAt
 	if err := SaveState(d.config.TownRoot, state); err != nil {
 		d.logger.Printf("Warning: failed to save state: %v", err)
 	}
@@ -1970,46 +1978,38 @@ func (d *Daemon) ensureMayorRunning() {
 			// Pass 0 to skip tmux activity checking — a Mayor sitting idle at the
 			// prompt waiting for work is still healthy.
 			status := mgr.IsHealthy(0)
-			if status != tmux.SessionHealthy {
-				d.mayorZombieCount++
-				d.logger.Printf("Mayor not healthy (status=%s, cycle %d/3)", status.String(), d.mayorZombieCount)
-				if d.mayorZombieCount >= 3 {
-					d.restartMayor(mgr, cfg, fmt.Sprintf("mayor %s for %d consecutive cycles", status.String(), d.mayorZombieCount))
-				}
-				return
-			}
-
-			// Secondary liveness: heartbeat. The daemon writes heartbeats every
-			// patrol cycle. A missing heartbeat on an otherwise healthy session is
-			// treated as an initial heartbeat write; only a very stale heartbeat
-			// indicates the supervision path itself is stuck.
 			hb := mayor.ReadHeartbeat(townRoot)
 			veryStaleThreshold := cfg.HeartbeatVeryStaleThresholdD()
-			if hb == nil {
-				d.mayorZombieCount = 0
-				if hbErr := mayor.Touch(townRoot, "patrol-check", tmux.SessionHealthy.String()); hbErr != nil {
-					d.logger.Printf("Warning: could not write initial Mayor heartbeat: %v", hbErr)
-				}
-				d.checkMayorNudgePoller(mgr)
-				d.checkMayorCriticalMail(cfg)
-				return
-			}
-			if hb.IsVeryStale(veryStaleThreshold) {
+			action := evaluateMayorHealth(status, hb, veryStaleThreshold, d.startedAt)
+
+			switch action {
+			case mayorHealthActionZombie:
 				d.mayorZombieCount++
-				reason := fmt.Sprintf("heartbeat very stale (age=%v)", hb.Age())
+				reason := mayorUnhealthReason(status, hb)
 				d.logger.Printf("Mayor not healthy (%s, cycle %d/3)", reason, d.mayorZombieCount)
 				if d.mayorZombieCount >= 3 {
 					d.restartMayor(mgr, cfg, fmt.Sprintf("mayor %s for %d consecutive cycles", reason, d.mayorZombieCount))
 				}
-				return
+			case mayorHealthActionRefresh:
+				d.mayorZombieCount = 0
+				if hb != nil {
+					d.logger.Printf("Refreshing stale Mayor heartbeat on daemon resume (age=%v)", hb.Age())
+				} else {
+					d.logger.Println("Writing initial Mayor heartbeat")
+				}
+				if hbErr := mayor.Touch(townRoot, "resume-refresh", tmux.SessionHealthy.String()); hbErr != nil {
+					d.logger.Printf("Warning: could not write Mayor heartbeat: %v", hbErr)
+				}
+				d.checkMayorNudgePoller(mgr)
+				d.checkMayorCriticalMail(cfg)
+			case mayorHealthActionIdle:
+				d.mayorZombieCount = 0
+				if hbErr := mayor.Touch(townRoot, "patrol-check", tmux.SessionHealthy.String()); hbErr != nil {
+					d.logger.Printf("Warning: could not write Mayor heartbeat: %v", hbErr)
+				}
+				d.checkMayorNudgePoller(mgr)
+				d.checkMayorCriticalMail(cfg)
 			}
-
-			d.mayorZombieCount = 0
-			if hbErr := mayor.Touch(townRoot, "patrol-check", tmux.SessionHealthy.String()); hbErr != nil {
-				d.logger.Printf("Warning: could not write Mayor heartbeat: %v", hbErr)
-			}
-			d.checkMayorNudgePoller(mgr)
-			d.checkMayorCriticalMail(cfg)
 			return
 		}
 		d.logger.Printf("Error starting Mayor: %v", err)
@@ -2025,6 +2025,76 @@ func (d *Daemon) ensureMayorRunning() {
 	d.checkMayorNudgePoller(mgr)
 	d.checkMayorCriticalMail(cfg)
 	d.logger.Println("Mayor started successfully")
+}
+
+// mayorHealthAction describes what ensureMayorRunning should do based on the
+// combined session-health and heartbeat signals.
+type mayorHealthAction int
+
+const (
+	// mayorHealthActionIdle: session is healthy and the heartbeat is present
+	// and not very stale. Continue normal patrol.
+	mayorHealthActionIdle mayorHealthAction = iota
+
+	// mayorHealthActionRefresh: the heartbeat is missing or very stale, but the
+	// staleness is an artifact of daemon downtime (heartbeat timestamp predates
+	// this daemon's start). Refresh the heartbeat and reset the zombie count.
+	// This is the gastown-7yd resume-guard: after the daemon resumes, a healthy
+	// Mayor must not be restarted just because the daemon-written heartbeat is
+	// stale from before it went down.
+	mayorHealthActionRefresh
+
+	// mayorHealthActionZombie: a real signal of Mayor unhealth — the session
+	// is dead/hung, or the heartbeat is very stale while the daemon has been
+	// running normally. Increment the zombie count; restart at >=3.
+	mayorHealthActionZombie
+)
+
+// evaluateMayorHealth determines what action ensureMayorRunning should take.
+// Extracted from ensureMayorRunning so it can be tested without tmux or a real
+// heartbeat file (gastown-7yd).
+//
+// Inputs:
+//   - sessionStatus: result of mgr.IsHealthy(0); only SessionHealthy is "good".
+//   - hb: result of mayor.ReadHeartbeat(townRoot); nil if no heartbeat file.
+//   - veryStaleThreshold: configured threshold for "very stale" heartbeat.
+//   - daemonStartedAt: when this daemon process started; heartbeats older than
+//     this are treated as from-before-resume. Pass the zero time.Time to
+//     disable the resume guard.
+func evaluateMayorHealth(
+	sessionStatus tmux.ZombieStatus,
+	hb *mayor.Heartbeat,
+	veryStaleThreshold time.Duration,
+	daemonStartedAt time.Time,
+) mayorHealthAction {
+	if sessionStatus != tmux.SessionHealthy {
+		return mayorHealthActionZombie
+	}
+	if hb == nil {
+		return mayorHealthActionRefresh
+	}
+	if hb.IsVeryStale(veryStaleThreshold) {
+		// If the heartbeat predates this daemon run, the staleness is an
+		// artifact of the daemon being down — not evidence of Mayor unhealth.
+		// Refresh and reset. This is the gastown-7yd resume guard.
+		if !daemonStartedAt.IsZero() && hb.Timestamp.Before(daemonStartedAt) {
+			return mayorHealthActionRefresh
+		}
+		return mayorHealthActionZombie
+	}
+	return mayorHealthActionIdle
+}
+
+// mayorUnhealthReason produces a short human-readable explanation of why the
+// Mayor is being treated as unhealthy, for use in logs and the restart reason.
+func mayorUnhealthReason(status tmux.ZombieStatus, hb *mayor.Heartbeat) string {
+	if status != tmux.SessionHealthy {
+		return status.String()
+	}
+	if hb != nil {
+		return fmt.Sprintf("heartbeat very stale (age=%v)", hb.Age())
+	}
+	return "unknown"
 }
 
 // checkMayorNudgePoller ensures the Mayor's nudge poller is running. It starts
