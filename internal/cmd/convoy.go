@@ -1386,9 +1386,17 @@ func removePolecatWorktree(wt convoyWorktreeInfo) error {
 }
 
 // strandedConvoyInfo holds info about a stranded convoy.
+//
+// Status reflects the convoy's current issue status at the time `gt convoy
+// stranded --json` is computed. The daemon uses this field as a defensive
+// gate: even if the upstream `bd list --status=open` filter is bypassed by
+// a stale read, race, or future regression, the daemon will skip convoys
+// whose status is closed/deferred/staged and never feed or completion-check
+// them. See gastown-cet.14.
 type strandedConvoyInfo struct {
 	ID           string   `json:"id"`
 	Title        string   `json:"title"`
+	Status       string   `json:"status,omitempty"`
 	TrackedCount int      `json:"tracked_count"`
 	ReadyCount   int      `json:"ready_count"`
 	ReadyIssues  []string `json:"ready_issues"`
@@ -1501,6 +1509,15 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 			baseBranch = cf.BaseBranch
 		}
 
+		// Defensive: skip non-active convoys even though listConvoyIssues
+		// already requested status=open. Stale Dolt reads, race windows, or
+		// a future regression in `bd list --status=open` could otherwise
+		// hand the daemon a closed/deferred/staged convoy to scan.
+		// See gastown-cet.14.
+		if !convoyops.IsActiveJSONStatus(convoy.Status) {
+			continue
+		}
+
 		tracked, err := getTrackedIssues(townBeads, convoy.ID)
 		if err != nil {
 			// Write to stderr explicitly — stdout may be consumed as JSON
@@ -1514,6 +1531,7 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 			stranded = append(stranded, strandedConvoyInfo{
 				ID:           convoy.ID,
 				Title:        convoy.Title,
+				Status:       convoy.Status,
 				TrackedCount: 0,
 				ReadyCount:   0,
 				ReadyIssues:  []string{},
@@ -1552,6 +1570,7 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 			stranded = append(stranded, strandedConvoyInfo{
 				ID:           convoy.ID,
 				Title:        convoy.Title,
+				Status:       convoy.Status,
 				TrackedCount: len(tracked),
 				ReadyCount:   len(readyIssues),
 				ReadyIssues:  readyIssues,
@@ -1564,6 +1583,7 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 			stranded = append(stranded, strandedConvoyInfo{
 				ID:           convoy.ID,
 				Title:        convoy.Title,
+				Status:       convoy.Status,
 				TrackedCount: len(tracked),
 				ReadyCount:   0,
 				ReadyIssues:  []string{},
