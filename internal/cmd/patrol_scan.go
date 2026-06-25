@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/alerts"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/witness"
@@ -178,7 +181,12 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	if zombieResult != nil {
 		activeZombies := countActiveWorkZombies(zombieResult)
 		if activeZombies > 0 {
-			sendZombieNotification(router, rigName, zombieResult, activeZombies)
+			// Aggregate alerts into canonical root-cause tracking beads before
+			// sending notification summaries. This prevents flooding independent
+			// beads for repeated POLECAT_DIED / ZOMBIE_DETECTED alerts.
+			rigPath := filepath.Join(townRoot, rigName)
+			alertClient := beads.NewWithBeadsDir(rigPath, filepath.Join(rigPath, ".beads"))
+			sendZombieNotification(router, alertClient, rigName, zombieResult, activeZombies)
 		}
 	}
 
@@ -243,14 +251,22 @@ func countActiveWorkZombies(result *witness.DetectZombiePolecatsResult) int {
 	return count
 }
 
-func sendZombieNotification(router *mail.Router, rigName string, result *witness.DetectZombiePolecatsResult, activeCount int) {
+// notificationSender abstracts mail delivery so sendZombieNotification can be
+// unit-tested without a real Router.
+type notificationSender interface {
+	Send(msg *mail.Message) error
+}
+
+func sendZombieNotification(router notificationSender, alertClient alerts.BeadsClient, rigName string, result *witness.DetectZombiePolecatsResult, activeCount int) {
 	var lines []string
-	lines = append(lines, fmt.Sprintf("Patrol scan detected %d zombie(s) with active work in rig %s:", activeCount, rigName))
+	lines = append(lines, fmt.Sprintf("Patrol scan detected %d active-work zombie(s) in rig %s:", activeCount, rigName))
 	lines = append(lines, "")
+	var affectedAgents []string
 	for _, z := range result.Zombies {
 		if !z.WasActive {
 			continue
 		}
+		affectedAgents = append(affectedAgents, fmt.Sprintf("%s/%s", rigName, z.PolecatName))
 		line := fmt.Sprintf("- %s: %s (hook=%s, action=%s)",
 			z.PolecatName, string(z.Classification), z.HookBead, z.Action)
 		if z.Error != nil {
@@ -259,30 +275,76 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
 		lines = append(lines, line)
 	}
 
-	body := strings.Join(lines, "\n")
-	subject := fmt.Sprintf("ZOMBIE_DETECTED: %d active-work zombie(s) in %s", activeCount, rigName)
-
-	// Send to witness (best-effort)
-	witMsg := &mail.Message{
-		From:    fmt.Sprintf("%s/witness", rigName),
-		To:      fmt.Sprintf("%s/witness", rigName),
-		Subject: subject,
-		Body:    body,
-	}
-	_ = router.Send(witMsg)
-
-	// Also notify the mayor so dead polecats don't go unnoticed. (GH #3584)
-	// The mayor needs to know so work can be reslung.
-	mayorBody := strings.Join(lines, "\n") +
+	body := strings.Join(lines, "\n") +
 		"\n\nResling instructions:\n" +
 		"  gt sling <bead-id> <rig> --create --force"
+
+	agg := alerts.NewAggregator(alertClient)
+	now := time.Now().UTC()
+
+	// Create or update the canonical ZOMBIE_DETECTED tracking bead. This is the
+	// witness-facing operational alert — repeated occurrences collapse to one
+	// bead keyed by (alert class, rig).
+	zombieKey := alerts.RootCauseKey{Class: alerts.ClassZombieDetected, Scope: rigName}
+	zombieRes, err := agg.Record(zombieKey, alerts.Evidence{
+		Timestamp: now,
+		Severity:  "high",
+		Agents:    affectedAgents,
+		Body:      body,
+	})
+	if err != nil {
+		// Fail open: still send the notification so operators are not left blind.
+		fmt.Fprintf(os.Stderr, "warning: failed to aggregate ZOMBIE_DETECTED alert: %v\n", err)
+	}
+
+	// Create or update the canonical POLECAT_DIED tracking bead. This is the
+	// mayor-facing escalation alert — it is a distinct root cause from the zombie
+	// detection alert above and is tracked separately.
+	polecatKey := alerts.RootCauseKey{Class: alerts.ClassPolecatDied, Scope: rigName}
+	polecatRes, err := agg.Record(polecatKey, alerts.Evidence{
+		Timestamp: now,
+		Severity:  "high",
+		Agents:    affectedAgents,
+		Body:      body,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to aggregate POLECAT_DIED alert: %v\n", err)
+	}
+
+	// Send lightweight notification summaries that reference the canonical
+	// tracking beads. The durable alert record lives in the tracking bead;
+	// these messages are only for awareness.
+	notifyBody := func(label, issueID string) string {
+		if issueID == "" {
+			return body
+		}
+		return fmt.Sprintf("Canonical tracking bead: %s\n\n%s", issueID, body)
+	}
+
+	witnessSubject := fmt.Sprintf("ZOMBIE_DETECTED: %d active-work zombie(s) in %s", activeCount, rigName)
+	witnessMsg := &mail.Message{
+		From:    fmt.Sprintf("%s/witness", rigName),
+		To:      fmt.Sprintf("%s/witness", rigName),
+		Subject: witnessSubject,
+		Body:    notifyBody("Zombie tracking bead", alertResIssueID(zombieRes)),
+	}
+	_ = router.Send(witnessMsg)
+
+	mayorSubject := fmt.Sprintf("POLECAT_DIED: %d polecat(s) died with active work in %s", activeCount, rigName)
 	mayorMsg := &mail.Message{
 		From:    fmt.Sprintf("%s/witness", rigName),
 		To:      "mayor/",
-		Subject: fmt.Sprintf("POLECAT_DIED: %d polecat(s) died with active work in %s", activeCount, rigName),
-		Body:    mayorBody,
+		Subject: mayorSubject,
+		Body:    notifyBody("Polecat-died tracking bead", alertResIssueID(polecatRes)),
 	}
 	_ = router.Send(mayorMsg)
+}
+
+func alertResIssueID(res *alerts.RecordResult) string {
+	if res == nil {
+		return ""
+	}
+	return res.IssueID
 }
 
 func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, receipts []witness.PatrolReceipt) error {

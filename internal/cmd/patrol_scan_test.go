@@ -3,11 +3,15 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/alerts"
+	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/witness"
 )
 
@@ -219,5 +223,137 @@ func TestPatrolScanZombieItemSerialization(t *testing.T) {
 	}
 	if parsed.Error != "restart failed: tmux error" {
 		t.Errorf("Error = %q, want %q", parsed.Error, "restart failed: tmux error")
+	}
+}
+
+// alertFakeBeadsClient is a minimal in-memory alerts.BeadsClient for testing
+// sendZombieNotification without touching a real Dolt database.
+type alertFakeBeadsClient struct {
+	issues []*beads.Issue
+	nextID int
+}
+
+func (f *alertFakeBeadsClient) Search(opts beads.SearchOptions) ([]*beads.Issue, error) {
+	var out []*beads.Issue
+	for _, issue := range f.issues {
+		if opts.Status != "" && issue.Status != opts.Status {
+			continue
+		}
+		if opts.Label != "" && !beads.HasLabel(issue, opts.Label) {
+			continue
+		}
+		out = append(out, issue)
+	}
+	return out, nil
+}
+
+func (f *alertFakeBeadsClient) Create(opts beads.CreateOptions) (*beads.Issue, error) {
+	f.nextID++
+	issue := &beads.Issue{
+		ID:          fmt.Sprintf("gt-alert-%03d", f.nextID),
+		Title:       opts.Title,
+		Description: opts.Description,
+		Status:      "open",
+		Priority:    opts.Priority,
+		Labels:      opts.Labels,
+		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	f.issues = append(f.issues, issue)
+	return issue, nil
+}
+
+func (f *alertFakeBeadsClient) Update(id string, opts beads.UpdateOptions) error {
+	for _, issue := range f.issues {
+		if issue.ID != id {
+			continue
+		}
+		if opts.Description != nil {
+			issue.Description = *opts.Description
+		}
+		if opts.Priority != nil {
+			issue.Priority = *opts.Priority
+		}
+		if len(opts.SetLabels) > 0 {
+			issue.Labels = opts.SetLabels
+		}
+		return nil
+	}
+	return fmt.Errorf("issue not found: %s", id)
+}
+
+type alertFakeSender struct {
+	messages []*mail.Message
+}
+
+func (f *alertFakeSender) Send(msg *mail.Message) error {
+	f.messages = append(f.messages, msg)
+	return nil
+}
+
+func TestSendZombieNotification_CreatesCanonicalAlertBeads(t *testing.T) {
+	client := &alertFakeBeadsClient{}
+	sender := &alertFakeSender{}
+
+	result := &witness.DetectZombiePolecatsResult{
+		Zombies: []witness.ZombieResult{
+			{
+				PolecatName:    "onyx",
+				WasActive:      true,
+				Classification: witness.ZombieSessionDeadActive,
+				HookBead:       "gt-123",
+				Action:         "restarted",
+			},
+		},
+	}
+
+	sendZombieNotification(sender, client, "gastown", result, 1)
+
+	if len(client.issues) != 2 {
+		t.Fatalf("expected 2 canonical alert beads (ZOMBIE_DETECTED + POLECAT_DIED), got %d", len(client.issues))
+	}
+
+	labels := []string{
+		alerts.RootCauseKey{Class: alerts.ClassZombieDetected, Scope: "gastown"}.Label(),
+		alerts.RootCauseKey{Class: alerts.ClassPolecatDied, Scope: "gastown"}.Label(),
+	}
+	for i, wantLabel := range labels {
+		if !beads.HasLabel(client.issues[i], wantLabel) {
+			t.Errorf("issue %d missing label %q, labels=%v", i, wantLabel, client.issues[i].Labels)
+		}
+	}
+
+	// Verify the description carries the affected agent and occurrence metadata.
+	polecatDied := client.issues[1]
+	if !strings.Contains(polecatDied.Description, "gastown/onyx") {
+		t.Errorf("POLECAT_DIED bead missing affected agent: %s", polecatDied.Description)
+	}
+
+	// Both witness and mayor should receive a notification referencing the bead.
+	if len(sender.messages) != 2 {
+		t.Errorf("expected 2 notification messages, got %d", len(sender.messages))
+	}
+}
+
+func TestSendZombieNotification_AggregatesRepeatedAlerts(t *testing.T) {
+	client := &alertFakeBeadsClient{}
+	sender := &alertFakeSender{}
+
+	for i := 0; i < 3; i++ {
+		result := &witness.DetectZombiePolecatsResult{
+			Zombies: []witness.ZombieResult{
+				{PolecatName: fmt.Sprintf("onyx-%d", i), WasActive: true, Action: "restarted"},
+			},
+		}
+		sendZombieNotification(sender, client, "gastown", result, 1)
+	}
+
+	if len(client.issues) != 2 {
+		t.Fatalf("expected 2 canonical alert beads after repeated scans, got %d", len(client.issues))
+	}
+
+	for _, issue := range client.issues {
+		if !strings.Contains(issue.Description, "**Total occurrences**: 3") {
+			t.Errorf("expected 3 occurrences in %s: %s", issue.Title, issue.Description)
+		}
 	}
 }
