@@ -170,8 +170,8 @@ func TestCaptureContextSnapshot(t *testing.T) {
 	}
 	fakeGT := filepath.Join(binDir, "gt")
 	script := `#!/bin/sh
-if [ "$1" = "hook" ] && [ "$2" = "--json" ]; then
-  echo '{"bead_id":"gastown-cet.6.2"}'
+if [ "$1" = "hook" ] && [ "$2" = "status" ] && [ "$3" = "mayor/" ] && [ "$4" = "--json" ]; then
+  echo '{"has_work":true,"pinned_bead":{"id":"gastown-cet.6.2","title":"Mayor liveness","status":"hooked"}}'
   exit 0
 fi
 if [ "$1" = "mail" ] && [ "$2" = "inbox" ]; then

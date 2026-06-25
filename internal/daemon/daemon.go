@@ -46,6 +46,14 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+const (
+	// mayorBootVerificationDelay is the grace period after a Mayor restart before
+	// the daemon verifies the session. This lets the tmux session and agent
+	// process settle, avoiding false-positive "restart failed" alerts on every
+	// supervised restart.
+	mayorBootVerificationDelay = 5 * time.Second
+)
+
 // Daemon is the town-level background service.
 // It ensures patrol agents (Deacon, Witnesses) are running and detects failures.
 // This is recovery-focused: normal wake is handled by feed subscription (bd activity --follow).
@@ -112,9 +120,10 @@ type Daemon struct {
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	lastMaintenanceRun time.Time
 
-	// mayorZombieCount tracks consecutive patrol cycles where the Mayor tmux
-	// session exists but the agent process is not detected. A count >= 3
-	// triggers a zombie restart, debouncing transient gaps during handoffs.
+	// mayorZombieCount tracks consecutive patrol cycles where the Mayor is
+	// unhealthy: the tmux session/agent is dead, or the heartbeat is missing or
+	// very stale. A count >= 3 triggers a supervised restart, debouncing
+	// transient gaps during handoffs.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	mayorZombieCount int
 
@@ -1855,12 +1864,12 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 
 // ensureMayorRunning ensures the Mayor is running and healthy.
 // Uses mayor.Manager for consistent startup behavior.
-// Detects hung sessions (not just dead agents) using CheckSessionHealth, and
-// records context snapshots + post-restart verification for durable evidence.
+// Detects dead agents using CheckSessionHealth without requiring tmux activity,
+// consults the Mayor heartbeat for idle-but-healthy sessions, and records
+// context snapshots + post-restart verification for durable evidence.
 func (d *Daemon) ensureMayorRunning() {
 	mgr := mayor.NewManager(d.config.TownRoot)
 	cfg := d.loadOperationalConfig().GetMayorConfig()
-	maxInactivity := cfg.HungSessionThresholdD()
 	townRoot := d.config.TownRoot
 
 	if err := mgr.Start(""); err != nil {
@@ -1870,23 +1879,50 @@ func (d *Daemon) ensureMayorRunning() {
 			return
 		}
 		if err == mayor.ErrAlreadyRunning {
-			status := mgr.IsHealthy(maxInactivity)
-			if status == tmux.SessionHealthy {
+			// Primary liveness: session exists and the agent process is alive.
+			// Pass 0 to skip tmux activity checking — a Mayor sitting idle at the
+			// prompt waiting for work is still healthy.
+			status := mgr.IsHealthy(0)
+			if status != tmux.SessionHealthy {
+				d.mayorZombieCount++
+				d.logger.Printf("Mayor not healthy (status=%s, cycle %d/3)", status.String(), d.mayorZombieCount)
+				if d.mayorZombieCount >= 3 {
+					d.restartMayor(mgr, cfg, fmt.Sprintf("mayor %s for %d consecutive cycles", status.String(), d.mayorZombieCount))
+				}
+				return
+			}
+
+			// Secondary liveness: heartbeat. The daemon writes heartbeats every
+			// patrol cycle. A missing heartbeat on an otherwise healthy session is
+			// treated as an initial heartbeat write; only a very stale heartbeat
+			// indicates the supervision path itself is stuck.
+			hb := mayor.ReadHeartbeat(townRoot)
+			veryStaleThreshold := cfg.HeartbeatVeryStaleThresholdD()
+			if hb == nil {
 				d.mayorZombieCount = 0
-				if hbErr := mayor.Touch(townRoot, "patrol-check", status.String()); hbErr != nil {
-					d.logger.Printf("Warning: could not write Mayor heartbeat: %v", hbErr)
+				if hbErr := mayor.Touch(townRoot, "patrol-check", tmux.SessionHealthy.String()); hbErr != nil {
+					d.logger.Printf("Warning: could not write initial Mayor heartbeat: %v", hbErr)
 				}
 				d.checkMayorNudgePoller(mgr)
 				d.checkMayorCriticalMail(cfg)
 				return
 			}
-
-			// Session exists but is dead or hung.
-			d.mayorZombieCount++
-			d.logger.Printf("Mayor not healthy (status=%s, cycle %d/3)", status.String(), d.mayorZombieCount)
-			if d.mayorZombieCount >= 3 {
-				d.restartMayor(mgr, cfg, fmt.Sprintf("mayor %s for %d consecutive cycles", status.String(), d.mayorZombieCount))
+			if hb.IsVeryStale(veryStaleThreshold) {
+				d.mayorZombieCount++
+				reason := fmt.Sprintf("heartbeat very stale (age=%v)", hb.Age())
+				d.logger.Printf("Mayor not healthy (%s, cycle %d/3)", reason, d.mayorZombieCount)
+				if d.mayorZombieCount >= 3 {
+					d.restartMayor(mgr, cfg, fmt.Sprintf("mayor %s for %d consecutive cycles", reason, d.mayorZombieCount))
+				}
+				return
 			}
+
+			d.mayorZombieCount = 0
+			if hbErr := mayor.Touch(townRoot, "patrol-check", tmux.SessionHealthy.String()); hbErr != nil {
+				d.logger.Printf("Warning: could not write Mayor heartbeat: %v", hbErr)
+			}
+			d.checkMayorNudgePoller(mgr)
+			d.checkMayorCriticalMail(cfg)
 			return
 		}
 		d.logger.Printf("Error starting Mayor: %v", err)
@@ -1983,9 +2019,17 @@ func (d *Daemon) restartMayor(mgr *mayor.Manager, cfg *agentconfig.MayorThreshol
 	}
 
 	d.mayorZombieCount = 0
+
+	// Let the session and agent process settle before verifying. The agent has
+	// already waited for startup during StartSession, but a short grace period
+	// prevents false-positive verification failures on every restart.
+	time.Sleep(mayorBootVerificationDelay)
+
 	d.checkMayorNudgePoller(mgr)
 
-	status := mgr.IsHealthy(cfg.HungSessionThresholdD())
+	// Verify using tmux session + agent liveness only; activity-based checks would
+	// falsely fail an otherwise healthy Mayor that has not produced tmux output.
+	status := mgr.IsHealthy(0)
 	modelVerify := sup.VerifyModel()
 	attempt := &mayor.RecoveryAttempt{
 		Timestamp:       time.Now().UTC(),

@@ -180,28 +180,34 @@ func CaptureContextSnapshot(townRoot, gtPath string) (*ContextSnapshot, error) {
 	return snap, nil
 }
 
-// queryMayorHook runs `gt hook --json` and returns the hooked bead ID and count.
+// queryMayorHook runs `gt hook status mayor/ --json` and returns the hooked bead ID and count.
+// It uses the molecule-status JSON format (has_work + pinned_bead.id) rather than the compact
+// hook-show format, because the daemon needs full Mayor context including the attached molecule.
 func queryMayorHook(townRoot, gtPath string) (string, int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, gtPath, "hook", "--json")
+	cmd := exec.CommandContext(ctx, gtPath, "hook", "status", "mayor/", "--json")
 	cmd.Dir = townRoot
 	output, err := cmd.Output()
 	if err != nil {
-		return "", 0, fmt.Errorf("gt hook: %w", err)
+		return "", 0, fmt.Errorf("gt hook status mayor/: %w", err)
 	}
 
 	var payload struct {
-		BeadID string `json:"bead_id"`
-		ID     string `json:"id"`
+		HasWork    bool `json:"has_work"`
+		PinnedBead *struct {
+			ID     string `json:"id"`
+			Title  string `json:"title"`
+			Status string `json:"status"`
+		} `json:"pinned_bead,omitempty"`
 	}
 	if err := json.Unmarshal(output, &payload); err != nil {
 		return "", 0, err
 	}
-	beadID := payload.BeadID
-	if beadID == "" {
-		beadID = payload.ID
+	beadID := ""
+	if payload.HasWork && payload.PinnedBead != nil {
+		beadID = payload.PinnedBead.ID
 	}
 	count := 0
 	if beadID != "" {
