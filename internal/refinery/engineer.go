@@ -548,6 +548,15 @@ type ProcessResult struct {
 	NoMerge        bool // Source issue has no_merge flag — intentionally blocked, not a failure
 	NeedsApproval  bool // PR exists but lacks required approving review (merge_strategy=pr)
 
+	// NeedsRework is true when a reviewer explicitly rejected the change with
+	// concrete blockers. The MR is closed as rejected-needs-rework and the
+	// polecat is asked to revise and resubmit.
+	NeedsRework bool
+
+	// ReviewerRejectionCause is a machine-readable key for the rejection when
+	// NeedsRework is true. E.g. "race_condition", "missing_test".
+	ReviewerRejectionCause string
+
 	// DegradedQuorum is true when the merge proceeded under the explicit degraded
 	// quorum rule: some reviewers were unavailable/no-verdict, but enough
 	// independent PASS reviews existed and an audit obligation was recorded.
@@ -873,9 +882,10 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string, mr *MRI
 		case ReviewStateFail:
 			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d rejected by reviewer(s): %s\n", prNumber, ev.Error)
 			return ProcessResult{
-				Success:     false,
-				TestsFailed: true, // Reuse the test-failure path for reviewer rejection.
-				Error:       fmt.Sprintf("PR #%d reviewer rejection: %s", prNumber, ev.Error),
+				Success:                false,
+				NeedsRework:            true,
+				ReviewerRejectionCause: ev.CauseKey,
+				Error:                  fmt.Sprintf("PR #%d reviewer rejection: %s", prNumber, ev.Error),
 			}
 		case ReviewStateDegradedQuorum:
 			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d proceeding under degraded quorum: %s\n", prNumber, ev.Error)
@@ -1618,6 +1628,65 @@ func (e *Engineer) clearAgentActiveMR(agentBeadID string) error {
 	return e.beads.ForAgentBead().UpdateAgentActiveMR(agentBeadID, "")
 }
 
+// handleReviewerRejection closes the MR as rejected-needs-rework and notifies
+// the worker that the change requires revision. This is a terminal state, unlike
+// NeedsApproval which keeps the MR in queue.
+func (e *Engineer) handleReviewerRejection(mr *MRInfo, result ProcessResult) {
+	cause := result.ReviewerRejectionCause
+	if cause == "" {
+		cause = "reviewer_rejection"
+	}
+	_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: reviewer rejection (cause=%s) — closing as rejected-needs-rework\n", mr.ID, cause)
+
+	// Persist the rejection cause on the MR bead before closing.
+	if mr.ID != "" {
+		mrBead, err := e.beads.Show(mr.ID)
+		if err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to fetch MR bead %s: %v\n", mr.ID, err)
+		} else {
+			mrFields := beads.ParseMRFields(mrBead)
+			if mrFields == nil {
+				mrFields = &beads.MRFields{}
+			}
+			mrFields.CloseReason = "rejected"
+			mrFields.TerminalState = beads.MRTerminalRejectedNeedsRework
+			mrFields.ReviewerRejectionCause = cause
+			newDesc := beads.SetMRFields(mrBead, mrFields)
+			if err := e.beads.Update(mr.ID, beads.UpdateOptions{Description: &newDesc}); err != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to record reviewer rejection on MR %s: %v\n", mr.ID, err)
+			}
+		}
+		if err := e.beads.CloseWithReason("rejected", mr.ID); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close MR %s as rejected: %v\n", mr.ID, err)
+		} else {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Closed MR %s as rejected-needs-rework\n", mr.ID)
+		}
+	}
+
+	// Nudge the worker directly so they can revise and resubmit.
+	polecatName := strings.TrimPrefix(mr.Worker, "polecats/")
+	nudgeTarget := fmt.Sprintf("%s/%s", e.rig.Name, polecatName)
+	nudgeMsg := fmt.Sprintf("REVIEWER_REJECTED: branch=%s issue=%s cause=%s error=%s — revise and resubmit with 'gt done'",
+		mr.Branch, mr.SourceIssue, cause, result.Error)
+	nudgeCmd := exec.Command("gt", "nudge", nudgeTarget, nudgeMsg)
+	util.SetDetachedProcessGroup(nudgeCmd)
+	nudgeCmd.Dir = e.workDir
+	if err := nudgeCmd.Run(); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge %s about reviewer rejection: %v\n", polecatName, err)
+	} else {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Nudged %s about reviewer rejection\n", polecatName)
+	}
+
+	// Nudge mayor so dependent work stays blocked until the revision lands.
+	mayorMsg := fmt.Sprintf("REVIEWER_REJECTED: %s issue=%s branch=%s cause=%s", mr.ID, mr.SourceIssue, mr.Branch, cause)
+	mayorCmd := exec.Command("gt", "nudge", "mayor/", mayorMsg)
+	util.SetDetachedProcessGroup(mayorCmd)
+	mayorCmd.Dir = e.workDir
+	if err := mayorCmd.Run(); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about reviewer rejection: %v\n", err)
+	}
+}
+
 // HandleMRInfoFailure handles a failed merge from MRInfo.
 // For conflicts, creates a resolution task and blocks the MR until resolved.
 // For slot timeouts, the MR stays in queue for automatic retry without notifying polecats.
@@ -1644,6 +1713,13 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	// No polecat notification needed; the PR just needs a human review on GitHub.
 	if result.NeedsApproval {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: PR awaiting human approval, will retry next poll\n", mr.ID)
+		return
+	}
+
+	// NeedsRework: a reviewer explicitly rejected the change with concrete
+	// blockers. Close the MR as rejected-needs-rework and notify the worker.
+	if result.NeedsRework {
+		e.handleReviewerRejection(mr, result)
 		return
 	}
 

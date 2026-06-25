@@ -39,12 +39,18 @@ func (p *bitbucketPRProvider) IsPRApproved(prNumber int) (bool, error) {
 }
 
 func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation, error) {
+	// Record the merge-candidate diff basis so the review packet identifies the
+	// exact diff reviewed (gastown-cet.8). A verdict against intermediate
+	// commit history is distinguished from one against the final candidate.
+	basis := p.mergeCandidateBasis()
+
 	participants, err := p.git.GetBitbucketPRParticipants(p.workspace, p.repoSlug, prNumber)
 	if err != nil {
 		return &ReviewEvaluation{
 			State:            ReviewStateUnavailable,
-			Results:          []ReviewerResult{{Reviewer: "bitbucket", Verdict: ReviewerVerdictUnavailable, Evidence: err.Error()}},
+			Results:          []ReviewerResult{{Reviewer: "bitbucket", Verdict: ReviewerVerdictUnavailable, Evidence: err.Error(), DiffBasis: basis}},
 			UnavailableCount: 1,
+			DiffBasis:        basis,
 			Error:            err.Error(),
 		}, nil
 	}
@@ -52,15 +58,16 @@ func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluati
 	if len(participants) == 0 {
 		return &ReviewEvaluation{
 			State:          ReviewStateNoVerdict,
-			Results:        []ReviewerResult{{Reviewer: "bitbucket", Verdict: ReviewerVerdictNoVerdict, Evidence: "no participants"}},
+			Results:        []ReviewerResult{{Reviewer: "bitbucket", Verdict: ReviewerVerdictNoVerdict, Evidence: "no participants", DiffBasis: basis}},
 			NoVerdictCount: 1,
+			DiffBasis:      basis,
 			Error:          "no participants",
 		}, nil
 	}
 
 	results := make([]ReviewerResult, 0, len(participants))
 	for _, participant := range participants {
-		result := ReviewerResult{Reviewer: participant.User}
+		result := ReviewerResult{Reviewer: participant.User, DiffBasis: basis}
 		if participant.Role == "REVIEWER" && participant.Approved {
 			result.Verdict = ReviewerVerdictPass
 		} else if participant.Role == "REVIEWER" {
@@ -78,14 +85,25 @@ func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluati
 	if len(results) == 0 {
 		return &ReviewEvaluation{
 			State:          ReviewStateNoVerdict,
-			Results:        []ReviewerResult{{Reviewer: "bitbucket", Verdict: ReviewerVerdictNoVerdict, Evidence: "no reviewers"}},
+			Results:        []ReviewerResult{{Reviewer: "bitbucket", Verdict: ReviewerVerdictNoVerdict, Evidence: "no reviewers", DiffBasis: basis}},
 			NoVerdictCount: 1,
+			DiffBasis:      basis,
 			Error:          "no reviewers",
 		}, nil
 	}
 
 	ev := EvaluateReviews(results, DegradedQuorumRule{})
+	ev.DiffBasis = basis
 	return &ev, nil
+}
+
+// mergeCandidateBasis returns the merge-candidate diff basis for the PR under
+// review. Best-effort resolution; an empty component means "unknown" (treated
+// as a merge-candidate basis, the safe default).
+func (p *bitbucketPRProvider) mergeCandidateBasis() DiffBasis {
+	base, _ := p.git.RemoteBranchTip("origin", "main")
+	head, _ := p.git.Rev("HEAD")
+	return MergeCandidateBasis(base, head)
 }
 
 func (p *bitbucketPRProvider) MergePR(prNumber int, method string) (string, error) {

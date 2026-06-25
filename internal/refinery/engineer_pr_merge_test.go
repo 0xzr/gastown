@@ -251,7 +251,11 @@ func TestDoMergePR_NoVerdict_NotTreatedAsFail(t *testing.T) {
 	}
 }
 
-func TestDoMergePR_ParsedFail_Rejects(t *testing.T) {
+func TestDoMergePR_ParsedFail_RoutesToNeedsRework(t *testing.T) {
+	// gastown-cet.8: a concrete parsed reviewer FAIL with blockers routes to
+	// NeedsRework (rejected-needs-rework), NOT the generic TestsFailed/build
+	// failure path and NOT the NeedsApproval hold (review-unavailable). The
+	// worker must be told to revise, not that the build broke.
 	workDir, g, _ := testGitRepo(t)
 	e := newTestEngineer(t, workDir, g)
 	e.config.MergeStrategy = "pr"
@@ -265,8 +269,9 @@ func TestDoMergePR_ParsedFail_Rejects(t *testing.T) {
 		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
 			return &ReviewEvaluation{
 				State:     ReviewStateFail,
-				Results:   []ReviewerResult{{Reviewer: "reviewer", Verdict: ReviewerVerdictFail, Blockers: []string{"race condition"}}},
+				Results:   []ReviewerResult{{Reviewer: "reviewer", Verdict: ReviewerVerdictFail, Blockers: []string{"race condition"}, CauseKey: "race_condition"}},
 				FailCount: 1,
+				CauseKey:  "race_condition",
 				Error:     "reviewer rejection",
 			}, nil
 		},
@@ -276,13 +281,57 @@ func TestDoMergePR_ParsedFail_Rejects(t *testing.T) {
 	result := e.doMergePR(context.Background(), "feat/fail", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
 
 	if result.Success || result.NeedsApproval {
-		t.Errorf("expected hard failure, got %+v", result)
+		t.Errorf("expected hard rejection (not success, not approval hold), got %+v", result)
 	}
-	if !result.TestsFailed {
-		t.Error("expected parsed FAIL to set TestsFailed so the failure is actionable")
+	if !result.NeedsRework {
+		t.Errorf("expected NeedsRework=true for parsed reviewer FAIL, got %+v", result)
+	}
+	if result.TestsFailed {
+		t.Error("parsed reviewer FAIL must NOT set TestsFailed (that is the build-failure path)")
+	}
+	if result.ReviewerRejectionCause != "race_condition" {
+		t.Errorf("expected ReviewerRejectionCause=race_condition, got %q", result.ReviewerRejectionCause)
 	}
 	if !strings.Contains(result.Error, "race condition") {
 		t.Errorf("expected error to include reviewer evidence, got %s", result.Error)
+	}
+}
+
+func TestDoMergePR_ParsedFail_DefaultCauseWhenNoneSupplied(t *testing.T) {
+	// gastown-cet.8: a concrete FAIL without an explicit cause key must still
+	// route to NeedsRework with a stable default cause, not be mislabeled as a
+	// review-unavailable hold (the codex-FAIL mislabeling incident class).
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = "pr"
+	e.config.RequireReview = boolPtr(true)
+
+	createFeatureBranch(t, workDir, "feat/fail-nocause", "test.txt", "hello")
+
+	e.prProvider = &reviewerMockPRProvider{
+		findPRNumber: func(string) (int, error) { return 42, nil },
+		isPRApproved: func(int) (bool, error) { return false, nil },
+		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
+			return &ReviewEvaluation{
+				State:     ReviewStateFail,
+				Results:   []ReviewerResult{{Reviewer: "codex", Verdict: ReviewerVerdictFail, Blockers: []string{"missing test"}}},
+				FailCount: 1,
+				Error:     "reviewer rejection: codex: missing test",
+			}, nil
+		},
+		mergePR: nil,
+	}
+
+	result := e.doMergePR(context.Background(), "feat/fail-nocause", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+
+	if result.NeedsApproval {
+		t.Errorf("codex concrete FAIL must NOT be mislabeled REVIEW_UNAVAILABLE_HOLD (NeedsApproval), got %+v", result)
+	}
+	if !result.NeedsRework {
+		t.Fatalf("expected NeedsRework=true for codex FAIL, got %+v", result)
+	}
+	if result.ReviewerRejectionCause != "reviewer_rejection" {
+		t.Errorf("expected default ReviewerRejectionCause=reviewer_rejection, got %q", result.ReviewerRejectionCause)
 	}
 }
 

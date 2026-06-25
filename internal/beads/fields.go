@@ -656,6 +656,9 @@ type MRFields struct {
 	StackedAt        string // ISO 8601 timestamp when the stacked-branch rejection was recorded
 	StackedCommitSHA string // Branch tip SHA at rejection time, for forensics
 	StackedCommits   int    // Commits ahead of merge-base at rejection time
+
+	// Reviewer rejection tracking (gastown-cet.8).
+	ReviewerRejectionCause string // Machine-readable cause key, e.g. "race_condition"
 }
 
 // ParseMRFields extracts structured merge-request fields from an issue's description.
@@ -768,6 +771,9 @@ func ParseMRFields(issue *Issue) *MRFields {
 				fields.StackedCommits = n
 				hasFields = true
 			}
+		case "reviewer_rejection_cause", "reviewer-rejection-cause", "reviewerrejectioncause":
+			fields.ReviewerRejectionCause = value
+			hasFields = true
 		}
 	}
 
@@ -868,6 +874,9 @@ func FormatMRFields(fields *MRFields) string {
 	if fields.StackedCommits > 0 {
 		lines = append(lines, fmt.Sprintf("stacked_commits: %d", fields.StackedCommits))
 	}
+	if fields.ReviewerRejectionCause != "" {
+		lines = append(lines, "reviewer_rejection_cause: "+fields.ReviewerRejectionCause)
+	}
 
 	return strings.Join(lines, "\n")
 }
@@ -882,74 +891,77 @@ func SetMRFields(issue *Issue, fields *MRFields) string {
 
 	// Known MR field keys (lowercase)
 	mrKeys := map[string]bool{
-		"branch":             true,
-		"target":             true,
-		"source_issue":       true,
-		"source-issue":       true,
-		"sourceissue":        true,
-		"worker":             true,
-		"rig":                true,
-		"commit_sha":         true,
-		"commit-sha":         true,
-		"commitsha":          true,
-		"merge_commit":       true,
-		"merge-commit":       true,
-		"mergecommit":        true,
-		"close_reason":       true,
-		"close-reason":       true,
-		"closereason":        true,
-		"agent_bead":         true,
-		"agent-bead":         true,
-		"agentbead":          true,
-		"retry_count":        true,
-		"retry-count":        true,
-		"retrycount":         true,
-		"last_conflict_sha":  true,
-		"last-conflict-sha":  true,
-		"lastconflictsha":    true,
-		"conflict_task_id":   true,
-		"conflict-task-id":   true,
-		"conflicttaskid":     true,
-		"convoy_id":          true,
-		"convoy-id":          true,
-		"convoyid":           true,
-		"convoy":             true,
-		"convoy_created_at":  true,
-		"convoy-created-at":  true,
-		"convoycreatedat":    true,
-		"pre_verified":       true,
-		"pre-verified":       true,
-		"preverified":        true,
-		"pre_verified_at":    true,
-		"pre-verified-at":    true,
-		"preverifiedat":      true,
-		"pre_verified_base":  true,
-		"pre-verified-base":  true,
-		"preverifiedbase":    true,
-		"terminal_state":     true,
-		"terminal-state":     true,
-		"terminalstate":      true,
-		"published_commit":   true,
-		"published-commit":   true,
-		"publishedcommit":    true,
-		"published_remote":   true,
-		"published-remote":   true,
-		"publishedremote":    true,
-		"published_at":       true,
-		"published-at":       true,
-		"publishedat":        true,
-		"stacked_branch":     true,
-		"stacked-branch":     true,
-		"stackedbranch":      true,
-		"stacked_at":         true,
-		"stacked-at":         true,
-		"stackedat":          true,
-		"stacked_commit_sha": true,
-		"stacked-commit-sha": true,
-		"stackedcommitsha":   true,
-		"stacked_commits":    true,
-		"stacked-commits":    true,
-		"stackedcommits":     true,
+		"branch":                   true,
+		"target":                   true,
+		"source_issue":             true,
+		"source-issue":             true,
+		"sourceissue":              true,
+		"worker":                   true,
+		"rig":                      true,
+		"commit_sha":               true,
+		"commit-sha":               true,
+		"commitsha":                true,
+		"merge_commit":             true,
+		"merge-commit":             true,
+		"mergecommit":              true,
+		"close_reason":             true,
+		"close-reason":             true,
+		"closereason":              true,
+		"agent_bead":               true,
+		"agent-bead":               true,
+		"agentbead":                true,
+		"retry_count":              true,
+		"retry-count":              true,
+		"retrycount":               true,
+		"last_conflict_sha":        true,
+		"last-conflict-sha":        true,
+		"lastconflictsha":          true,
+		"conflict_task_id":         true,
+		"conflict-task-id":         true,
+		"conflicttaskid":           true,
+		"convoy_id":                true,
+		"convoy-id":                true,
+		"convoyid":                 true,
+		"convoy":                   true,
+		"convoy_created_at":        true,
+		"convoy-created-at":        true,
+		"convoycreatedat":          true,
+		"pre_verified":             true,
+		"pre-verified":             true,
+		"preverified":              true,
+		"pre_verified_at":          true,
+		"pre-verified-at":          true,
+		"preverifiedat":            true,
+		"pre_verified_base":        true,
+		"pre-verified-base":        true,
+		"preverifiedbase":          true,
+		"terminal_state":           true,
+		"terminal-state":           true,
+		"terminalstate":            true,
+		"published_commit":         true,
+		"published-commit":         true,
+		"publishedcommit":          true,
+		"published_remote":         true,
+		"published-remote":         true,
+		"publishedremote":          true,
+		"published_at":             true,
+		"published-at":             true,
+		"publishedat":              true,
+		"stacked_branch":           true,
+		"stacked-branch":           true,
+		"stackedbranch":            true,
+		"stacked_at":               true,
+		"stacked-at":               true,
+		"stackedat":                true,
+		"stacked_commit_sha":       true,
+		"stacked-commit-sha":       true,
+		"stackedcommitsha":         true,
+		"stacked_commits":          true,
+		"stacked-commits":          true,
+		"stackedcommits":           true,
+		"reviewer_rejection_cause": true,
+		"reviewer-rejection-cause": true,
+		"reviewerrejectioncause":   true,
 	}
 
 	// Collect non-MR lines from existing description
