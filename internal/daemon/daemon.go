@@ -32,6 +32,7 @@ import (
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/feed"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -1830,6 +1831,14 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 // (per the durable handoff's stopped-lanes list).
 func (d *Daemon) checkWitnessStall(rigName string, r *rig.Rig, mgr *witness.Manager) {
 	sup := witness.NewSupervisor(d.config.TownRoot, r.Path, rigName, d.gtPath)
+	// gastown-c4r finding #2: install a lane-state resolver so a
+	// supervised restart writes a fully-populated durable handoff
+	// (stopped lanes, dirty lanes) instead of the metadata-only
+	// synthetic handoff the original EnsureHandoff produced. The
+	// resolver is backed by DetectZombiePolecats, the same scan the
+	// witness runs each patrol, so the handoff reflects the rig's
+	// actual outstanding obligations at restart time.
+	sup.ResolveLanes = d.witnessLaneResolver(rigName)
 	should, reason := sup.ShouldRestart()
 	if !should {
 		// Healthy / fresh heartbeat — reset debounce counter and move on.
@@ -1878,6 +1887,53 @@ func (d *Daemon) checkWitnessStall(rigName string, r *rig.Rig, mgr *witness.Mana
 			rigName, attempt.Verification.ExpectedAgent, attempt.Verification.ActualAgent)
 	}
 	d.notifySlack("admin", "high", fmt.Sprintf("Witness %s restarted after stall (%s)", rigName, reason))
+}
+
+// witnessLaneResolver returns a witness.LaneStateResolver backed by
+// DetectZombiePolecats (gastown-c4r finding #2). It supplies the live
+// stopped/dirty lane state a supervised-restart handoff needs so the
+// post-restart witness resumes recovery of the rig's actual
+// outstanding obligations instead of an empty snapshot.
+//
+// Stopped lanes: zombies whose classification implies active work
+// (session-dead/agent-dead/hung etc.) — these need a model-preserving
+// restart, the replayer's job. Dirty lanes: idle polecats with
+// uncommitted/unpushed changes (ZombieIdleDirtySandbox) — these need
+// cleanup attention, not a restart.
+//
+// Errors are non-fatal: a transient bd/tmux failure yields empty lanes
+// rather than blocking the restart (a restart with an empty handoff is
+// still strictly better than no restart).
+func (d *Daemon) witnessLaneResolver(rigName string) witness.LaneStateResolver {
+	return func(rigPath, rigName string) ([]witness.StoppedLane, []witness.DirtyLane) {
+		bd := witness.DefaultBdCli()
+		router := mail.NewRouterWithTownRoot(d.config.TownRoot, d.config.TownRoot)
+		res := witness.DetectZombiePolecats(bd, rigPath, rigName, router)
+		now := time.Now().UTC()
+		var stopped []witness.StoppedLane
+		var dirty []witness.DirtyLane
+		for _, z := range res.Zombies {
+			if z.Classification == witness.ZombieIdleDirtySandbox {
+				dirty = append(dirty, witness.DirtyLane{
+					Polecat:    z.PolecatName,
+					ObservedAt: now,
+				})
+				continue
+			}
+			if !z.Classification.ImpliesActiveWork() {
+				continue
+			}
+			stopped = append(stopped, witness.StoppedLane{
+				Polecat:          z.PolecatName,
+				Bead:             z.HookBead,
+				IssueID:          z.HookBead,
+				Reason:           string(z.Classification),
+				ObservedAt:       now,
+				AssignmentSource: witness.AssignmentSourceUnassigned,
+			})
+		}
+		return stopped, dirty
+	}
 }
 
 // ensureRefineriesRunning ensures refineries are running for configured rigs.

@@ -29,6 +29,13 @@ var (
 	witnessReplayJSON       bool
 	witnessReplayApply      bool
 	witnessReplayClearAfter bool
+
+	witnessHeartbeatJSON            bool
+	witnessHeartbeatStep            string
+	witnessHeartbeatAction          string
+	witnessHeartbeatSaturation      float64
+	witnessHeartbeatCommandDuration time.Duration
+	witnessHeartbeatObligations     int
 )
 
 // witnessHandoffCmd writes a durable handoff file for the witness of a
@@ -91,9 +98,23 @@ func init() {
 	witnessReplayCmd.Flags().BoolVar(&witnessReplayClearAfter, "clear-after", false,
 		"After applying (or printing) the plan, remove the handoff file")
 
+	witnessHeartbeatCmd.Flags().BoolVar(&witnessHeartbeatJSON, "json", false,
+		"Emit the written heartbeat as JSON instead of human-readable text")
+	witnessHeartbeatCmd.Flags().StringVar(&witnessHeartbeatStep, "step", "heartbeat",
+		"Last completed patrol step to record (e.g. context-check, survey-workers)")
+	witnessHeartbeatCmd.Flags().StringVar(&witnessHeartbeatAction, "action", "patrol-cycle",
+		"Action that produced this heartbeat (e.g. step-inbox-check, patrol-cycle)")
+	witnessHeartbeatCmd.Flags().Float64Var(&witnessHeartbeatSaturation, "saturation", 0,
+		"Context saturation percentage (0.0-1.0) the witness self-reports")
+	witnessHeartbeatCmd.Flags().DurationVar(&witnessHeartbeatCommandDuration, "command-duration", 0,
+		"Wall-clock duration of the last patrol command (e.g. 320ms, 90s)")
+	witnessHeartbeatCmd.Flags().IntVar(&witnessHeartbeatObligations, "obligations", 0,
+		"Outstanding recovery obligation count to record")
+
 	witnessCmd.AddCommand(witnessHandoffCmd)
 	witnessCmd.AddCommand(witnessLivenessCmd)
 	witnessCmd.AddCommand(witnessReplayCmd)
+	witnessCmd.AddCommand(witnessHeartbeatCmd)
 }
 
 func runWitnessHandoff(cmd *cobra.Command, args []string) error {
@@ -408,10 +429,23 @@ func runWitnessReplay(cmd *cobra.Command, args []string) error {
 
 	// Apply phase. Run each model-preserving restart. We deliberately
 	// do NOT execute escalations: the operator must decide.
+	//
+	// gastown-c4r finding #1: the previous implementation ran
+	// `sh -c <a.Command>` where a.Command was a string interpolated
+	// from handoff fields — a command-injection vector for any
+	// non-supervisor code path that writes the handoff. We now build
+	// argv directly from the structured LaneRecovery fields via
+	// ApplyArgs, which validates every identifier against a strict
+	// schema and never invokes a shell. The plan-time Command string
+	// is kept only for human/JSON display, never executed.
 	applyErrs := []string{}
 	for _, a := range plan.Actions {
-		c := exec.Command("sh", "-c", a.Command)
-		out, err := c.CombinedOutput()
+		args, err := a.ApplyArgs(sup.GTPath(), rigName)
+		if err != nil {
+			applyErrs = append(applyErrs, fmt.Sprintf("%s/%s: %v", rigName, a.Polecat, err))
+			continue
+		}
+		out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
 		if err != nil {
 			applyErrs = append(applyErrs,
 				fmt.Sprintf("%s/%s: %v (%s)", rigName, a.Polecat, err, strings.TrimSpace(string(out))))
@@ -426,6 +460,76 @@ func runWitnessReplay(cmd *cobra.Command, args []string) error {
 		if err := witness.ClearHandoff(rigPath); err != nil {
 			return fmt.Errorf("clearing handoff: %w", err)
 		}
+	}
+	return nil
+}
+
+// witnessHeartbeatCmd writes/refreshes the witness heartbeat file
+// (gastown-c4r finding #3). The witness patrol formula MUST call this
+// every cycle (or every N steps) so the daemon supervisor's
+// ShouldRestart() has a fresh heartbeat to poll. Without it, the
+// heartbeat writer (witness.Touch/WriteHeartbeat) has no production
+// caller reachable from the witness's own patrol loop (a Claude session
+// that only invokes `gt`), so ShouldRestart always returns false for the
+// canonical "stalled witness" failure mode this commit was meant to
+// handle.
+//
+// Mirrors `gt deacon heartbeat` — the proven precedent for a patrol
+// agent recording liveness on each wake cycle.
+var witnessHeartbeatCmd = &cobra.Command{
+	Use:   "heartbeat <rig>",
+	Short: "Update the witness heartbeat (gastown-o9d)",
+	Long: `Update the witness self-recovery heartbeat for a single rig.
+
+The heartbeat is the file the daemon supervisor polls to decide whether
+the Witness is making forward progress. A saturated + very-stale (or
+long-command-wedged) heartbeat triggers a supervised self-restart with a
+durable handoff.
+
+Call this at the end of each patrol step (or at least each patrol
+cycle) so the supervisor never mistakes a live, patrolling witness for a
+stalled one.
+
+Examples:
+  gt witness heartbeat gastown                           # Touch with defaults
+  gt witness heartbeat gastown --step context-check --action patrol-cycle
+  gt witness heartbeat gastown --saturation 0.93 --obligations 2
+  gt witness heartbeat gastown --command-duration 320ms
+  gt witness heartbeat gastown --json`,
+	Args: cobra.ExactArgs(1),
+	RunE: runWitnessHeartbeat,
+}
+
+func runWitnessHeartbeat(cmd *cobra.Command, args []string) error {
+	rigName := args[0]
+
+	townRoot, err := workspace.Find(".")
+	if err != nil || townRoot == "" {
+		cwd, _ := os.Getwd()
+		townRoot = filepath.Dir(cwd)
+	}
+	rigPath := filepath.Join(townRoot, rigName)
+
+	sup := witness.NewSupervisor(townRoot, rigPath, rigName, "gt")
+	if err := sup.Touch(witnessHeartbeatStep, witnessHeartbeatAction,
+		witnessHeartbeatSaturation, witnessHeartbeatCommandDuration, witnessHeartbeatObligations); err != nil {
+		return fmt.Errorf("updating witness heartbeat: %w", err)
+	}
+
+	hb := sup.ReadHeartbeat()
+	if witnessHeartbeatJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(hb)
+	}
+
+	fmt.Printf("%s Witness heartbeat updated: %s\n", style.Bold.Render("✓"), rigName)
+	if hb != nil {
+		fmt.Printf("  Cycle:        %d\n", hb.Cycle)
+		fmt.Printf("  Step:         %q\n", hb.LastStep)
+		fmt.Printf("  Saturation:   %.2f\n", hb.ContextSaturationPercent)
+		fmt.Printf("  Obligations:  %d\n", hb.OutstandingRecoveryObligations)
+		fmt.Printf("  Path:         %s\n", witness.HeartbeatFile(rigPath))
 	}
 	return nil
 }

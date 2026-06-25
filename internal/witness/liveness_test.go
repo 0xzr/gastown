@@ -865,6 +865,180 @@ func TestHandoffReplayer_EscalatesConfigDefaultAssignment(t *testing.T) {
 	}
 }
 
+// TestValidIdentifier is the regression guard for gastown-c4r finding #1:
+// the only values permitted to become restart-command arguments are those
+// passing this schema. Anything that could break out of an argv token —
+// shell metacharacters, whitespace, path traversal, command separators —
+// must be rejected. The original vulnerability interpolated these fields
+// into a string later passed to `sh -c`; even though the apply path no
+// longer shells, validIdentifier is still the choke point planLane uses
+// to decide escalate-vs-execute.
+func TestValidIdentifier(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"empty", "", false},
+		{"simple", "onyx", true},
+		{"alphanumeric", "polecat42", true},
+		{"with dot", "gastown-cet.16", true},
+		{"with dash", "obsidian-xl", true},
+		{"with underscore", "kimi_k2", true},
+		{"leading dash", "-x", true}, // schema permits; apply-time still safe (argv token)
+		{"shell injection semicolon", "claude;rm -rf /", false},
+		{"shell injection pipe", "claude|cat /etc/passwd", false},
+		{"shell injection backtick", "claude`whoami`", false},
+		{"shell injection dollar", "claude$(id)", false},
+		{"shell injection and", "claude&&reboot", false},
+		{"whitespace", "claude sonnet", false},
+		{"newline", "claude\n--agent", false},
+		{"path traversal", "../etc/passwd", false},
+		{"subshell", "claude(whoami)", false},
+		{"redirect", "claude>/etc/shadow", false},
+		{"unicode", "claudeé", false},
+		{"null byte", "claude\x00", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validIdentifier(tc.in); got != tc.want {
+				t.Errorf("validIdentifier(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLaneRecovery_ApplyArgs is the regression guard for gastown-c4r
+// finding #1: the apply phase builds argv directly from structured
+// fields and never invokes a shell. A tainted lane must refuse to
+// produce an argv (returns an error) rather than emit a vector an
+// exec.Command could run. A clean lane produces the static
+// allow-listed form with no shell and no field interpolation into a
+// string.
+func TestLaneRecovery_ApplyArgs(t *testing.T) {
+	// Clean lane → static argv form, gt path preserved.
+	clean := LaneRecovery{Polecat: "onyx", AssignedAgent: "codex"}
+	got, err := clean.ApplyArgs("/usr/bin/gt", "gastown")
+	if err != nil {
+		t.Fatalf("clean ApplyArgs: %v", err)
+	}
+	want := []string{"/usr/bin/gt", "session", "start", "gastown/onyx", "--agent", "codex"}
+	if len(got) != len(want) {
+		t.Fatalf("argv len = %d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// Escalate set → never executable.
+	esc := LaneRecovery{Polecat: "onyx", AssignedAgent: "codex", Escalate: true}
+	if _, err := esc.ApplyArgs("gt", "gastown"); err == nil {
+		t.Error("ApplyArgs on an escalation must error, not return argv")
+	}
+
+	// Tainted polecat → refused even if agent is clean.
+	tainted := LaneRecovery{Polecat: "onyx;rm -rf /", AssignedAgent: "codex"}
+	if _, err := tainted.ApplyArgs("gt", "gastown"); err == nil {
+		t.Error("ApplyArgs must refuse a tainted polecat identifier")
+	}
+
+	// Tainted agent → refused.
+	taintedAgent := LaneRecovery{Polecat: "onyx", AssignedAgent: "codex$(pwn)"}
+	if _, err := taintedAgent.ApplyArgs("gt", "gastown"); err == nil {
+		t.Error("ApplyArgs must refuse a tainted agent identifier")
+	}
+
+	// Tainted rig name → refused (defense in depth).
+	if _, err := clean.ApplyArgs("gt", "gastown;rm -rf /"); err == nil {
+		t.Error("ApplyArgs must refuse a tainted rig name")
+	}
+
+	// Empty gt path → defaults to "gt" (the supervisor default).
+	gotDefault, err := clean.ApplyArgs("", "gastown")
+	if err != nil {
+		t.Fatalf("ApplyArgs with empty gtPath: %v", err)
+	}
+	if gotDefault[0] != "gt" {
+		t.Errorf("argv[0] = %q, want \"gt\" default", gotDefault[0])
+	}
+}
+
+// TestHandoffReplayer_TaintedAssignmentEscalates proves the #1 hotfix
+// end-to-end at the plan layer: a handoff lane whose pre-populated
+// AssignedAgent contains shell metacharacters — written by a
+// non-supervisor code path — is escalated to the Mayor rather than
+// turned into a restart Command string. Before the fix, this field was
+// interpolated into a string the apply phase passed to `sh -c`.
+func TestHandoffReplayer_TaintedAssignmentEscalates(t *testing.T) {
+	rep := NewHandoffReplayer(t.TempDir(), t.TempDir(), "gastown", "/usr/bin/gt")
+	hf := &HandoffFile{
+		StoppedLanes: []StoppedLane{
+			{
+				Polecat:          "onyx",
+				AssignedAgent:    "claude;rm -rf /", // injected field
+				AssignmentSource: AssignmentSourceAgentBead,
+			},
+		},
+	}
+	plan, err := rep.Replay(hf)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(plan.Actions) != 0 {
+		t.Errorf("Actions should be empty for tainted assignment, got %d (%+v)",
+			len(plan.Actions), plan.Actions)
+	}
+	if len(plan.Escalations) != 1 || !plan.Escalations[0].Escalate {
+		t.Fatalf("expected 1 escalation for tainted assignment, got %+v", plan.Escalations)
+	}
+	esc := plan.Escalations[0]
+	if esc.Polecat != "onyx" {
+		t.Errorf("escalation Polecat = %q, want onyx", esc.Polecat)
+	}
+	// The injection payload must not survive into the reason or any
+	// command-shaped field.
+	if strings.Contains(esc.Reason, "rm -rf") {
+		t.Errorf("escalation Reason leaked injection payload: %q", esc.Reason)
+	}
+	// And no action's Command may carry the payload (defensive: there
+	// are zero actions, but assert the invariant explicitly).
+	for _, a := range plan.Actions {
+		if strings.Contains(a.Command, "rm -rf") {
+			t.Errorf("action Command leaked injection payload: %q", a.Command)
+		}
+	}
+}
+
+// TestHandoffReplayer_ResolverTaintedEscalates proves the #1 hotfix
+// holds on the resolver path too: even if a resolver returns a durable
+// source, a tainted agent value is escalated rather than shelled.
+func TestHandoffReplayer_ResolverTaintedEscalates(t *testing.T) {
+	rep := NewHandoffReplayerWithResolver(
+		t.TempDir(), t.TempDir(), "gastown", "",
+		func(rigPath, polecat, beadKey string) (string, string) {
+			// Resolver returns an injected agent with a durable source.
+			return "claude$(reboot)", AssignmentSourceModelAssignments
+		},
+	)
+	hf := &HandoffFile{
+		StoppedLanes: []StoppedLane{
+			{Polecat: "onyx", BeadKey: "gastown-x"},
+		},
+	}
+	plan, err := rep.Replay(hf)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(plan.Actions) != 0 {
+		t.Errorf("Actions should be empty for tainted resolver agent, got %d", len(plan.Actions))
+	}
+	if len(plan.Escalations) != 1 || !plan.Escalations[0].Escalate {
+		t.Fatalf("expected escalation for tainted resolver agent, got %+v", plan.Escalations)
+	}
+}
+
 // TestHandoffReplayer_ResolverFallback: when the handoff has no
 // pre-populated assignment but a custom AssignmentResolver is
 // installed (e.g. backed by the wrapper's readModelAssignment),

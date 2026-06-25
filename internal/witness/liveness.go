@@ -659,6 +659,16 @@ func (r *HandoffReplayer) planLane(lane StoppedLane) LaneRecovery {
 	// Step 1: trust the handoff's pre-populated assignment if it
 	// came from a durable source.
 	if lane.AssignedAgent != "" && isDurableAssignmentSource(lane.AssignmentSource) {
+		// gastown-c4r finding #1: never trust a handoff-derived
+		// identifier enough to shell it. Validate polecat + agent
+		// against a strict schema; anything that does not match is
+		// escalated rather than turned into a command string.
+		if !validIdentifier(lane.Polecat) || !validIdentifier(lane.AssignedAgent) {
+			rec.Escalate = true
+			rec.AssignmentSource = AssignmentSourceUnassigned
+			rec.Reason = "invalid polecat/agent identifier in handoff (would be shelled); escalate to Mayor"
+			return rec
+		}
 		rec.AssignedAgent = lane.AssignedAgent
 		rec.AssignmentSource = lane.AssignmentSource
 		rec.Command = r.restartCommand(lane.Polecat, lane.AssignedAgent)
@@ -669,6 +679,12 @@ func (r *HandoffReplayer) planLane(lane StoppedLane) LaneRecovery {
 	// Step 2: ask the resolver for a durable fallback.
 	if r.Resolve != nil {
 		if agent, source := r.Resolve(r.rigPath, lane.Polecat, lane.BeadKey); agent != "" && isDurableAssignmentSource(source) {
+			if !validIdentifier(lane.Polecat) || !validIdentifier(agent) {
+				rec.Escalate = true
+				rec.AssignmentSource = AssignmentSourceUnassigned
+				rec.Reason = "invalid polecat/agent identifier from resolver (would be shelled); escalate to Mayor"
+				return rec
+			}
 			rec.AssignedAgent = agent
 			rec.AssignmentSource = source
 			rec.Command = r.restartCommand(lane.Polecat, agent)
@@ -703,6 +719,61 @@ func (r *HandoffReplayer) restartCommand(polecat, agent string) string {
 // non-durable and trigger escalation.
 func isDurableAssignmentSource(source string) bool {
 	return source == AssignmentSourceAgentBead || source == AssignmentSourceModelAssignments
+}
+
+// validIdentifier is the strict schema for any value that will be
+// turned into a restart-command argument (gastown-c4r finding #1).
+// It accepts a conservative shell-safe subset: alphanumerics, dot,
+// dash, and underscore, anchored at both ends, non-empty. This is the
+// single choke point that prevents a handoff field written by a
+// non-supervisor code path from injecting shell metacharacters into the
+// `sh -c` apply path (the original vulnerability: restartCommand
+// interpolated rigName/polecat/agent into a string that was later
+// passed to `sh -c`).
+func validIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= 'a' && c <= 'z',
+			c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9',
+			c == '.', c == '-', c == '_':
+			// allowed
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ApplyArgs returns the argv vector for a model-preserving restart of
+// a single lane, built directly from the structured LaneRecovery fields
+// (gastown-c4r finding #1). Callers MUST use this instead of parsing
+// or shelling Action.Command: it is the only apply path that cannot be
+// subverted by handoff field contents, because no shell is involved
+// and every interpolated value has already passed validIdentifier at
+// plan time.
+//
+// rigName is the rig the handoff belongs to; it is validated here as
+// defense in depth (it came from Supervisor construction, but the
+// supervisor is long-lived and a stale value is plausible).
+//
+// Returns (nil, error) if the lane is not executable (Escalate set, or
+// polecat/agent failed validation) so the caller skips it instead of
+// silently dropping it.
+func (a LaneRecovery) ApplyArgs(gtPath, rigName string) ([]string, error) {
+	if a.Escalate {
+		return nil, errors.New("witness: cannot apply an escalation action")
+	}
+	if !validIdentifier(a.Polecat) || !validIdentifier(a.AssignedAgent) || !validIdentifier(rigName) {
+		return nil, fmt.Errorf("witness: invalid identifier for apply (rig=%q polecat=%q agent=%q)", rigName, a.Polecat, a.AssignedAgent)
+	}
+	if gtPath == "" {
+		gtPath = "gt"
+	}
+	return []string{gtPath, "session", "start", rigName + "/" + a.Polecat, "--agent", a.AssignedAgent}, nil
 }
 
 // RecoveryAttempt records a single supervised restart of the Witness.
@@ -885,6 +956,18 @@ func ParseDurationOrZero(s string) time.Duration {
 	return d
 }
 
+// LaneStateResolver is the integration point between the supervisor and
+// the rig's live polecat state (gastown-c4r finding #2). It is kept as a
+// callback so the witness package does not import the daemon/polecat
+// packages (avoiding an import cycle). The daemon installs a resolver
+// backed by DetectZombiePolecats so a supervised restart writes a
+// fully-populated handoff (stopped lanes, dirty lanes) instead of the
+// metadata-only synthetic handoff the original EnsureHandoff produced.
+//
+// Returns the stopped and dirty lanes observed for the rig at call
+// time. Either slice may be nil/empty.
+type LaneStateResolver func(rigPath, rigName string) (stopped []StoppedLane, dirty []DirtyLane)
+
 // Supervisor is the bundled interface for daemon-driven witness
 // supervision checks and for the Witness itself to write its own
 // handoff before a self-restart. All methods are safe for concurrent
@@ -895,6 +978,10 @@ type Supervisor struct {
 	rigName  string
 	gtPath   string
 	startMu  sync.Mutex
+	// ResolveLanes, when set, supplies live stopped/dirty lane state
+	// to EnsureHandoff so the durable handoff captures the rig's
+	// actual outstanding obligations instead of an empty snapshot.
+	ResolveLanes LaneStateResolver
 }
 
 // NewSupervisor creates a Supervisor for the witness of a specific rig.
@@ -920,6 +1007,15 @@ func (s *Supervisor) RigPath() string { return s.rigPath }
 
 // RigName returns the configured rig name.
 func (s *Supervisor) RigName() string { return s.rigName }
+
+// GTPath returns the configured gt binary path (for the apply phase
+// of replay, which builds argv via LaneRecovery.ApplyArgs).
+func (s *Supervisor) GTPath() string {
+	if s.gtPath == "" {
+		return "gt"
+	}
+	return s.gtPath
+}
 
 // ReadHeartbeat loads the witness heartbeat (or nil if missing).
 func (s *Supervisor) ReadHeartbeat() *Heartbeat {
@@ -994,6 +1090,17 @@ func (s *Supervisor) IsOnCooldown() (bool, time.Time, error) {
 // ShouldRestart returns true if the supervisor believes the witness
 // should be restarted, based on heartbeat state and the configured
 // thresholds. Cooldown is honored.
+//
+// This honors the SAME signals Heartbeat.ShouldSelfRestart exposes
+// (gastown-c4r finding #4): a saturated witness that is very-stale OR
+// wedged in a long-running command (CommandDurationMs > MaxCommandDuration)
+// is a restart candidate. The previous implementation only checked
+// saturation + IsVeryStale, so a saturated witness stuck in a single
+// long-running tool call but still refreshing its heartbeat was never
+// restarted — the canonical degraded mode this supervisor exists to
+// catch. Delegating to ShouldSelfRestart keeps the two decision paths
+// aligned instead of reimplementing (and dropping) the command-duration
+// signal.
 func (s *Supervisor) ShouldRestart() (bool, string) {
 	t := s.Thresholds()
 	hb := s.ReadHeartbeat()
@@ -1003,10 +1110,7 @@ func (s *Supervisor) ShouldRestart() (bool, string) {
 		// written its first heartbeat yet.
 		return false, ""
 	}
-	if !hb.IsSaturated(t.ContextSaturationThreshold) {
-		return false, ""
-	}
-	if !hb.IsVeryStale(t.VeryStaleThreshold) {
+	if !hb.ShouldSelfRestart(t.ContextSaturationThreshold, t.VeryStaleThreshold, t.MaxCommandDuration) {
 		return false, ""
 	}
 	if onCD, last, err := s.IsOnCooldown(); err == nil && onCD {
@@ -1014,7 +1118,14 @@ func (s *Supervisor) ShouldRestart() (bool, string) {
 	}
 	// Compose reason with rig prefix so a single recovery ledger
 	// serves multiple rigs.
-	return true, s.rigName + ":context-saturated-stalled"
+	reason := s.rigName + ":context-saturated-stalled"
+	if !hb.IsVeryStale(t.VeryStaleThreshold) {
+		// Reached here via the long-command branch (not very-stale).
+		// Surface that distinction so the recovery ledger records the
+		// actual trigger.
+		reason = s.rigName + ":command-wedged"
+	}
+	return true, reason
 }
 
 // VerifyAgent runs `gt model-status --json` and compares the actual
@@ -1046,9 +1157,17 @@ func (s *Supervisor) VerifyAgent() *ModelVerification {
 
 // EnsureHandoff makes sure a handoff file is on disk for the next
 // Witness to consume. If one already exists, it is left in place (the
-// witness will consume and clear it on resume). Otherwise a minimal
-// handoff is synthesized from the current heartbeat so the post-restart
-// witness has authoritative state to resume from.
+// witness will consume and clear it on resume). Otherwise a handoff is
+// synthesized from the current heartbeat so the post-restart witness
+// has authoritative state to resume from.
+//
+// gastown-c4r finding #2: the original implementation synthesized a
+// handoff carrying only heartbeat metadata and StoppedLanes: nil, so a
+// supervised restart dropped stopped lanes, dirty/ahead state, and the
+// recovery obligations the spec requires. When a LaneStateResolver is
+// installed (daemon backs it with DetectZombiePolecats), the synthetic
+// handoff is now populated with the rig's actual stopped and dirty
+// lanes at restart time.
 //
 // Returns the path to the handoff file (or "" if no handoff was
 // written because neither handoff file nor heartbeat existed).
@@ -1067,8 +1186,18 @@ func (s *Supervisor) EnsureHandoff(reason string) (string, error) {
 		LastCycle:                hb.Cycle,
 		RigName:                  s.rigName,
 		ContextSaturationPercent: hb.ContextSaturationPercent,
-		StoppedLanes:             nil,
 	}
+	// Populate outstanding obligations from live rig state when a
+	// resolver is available. Stopped/dirty lanes carry the durable
+	// assignment metadata the post-restart replayer needs.
+	if s.ResolveLanes != nil {
+		stopped, dirty := s.ResolveLanes(s.rigPath, s.rigName)
+		synth.StoppedLanes = stopped
+		synth.DirtyLanes = dirty
+	}
+	// Mirror the obligation count into the snapshot field so the
+	// post-restart witness and dashboards see a consistent number.
+	synth.OutstandingObligations = len(synth.StoppedLanes) + len(synth.DirtyLanes)
 	if err := WriteHandoff(s.rigPath, synth); err != nil {
 		return "", err
 	}
