@@ -57,6 +57,12 @@ and the git revision the binary was built from (if available).`,
 		if versionVerbose {
 			fmt.Printf("Timestamp: %s\n", time.Now().Format(time.RFC3339))
 			fmt.Printf("Go version: %s\n", runtime.Version())
+			if version.PinnedRuntimeLine != "" {
+				fmt.Printf("Pinned runtime line: %s\n", version.PinnedRuntimeLine)
+			}
+			if features := version.FeatureList(); len(features) > 0 {
+				fmt.Printf("Hardening fixes: %s\n", strings.Join(features, ", "))
+			}
 		}
 	},
 }
