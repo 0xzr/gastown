@@ -256,3 +256,292 @@ func TestMergeCandidateBasis_DiffBasis(t *testing.T) {
 		t.Error("commit_history basis must not be treated as merge candidate")
 	}
 }
+
+// --- Core multi-model refinery quorum (gastown-cet.17) ----------------------
+//
+// These tests pin the source-controlled counterpart of the live runtime gate
+// (gastown-spike/dropin/refinery-gate.sh). The rule: core reviewers are
+// m3, codex, umans-kimi, umans-glm. A known writer is excluded and all
+// remaining core reviewers must PASS; an unknown writer requires all four.
+// Any parsed FAIL rejects. Any core unavailable/no-verdict defers (non-zero,
+// no attestation) and records an audit obligation. Opus FAIL rejects; Opus
+// unavailable/no-verdict files an audit bead but does not block a fully PASSed
+// core panel.
+
+// coreResult builds a ReviewerResult for a core reviewer with the given verdict.
+func coreResult(name string, v ReviewerVerdict) ReviewerResult {
+	return ReviewerResult{Reviewer: name, Verdict: v}
+}
+
+// allCorePass returns a PASS result for every name in the slice.
+func allCorePass(names []string) []ReviewerResult {
+	out := make([]ReviewerResult, 0, len(names))
+	for _, n := range names {
+		out = append(out, coreResult(n, ReviewerVerdictPass))
+	}
+	return out
+}
+
+func TestCoreQuorum_UnknownWriterRequiresAllFour(t *testing.T) {
+	// Unknown writer: all four core reviewers required.
+	q := CoreReviewerQuorum{Writer: "unknown"}
+	if got := q.ExpectedPeerCount(); got != 4 {
+		t.Fatalf("unknown writer expects 4 core peers, got %d", got)
+	}
+	if got := q.PeerReviewPhase(4); got != "peer-review:4/4" {
+		t.Errorf("expected peer-review:4/4, got %s", got)
+	}
+
+	t.Run("all_four_pass_merges", func(t *testing.T) {
+		ev := EvaluateCoreReviewerQuorum(allCorePass(q.SelectedCoreReviewers()), q)
+		if ev.State != ReviewStatePass {
+			t.Fatalf("expected PASS for 4/4 core, got %s: %s", ev.State, ev.Error)
+		}
+		if ev.PassCount != 4 {
+			t.Errorf("expected PassCount=4, got %d", ev.PassCount)
+		}
+	})
+}
+
+func TestCoreQuorum_KnownM3WriterRequiresCodexKimiGlm(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "m3"}
+	selected := q.SelectedCoreReviewers()
+	if len(selected) != 3 {
+		t.Fatalf("known m3 writer should exclude m3, got %v", selected)
+	}
+	for _, r := range selected {
+		if r == "m3" {
+			t.Fatalf("writer m3 must be excluded from selected core, got %v", selected)
+		}
+	}
+	if got := q.PeerReviewPhase(3); got != "peer-review:3/3" {
+		t.Errorf("expected peer-review:3/3, got %s", got)
+	}
+
+	t.Run("three_pass_merges", func(t *testing.T) {
+		ev := EvaluateCoreReviewerQuorum(allCorePass(selected), q)
+		if ev.State != ReviewStatePass {
+			t.Fatalf("expected PASS for 3/3 core (m3 writer), got %s: %s", ev.State, ev.Error)
+		}
+		if ev.PassCount != 3 {
+			t.Errorf("expected PassCount=3, got %d", ev.PassCount)
+		}
+	})
+}
+
+func TestCoreQuorum_KnownCodexWriterRequiresM3KimiGlm(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "codex"}
+	selected := q.SelectedCoreReviewers()
+	if len(selected) != 3 {
+		t.Fatalf("known codex writer should exclude codex, got %v", selected)
+	}
+	for _, r := range selected {
+		if r == "codex" {
+			t.Fatalf("writer codex must be excluded, got %v", selected)
+		}
+	}
+	ev := EvaluateCoreReviewerQuorum(allCorePass(selected), q)
+	if ev.State != ReviewStatePass {
+		t.Fatalf("expected PASS for 3/3 core (codex writer), got %s: %s", ev.State, ev.Error)
+	}
+}
+
+// TestCoreQuorum_CodexImplWriterNormalizes confirms an implementer-style writer
+// id ("codex-impl") is excluded like "codex", mirroring the dropin's
+// codex-impl -> codex normalization so a writer cannot review its own diff.
+func TestCoreQuorum_CodexImplWriterNormalizes(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "codex-impl"}
+	for _, r := range q.SelectedCoreReviewers() {
+		if r == "codex" {
+			t.Fatalf("codex-impl writer must exclude codex reviewer, got %v", q.SelectedCoreReviewers())
+		}
+	}
+	if q.ExpectedPeerCount() != 3 {
+		t.Errorf("codex-impl writer expects 3 peers, got %d", q.ExpectedPeerCount())
+	}
+}
+
+func TestCoreQuorum_OneUnavailableCoreDefersNoAttestation(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "unknown"}
+	results := []ReviewerResult{
+		coreResult("m3", ReviewerVerdictPass),
+		coreResult("codex", ReviewerVerdictPass),
+		coreResult("umans-kimi", ReviewerVerdictPass),
+		// umans-glm could not be reached.
+		coreResult("umans-glm", ReviewerVerdictUnavailable),
+	}
+	ev := EvaluateCoreReviewerQuorum(results, q)
+
+	// DEFER: non-zero (not PASS/mergeable), no attestation.
+	if ev.State == ReviewStatePass || ev.State == ReviewStateDegradedQuorum {
+		t.Fatalf("unavailable core reviewer must DEFER, not merge; got %s: %s", ev.State, ev.Error)
+	}
+	if ev.UnavailableCount != 1 {
+		t.Errorf("expected UnavailableCount=1, got %d", ev.UnavailableCount)
+	}
+	if ev.PassCount != 3 {
+		t.Errorf("expected PassCount=3, got %d", ev.PassCount)
+	}
+	// The unavailable reviewer must be recorded as an audit obligation.
+	found := false
+	for _, r := range ev.AuditReviewers {
+		if r == "umans-glm" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected umans-glm in audit reviewers, got %v", ev.AuditReviewers)
+	}
+}
+
+func TestCoreQuorum_OneCoreNoVerdictDefers(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "unknown"}
+	results := []ReviewerResult{
+		coreResult("m3", ReviewerVerdictPass),
+		coreResult("codex", ReviewerVerdictPass),
+		coreResult("umans-kimi", ReviewerVerdictPass),
+		coreResult("umans-glm", ReviewerVerdictNoVerdict),
+	}
+	ev := EvaluateCoreReviewerQuorum(results, q)
+	if ev.State == ReviewStatePass || ev.State == ReviewStateDegradedQuorum {
+		t.Fatalf("no-verdict core reviewer must DEFER, got %s: %s", ev.State, ev.Error)
+	}
+	if ev.NoVerdictCount != 1 {
+		t.Errorf("expected NoVerdictCount=1, got %d", ev.NoVerdictCount)
+	}
+}
+
+func TestCoreQuorum_OneCoreFailRejects(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "unknown"}
+	results := []ReviewerResult{
+		coreResult("m3", ReviewerVerdictPass),
+		{Reviewer: "codex", Verdict: ReviewerVerdictFail, Blockers: []string{"missing test"}, CauseKey: "missing_test"},
+		coreResult("umans-kimi", ReviewerVerdictPass),
+		coreResult("umans-glm", ReviewerVerdictPass),
+	}
+	ev := EvaluateCoreReviewerQuorum(results, q)
+	if ev.State != ReviewStateFail {
+		t.Fatalf("core FAIL must REJECT, got %s: %s", ev.State, ev.Error)
+	}
+	if ev.FailCount != 1 {
+		t.Errorf("expected FailCount=1, got %d", ev.FailCount)
+	}
+	if ev.CauseKey == "" {
+		t.Errorf("expected non-empty cause key for FAIL, got %q", ev.CauseKey)
+	}
+}
+
+// TestCoreQuorum_MixedFailAndUnavailableRejects confirms FAIL precedence: a
+// real FAIL must reject even when another core reviewer is unavailable, so a
+// rejection is never masked by peer unavailability (M3/GLM non-blocking test).
+func TestCoreQuorum_MixedFailAndUnavailableRejects(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "unknown"}
+	results := []ReviewerResult{
+		coreResult("m3", ReviewerVerdictPass),
+		coreResult("codex", ReviewerVerdictFail),
+		coreResult("umans-kimi", ReviewerVerdictUnavailable),
+		coreResult("umans-glm", ReviewerVerdictPass),
+	}
+	ev := EvaluateCoreReviewerQuorum(results, q)
+	if ev.State != ReviewStateFail {
+		t.Fatalf("mixed FAIL+UNAVAILABLE must REJECT (FAIL precedence), got %s: %s", ev.State, ev.Error)
+	}
+}
+
+func TestCoreQuorum_OpusUnavailableAfterCorePassMergesWithAudit(t *testing.T) {
+	// Known-writer 3/3 core PASS + Opus NO_VERDICT -> merge with audit (M3/GLM
+	// non-blocking test).
+	q := CoreReviewerQuorum{Writer: "m3", Opus: OpusVerdictUnavailable}
+	results := allCorePass(q.SelectedCoreReviewers())
+	ev := EvaluateCoreReviewerQuorum(results, q)
+	if ev.State != ReviewStateDegradedQuorum {
+		t.Fatalf("opus unavailable after core PASS should merge under audit (DEGRADED_QUORUM), got %s: %s", ev.State, ev.Error)
+	}
+	if len(ev.AuditReviewers) != 1 || ev.AuditReviewers[0] != OpusReviewerName {
+		t.Errorf("expected opus audit obligation, got %v", ev.AuditReviewers)
+	}
+	if q.OpusStatus() != "UNAVAILABLE" {
+		t.Errorf("expected opus status UNAVAILABLE, got %s", q.OpusStatus())
+	}
+}
+
+func TestCoreQuorum_OpusFailRejects(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "unknown", Opus: OpusVerdictFail}
+	results := allCorePass(q.SelectedCoreReviewers())
+	ev := EvaluateCoreReviewerQuorum(results, q)
+	if ev.State != ReviewStateFail {
+		t.Fatalf("opus FAIL must REJECT even with all core PASS, got %s: %s", ev.State, ev.Error)
+	}
+	if ev.CauseKey != "opus_rejection" {
+		t.Errorf("expected cause opus_rejection, got %s", ev.CauseKey)
+	}
+}
+
+// TestCoreQuorum_OpusPassMerges confirms the explicit Opus PASS path remains
+// covered: a fully PASSed core panel plus an explicit Opus PASS merges cleanly
+// (M3/GLM non-blocking test).
+func TestCoreQuorum_OpusPassMerges(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "unknown", Opus: OpusVerdictPass}
+	results := append(allCorePass(q.SelectedCoreReviewers()), coreResult(OpusReviewerName, ReviewerVerdictPass))
+	ev := EvaluateCoreReviewerQuorum(results, q)
+	if ev.State != ReviewStatePass {
+		t.Fatalf("core 4/4 + opus PASS should MERGE, got %s: %s", ev.State, ev.Error)
+	}
+	if q.OpusStatus() != "PASS" {
+		t.Errorf("expected opus status PASS, got %s", q.OpusStatus())
+	}
+}
+
+// TestCoreQuorum_KnownWriterPeerFailRejects mirrors the live smoke test where
+// a known writer's peer FAIL was rejected as expected.
+func TestCoreQuorum_KnownWriterPeerFailRejects(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "m3"}
+	results := []ReviewerResult{
+		coreResult("codex", ReviewerVerdictPass),
+		coreResult("umans-kimi", ReviewerVerdictFail),
+		coreResult("umans-glm", ReviewerVerdictPass),
+	}
+	ev := EvaluateCoreReviewerQuorum(results, q)
+	if ev.State != ReviewStateFail {
+		t.Fatalf("known-writer peer FAIL must REJECT, got %s: %s", ev.State, ev.Error)
+	}
+}
+
+// TestCoreQuorum_TelemetryShape confirms the evaluation records the telemetry
+// fields the bead requires: expected peer count, peer_passes, unavailable count,
+// opus status, and the peer-review:N/N phase.
+func TestCoreQuorum_TelemetryShape(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "codex", Opus: OpusVerdictPass}
+	results := append(allCorePass(q.SelectedCoreReviewers()), coreResult(OpusReviewerName, ReviewerVerdictPass))
+	ev := EvaluateCoreReviewerQuorum(results, q)
+
+	if ev.PassCount != 3 {
+		t.Errorf("telemetry peer_passes: expected 3, got %d", ev.PassCount)
+	}
+	if q.ExpectedPeerCount() != 3 {
+		t.Errorf("telemetry expected peer count: expected 3, got %d", q.ExpectedPeerCount())
+	}
+	if ev.UnavailableCount != 0 {
+		t.Errorf("telemetry unavailable: expected 0, got %d", ev.UnavailableCount)
+	}
+	if q.OpusStatus() != "PASS" {
+		t.Errorf("telemetry opus status: expected PASS, got %s", q.OpusStatus())
+	}
+	if got := q.PeerReviewPhase(ev.PassCount); got != "peer-review:3/3" {
+		t.Errorf("telemetry phase: expected peer-review:3/3, got %s", got)
+	}
+}
+
+// TestCoreQuorum_OpusNotConsultedMerges confirms that when Opus is not part of
+// the gate pass (zero-valued Opus), a fully PASSed core panel still merges.
+func TestCoreQuorum_OpusNotConsultedMerges(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "unknown"}
+	results := allCorePass(q.SelectedCoreReviewers())
+	ev := EvaluateCoreReviewerQuorum(results, q)
+	if ev.State != ReviewStatePass {
+		t.Fatalf("core 4/4 with opus not consulted should MERGE, got %s: %s", ev.State, ev.Error)
+	}
+	if q.OpusStatus() != "NOT_CONSULTED" {
+		t.Errorf("expected opus status NOT_CONSULTED, got %s", q.OpusStatus())
+	}
+}

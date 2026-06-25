@@ -79,3 +79,46 @@ and `audit_bead: <id>` for traceability.
   `FAIL` notification.
 * `require_review` still defaults to `false`.
 * Existing `require_review` configs continue to work.
+
+## Core Multi-Model Quorum (source-controlled runtime gate)
+
+The live multi-model runtime gate (`gastown-spike/dropin/refinery-gate.sh`)
+enforces a strict core reviewer quorum. That rule is **source-controlled** in
+`internal/refinery/review.go` via `EvaluateCoreReviewerQuorum` +
+`CoreReviewerQuorum` so it is durable and tested, not just a property of the
+dropin script. The two implementations agree.
+
+**Core reviewers:** `m3`, `codex`, `umans-kimi`, `umans-glm` (the
+`CoreMultiModelReviewers` set).
+
+**Rules:**
+
+1. **Writer exclusion.** If the writer is a known core reviewer, it is the
+   *only* reviewer excluded; the merge requires **all remaining** core reviewers
+   to return `PASS` (`peer-review:3/3`). If the writer is unknown, the merge
+   requires **all four** core reviewers to return `PASS` (`peer-review:4/4`).
+   Implementer-style writer ids (`codex-impl`) normalize to the canonical id
+   (`codex`) so a writer never reviews its own diff.
+2. **Any parsed `FAIL` rejects.** A `FAIL` from any consulted reviewer (core or
+   Opus) takes precedence over unavailability — a real rejection is never masked
+   by a peer being down (`mixed FAIL + UNAVAILABLE -> REJECT`).
+3. **Unavailable core defers.** Any selected core reviewer that is
+   `UNAVAILABLE` or `NO_VERDICT` **defers** the merge (non-zero, no attestation)
+   and is recorded in `AuditReviewers` so a re-audit bead can be filed. It
+   never merges under incomplete core coverage.
+4. **Opus verify.** Opus runs after the core panel: an Opus `FAIL` **rejects**;
+   Opus `UNAVAILABLE`/`NO_VERDICT` files an audit bead but does **not** block a
+   merge once the core panel has fully `PASS`ed (merge under
+   `ReviewStateDegradedQuorum`).
+
+**Telemetry.** `EvaluateCoreReviewerQuorum` returns a `ReviewEvaluation`
+recording the fields the runtime gate emits: `PassCount` (peer_passes),
+`UnavailableCount`, `NoVerdictCount`, plus `ExpectedPeerCount()` and the
+`PeerReviewPhase()`/`OpusStatus()` tokens (`peer-review:4/4`, `peer-review:3/3`).
+
+The acceptance tests in `review_test.go` (`TestCoreQuorum_*`) cover: unknown
+writer requires all four; known `m3`/`codex` writers require the other three;
+`codex-impl` normalization; one unavailable core defers with no attestation; one
+core `NO_VERDICT` defers; one core `FAIL` rejects; mixed `FAIL`+`UNAVAILABLE`
+rejects (FAIL precedence); Opus unavailable after core PASS merges with audit;
+Opus `FAIL` rejects; explicit Opus PASS merges; and telemetry shape.

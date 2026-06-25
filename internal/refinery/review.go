@@ -301,3 +301,250 @@ func EvaluateReviews(results []ReviewerResult, rule DegradedQuorumRule) ReviewEv
 	}
 	return ev
 }
+
+// CoreMultiModelReviewers are the mandatory multi-model peer reviewers for the
+// Gastown refinery gate. This is the source-controlled counterpart of the live
+// runtime gate in gastown-spike/dropin/refinery-gate.sh: every selected core
+// reviewer must return PASS before a merge may proceed. A missing/unavailable
+// core reviewer DEFERS the merge (it never merges under core coverage); a parsed
+// FAIL from any reviewer REJECTs.
+//
+// The set is intentionally a fixed four-family pool so that, even when the writer
+// is unknown, no model family is arbitrarily dropped — the change is reviewed by
+// every family other than (optionally) the writer's own.
+var CoreMultiModelReviewers = []string{"m3", "codex", "umans-kimi", "umans-glm"}
+
+// OpusReviewerName is the anchor reviewer that runs after the core panel. Opus
+// FAIL rejects; Opus unavailability/no-verdict files an audit bead but does NOT
+// block a merge once all selected core reviewers have PASSed.
+const OpusReviewerName = "opus"
+
+// CoreReviewerQuorum encodes the strict multi-model refinery quorum that the
+// live runtime gate (refinery-gate.sh) enforces. It is the source-controlled
+// source of truth for that behavior so it is durable and testable, not just a
+// property of the dropin script.
+//
+// Rules (mirroring the dropin exactly):
+//   - Core reviewers are CoreMultiModelReviewers (m3, codex, umans-kimi, umans-glm).
+//   - If Writer is a known core reviewer, it is the only reviewer excluded; the
+//     merge requires ALL remaining core reviewers to return PASS
+//     (peer-review:3/3).
+//   - If Writer is empty/"unknown", the merge requires ALL FOUR core reviewers
+//     to return PASS (peer-review:4/4).
+//   - Any parsed FAIL from a reviewed reviewer REJECTs, taking precedence over
+//     any unavailability (a real rejection is never masked by a peer being down).
+//   - Any selected core reviewer that is UNAVAILABLE or returns NO_VERDICT
+//     DEFERS the merge (non-zero, no attestation) and is recorded as an audit
+//     reviewer so a follow-up re-audit bead can be filed.
+//   - Opus is evaluated separately: a parsed Opus FAIL REJECTs; Opus
+//     UNAVAILABLE/NO_VERDICT is recorded as an audit reviewer but does NOT
+//     block a merge once the core panel has fully PASSed.
+type CoreReviewerQuorum struct {
+	// Writer identifies the implementer whose own review must be excluded to
+	// avoid self-review. Empty or "unknown" means the writer is unknown and
+	// all four core reviewers are required. Writer ids are matched against the
+	// core reviewer ids case-insensitively (e.g. "codex" matches writer
+	// "codex-impl").
+	Writer string
+
+	// Opus is the Opus verdict, if Opus was consulted. OpusVerdictPass does
+	// not change the decision; OpusVerdictFail rejects; the no-verdict/
+	// unavailable states file an audit obligation but do not block a fully
+	// PASSed core panel. Leave zero-valued (OpusVerdictNotConsulted) when Opus
+	// was not consulted at all.
+	Opus OpusVerdict
+}
+
+// OpusVerdict is the classified outcome of the Opus verify phase.
+type OpusVerdict string
+
+const (
+	// OpusVerdictNotConsulted means Opus was not run for this gate pass. It is
+	// not an audit obligation and does not affect the core decision.
+	OpusVerdictNotConsulted OpusVerdict = ""
+
+	// OpusVerdictPass means Opus explicitly approved the change.
+	OpusVerdictPass OpusVerdict = "PASS"
+
+	// OpusVerdictFail means Opus explicitly rejected the change. This rejects
+	// the merge outright, regardless of the core panel.
+	OpusVerdictFail OpusVerdict = "FAIL"
+
+	// OpusVerdictUnavailable means Opus could not be reached or produced no
+	// verdict. It files an audit bead but does not block a fully PASSed core
+	// panel.
+	OpusVerdictUnavailable OpusVerdict = "UNAVAILABLE"
+)
+
+// SelectedCoreReviewers returns the core reviewers that must PASS for the given
+// writer: all four when the writer is unknown, or all except the writer when it
+// names a known core reviewer. The returned slice preserves the canonical order
+// of CoreMultiModelReviewers.
+func (q CoreReviewerQuorum) SelectedCoreReviewers() []string {
+	writer := normalizeWriter(q.Writer)
+	if writer == "" || writer == "unknown" {
+		out := make([]string, len(CoreMultiModelReviewers))
+		copy(out, CoreMultiModelReviewers)
+		return out
+	}
+	out := make([]string, 0, len(CoreMultiModelReviewers))
+	for _, r := range CoreMultiModelReviewers {
+		if strings.EqualFold(r, writer) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// ExpectedPeerCount returns the number of core reviewers whose PASS is required
+// (4 for an unknown writer, 3 for a known core writer).
+func (q CoreReviewerQuorum) ExpectedPeerCount() int {
+	return len(q.SelectedCoreReviewers())
+}
+
+// PeerReviewPhase returns the telemetry phase string for the core panel, e.g.
+// "peer-review:4/4" or "peer-review:3/3".
+func (q CoreReviewerQuorum) PeerReviewPhase(passes int) string {
+	return fmt.Sprintf("peer-review:%d/%d", passes, q.ExpectedPeerCount())
+}
+
+// EvaluateCoreReviewerQuorum aggregates per-reviewer results under the strict
+// core multi-model quorum. It is the source-controlled mirror of the live
+// runtime gate's Phase-2/Phase-3 logic.
+//
+// results should contain the classified verdict for each reviewer that was
+// consulted (core reviewers and, optionally, Opus). Reviewers that were not
+// consulted are simply absent. The decision is:
+//
+//   - Any parsed FAIL (core or Opus) -> ReviewStateFail (REJECT).
+//   - Otherwise, if every selected core reviewer PASSed and Opus did not FAIL
+//     -> ReviewStatePass, unless Opus was unavailable/no-verdict, in which case
+//     ReviewStateDegradedQuorum (merge proceeds under a filed audit obligation).
+//   - Any selected core reviewer UNAVAILABLE/NO_VERDICT with no FAIL ->
+//     ReviewStateNoVerdict (DEFER; non-zero, no attestation) with the missing
+//     reviewer(s) recorded in AuditReviewers.
+//
+// The returned ReviewEvaluation records PassCount/FailCount/NoVerdictCount/
+// UnavailableCount for the core panel and an Opus status in OpusStatus so
+// telemetry can record expected peer count, peer_passes, unavailable count,
+// opus status, and the peer-review:N/N phase.
+func EvaluateCoreReviewerQuorum(results []ReviewerResult, q CoreReviewerQuorum) ReviewEvaluation {
+	selected := q.SelectedCoreReviewers()
+	// index verdicts by reviewer for quick lookup; last one wins if duplicated.
+	byName := make(map[string]ReviewerVerdict, len(results))
+	for _, r := range results {
+		byName[strings.ToLower(r.Reviewer)] = r.Verdict
+	}
+
+	ev := ReviewEvaluation{
+		Results: results,
+	}
+
+	// FAIL precedence: a parsed FAIL from ANY consulted reviewer (core or Opus)
+	// rejects immediately, even if other core reviewers were unavailable. This
+	// matches the dropin's "any parsed FAIL rejects" rule.
+	var failReviewer string
+	var failCause string
+	for _, r := range results {
+		if r.Verdict == ReviewerVerdictFail {
+			failReviewer = r.Reviewer
+			failCause = r.CauseKey
+			break
+		}
+	}
+	if failReviewer != "" {
+		ev.State = ReviewStateFail
+		if failCause == "" {
+			failCause = "reviewer_rejection"
+		}
+		ev.CauseKey = failCause
+		ev.FailCount = 1
+		ev.Error = fmt.Sprintf("core multi-model reviewer rejection: %s", failReviewer)
+		return ev
+	}
+
+	// Evaluate the core panel: every selected reviewer must PASS.
+	corePass := 0
+	coreUnavailable := 0
+	coreNoVerdict := 0
+	var missing []string
+	for _, name := range selected {
+		v, ok := byName[strings.ToLower(name)]
+		switch {
+		case !ok || v == ReviewerVerdictNoVerdict:
+			coreNoVerdict++
+			missing = append(missing, name)
+		case v == ReviewerVerdictUnavailable:
+			coreUnavailable++
+			missing = append(missing, name)
+		case v == ReviewerVerdictPass:
+			corePass++
+		}
+	}
+	ev.PassCount = corePass
+	ev.NoVerdictCount = coreNoVerdict
+	ev.UnavailableCount = coreUnavailable
+
+	// Any selected core reviewer that did not explicitly PASS defers the merge.
+	// It must never merge on unavailable/no-verdict core coverage.
+	if corePass != len(selected) {
+		ev.State = ReviewStateNoVerdict
+		ev.AuditReviewers = missing
+		ev.Error = fmt.Sprintf("core multi-model quorum incomplete: %d/%d core PASS (missing: %s)", corePass, len(selected), strings.Join(missing, ", "))
+		return ev
+	}
+
+	// Core panel fully PASSed. Opus FAIL rejects; Opus unavailable/no-verdict
+	// files an audit obligation but does not block the merge.
+	switch q.Opus {
+	case OpusVerdictFail:
+		ev.State = ReviewStateFail
+		ev.CauseKey = "opus_rejection"
+		ev.FailCount = 1
+		ev.Error = "core multi-model reviewer rejection: opus"
+		return ev
+	case OpusVerdictUnavailable:
+		ev.State = ReviewStateDegradedQuorum
+		ev.AuditReviewers = []string{OpusReviewerName}
+		ev.Error = fmt.Sprintf("core quorum met (%d/%d PASS); opus unavailable/no-verdict — audit obligation filed", corePass, len(selected))
+		return ev
+	case OpusVerdictPass, OpusVerdictNotConsulted:
+		// Fall through to a clean PASS.
+	}
+
+	ev.State = ReviewStatePass
+	ev.Error = fmt.Sprintf("core multi-model quorum met: %d/%d core PASS", corePass, len(selected))
+	return ev
+}
+
+// OpusStatus returns the telemetry status string for the Opus phase, mirroring
+// the dropin's "opus-verify:<verdict>" phase token.
+func (q CoreReviewerQuorum) OpusStatus() string {
+	switch q.Opus {
+	case OpusVerdictPass:
+		return "PASS"
+	case OpusVerdictFail:
+		return "FAIL"
+	case OpusVerdictUnavailable:
+		return "UNAVAILABLE"
+	default:
+		return "NOT_CONSULTED"
+	}
+}
+
+// normalizeWriter maps implementer-style writer ids onto the canonical core
+// reviewer id space so writer-exclusion actually works. The peer pool uses ids
+// m3/codex/umans-kimi/umans-glm, but an implementer may be registered as
+// codex-impl / umans-kimi / umans-glm / m3. This mirrors the dropin's
+// codex-impl -> codex normalization.
+func normalizeWriter(writer string) string {
+	w := strings.ToLower(strings.TrimSpace(writer))
+	switch {
+	case w == "" || w == "unknown":
+		return w
+	case strings.HasPrefix(w, "codex-"):
+		return "codex"
+	}
+	return w
+}
