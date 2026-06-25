@@ -3457,6 +3457,29 @@ func TestFindOrphanedDatabases_ProtectsBeadsGlobal(t *testing.T) {
 	}
 }
 
+func TestFindOrphanedDatabases_ProtectsBdglobal(t *testing.T) {
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+
+	setupDoltDB(t, dataDir, "hq")
+	setupDoltDB(t, dataDir, "bdglobal")
+	setupDoltDB(t, dataDir, "orphan_db")
+
+	setupRigsJSON(t, townRoot, []string{})
+	setupRigMetadata(t, townRoot, "hq", "hq")
+
+	orphans, err := FindOrphanedDatabases(townRoot)
+	if err != nil {
+		t.Fatalf("FindOrphanedDatabases: %v", err)
+	}
+	if len(orphans) != 1 {
+		t.Fatalf("expected 1 orphan, got %d: %v", len(orphans), orphans)
+	}
+	if orphans[0].Name != "orphan_db" {
+		t.Errorf("expected orphan name 'orphan_db', got %q", orphans[0].Name)
+	}
+}
+
 func TestFindOrphanedDatabases_MultipleOrphans(t *testing.T) {
 	townRoot := t.TempDir()
 	dataDir := filepath.Join(townRoot, ".dolt-data")
@@ -3659,6 +3682,23 @@ func TestRemoveDatabase_RefusesProtectedSharedServerDatabase(t *testing.T) {
 	}
 	if _, statErr := os.Stat(dbPath); statErr != nil {
 		t.Errorf("expected beads_global to remain on disk, got stat error: %v", statErr)
+	}
+}
+
+func TestRemoveDatabase_RefusesProtectedSharedServerDatabase_Bdglobal(t *testing.T) {
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	dbPath := setupDoltDB(t, dataDir, "bdglobal")
+
+	err := RemoveDatabase(townRoot, "bdglobal", true)
+	if err == nil {
+		t.Fatal("expected error for protected shared-server database")
+	}
+	if !strings.Contains(err.Error(), "protected shared-server database") {
+		t.Errorf("expected protected database error, got: %v", err)
+	}
+	if _, statErr := os.Stat(dbPath); statErr != nil {
+		t.Errorf("expected bdglobal to remain on disk, got stat error: %v", statErr)
 	}
 }
 
@@ -4397,6 +4437,30 @@ func TestCollectDatabaseOwners_ProtectedSharedServerDatabaseLabeled(t *testing.T
 	label, ok := owners["beads_global"]
 	if !ok {
 		t.Fatalf("expected beads_global to have an owner label, got owners=%v", owners)
+	}
+	if !strings.Contains(label, "protected") {
+		t.Errorf("expected protected-DB label to mention 'protected', got %q", label)
+	}
+}
+
+// TestCollectDatabaseOwners_ProtectedSharedServerDatabaseLabeled_Bdglobal
+// verifies the same protected-label behavior for bdglobal.
+func TestCollectDatabaseOwners_ProtectedSharedServerDatabaseLabeled_Bdglobal(t *testing.T) {
+	townRoot := t.TempDir()
+
+	setupRigsJSON(t, townRoot, []string{})
+	setupRigMetadata(t, townRoot, "hq", "hq")
+
+	dataDir := DefaultConfig(townRoot).DataDir
+	bdglobalPath := filepath.Join(dataDir, "bdglobal", ".dolt")
+	if err := os.MkdirAll(bdglobalPath, 0o755); err != nil {
+		t.Fatalf("mkdir bdglobal: %v", err)
+	}
+
+	owners := CollectDatabaseOwners(townRoot)
+	label, ok := owners["bdglobal"]
+	if !ok {
+		t.Fatalf("expected bdglobal to have an owner label, got owners=%v", owners)
 	}
 	if !strings.Contains(label, "protected") {
 		t.Errorf("expected protected-DB label to mention 'protected', got %q", label)

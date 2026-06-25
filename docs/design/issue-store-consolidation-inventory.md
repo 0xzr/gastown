@@ -30,8 +30,8 @@ removed.
 | `/home/ubuntu/gt-town/gastown/.beads` | redirect | → `gastown/mayor/rig/.beads` | — | `gastown-` | (via redirect) | **Yes** (alias) | Retain redirect |
 | `/home/ubuntu/gt-town/mayor/gastown/.beads` | embedded | `hq` | `417de1f3-d3ad-4651-81bf-c00a16b5b210` | `hq-` | 14 open | **No** | **Quarantine as historical evidence**; duplicates closed, unique issues preserved read-only |
 | `/home/ubuntu/gt-town-backups/gastown-orphan-beadstore-20260624T162212Z/.beads` | embedded | `hq` | `417de1f3-d3ad-4651-81bf-c00a16b5b210`* | `hq-` | 1 open (`hq-27q`) | **No** | **Archive as historical evidence**; unique issue `hq-27q` documented |
-| `/home/ubuntu/gt-town/bdglobal/.beads` | server | `bdglobal` | — | — | 0 | **No** | **Document as legacy/empty**; no action unless future use is assigned |
-| `/home/ubuntu/gt-town/beads_global/.beads` | server | `beads_global` | — | — | 0 | **No** | **Document as legacy/empty**; no action unless future use is assigned |
+| `/home/ubuntu/gt-town/bdglobal/.beads` | server | `bdglobal` | — | — | 0 | **No** (legacy) | **Register as protected legacy/empty**; labeled in `gt dolt status`, ignored by `gt doctor` |
+| `/home/ubuntu/gt-town/beads_global/.beads` | server | `beads_global` | — | — | 0 | **No** (legacy) | **Register as protected legacy/empty**; labeled in `gt dolt status`, ignored by `gt doctor` |
 
 \* Orphan backup `metadata.json` reuses the same `project_id` as
 `mayor/gastown/.beads`; this is consistent with it being a backup of that
@@ -177,12 +177,25 @@ backup copy referenced as provenance.
 
 ### 4.3 `bdglobal` and `beads_global`
 
-**Decision:** DOCUMENT as legacy/empty.
+**Decision:** REGISTER as protected legacy empty stores.
 
-Both Dolt databases are currently empty (zero issues). They are listed by the
-Dolt server (`gt dolt status`) but are not referenced by any rig route. They are
-not deleted or removed; any future purpose must be explicitly registered in a
-route or documented before use.
+Both Dolt databases are currently empty (zero issues). They are retained on disk
+so existing metadata references remain stable. Their disposition is implemented
+in the codebase:
+
+- `internal/doltserver/doltserver.go:protectedSharedServerDatabases()` labels
+  `bdglobal` and `beads_global` as protected legacy empty databases. This makes
+  `gt dolt status` / `gt dolt list` report their purpose instead of an
+  unexplained empty store, and prevents `gt dolt cleanup` from removing them.
+- `internal/doctor/unregistered_beads_check.go` treats the top-level
+  `bdglobal/` and `beads_global/` directories as known legacy stores (via the
+  canonical list exposed by `doltserver.ProtectedSharedServerDatabaseNames()`),
+  so `gt doctor` no longer reports them as unregistered beads directories.
+
+No Dolt data is deleted. To reverse the registration, remove the entries from
+`protectedSharedServerDatabases()` (which automatically updates
+`knownLegacyStoreDirs`) and re-run `gt doctor` to confirm expected warnings
+return.
 
 ---
 
@@ -220,6 +233,7 @@ changes and this document.
 - [x] Stale export clobber case (`hq-k6lt`) explicitly tied to canonical `gastown-stale-export-clobber` fix.
 - [x] Rollback instructions recorded.
 - [x] No raw `.dolt/`, `noms/`, `LOCK`, `manifest`, or JSONL files edited or removed.
+- [x] `bdglobal` and `beads_global` registered as protected legacy empty stores in `doltserver.go` and ignored by `unregistered-beads-dirs`.
 
 ---
 

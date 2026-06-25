@@ -166,6 +166,30 @@ func TestUnregisteredBeadsDirs_MultipleOrphans(t *testing.T) {
 	}
 }
 
+func TestUnregisteredBeadsDirs_IgnoresLegacyStores(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// No rigs registered
+	setupRigsJSON(t, tmpDir, nil)
+
+	// bdglobal and beads_global are intentionally retained legacy empty stores;
+	// they should not be reported as unregistered.
+	for _, name := range []string{"bdglobal", "beads_global"} {
+		writeBeadsMetadata(t, filepath.Join(tmpDir, name), name)
+	}
+
+	check := NewUnregisteredBeadsDirsCheck()
+	ctx := &CheckContext{TownRoot: tmpDir}
+	result := check.Run(ctx)
+
+	if result.Status != StatusOK {
+		t.Errorf("expected StatusOK for legacy stores, got %v: %s", result.Status, result.Message)
+		for _, d := range result.Details {
+			t.Logf("  detail: %s", d)
+		}
+	}
+}
+
 func TestUnregisteredBeadsDirs_DirWithoutMetadata(t *testing.T) {
 	tmpDir := t.TempDir()
 

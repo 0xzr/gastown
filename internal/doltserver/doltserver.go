@@ -39,6 +39,7 @@ import (
 	"path/filepath"
 
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -3010,8 +3011,27 @@ type OrphanedDatabase struct {
 // new protected database here automatically picks up all three surfaces.
 func protectedSharedServerDatabases() map[string]string {
 	return map[string]string{
-		"beads_global": "global shared beads database (protected)",
+		// bdglobal and beads_global are legacy, intentionally-empty shared-server
+		// databases. They are kept on disk (not deleted) so that older tooling
+		// references remain stable, and they are labeled here so `gt dolt status`
+		// reports their purpose instead of an unexplained empty store. See
+		// docs/design/issue-store-consolidation-inventory.md §4.3.
+		"bdglobal":     "legacy empty bdglobal database (protected)",
+		"beads_global": "legacy empty beads_global database (protected)",
 	}
+}
+
+// ProtectedSharedServerDatabaseNames returns the names of databases that are
+// intentionally hosted by the shared Dolt server without rig metadata. Exposed
+// so that doctor checks can recognize the corresponding top-level directories.
+func ProtectedSharedServerDatabaseNames() []string {
+	dbs := protectedSharedServerDatabases()
+	names := make([]string, 0, len(dbs))
+	for name := range dbs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // isProtectedSharedServerDatabase reports databases that are intentionally
@@ -3228,11 +3248,16 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 			}
 			dirName := entry.Name()
 			if db := readExistingDoltDatabase(filepath.Join(townRoot, dirName, ".beads")); db != "" {
-				if _, already := owners[db]; !already {
-					owners[db] = dirName + " rig beads"
+				// Legacy protected stores are intentionally not rigs; skip the
+				// inferred label so they get their documented purpose label below.
+				if !isProtectedSharedServerDatabase(db) {
+					if _, already := owners[db]; !already {
+						owners[db] = dirName + " rig beads"
+					}
 				}
 			}
 			if db := readExistingDoltDatabase(filepath.Join(townRoot, dirName, "mayor", "rig", ".beads")); db != "" {
+				// Rig metadata under mayor/rig cannot be a legacy protected store.
 				if _, already := owners[db]; !already {
 					owners[db] = dirName + " rig beads"
 				}

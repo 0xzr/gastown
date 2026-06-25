@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 // UnregisteredBeadsDirsCheck detects directories in the town root that have
@@ -42,6 +44,18 @@ var knownSystemDirs = map[string]bool{
 	".github":   true,
 }
 
+// knownLegacyStoreDirs returns the set of top-level directories that hold
+// .beads metadata for intentionally-retained shared-server databases. They are
+// not rigs and should not be flagged as unregistered. The canonical list is
+// maintained in internal/doltserver/doltserver.go:protectedSharedServerDatabases.
+func knownLegacyStoreDirs() map[string]bool {
+	dirs := make(map[string]bool)
+	for _, name := range doltserver.ProtectedSharedServerDatabaseNames() {
+		dirs[name] = true
+	}
+	return dirs
+}
+
 // Run checks for unregistered directories with beads metadata.
 func (c *UnregisteredBeadsDirsCheck) Run(ctx *CheckContext) *CheckResult {
 	// Load registered rig names from rigs.json
@@ -51,6 +65,7 @@ func (c *UnregisteredBeadsDirsCheck) Run(ctx *CheckContext) *CheckResult {
 	townDB := readDoltDatabase(filepath.Join(ctx.TownRoot, ".beads"))
 
 	var details []string
+	legacyDirs := knownLegacyStoreDirs()
 
 	// Scan town root for directories with .beads/metadata.json
 	entries, err := os.ReadDir(ctx.TownRoot)
@@ -69,8 +84,8 @@ func (c *UnregisteredBeadsDirsCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 		name := entry.Name()
 
-		// Skip known system dirs and registered rigs
-		if knownSystemDirs[name] || registeredRigs[name] {
+		// Skip known system dirs, legacy empty stores, and registered rigs
+		if knownSystemDirs[name] || legacyDirs[name] || registeredRigs[name] {
 			continue
 		}
 
