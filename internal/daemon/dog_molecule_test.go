@@ -86,6 +86,11 @@ func TestParseChildrenJSON(t *testing.T) {
 			wantCount: 2,
 		},
 		{
+			name:      "map wrapper with schema metadata",
+			input:     `{"hq-wisp-root":[{"id":"hq-wisp-a","title":"Probe","status":"open"},{"id":"hq-wisp-b","title":"Report","status":"open"}],"schema_version":1}`,
+			wantCount: 2,
+		},
+		{
 			name:      "empty map wrapper",
 			input:     `{"hq-wisp-root":[]}`,
 			wantCount: 0,

@@ -195,6 +195,28 @@ func TestMergeRuntimeLivenessEnv_UsesEffectiveAgentForProcessNames(t *testing.T)
 	}
 }
 
+func TestMergeRuntimeLivenessEnv_UsesRuntimeTmuxProcessNames(t *testing.T) {
+	env := map[string]string{
+		"GT_ROLE": "dog",
+	}
+	rc := &config.RuntimeConfig{
+		Command:       "/home/ubuntu/.local/bin/gt-umans-flash-dog",
+		ResolvedAgent: "umans-flash-dog-wrapper",
+		Tmux: &config.RuntimeTmuxConfig{
+			ProcessNames: []string{"node", "claude", "gt-umans-flash-dog"},
+		},
+	}
+
+	got := MergeRuntimeLivenessEnv(env, rc)
+
+	if got["GT_AGENT"] != "umans-flash-dog-wrapper" {
+		t.Fatalf("GT_AGENT = %q, want %q", got["GT_AGENT"], "umans-flash-dog-wrapper")
+	}
+	if got["GT_PROCESS_NAMES"] != "node,claude,gt-umans-flash-dog" {
+		t.Fatalf("GT_PROCESS_NAMES = %q, want %q", got["GT_PROCESS_NAMES"], "node,claude,gt-umans-flash-dog")
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
 }

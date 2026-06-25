@@ -411,6 +411,7 @@ func MergeRuntimeLivenessEnv(envVars map[string]string, runtimeConfig *config.Ru
 		agentForLookup := runtimeConfig.ResolvedAgent
 		commandForLookup := runtimeConfig.Command
 		argsForLookup := runtimeConfig.Args
+		tmuxForLookup := runtimeConfig.Tmux
 		if existing, ok := envVars["GT_AGENT"]; ok && existing != "" {
 			agentForLookup = existing
 			// When GT_AGENT was set by AgentOverride (differs from the
@@ -420,9 +421,15 @@ func MergeRuntimeLivenessEnv(envVars map[string]string, runtimeConfig *config.Ru
 			if existing != runtimeConfig.ResolvedAgent {
 				commandForLookup = ""
 				argsForLookup = nil
+				tmuxForLookup = nil
 			}
 		}
-		processNames := config.ResolveProcessNames(agentForLookup, commandForLookup, argsForLookup...)
+		processNames := config.RuntimeProcessNames(&config.RuntimeConfig{
+			Command:       commandForLookup,
+			Args:          argsForLookup,
+			ResolvedAgent: agentForLookup,
+			Tmux:          tmuxForLookup,
+		}, agentForLookup)
 		if len(processNames) > 0 {
 			envVars["GT_PROCESS_NAMES"] = strings.Join(processNames, ",")
 		}
