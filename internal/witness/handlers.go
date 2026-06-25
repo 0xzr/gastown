@@ -2774,14 +2774,89 @@ func getBeadStatus(bd *BdCli, workDir, beadID string) (string, bool) {
 	return issues[0].Status, true
 }
 
+// activeMayorDecisionForBead resolves the durable Mayor decision for a source bead.
+// It is a package-level variable so tests can substitute decision state without
+// writing files. Production callers use the mayor package directly.
+var activeMayorDecisionForBead = func(townRoot, beadID string) (*mayor.Decision, error) {
+	state, err := mayor.LoadDecisions(townRoot)
+	if err != nil {
+		return nil, err
+	}
+	return state.ActiveDecision(beadID)
+}
+
+// notifyMayorOfReworkBlocked surfaces a conflict between an active Mayor decision
+// (DEFER/HOLD/PARK) and an automated rework request to the Mayor. Both inputs are
+// included: the decision and the rework context (bead, polecat, status, threshold).
+// If router is nil, falls back to stderr logging and a direct nudge when possible.
+func notifyMayorOfReworkBlocked(townRoot, rigName, hookBead, polecatName, beadStatus string, maxRespawns int, decision *mayor.Decision, router *mail.Router) {
+	subject := fmt.Sprintf("REWORK_DEFERRED %s (Mayor %s decision blocks rework)", hookBead, decision.Type)
+	body := fmt.Sprintf(`Automated rework for bead %s was blocked by an active Mayor decision.
+
+Mayor Decision
+==============
+Type: %s
+Reason: %s
+Mayor: %s
+Recorded: %s
+
+Rework Context
+==============
+Bead: %s
+Polecat: %s/%s
+Previous Status: %s
+Max Respawns Threshold: %d
+
+Action Required
+===============
+The bead was NOT reset and no polecat was spawned. To allow rework to resume,
+record an explicit override: gt mayor decision resume %s`,
+		hookBead,
+		decision.Type,
+		decision.Reason,
+		decision.MayorID,
+		decision.Timestamp.Format(time.RFC3339),
+		hookBead,
+		rigName, polecatName,
+		beadStatus,
+		maxRespawns,
+		hookBead,
+	)
+
+	if router != nil {
+		msg := &mail.Message{
+			From:     fmt.Sprintf("%s/witness", rigName),
+			To:       "mayor/",
+			Subject:  subject,
+			Priority: mail.PriorityHigh,
+			Body:     body,
+		}
+		if err := router.Send(msg); err != nil {
+			fmt.Fprintf(os.Stderr, "witness: failed to send %s mail for %s: %v, attempting nudge fallback\n", subject, hookBead, err)
+		} else {
+			return
+		}
+	}
+
+	// Nudge fallback when router is nil or mail failed.
+	t := tmux.NewTmux()
+	nudgeMsg := fmt.Sprintf("%s: bead=%s polecat=%s/%s status=%s mayor_decision=%s reason=%q",
+		subject, hookBead, rigName, polecatName, beadStatus, decision.Type, decision.Reason)
+	if nudgeErr := t.NudgeSession(session.MayorSessionName(), nudgeMsg); nudgeErr != nil {
+		fmt.Fprintf(os.Stderr, "witness: nudge fallback to mayor also failed for %s: %v\n", hookBead, nudgeErr)
+	}
+}
+
 // resetAbandonedBead resets a dead polecat's hooked bead so it can be re-dispatched.
 // If the bead is in "hooked" or "in_progress" status, it:
 //  0. Checks if the polecat's work is already on main — if so, closes
 //     the bead instead of resetting (prevents re-dispatch of completed work)
-//  1. Records the respawn in the witness spawn-count ledger
-//  2. Resets status to open
-//  3. Clears assignee
-//  4. Sends mail to deacon for re-dispatch (includes respawn count; SPAWN_STORM
+//  1. Checks the durable Mayor decision state; active DEFER/HOLD/PARK converts
+//     automated rework handling into HOLD/await-Mayor and does not start a polecat
+//  2. Records the respawn in the witness spawn-count ledger
+//  3. Resets status to open
+//  4. Clears assignee
+//  5. Sends mail to deacon for re-dispatch (includes respawn count; SPAWN_STORM
 //     prefix and Urgent priority when count exceeds max bead respawns config)
 //
 // Returns true if the bead was recovered.
@@ -2809,6 +2884,16 @@ func resetAbandonedBead(bd *BdCli, workDir, rigName, hookBead, polecatName strin
 		if err := bd.Run(workDir, "close", hookBead, "-r", reason); err != nil {
 			fmt.Fprintf(os.Stderr, "witness: failed to close bead %s (work already on main): %v\n", hookBead, err)
 		}
+		return false
+	}
+
+	// Binding Mayor decision precedence (gastown-cet.7 / hq-12zq): explicit
+	// DEFER/HOLD/PARK on the source bead prevents automated rework spawn/nudge.
+	// Conflicts are logged with both the decision and the rework inputs and
+	// surfaced to the Mayor. A newer explicit RESUME decision overrides the
+	// block and allows rework to resume.
+	if decision, err := activeMayorDecisionForBead(trRoot, hookBead); err == nil && decision != nil {
+		notifyMayorOfReworkBlocked(trRoot, rigName, hookBead, polecatName, status, maxRespawns, decision, router)
 		return false
 	}
 
