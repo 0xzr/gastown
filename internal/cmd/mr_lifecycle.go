@@ -1,7 +1,7 @@
 // Package cmd: mr_lifecycle.go provides shared helpers for stacked-branch
-// detection and source-bead terminal-state classification.
+// detection.
 //
-// Background (gastown-cet.2.3 / hq-try2 / hq-6sdu):
+// Background (gastown-cet.2.3 / hq-try2):
 //
 //   - A polecat branch with multiple commits ahead of the target creates an MR
 //     that advertises only the tip commit. The refinery then cherry-picks the
@@ -9,58 +9,17 @@
 //     conflicts. The fix: detect stacked branches BEFORE MR creation and
 //     reject with actionable remediation (squash or self-contained resubmit).
 //
-//   - A source bead must not be closed while its MR is still pending, rejected,
-//     deferred, or merged locally but not externally published. The MR's
-//     terminal state distinguishes four values:
-//     pending-refinery            - MR is queued/in_progress, not yet merged
-//     rejected-needs-rework       - Refinery rejected; source should be
-//     reopened as reworkable
-//     merged-local-not-published  - Refinery merged to local file remote
-//     but no upstream sync yet (hq-6sdu)
-//     published                   - Source shipped to upstream (terminal)
-//
-// This file is the single source of truth for those checks. Both `gt done`
-// and `gt mq submit` call the helpers here before creating or closing MRs.
+// Source-bead terminal-state classification lives in the beads package
+// (internal/beads/mr_lifecycle.go) because the refinery consumes beads issue
+// state directly. This file only exports the stacked-branch guard. Both
+// `gt done` and `gt mq submit` call CheckStackedBranch here before creating an
+// MR.
 package cmd
 
 import (
 	"fmt"
-	"strings"
 
-	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
-)
-
-// MR terminal-state constants (gastown-cet.2.3, workstream B).
-//
-// These are stored as the `terminal_state` field on the MR bead. They are
-// distinct from beads `Status` (open/in_progress/closed) and from `CloseReason`
-// (merged/rejected/conflict/superseded) — those record the moment of closure,
-// while terminal_state records the *observable lifecycle position* from the
-// outside. Source beads consult terminal_state to decide whether their work is
-// safe to close.
-const (
-	// MRTerminalPendingRefinery means the MR is queued or in progress and
-	// has not reached a terminal outcome yet. Source beads must remain
-	// pending and dependents must remain blocked while this is the state.
-	MRTerminalPendingRefinery = "pending-refinery"
-
-	// MRTerminalRejectedNeedsRework means the refinery rejected the MR and
-	// the source issue should be reopened in a reworkable state with the
-	// reviewer packet retained as evidence. Dependents stay blocked.
-	MRTerminalRejectedNeedsRework = "rejected-needs-rework"
-
-	// MRTerminalMergedLocalNotPublished means the refinery merged the branch
-	// to the local file remote but the configured upstream (e.g. GitHub
-	// origin/main) has not yet advanced to the merged commit. Until the
-	// upstream matches, source beads must NOT be considered externally
-	// shipped (hq-6sdu).
-	MRTerminalMergedLocalNotPublished = "merged-local-not-published"
-
-	// MRTerminalPublished means the merged commit is reachable from the
-	// configured upstream target. This is the only state that allows the
-	// source bead to close and dependents to unblock.
-	MRTerminalPublished = "published"
 )
 
 // StackedBranchInfo describes the result of a stacked-branch check.
@@ -185,103 +144,4 @@ func CheckStackedBranch(g *git.Git, branch, targetRef string) (*StackedBranchInf
 		}
 	}
 	return info, nil
-}
-
-// ClassifyMRTerminalState returns the terminal state for an MR issue given
-// its current beads Status, CloseReason, and structured fields.
-//
-// The classification rules are:
-//
-//	beads.Status=open   → pending-refinery (queued, not yet claimed)
-//	beads.Status=in_progress → pending-refinery (claimed, mid-flight)
-//	beads.Status=closed + CloseReason in {conflict, ""} → rejected-needs-rework
-//	beads.Status=closed + CloseReason=merged + PublishedCommit empty → merged-local-not-published
-//	beads.Status=closed + CloseReason=merged + PublishedCommit set  → published
-//	beads.Status=closed + CloseReason=superseded → rejected-needs-rework
-//	                                                       (the source needs a new MR,
-//	                                                        not a fresh issue)
-//	beads.Status=closed + CloseReason=rejected → rejected-needs-rework
-//
-// Returns "" when the MR is in an unknown state — callers should treat that
-// conservatively (e.g. leave source pending).
-func ClassifyMRTerminalState(mrIssue *beads.Issue) string {
-	if mrIssue == nil {
-		return ""
-	}
-	fields := beads.ParseMRFields(mrIssue)
-	switch mrIssue.Status {
-	case "open", "in_progress":
-		return MRTerminalPendingRefinery
-	case "closed":
-		// Inspect CloseReason from structured fields first, fall back to
-		// the description text. Some legacy MRs store the reason inline.
-		reason := ""
-		if fields != nil {
-			reason = fields.CloseReason
-		}
-		if reason == "" {
-			reason = extractCloseReasonFromDescription(mrIssue.Description)
-		}
-		switch reason {
-		case "merged":
-			// Distinguish local-only merge from upstream-published.
-			if fields != nil && fields.PublishedCommit != "" {
-				return MRTerminalPublished
-			}
-			return MRTerminalMergedLocalNotPublished
-		case "rejected", "conflict", "superseded":
-			return MRTerminalRejectedNeedsRework
-		default:
-			// Unknown close reason — treat as needs-rework so the source
-			// is not silently closed.
-			return MRTerminalRejectedNeedsRework
-		}
-	}
-	return ""
-}
-
-// IsMRTerminalPublished returns true when the MR has reached the
-// `published` terminal state — i.e. the merged commit is reachable from the
-// configured upstream. This is the only state in which the source bead and
-// its dependents are safe to close/unblock.
-//
-// Other terminal states (rejected-needs-rework, merged-local-not-published,
-// pending-refinery) all return false. Callers that want a strict "is the
-// MR done enough to ship" predicate should use this helper.
-func IsMRTerminalPublished(mrIssue *beads.Issue) bool {
-	return ClassifyMRTerminalState(mrIssue) == MRTerminalPublished
-}
-
-// CanCloseSourceBead returns true when the MR is in a state that permits the
-// source bead to be closed. Today that means published; future work may
-// relax this for `merged-local-not-published` only when paired with an
-// explicit operator override.
-//
-// Pass nil to get a conservative false — callers must always have the MR
-// issue at hand.
-func CanCloseSourceBead(mrIssue *beads.Issue) bool {
-	if mrIssue == nil {
-		return false
-	}
-	return ClassifyMRTerminalState(mrIssue) == MRTerminalPublished
-}
-
-// extractCloseReasonFromDescription is a tolerant fallback for legacy MRs
-// whose close reason was written as prose instead of a structured field.
-// Matches "close_reason: <value>" anywhere on a single line.
-func extractCloseReasonFromDescription(desc string) string {
-	for _, line := range strings.Split(desc, "\n") {
-		line = strings.TrimSpace(line)
-		lower := strings.ToLower(line)
-		if strings.HasPrefix(lower, "close_reason:") {
-			return strings.TrimSpace(line[len("close_reason:"):])
-		}
-		if strings.HasPrefix(lower, "close-reason:") {
-			return strings.TrimSpace(line[len("close-reason:"):])
-		}
-		if strings.HasPrefix(lower, "closereason:") {
-			return strings.TrimSpace(line[len("closereason:"):])
-		}
-	}
-	return ""
 }

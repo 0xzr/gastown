@@ -15,7 +15,7 @@
 //	          leave source beads looking shipped when the configured
 //	          upstream (e.g. GitHub origin/main) has not advanced. The fix
 //	          is the published_commit/terminal_state classification in
-//	          ClassifyMRTerminalState so source beads stay pending until
+//	          beads.ClassifyMRTerminalState so source beads stay pending until
 //	          upstream sync is verified.
 //
 // These tests are CHARACTERIZATION tests: they exercise the new helpers
@@ -197,10 +197,10 @@ func TestErrStackedBranchErrorFormat(t *testing.T) {
 // is the entire point of gastown-cet.2.3 acceptance criteria #2.
 func TestClassifyMRTerminalState_OpenIsPendingRefinery(t *testing.T) {
 	mr := &beads.Issue{Status: "open"}
-	if got := ClassifyMRTerminalState(mr); got != MRTerminalPendingRefinery {
-		t.Errorf("open MR classified as %q, want %q", got, MRTerminalPendingRefinery)
+	if got := beads.ClassifyMRTerminalState(mr); got != beads.MRTerminalPendingRefinery {
+		t.Errorf("open MR classified as %q, want %q", got, beads.MRTerminalPendingRefinery)
 	}
-	if CanCloseSourceBead(mr) {
+	if beads.CanCloseSourceBead(mr) {
 		t.Error("CanCloseSourceBead=true for open MR — source would close prematurely")
 	}
 }
@@ -209,10 +209,10 @@ func TestClassifyMRTerminalState_OpenIsPendingRefinery(t *testing.T) {
 // are still pending from the source-bead's perspective.
 func TestClassifyMRTerminalState_InProgressIsPendingRefinery(t *testing.T) {
 	mr := &beads.Issue{Status: "in_progress"}
-	if got := ClassifyMRTerminalState(mr); got != MRTerminalPendingRefinery {
-		t.Errorf("in_progress MR classified as %q, want %q", got, MRTerminalPendingRefinery)
+	if got := beads.ClassifyMRTerminalState(mr); got != beads.MRTerminalPendingRefinery {
+		t.Errorf("in_progress MR classified as %q, want %q", got, beads.MRTerminalPendingRefinery)
 	}
-	if CanCloseSourceBead(mr) {
+	if beads.CanCloseSourceBead(mr) {
 		t.Error("CanCloseSourceBead=true for in_progress MR — source would close prematurely")
 	}
 }
@@ -232,11 +232,11 @@ commit_sha: b5a6a81600000000000000000000000000000000
 merge_commit: f752592e00000000000000000000000000000000
 close_reason: merged`,
 	}
-	got := ClassifyMRTerminalState(mr)
-	if got != MRTerminalMergedLocalNotPublished {
-		t.Fatalf("closed+merged MR with no PublishedCommit classified as %q, want %q", got, MRTerminalMergedLocalNotPublished)
+	got := beads.ClassifyMRTerminalState(mr)
+	if got != beads.MRTerminalMergedLocalNotPublished {
+		t.Fatalf("closed+merged MR with no PublishedCommit classified as %q, want %q", got, beads.MRTerminalMergedLocalNotPublished)
 	}
-	if CanCloseSourceBead(mr) {
+	if beads.CanCloseSourceBead(mr) {
 		t.Error("CanCloseSourceBead=true for merged-local-not-published MR — hq-6sdu regression")
 	}
 }
@@ -257,14 +257,14 @@ published_commit: 7b076fc1000000000000000000000000000000000
 published_remote: origin
 published_at: 2026-06-24T17:30:00Z`,
 	}
-	got := ClassifyMRTerminalState(mr)
-	if got != MRTerminalPublished {
-		t.Fatalf("classified as %q, want %q", got, MRTerminalPublished)
+	got := beads.ClassifyMRTerminalState(mr)
+	if got != beads.MRTerminalPublished {
+		t.Fatalf("classified as %q, want %q", got, beads.MRTerminalPublished)
 	}
-	if !CanCloseSourceBead(mr) {
+	if !beads.CanCloseSourceBead(mr) {
 		t.Error("CanCloseSourceBead=false for published MR — source would stay open forever")
 	}
-	if !IsMRTerminalPublished(mr) {
+	if !beads.IsMRTerminalPublished(mr) {
 		t.Error("IsMRTerminalPublished=false for published MR")
 	}
 }
@@ -279,11 +279,11 @@ func TestClassifyMRTerminalState_ClosedRejected(t *testing.T) {
 target: main
 close_reason: rejected`,
 	}
-	got := ClassifyMRTerminalState(mr)
-	if got != MRTerminalRejectedNeedsRework {
-		t.Errorf("classified as %q, want %q", got, MRTerminalRejectedNeedsRework)
+	got := beads.ClassifyMRTerminalState(mr)
+	if got != beads.MRTerminalRejectedNeedsRework {
+		t.Errorf("classified as %q, want %q", got, beads.MRTerminalRejectedNeedsRework)
 	}
-	if CanCloseSourceBead(mr) {
+	if beads.CanCloseSourceBead(mr) {
 		t.Error("CanCloseSourceBead=true for rejected MR — source would close on rejection")
 	}
 }
@@ -296,9 +296,9 @@ func TestClassifyMRTerminalState_ClosedConflict(t *testing.T) {
 		Status:      "closed",
 		Description: "close_reason: conflict\n",
 	}
-	got := ClassifyMRTerminalState(mr)
-	if got != MRTerminalRejectedNeedsRework {
-		t.Errorf("classified as %q, want %q", got, MRTerminalRejectedNeedsRework)
+	got := beads.ClassifyMRTerminalState(mr)
+	if got != beads.MRTerminalRejectedNeedsRework {
+		t.Errorf("classified as %q, want %q", got, beads.MRTerminalRejectedNeedsRework)
 	}
 }
 
@@ -310,9 +310,9 @@ func TestClassifyMRTerminalState_ClosedSuperseded(t *testing.T) {
 		Status:      "closed",
 		Description: "close_reason: superseded\n",
 	}
-	got := ClassifyMRTerminalState(mr)
-	if got != MRTerminalRejectedNeedsRework {
-		t.Errorf("classified as %q, want %q", got, MRTerminalRejectedNeedsRework)
+	got := beads.ClassifyMRTerminalState(mr)
+	if got != beads.MRTerminalRejectedNeedsRework {
+		t.Errorf("classified as %q, want %q", got, beads.MRTerminalRejectedNeedsRework)
 	}
 }
 
@@ -325,9 +325,9 @@ func TestClassifyMRTerminalState_ClosedUnknownReason(t *testing.T) {
 		Status:      "closed",
 		Description: "close_reason: weather-is-nice\n",
 	}
-	got := ClassifyMRTerminalState(mr)
-	if got != MRTerminalRejectedNeedsRework {
-		t.Errorf("classified as %q, want %q (default safe state)", got, MRTerminalRejectedNeedsRework)
+	got := beads.ClassifyMRTerminalState(mr)
+	if got != beads.MRTerminalRejectedNeedsRework {
+		t.Errorf("classified as %q, want %q (default safe state)", got, beads.MRTerminalRejectedNeedsRework)
 	}
 }
 
@@ -335,13 +335,13 @@ func TestClassifyMRTerminalState_ClosedUnknownReason(t *testing.T) {
 // panic and must not permit closing the source. Returning "" forces
 // callers to take the conservative branch.
 func TestClassifyMRTerminalState_NilMR(t *testing.T) {
-	if got := ClassifyMRTerminalState(nil); got != "" {
+	if got := beads.ClassifyMRTerminalState(nil); got != "" {
 		t.Errorf("nil MR classified as %q, want empty", got)
 	}
-	if CanCloseSourceBead(nil) {
+	if beads.CanCloseSourceBead(nil) {
 		t.Error("CanCloseSourceBead(nil)=true — must be conservative on nil")
 	}
-	if IsMRTerminalPublished(nil) {
+	if beads.IsMRTerminalPublished(nil) {
 		t.Error("IsMRTerminalPublished(nil)=true — must be conservative on nil")
 	}
 }
@@ -357,9 +357,9 @@ func TestClassifyMRTerminalState_LegacyCloseReasonInProse(t *testing.T) {
 
 close_reason: merged`,
 	}
-	got := ClassifyMRTerminalState(mr)
-	if got != MRTerminalMergedLocalNotPublished {
-		t.Errorf("legacy close_reason classified as %q, want %q", got, MRTerminalMergedLocalNotPublished)
+	got := beads.ClassifyMRTerminalState(mr)
+	if got != beads.MRTerminalMergedLocalNotPublished {
+		t.Errorf("legacy close_reason classified as %q, want %q", got, beads.MRTerminalMergedLocalNotPublished)
 	}
 }
 
@@ -402,14 +402,14 @@ commit_sha: %s
 merge_commit: f752592e
 close_reason: merged`, stacked.TipSHA),
 	}
-	if CanCloseSourceBead(mr) {
+	if beads.CanCloseSourceBead(mr) {
 		t.Error("source bead would close despite no PublishedCommit — hq-6sdu regression")
 	}
-	if IsMRTerminalPublished(mr) {
+	if beads.IsMRTerminalPublished(mr) {
 		t.Error("MR reported as published with no PublishedCommit — hq-6sdu regression")
 	}
-	if ClassifyMRTerminalState(mr) != MRTerminalMergedLocalNotPublished {
-		t.Errorf("classification=%q, want %q", ClassifyMRTerminalState(mr), MRTerminalMergedLocalNotPublished)
+	if beads.ClassifyMRTerminalState(mr) != beads.MRTerminalMergedLocalNotPublished {
+		t.Errorf("classification=%q, want %q", beads.ClassifyMRTerminalState(mr), beads.MRTerminalMergedLocalNotPublished)
 	}
 }
 
