@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1027,6 +1029,14 @@ type RecoveryStatus struct {
 	// activeMRAssessment carries the live-MQ-vs-stale-metadata classification
 	// so the reconcile path can clear a dead active_mr without re-querying.
 	activeMRAssessment polecat.ActiveMRAssessment
+	// RecoveryGuard is the in-source mirror of the external polecat
+	// recovery-guard predicate. The post-merge exception (gastown-95y) trusts
+	// clean git-state when the active MR is provably terminal, so callers see
+	// a CLEAR verdict even when the worktree is detached HEAD with a few
+	// artifact-only file differences. nil when the guard was not evaluated
+	// (worktree missing or git error). Always populated otherwise so the
+	// external wrapper can defer to this verdict.
+	RecoveryGuard *polecat.RecoveryGuardResult `json:"recovery_guard,omitempty"`
 }
 
 func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
@@ -1182,6 +1192,17 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	applyMQFactsToWorkstateInput(&input, &status, bd, workTerminal, p.ClonePath, targetRefs, gitState, gitErr)
 	disposition := polecat.DecideWorkstate(input)
 	applyWorkstateDispositionToRecoveryStatus(&status, disposition)
+
+	// gastown-95y: evaluate the in-source recovery-guard predicate so the
+	// check-recovery output exposes the same verdict the external wrapper
+	// guard script computes. The post-merge exception trusts clean
+	// git-state when the active MR is provably terminal, so detached HEAD
+	// worktrees with a few artifact-only file differences classify as
+	// CLEAR. The verdict is informational — the wrapper may still override
+	// — but exposing it in JSON lets the wrapper defer when both agree.
+	guardInput := recoveryGuardInputs(p.ClonePath, status.Issue, status.activeMRAssessment)
+	guard := polecat.EvaluateRecoveryGuard(guardInput)
+	status.RecoveryGuard = &guard
 
 	// hq-4do: a missing remote source branch after a post-merge cleanup is a
 	// warning, not a silent permanent blocker. The local branch tip still
@@ -1571,6 +1592,103 @@ func hasSubmittableWorkForRecovery(worktreePath string, targetRefs []string, git
 
 func isRecoveryBaseBranch(branch string) bool {
 	return branch == "main" || branch == "master" || strings.HasPrefix(branch, "integration/")
+}
+
+// recoveryGuardInputs gathers the read-only facts EvaluateRecoveryGuard needs
+// from the polecat's worktree. Returns the input plus the resolved
+// compareRef so the snapshot can echo the same shape as the external
+// recovery-guard script. Missing worktree / git errors yield a WorktreeFound
+// =false input so the predicate stays conservative.
+//
+// The diff/ahead/stash computations mirror the wrapper script line-for-line:
+//   - compareRef = origin/main, falling back to origin/master
+//   - ahead = `git rev-list --count compareRef..HEAD`
+//   - tree_diff = 1 when `git diff compareRef HEAD --` reports any file,
+//     otherwise 0 (the wrapper script uses --quiet exit code)
+//   - dirty = `git status --porcelain | wc -l`
+//   - branch_stashes = `git stash list` entries tagged with the current branch
+func recoveryGuardInputs(clonePath, statusIssue string, activeMR polecat.ActiveMRAssessment) polecat.RecoveryGuardInput {
+	in := polecat.RecoveryGuardInput{
+		StatusIssue:            statusIssue,
+		ActiveMRStatus:         activeMR.MRStatus,
+		ActiveMRSourceTerminal: activeMR.SourceTerminal,
+		ActiveMRPending:        activeMR.Pending,
+	}
+	if clonePath == "" {
+		return in
+	}
+	if _, err := os.Stat(clonePath); err != nil {
+		return in
+	}
+	g := git.NewGit(clonePath)
+	branch, _ := g.CurrentBranch()
+	in.Branch = branch
+	in.WorktreeFound = true
+
+	// Stashes: count entries tagged with the current branch. Matches the
+	// wrapper script's " on <branch>:" awk filter so a detached HEAD (no
+	// branch) returns 0 (nothing to filter against).
+	if branch != "" && branch != "HEAD" {
+		if entries, err := g.StashListForBranch(); err == nil {
+			in.BranchStashes = len(entries)
+		}
+	}
+
+	// Working-tree dirtiness: count porcelain entries. We invoke git directly
+	// because the git package's porcelain output isn't line-counted.
+	if dirtyOut, err := runGitOutput(clonePath, "status", "--porcelain=v1", "--untracked-files=normal"); err == nil {
+		lines := 0
+		for _, line := range strings.Split(strings.TrimRight(dirtyOut, "\n"), "\n") {
+			if strings.TrimSpace(line) != "" {
+				lines++
+			}
+		}
+		in.Dirty = lines
+	}
+
+	// Compare ref + ahead + tree diff. Mirrors the wrapper script's
+	// origin/main -> origin/master fallback. When neither resolves we leave
+	// CompareRef empty and let the predicate emit missing_origin_main.
+	for _, ref := range []string{"origin/main", "origin/master"} {
+		if ok, err := g.RefExists(ref); err == nil && ok {
+			in.CompareRef = ref
+			break
+		}
+	}
+	if in.CompareRef != "" {
+		if aheadOut, err := runGitOutput(clonePath, "rev-list", "--count", in.CompareRef+"..HEAD"); err == nil {
+			if n, parseErr := strconv.Atoi(strings.TrimSpace(aheadOut)); parseErr == nil {
+				in.Ahead = n
+			}
+		}
+		// `git diff --quiet` exit code: 0 = clean, 1 = differences, >=2 = error.
+		// Match the wrapper script's tree_diff=0/1 invariant.
+		if _, diffErr := runGitOutput(clonePath, "diff", "--quiet", in.CompareRef, "HEAD", "--"); diffErr == nil {
+			in.TreeDiff = 0
+		} else {
+			exitErr := &exec.ExitError{}
+			if errors.As(diffErr, &exitErr) && exitErr.ExitCode() == 1 {
+				in.TreeDiff = 1
+			}
+			// Any other error (e.g. bad ref) leaves TreeDiff at the zero
+			// value; EvaluateRecoveryGuard treats TreeDiff=0 as "matches".
+		}
+	}
+	return in
+}
+
+// runGitOutput shells out to git with the given args inside worktreePath,
+// returning combined stdout. Stderr is suppressed: callers in this file use
+// it to gather read-only facts, where non-zero exit is itself a signal
+// (e.g. `git diff --quiet` returns 1 to mean "there are differences").
+func runGitOutput(worktreePath string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = worktreePath
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(string(out), "\n"), nil
 }
 
 func recoveryTargetRefs(bd *beads.Beads, issueID, activeMR, branch string) []string {

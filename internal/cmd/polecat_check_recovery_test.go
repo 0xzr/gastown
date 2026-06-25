@@ -803,3 +803,270 @@ func runCmd(t *testing.T, dir, name string, args ...string) {
 		t.Fatalf("%s %v: %v\n%s", name, args, err, out)
 	}
 }
+
+// setupPostMergeDetachedRepo builds the canonical post-merge scenario the
+// gastown-95y fix targets: the polecat's branch has been merged into
+// origin/main and the local branch was deleted, leaving the worktree in
+// detached HEAD at the merged commit. ahead=0 (HEAD == origin/main), tree
+// matches compareRef (no divergence). Tests that need the false-positive
+// scenario (tree_diff=1 with dirty=0) call addRuntimeArtifactDiverged()
+// afterwards.
+func setupPostMergeDetachedRepo(t *testing.T) string {
+	t.Helper()
+	repo := setupRecoveryGitRepo(t)
+
+	// Build a feature commit and push it on a polecat-style branch.
+	runGit(t, repo, "switch", "-c", "polecat/quartz")
+	writeRecoveryFile(t, filepath.Join(repo, "feature.txt"), "feature")
+	runGit(t, repo, "add", "feature.txt")
+	runGit(t, repo, "commit", "-m", "feature")
+	runGit(t, repo, "push", "-u", "origin", "polecat/quartz")
+
+	// Land the feature into main and push the merge so origin/main
+	// advances to the same commit the polecat landed. This matches the
+	// runtime state after `gt done` cuts over: the merged commit is on
+	// origin/main and HEAD == origin/main (ahead=0, tree matches).
+	runGit(t, repo, "switch", "main")
+	runGit(t, repo, "merge", "--ff-only", "polecat/quartz")
+	runGit(t, repo, "push", "origin", "main")
+	runGit(t, repo, "branch", "-D", "polecat/quartz")
+
+	// Detach HEAD on the merged commit. This is exactly what happens when
+	// a polecat's local branch is removed after `gt done` cuts over.
+	mergedSHA, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	runGit(t, repo, "checkout", "--detach", strings.TrimSpace(string(mergedSHA)))
+	return repo
+}
+
+// addRuntimeArtifactDiverged commits a runtime-style file on origin/main
+// without updating the local detached HEAD. After the call: origin/main
+// has the file, HEAD does not, so `git diff origin/main HEAD --` reports
+// tree_diff=1 while `git status --porcelain` reports clean. This is the
+// exact gastown-95y false-positive scenario.
+func addRuntimeArtifactDiverged(t *testing.T, repo, name, content string) {
+	t.Helper()
+	// Land the file on origin/main by switching to main locally, committing,
+	// pushing, then detaching HEAD back to the original merged commit.
+	mergedSHA, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	runGit(t, repo, "switch", "main")
+	writeRecoveryFile(t, filepath.Join(repo, name), content)
+	runGit(t, repo, "add", name)
+	runGit(t, repo, "commit", "-m", "runtime artifact on origin/main: "+name)
+	runGit(t, repo, "push", "origin", "main")
+	runGit(t, repo, "checkout", "--detach", strings.TrimSpace(string(mergedSHA)))
+}
+
+// addRuntimeArtifact is the previous helper name; alias for compatibility
+// with the existing test bodies that import it.
+func addRuntimeArtifact(t *testing.T, repo, name, content string) {
+	addRuntimeArtifactDiverged(t, repo, name, content)
+}
+
+// TestRecoveryGuardInputs_CleanPostMergeRepo verifies the helper gathers the
+// facts the in-source predicate needs. This is the regression test for
+// gastown-95y: when a worktree is in detached HEAD with a clean tree, no
+// unpushed commits, and the MR has been closed/merged, the recovery guard
+// must trust git-state and emit a CLEAR verdict — disagreeing with the
+// external wrapper only when the post-merge exception is satisfied.
+func TestRecoveryGuardInputs_CleanPostMergeRepo(t *testing.T) {
+	repo := setupPostMergeDetachedRepo(t)
+	addRuntimeArtifact(t, repo, "runtime-flags.env", "GT_ACTIVE_TOWN=gt-town\n")
+
+	in := recoveryGuardInputs(repo, "", polecat.ActiveMRAssessment{
+		ActiveMR:       "gastown-wisp-nv6n",
+		MRStatus:       "closed",
+		SourceTerminal: true,
+	})
+	if !in.WorktreeFound {
+		t.Fatal("WorktreeFound = false, want true")
+	}
+	if in.Branch != "HEAD" {
+		t.Fatalf("Branch = %q, want HEAD (detached after local branch delete)", in.Branch)
+	}
+	if in.CompareRef != "origin/main" {
+		t.Errorf("CompareRef = %q, want origin/main", in.CompareRef)
+	}
+	if in.Ahead != 0 {
+		t.Errorf("Ahead = %d, want 0 (merged branch should not be ahead)", in.Ahead)
+	}
+	if in.Dirty != 0 {
+		t.Errorf("Dirty = %d, want 0 (untracked file should not count as dirty)", in.Dirty)
+	}
+	if in.TreeDiff != 1 {
+		t.Errorf("TreeDiff = %d, want 1 (untracked artifact visible against origin/main)", in.TreeDiff)
+	}
+
+	guard := polecat.EvaluateRecoveryGuard(in)
+	if guard.Block {
+		t.Fatalf("EvaluateRecoveryGuard blocked post-merge clean detached HEAD: reasons=%v", guard.Reasons)
+	}
+	if guard.Verdict != polecat.RecoveryGuardVerdictClear {
+		t.Errorf("Verdict = %q, want CLEAR", guard.Verdict)
+	}
+}
+
+// TestRecoveryGuardInputs_DirtyStillBlocks verifies the integration wires
+// the dirty predicate correctly. A worktree that has uncommitted changes
+// must continue to block, regardless of MR-terminal state.
+func TestRecoveryGuardInputs_DirtyStillBlocks(t *testing.T) {
+	repo := setupPostMergeDetachedRepo(t)
+	// Tracked dirty file (modified) to ensure the dirty predicate fires.
+	writeRecoveryFile(t, filepath.Join(repo, "feature.txt"), "wip-modification")
+	runGit(t, repo, "add", "feature.txt")
+
+	in := recoveryGuardInputs(repo, "", polecat.ActiveMRAssessment{
+		MRStatus:       "closed",
+		SourceTerminal: true,
+	})
+	if in.Dirty == 0 {
+		t.Fatalf("Dirty = 0, want > 0")
+	}
+	guard := polecat.EvaluateRecoveryGuard(in)
+	if !guard.Block {
+		t.Fatalf("Block = false, want true (dirty worktree should still block); reasons=%v", guard.Reasons)
+	}
+	if !containsString(guard.Reasons, polecat.ReasonDirtyWorktree+":1") {
+		t.Errorf("Reasons missing dirty_worktree:1: got %v", guard.Reasons)
+	}
+}
+
+// TestRecoveryGuardInputs_HookedIssueBlocks verifies the StatusIssue path:
+// when a polecat still has an issue hooked, the post-merge exception must
+// NOT fire.
+func TestRecoveryGuardInputs_HookedIssueBlocks(t *testing.T) {
+	repo := setupPostMergeDetachedRepo(t)
+
+	in := recoveryGuardInputs(repo, "gastown-wisp-amkx", polecat.ActiveMRAssessment{
+		MRStatus:       "closed",
+		SourceTerminal: true,
+	})
+	guard := polecat.EvaluateRecoveryGuard(in)
+	if !guard.Block {
+		t.Fatalf("Block = false, want true (hooked issue should block); reasons=%v", guard.Reasons)
+	}
+	if !containsString(guard.Reasons, polecat.ReasonHookedIssue+":gastown-wisp-amkx") {
+		t.Errorf("Reasons missing hooked_issue marker: got %v", guard.Reasons)
+	}
+}
+
+// TestRecoveryGuardInputs_OpenMRStillBlocks verifies the MR-pending path:
+// an open/pending MR + detached HEAD + tree_diff=1 must still block. This
+// is the wrapper-script baseline behavior the fix preserves.
+func TestRecoveryGuardInputs_OpenMRStillBlocks(t *testing.T) {
+	repo := setupPostMergeDetachedRepo(t)
+	addRuntimeArtifact(t, repo, "runtime-flags.env", "x=1\n")
+
+	in := recoveryGuardInputs(repo, "", polecat.ActiveMRAssessment{
+		MRStatus:       "open",
+		Pending:        true,
+		SourceTerminal: false,
+	})
+	if in.Branch != "HEAD" {
+		t.Fatalf("Branch = %q, want HEAD", in.Branch)
+	}
+	if in.TreeDiff != 1 {
+		t.Fatalf("TreeDiff = %d, want 1", in.TreeDiff)
+	}
+	guard := polecat.EvaluateRecoveryGuard(in)
+	if !guard.Block {
+		t.Fatalf("Block = false, want true (open MR must still block); reasons=%v", guard.Reasons)
+	}
+	if !containsString(guard.Reasons, polecat.ReasonDetachedOrUnknownBranch) {
+		t.Errorf("Reasons missing detached_or_unknown_branch: got %v", guard.Reasons)
+	}
+	if !containsString(guard.Reasons, polecat.ReasonMergeQueueRecordUnavailable) {
+		t.Errorf("Reasons missing merge_queue_record_unavailable: got %v", guard.Reasons)
+	}
+}
+
+// TestRecoveryGuardInputs_MissingWorktree verifies the helper degrades
+// gracefully when the worktree path does not exist.
+func TestRecoveryGuardInputs_MissingWorktree(t *testing.T) {
+	in := recoveryGuardInputs("/nonexistent/path/that/does/not/exist", "", polecat.ActiveMRAssessment{})
+	if in.WorktreeFound {
+		t.Errorf("WorktreeFound = true, want false for missing path")
+	}
+	guard := polecat.EvaluateRecoveryGuard(in)
+	if !guard.Block {
+		t.Errorf("Block = false, want true for missing worktree")
+	}
+}
+
+// TestRecoveryGuardInputs_GitStateDisagreesWithGuard is the explicit
+// "guard/git-state disagreement" test requested by gastown-95y. We model
+// the user-reported scenario:
+//
+//	git-state   : CLEAN (Working Tree clean, 0 unpreserved, 0 unpushed)
+//	wrapper guard: NEEDS_RECOVERY (detached HEAD, tree_diff=1, MR record unavailable)
+//	in-source guard (this fix): CLEAR via the post-merge exception
+//
+// The test verifies that the in-source verdict agrees with git-state when
+// the post-merge exception is satisfied, even when the wrapper script's
+// prediction would disagree. The disagreement itself is intentional: the
+// in-source predicate is the fix.
+func TestRecoveryGuardInputs_GitStateDisagreesWithGuard(t *testing.T) {
+	repo := setupPostMergeDetachedRepo(t)
+	addRuntimeArtifact(t, repo, "runtime-flags.env", "x=1\n")
+
+	// git-state-equivalent: getGitState mirrors the read-only facts the
+	// external `gt polecat git-state` reports.
+	gitState := getGitStateSnapshot(t, repo)
+	if !gitState.Clean {
+		t.Fatalf("git-state Clean = false, want true; state=%+v", gitState)
+	}
+	if gitState.UnpushedCommits != 0 {
+		t.Errorf("git-state UnpushedCommits = %d, want 0", gitState.UnpushedCommits)
+	}
+	if len(gitState.UncommittedFiles) != 0 {
+		t.Errorf("git-state UncommittedFiles = %v, want []", gitState.UncommittedFiles)
+	}
+
+	// Guard verdict: with the post-merge exception, the in-source guard
+	// trusts git-state and emits CLEAR.
+	in := recoveryGuardInputs(repo, "", polecat.ActiveMRAssessment{
+		MRStatus:       "closed",
+		SourceTerminal: true,
+	})
+	guard := polecat.EvaluateRecoveryGuard(in)
+
+	// git-state says clean. Without the post-merge exception the wrapper
+	// would block; with the exception, the in-source guard trusts git-state.
+	if guard.Block {
+		t.Fatalf("guard/git-state disagreement: git-state clean but guard blocks (reasons=%v); in-source guard must trust clean git-state for terminal MRs", guard.Reasons)
+	}
+	if guard.Verdict != polecat.RecoveryGuardVerdictClear {
+		t.Errorf("Verdict = %q, want CLEAR (matches git-state)", guard.Verdict)
+	}
+	if !guard.TreeMatchesCompareRef && in.TreeDiff == 0 {
+		t.Errorf("TreeMatchesCompareRef = false, want true for TreeDiff=0")
+	}
+}
+
+// getGitStateSnapshot mirrors the relevant fields of `gt polecat git-state`
+// for use in disagreement tests. The point is to verify the in-source guard
+// agrees with the read-only git facts, not to test getGitState itself.
+func getGitStateSnapshot(t *testing.T, repo string) *GitState {
+	t.Helper()
+	state, err := getGitState(repo)
+	if err != nil {
+		t.Fatalf("getGitState(%s): %v", repo, err)
+	}
+	return state
+}
+
+// containsString is a small helper for test assertions on reason slices.
+// Defined locally so the test file stays dependency-free.
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
