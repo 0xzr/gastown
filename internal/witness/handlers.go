@@ -2891,21 +2891,21 @@ func formatReworkDeferredNotification(td ReworkDeferredDecision, throttleWindow 
 	body = bodyPrefix + fmt.Sprintf(`Automated rework for bead %s was blocked by an active Mayor decision.
 
 Mayor Decision
-==============
+--------------
 Type: %s
 Reason: %s
 Mayor: %s
 Recorded: %s
 
 Rework Context
-==============
+--------------
 Bead: %s
 Polecat: %s/%s
 Previous Status: %s
 Max Respawns Threshold: %d
 
 Action Required
-===============
+---------------
 The bead was NOT reset and no polecat was spawned. To allow rework to resume,
 record an explicit override: gt mayor decision resume %s`,
 		hookBead,
