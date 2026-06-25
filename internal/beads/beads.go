@@ -322,6 +322,22 @@ type UpdateOptions struct {
 	SetLabels    []string // Labels to set (replaces all existing)
 }
 
+// descriptionArg returns the bd flag and optional stdin payload for a
+// description value. bd 1.0.3+ rejects newline bytes inside --description
+// flag values, so multi-line descriptions must reach bd via stdin
+// (--body-file=-). See gastown-yti: alerts.Record rendered multi-line
+// markdown and broke the aggregator's canonical tracking bead path.
+//
+// useStdin is true when the caller must pipe stdin (--body-file=-); stdin
+// then carries the full description bytes. When false, arg is the standard
+// --description=... flag and stdin is nil.
+func descriptionArg(desc string) (arg string, stdin []byte, useStdin bool) {
+	if strings.ContainsRune(desc, '\n') {
+		return "--body-file=-", []byte(desc), true
+	}
+	return "--description=" + desc, nil, false
+}
+
 // Beads wraps bd CLI operations for a working directory.
 // When store is non-nil, methods with in-process implementations use the
 // beadsdk.Storage directly instead of shelling out to the bd CLI. This
@@ -1461,8 +1477,15 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 	if opts.Priority >= 0 {
 		args = append(args, fmt.Sprintf("--priority=%d", opts.Priority))
 	}
+	// bd 1.0.3+ rejects newlines in --description; route multi-line content
+	// via stdin (--body-file=-) instead. See gastown-yti.
+	var descStdin []byte
 	if opts.Description != "" {
-		args = append(args, "--description="+opts.Description)
+		arg, body, useStdin := descriptionArg(opts.Description)
+		args = append(args, arg)
+		if useStdin {
+			descStdin = body
+		}
 	}
 	if opts.Parent != "" {
 		args = append(args, "--parent="+opts.Parent)
@@ -1480,7 +1503,12 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 		args = append(args, "--actor="+actor)
 	}
 
-	out, err := b.run(args...)
+	var out []byte
+	if descStdin != nil {
+		out, err = b.runWithStdin(descStdin, args...)
+	} else {
+		out, err = b.run(args...)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1535,8 +1563,15 @@ func (b *Beads) CreateWithID(id string, opts CreateOptions) (*Issue, error) {
 	if opts.Priority >= 0 {
 		args = append(args, fmt.Sprintf("--priority=%d", opts.Priority))
 	}
+	// bd 1.0.3+ rejects newlines in --description; route multi-line content
+	// via stdin (--body-file=-) instead. See gastown-yti.
+	var descStdin []byte
 	if opts.Description != "" {
-		args = append(args, "--description="+opts.Description)
+		arg, body, useStdin := descriptionArg(opts.Description)
+		args = append(args, arg)
+		if useStdin {
+			descStdin = body
+		}
 	}
 	if opts.Parent != "" {
 		args = append(args, "--parent="+opts.Parent)
@@ -1551,7 +1586,12 @@ func (b *Beads) CreateWithID(id string, opts CreateOptions) (*Issue, error) {
 		args = append(args, "--actor="+actor)
 	}
 
-	out, err := b.run(args...)
+	var out []byte
+	if descStdin != nil {
+		out, err = b.runWithStdin(descStdin, args...)
+	} else {
+		out, err = b.run(args...)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1694,8 +1734,15 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 	if opts.Priority != nil {
 		args = append(args, fmt.Sprintf("--priority=%d", *opts.Priority))
 	}
+	// bd 1.0.3+ rejects newlines in --description; route multi-line content
+	// via stdin (--body-file=-) instead. See gastown-yti.
+	var descStdin []byte
 	if opts.Description != nil {
-		args = append(args, "--description="+*opts.Description)
+		arg, body, useStdin := descriptionArg(*opts.Description)
+		args = append(args, arg)
+		if useStdin {
+			descStdin = body
+		}
 	}
 	if opts.Assignee != nil {
 		args = append(args, "--assignee="+*opts.Assignee)
@@ -1714,6 +1761,10 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 		}
 	}
 
+	if descStdin != nil {
+		_, err := b.runWithStdin(descStdin, args...)
+		return err
+	}
 	_, err := b.run(args...)
 	return err
 }
