@@ -122,6 +122,14 @@ const (
 	DefaultReworkDeferredThrottleWindow = 1 * time.Hour
 )
 
+// Mayor defaults.
+const (
+	DefaultMayorHeartbeatStaleThreshold       = 5 * time.Minute
+	DefaultMayorHeartbeatVeryStaleThreshold   = 20 * time.Minute
+	DefaultMayorHungSessionThreshold          = 30 * time.Minute
+	DefaultMayorCriticalMailBacklogThreshold = 5
+)
+
 // LoadOperationalConfig loads operational config from a town root.
 // Returns a valid (possibly empty) config — never nil, never errors.
 // Callers can use accessor methods that return defaults for nil sub-configs.
@@ -771,4 +779,46 @@ func (wt *WitnessThresholds) ReworkDeferredThrottleWindowD() time.Duration {
 		return ParseDurationOrDefault(wt.ReworkDeferredThrottleWindow, DefaultReworkDeferredThrottleWindow)
 	}
 	return DefaultReworkDeferredThrottleWindow
+}
+
+// --- Mayor accessors ---
+
+// GetMayorConfig returns the mayor thresholds, never nil.
+func (c *OperationalConfig) GetMayorConfig() *MayorThresholds {
+	if c != nil && c.Mayor != nil {
+		return c.Mayor
+	}
+	return &MayorThresholds{}
+}
+
+// HeartbeatStaleThresholdD returns the configured or default mayor heartbeat stale threshold.
+func (m *MayorThresholds) HeartbeatStaleThresholdD() time.Duration {
+	if m != nil {
+		return ParseDurationOrDefault(m.HeartbeatStaleThreshold, DefaultMayorHeartbeatStaleThreshold)
+	}
+	return DefaultMayorHeartbeatStaleThreshold
+}
+
+// HeartbeatVeryStaleThresholdD returns the configured or default mayor heartbeat very-stale threshold.
+func (m *MayorThresholds) HeartbeatVeryStaleThresholdD() time.Duration {
+	if m != nil {
+		return ParseDurationOrDefault(m.HeartbeatVeryStaleThreshold, DefaultMayorHeartbeatVeryStaleThreshold)
+	}
+	return DefaultMayorHeartbeatVeryStaleThreshold
+}
+
+// HungSessionThresholdD returns the configured or default mayor hung-session threshold.
+func (m *MayorThresholds) HungSessionThresholdD() time.Duration {
+	if m != nil {
+		return ParseDurationOrDefault(m.HungSessionThreshold, DefaultMayorHungSessionThreshold)
+	}
+	return DefaultMayorHungSessionThreshold
+}
+
+// CriticalMailBacklogThresholdV returns the configured or default critical-mail backlog threshold.
+func (m *MayorThresholds) CriticalMailBacklogThresholdV() int {
+	if m != nil && m.CriticalMailBacklogThreshold != nil {
+		return *m.CriticalMailBacklogThreshold
+	}
+	return DefaultMayorCriticalMailBacklogThreshold
 }

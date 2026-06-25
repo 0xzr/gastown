@@ -360,6 +360,21 @@ func DefaultOverrides() map[string]*HooksConfig {
 				},
 			},
 		},
+		// Mayor: auto-cycle session on compaction to preserve hook/mail context
+		// instead of silently losing it. Mirrors crew behavior.
+		"mayor": {
+			PreCompact: []HookEntry{
+				{
+					Matcher: "",
+					Hooks: []Hook{
+						{
+							Type:    "command",
+							Command: gtCommand("gt handoff --cycle --reason compaction"),
+						},
+					},
+				},
+			},
+		},
 		// Witness roles: patrol-formula-guard (gt-e47hxn).
 		// Blocks patrol formulas from using persistent molecules — must use wisps.
 		// Without this, witnesses could accidentally create permanent patrol molecules

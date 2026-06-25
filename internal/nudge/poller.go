@@ -138,6 +138,12 @@ func StopPoller(townRoot, session string) error {
 	return nil
 }
 
+// IsPollerAlive reports whether a nudge poller is running for the given session.
+// Returns the PID and true if alive. It is the exported version of pollerAlive.
+func IsPollerAlive(townRoot, session string) (int, bool) {
+	return pollerAlive(townRoot, session)
+}
+
 // pollerAlive checks if a poller is running for the given session.
 // Returns the PID and whether the process is alive.
 func pollerAlive(townRoot, session string) (int, bool) {

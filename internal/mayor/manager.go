@@ -12,6 +12,7 @@ import (
 	"github.com/steveyegge/gastown/internal/acp"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/templates"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -181,6 +182,15 @@ func (m *Manager) StartTMUX(agentOverride string) error {
 	if err != nil {
 		return err
 	}
+
+	// Start nudge-queue poller so queued nudges drain even when the Mayor is idle.
+	// Mirrors witness/refinery/crew startup behavior.
+	if _, pollerErr := nudge.StartPoller(m.townRoot, sessionID); pollerErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not start nudge poller for mayor: %v\n", pollerErr)
+	}
+
+	// Record an initial heartbeat so the daemon knows the Mayor is fresh.
+	_ = Touch(m.townRoot, "session-started", "healthy")
 
 	time.Sleep(session.ShutdownDelay())
 

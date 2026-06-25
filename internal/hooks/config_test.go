@@ -556,15 +556,19 @@ func TestComputeExpectedNoBase(t *testing.T) {
 	tmpDir := t.TempDir()
 	setTestHome(t, tmpDir)
 
-	// Mayor should get DefaultBase (no built-in overrides)
-	expected, err := ComputeExpected("mayor")
+	// Mayor should get DefaultBase plus a PreCompact override.
+	mayorExpected, err := ComputeExpected("mayor")
 	if err != nil {
 		t.Fatalf("ComputeExpected failed: %v", err)
 	}
 
 	defaultBase := DefaultBase()
-	if !HooksEqual(expected, defaultBase) {
-		t.Error("expected DefaultBase for mayor when no configs exist")
+	if len(mayorExpected.PreCompact) == 0 {
+		t.Error("expected mayor to have PreCompact hook from DefaultOverrides")
+	}
+	// Should still inherit base SessionStart hooks.
+	if len(mayorExpected.SessionStart) != len(defaultBase.SessionStart) {
+		t.Error("expected mayor to inherit SessionStart from DefaultBase")
 	}
 
 	// Crew should get DefaultBase + built-in crew override (PreCompact)

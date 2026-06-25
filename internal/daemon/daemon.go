@@ -33,6 +33,7 @@ import (
 	"github.com/steveyegge/gastown/internal/feed"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mayor"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
@@ -116,6 +117,13 @@ type Daemon struct {
 	// triggers a zombie restart, debouncing transient gaps during handoffs.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	mayorZombieCount int
+
+	// mayorLastStarted records when the daemon last started the Mayor so the
+	// post-start heartbeat grace period can avoid false-positive restart loops.
+	mayorLastStarted time.Time
+
+	// mayorCriticalMailLastNotified throttles repeated critical-mail alerts.
+	mayorCriticalMailLastNotified time.Time
 
 	// rigPool runs per-rig heartbeat operations (witness checks, refinery checks,
 	// polecat health, idle reaping, branch pruning) with bounded concurrency and
@@ -1845,38 +1853,39 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	d.logger.Printf("Refinery session for %s started successfully", rigName)
 }
 
-// ensureMayorRunning ensures the Mayor is running.
+// ensureMayorRunning ensures the Mayor is running and healthy.
 // Uses mayor.Manager for consistent startup behavior.
-// If the tmux session exists but the agent is dead (zombie), the daemon
-// stops the zombie session and starts a fresh one.
+// Detects hung sessions (not just dead agents) using CheckSessionHealth, and
+// records context snapshots + post-restart verification for durable evidence.
 func (d *Daemon) ensureMayorRunning() {
 	mgr := mayor.NewManager(d.config.TownRoot)
+	cfg := d.loadOperationalConfig().GetMayorConfig()
+	maxInactivity := cfg.HungSessionThresholdD()
+	townRoot := d.config.TownRoot
 
 	if err := mgr.Start(""); err != nil {
+		if err == mayor.ErrACPActive {
+			// ACP mode is not supervised by the tmux-based health check.
+			_ = mayor.Touch(townRoot, "acp-active", tmux.SessionHealthy.String())
+			return
+		}
 		if err == mayor.ErrAlreadyRunning {
-			// Session exists — verify agent is actually alive.
-			// During handoffs the agent is briefly undetectable, so we
-			// only restart if the session has been a zombie for multiple
-			// consecutive patrol cycles (debounce).
-			if !d.isMayorAgentAlive(mgr) {
-				d.mayorZombieCount++
-				if d.mayorZombieCount >= 3 {
-					d.logger.Printf("Mayor zombie detected (%d cycles), restarting", d.mayorZombieCount)
-					if stopErr := mgr.Stop(); stopErr != nil && stopErr != mayor.ErrNotRunning {
-						d.logger.Printf("Error stopping zombie Mayor: %v", stopErr)
-						return
-					}
-					d.mayorZombieCount = 0
-					if startErr := mgr.Start(""); startErr != nil {
-						d.logger.Printf("Error restarting Mayor after zombie cleanup: %v", startErr)
-						return
-					}
-					d.logger.Println("Mayor restarted after zombie cleanup")
-				} else {
-					d.logger.Printf("Mayor agent not detected (cycle %d/3), waiting before restart", d.mayorZombieCount)
-				}
-			} else {
+			status := mgr.IsHealthy(maxInactivity)
+			if status == tmux.SessionHealthy {
 				d.mayorZombieCount = 0
+				if hbErr := mayor.Touch(townRoot, "patrol-check", status.String()); hbErr != nil {
+					d.logger.Printf("Warning: could not write Mayor heartbeat: %v", hbErr)
+				}
+				d.checkMayorNudgePoller(mgr)
+				d.checkMayorCriticalMail(cfg)
+				return
+			}
+
+			// Session exists but is dead or hung.
+			d.mayorZombieCount++
+			d.logger.Printf("Mayor not healthy (status=%s, cycle %d/3)", status.String(), d.mayorZombieCount)
+			if d.mayorZombieCount >= 3 {
+				d.restartMayor(mgr, cfg, fmt.Sprintf("mayor %s for %d consecutive cycles", status.String(), d.mayorZombieCount))
 			}
 			return
 		}
@@ -1884,14 +1893,122 @@ func (d *Daemon) ensureMayorRunning() {
 		return
 	}
 
+	// Mayor was just started.
 	d.mayorZombieCount = 0
+	d.mayorLastStarted = time.Now()
+	if hbErr := mayor.Touch(townRoot, "session-started", tmux.SessionHealthy.String()); hbErr != nil {
+		d.logger.Printf("Warning: could not write Mayor heartbeat: %v", hbErr)
+	}
+	d.checkMayorNudgePoller(mgr)
+	d.checkMayorCriticalMail(cfg)
 	d.logger.Println("Mayor started successfully")
 }
 
-// isMayorAgentAlive checks if the Mayor's agent process is running in tmux.
-func (d *Daemon) isMayorAgentAlive(mgr *mayor.Manager) bool {
-	t := tmux.NewTmux()
-	return t.IsAgentAlive(mgr.SessionName())
+// checkMayorNudgePoller ensures the Mayor's nudge poller is running. It starts
+// a new poller if the session is healthy but the poller is dead.
+func (d *Daemon) checkMayorNudgePoller(mgr *mayor.Manager) {
+	if _, alive := mgr.IsPollerAlive(); alive {
+		return
+	}
+	d.logger.Printf("Mayor nudge poller not running, attempting to start")
+	if _, err := nudge.StartPoller(d.config.TownRoot, mgr.SessionName()); err != nil {
+		d.logger.Printf("Warning: could not start Mayor nudge poller: %v", err)
+	}
+}
+
+// checkMayorCriticalMail alerts when unread high-priority mail is backing up
+// for the Mayor. Alerts are throttled to avoid notification spam.
+func (d *Daemon) checkMayorCriticalMail(cfg *agentconfig.MayorThresholds) {
+	threshold := cfg.CriticalMailBacklogThresholdV()
+	if threshold <= 0 {
+		return
+	}
+
+	_, critical, err := mayor.CriticalMailBacklog(d.config.TownRoot, d.gtPath)
+	if err != nil {
+		d.logger.Printf("Warning: could not check Mayor critical mail backlog: %v", err)
+		return
+	}
+	if critical < threshold {
+		return
+	}
+
+	const notifyCooldown = 15 * time.Minute
+	if time.Since(d.mayorCriticalMailLastNotified) < notifyCooldown {
+		return
+	}
+	d.mayorCriticalMailLastNotified = time.Now()
+
+	msg := fmt.Sprintf("Mayor has %d unread critical messages (threshold %d)", critical, threshold)
+	d.notifySlack("admin", "high", msg)
+	d.logger.Printf("ALERT: %s", msg)
+}
+
+// restartMayor performs a supervised restart of the Mayor: captures hook/mail
+// context and git state, stops and starts the session, verifies identity/model,
+// and records the attempt in the durable ledger.
+func (d *Daemon) restartMayor(mgr *mayor.Manager, cfg *agentconfig.MayorThresholds, reason string) {
+	townRoot := d.config.TownRoot
+
+	sup := mayor.NewSupervisor(townRoot, d.gtPath)
+	ctxSnap, _ := sup.SnapshotContext()
+	gitSnap := sup.SnapshotGit()
+
+	preAttempt := &mayor.RecoveryAttempt{
+		Timestamp:       time.Now().UTC(),
+		Reason:          reason,
+		ContextSnapshot: ctxSnap,
+		GitSnapshot:     gitSnap,
+	}
+	if err := sup.RecordRecovery(preAttempt); err != nil {
+		d.logger.Printf("Warning: could not record pre-restart recovery snapshot: %v", err)
+	}
+
+	d.logger.Printf("Restarting Mayor: %s", reason)
+	if stopErr := mgr.Stop(); stopErr != nil && stopErr != mayor.ErrNotRunning {
+		d.logger.Printf("Error stopping Mayor before restart: %v", stopErr)
+	}
+
+	d.mayorLastStarted = time.Now()
+	if startErr := mgr.Start(""); startErr != nil {
+		d.mayorZombieCount = 0
+		attempt := &mayor.RecoveryAttempt{
+			Timestamp: time.Now().UTC(),
+			Reason:    reason,
+			Error:     fmt.Sprintf("failed to restart mayor: %v", startErr),
+		}
+		_ = sup.RecordRecovery(attempt)
+		d.notifySlack("admin", "critical", fmt.Sprintf("Mayor restart FAILED: %v", startErr))
+		return
+	}
+
+	d.mayorZombieCount = 0
+	d.checkMayorNudgePoller(mgr)
+
+	status := mgr.IsHealthy(cfg.HungSessionThresholdD())
+	modelVerify := sup.VerifyModel()
+	attempt := &mayor.RecoveryAttempt{
+		Timestamp:       time.Now().UTC(),
+		Reason:            reason,
+		ContextSnapshot:   ctxSnap,
+		GitSnapshot:       gitSnap,
+		Verification:      modelVerify,
+	}
+	if status != tmux.SessionHealthy {
+		attempt.Error = fmt.Sprintf("post-restart health check failed: %s", status.String())
+		if modelVerify.Error != "" {
+			attempt.Error += "; " + modelVerify.Error
+		}
+	}
+	_ = sup.RecordRecovery(attempt)
+
+	if status != tmux.SessionHealthy || (modelVerify.ExpectedModel != "" && !modelVerify.Verified) {
+		d.notifySlack("admin", "critical", fmt.Sprintf(
+			"Mayor restart verification failed: health=%s expected_model=%s actual_model=%s error=%s",
+			status.String(), modelVerify.ExpectedModel, modelVerify.ActualModel, modelVerify.Error))
+	} else {
+		d.notifySlack("admin", "high", fmt.Sprintf("Mayor restarted successfully (%s)", reason))
+	}
 }
 
 // killDeaconSessions kills leftover deacon and boot tmux sessions.
