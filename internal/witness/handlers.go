@@ -2,6 +2,7 @@ package witness
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -489,6 +490,14 @@ func handleMergedCleanupStatus(_, _, polecatName, cleanupStatus, wispID string, 
 
 // HandleMergeFailed processes a MERGE_FAILED message from the Refinery.
 // Notifies the polecat that their merge was rejected and rework is needed.
+//
+// Binding Mayor decision precedence (gastown-cet.7 / hq-12zq): before nudging
+// the polecat to rework, the source bead's durable Mayor decision is checked.
+// An active DEFER/HOLD/PARK converts automated NEEDS_REWORK handling into
+// HOLD/await-Mayor: the rework nudge is suppressed, the conflict is surfaced
+// to the Mayor with both inputs, and the polecat/branch are left untouched. A
+// newer explicit RESUME override allows the nudge to proceed. Without an issue
+// ID in the payload there is no decision key, so the guard is skipped.
 func HandleMergeFailed(workDir, rigName string, msg *mail.Message, router *mail.Router) *HandlerResult {
 	result := &HandlerResult{
 		MessageID:    msg.ID,
@@ -500,6 +509,24 @@ func HandleMergeFailed(workDir, rigName string, msg *mail.Message, router *mail.
 	if err != nil {
 		result.Error = fmt.Errorf("parsing MERGE_FAILED: %w", err)
 		return result
+	}
+
+	// Mayor decision precedence: an explicit DEFER/HOLD/PARK on the source bead
+	// must prevent the automated rework nudge (the hq-12zq failure mode). The
+	// rework the Refinery requests may be exactly the scope the Mayor forbade.
+	if payload.IssueID != "" {
+		trRoot, trErr := workspace.Find(workDir)
+		if trErr != nil || trRoot == "" {
+			trRoot = workDir
+		}
+		if decision, dErr := activeMayorDecisionForBead(trRoot, payload.IssueID); dErr == nil && decision != nil {
+			notifyMayorOfReworkBlocked(trRoot, rigName, payload.IssueID, payload.PolecatName,
+				"merge_failed", 0, decision, router)
+			result.Handled = true
+			result.Action = fmt.Sprintf("rework nudge for %s held: Mayor %s decision active on %s (not nudged)",
+				payload.PolecatName, decision.Type, payload.IssueID)
+			return result
+		}
 	}
 
 	// Nudge the polecat about the failure instead of sending permanent mail.
@@ -752,6 +779,103 @@ var slotOpenRecoveryCheck = func(workDir, rigName, polecatName string) (string, 
 	return util.ExecWithOutput(workDir, "gt", "polecat", "check-recovery", rigName+"/"+polecatName, "--json", "--reconcile-cleanup")
 }
 
+type slotOpenSchedulerStatus struct {
+	Paused      bool `json:"paused"`
+	QueuedReady int  `json:"queued_ready"`
+	Capacity    struct {
+		Max  int `json:"max"`
+		Free int `json:"free"`
+	} `json:"capacity"`
+}
+
+type slotOpenSchedulerResult struct {
+	Before     slotOpenSchedulerStatus
+	After      slotOpenSchedulerStatus
+	Ran        bool
+	Dispatched int
+	Output     string
+}
+
+var runSchedulerForSlotOpen = defaultRunSchedulerForSlotOpen
+var slotOpenDecisionForNotify = slotOpenDecision
+
+func defaultRunSchedulerForSlotOpen(townRoot string) (slotOpenSchedulerResult, error) {
+	var result slotOpenSchedulerResult
+
+	before, err := readSchedulerStatusForSlotOpen(townRoot)
+	if err != nil {
+		return result, err
+	}
+	result.Before = before
+
+	if before.Paused || before.Capacity.Max <= 0 || before.Capacity.Free <= 0 || before.QueuedReady == 0 {
+		return result, nil
+	}
+
+	output, err := runGTForSlotOpen(townRoot, "scheduler", "run")
+	result.Ran = true
+	result.Output = output
+	if err != nil {
+		return result, err
+	}
+	result.Dispatched = parseSchedulerRunDispatched(output)
+
+	after, err := readSchedulerStatusForSlotOpen(townRoot)
+	if err != nil {
+		return result, err
+	}
+	result.After = after
+	return result, nil
+}
+
+func parseSchedulerRunDispatched(output string) int {
+	fields := strings.Fields(output)
+	for i, field := range fields {
+		if field != "Dispatched" || i+1 >= len(fields) {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimRight(fields[i+1], ","))
+		if err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+func readSchedulerStatusForSlotOpen(townRoot string) (slotOpenSchedulerStatus, error) {
+	var status slotOpenSchedulerStatus
+	output, err := runGTForSlotOpen(townRoot, "scheduler", "status", "--json")
+	if err != nil {
+		return status, err
+	}
+	jsonOutput := strings.TrimSpace(output)
+	if idx := strings.Index(jsonOutput, "{"); idx > 0 {
+		jsonOutput = jsonOutput[idx:]
+	}
+	if err := json.Unmarshal([]byte(jsonOutput), &status); err != nil {
+		return status, fmt.Errorf("parse scheduler status: %w", err)
+	}
+	return status, nil
+}
+
+func runGTForSlotOpen(townRoot string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "gt", args...)
+	cmd.Dir = townRoot
+	cmd.Env = append(beads.BuildMutationRoutingBDEnv(os.Environ(), filepath.Join(townRoot, ".beads")), "GT_DAEMON=1")
+	out, err := cmd.CombinedOutput()
+	output := string(out)
+	if ctx.Err() == context.DeadlineExceeded {
+		return output, fmt.Errorf("gt %s timed out after 5m", strings.Join(args, " "))
+	}
+	if err != nil {
+		return output, fmt.Errorf("gt %s failed: %w (output: %s)", strings.Join(args, " "), err, strings.TrimSpace(output))
+	}
+	return output, nil
+}
+
 func shouldNotifyMayorSlotOpen(workDir, rigName, polecatName string) (bool, string) {
 	output, err := slotOpenRecoveryCheck(workDir, rigName, polecatName)
 	if err != nil {
@@ -790,7 +914,7 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 		return
 	}
 	if exitType != string(ExitTypeCompleted) {
-		decision := slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType)
+		decision := slotOpenDecisionForNotify(workDir, townRoot, rigName, polecatName, exitType)
 		if !decision.Reusable {
 			_, _ = channelevents.EmitToTown(townRoot, "mayor", "SLOT_BLOCKED", []string{
 				"source=witness",
@@ -806,7 +930,7 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 		fmt.Fprintf(os.Stderr, "witness: suppressing SLOT_OPEN for %s/%s: %s\n", rigName, polecatName, reason)
 		return
 	}
-	decision := slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType)
+	decision := slotOpenDecisionForNotify(workDir, townRoot, rigName, polecatName, exitType)
 	if !decision.Reusable {
 		_, _ = channelevents.EmitToTown(townRoot, "mayor", "SLOT_BLOCKED", []string{
 			"source=witness",
@@ -815,6 +939,22 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 			"exit=" + exitType,
 			"reason=" + decision.Reason,
 		})
+		return
+	}
+	if result, err := runSchedulerForSlotOpen(townRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "witness: SLOT_OPEN scheduler trigger failed for %s/%s: %v\n", rigName, polecatName, err)
+		if result.Dispatched > 0 {
+			return
+		}
+	} else if result.Dispatched > 0 {
+		if status, ok := schedulerOpenAfterSlot(result); ok {
+			notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType, status)
+		}
+		return
+	} else if status, ok := schedulerOpenAfterSlot(result); ok {
+		notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType, status)
+		return
+	} else if status := schedulerStatusAfterSlot(result); status.Capacity.Max > 0 && (status.Paused || status.Capacity.Free <= 0) {
 		return
 	}
 
@@ -845,6 +985,44 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 	_ = cmd.Run()
 }
 
+func schedulerOpenAfterSlot(result slotOpenSchedulerResult) (slotOpenSchedulerStatus, bool) {
+	status := schedulerStatusAfterSlot(result)
+	return status, !status.Paused && status.Capacity.Max > 0 && status.Capacity.Free > 0 && status.QueuedReady == 0
+}
+
+func schedulerStatusAfterSlot(result slotOpenSchedulerResult) slotOpenSchedulerStatus {
+	status := result.Before
+	if result.Ran {
+		status = result.After
+	}
+	return status
+}
+
+func notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType string, status slotOpenSchedulerStatus) {
+	_, _ = channelevents.EmitToTown(townRoot, "mayor", "SCHEDULER_OPEN", []string{
+		"source=witness",
+		"rig=" + rigName,
+		"polecat=" + polecatName,
+		"exit=" + exitType,
+		"capacity_free=" + strconv.Itoa(status.Capacity.Free),
+		"queued_ready=" + strconv.Itoa(status.QueuedReady),
+	})
+
+	mayorSession := session.MayorSessionName()
+	t := tmux.NewTmux()
+	msg := fmt.Sprintf("SCHEDULER_OPEN: %s/%s completed (exit=%s); scheduler has capacity but no eligible queued beads remain.", rigName, polecatName, exitType)
+	if running, err := t.HasSession(mayorSession); err == nil && running {
+		if err := t.NudgeSession(mayorSession, msg); err == nil {
+			return
+		}
+	}
+
+	subject := fmt.Sprintf("SCHEDULER_OPEN: %s/%s completed (exit=%s)", rigName, polecatName, exitType)
+	cmd := exec.Command("gt", "mail", "send", "mayor/", "-s", subject, "-m", msg)
+	cmd.Dir = townRoot
+	_ = cmd.Run()
+}
+
 func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) polecat.SlotReuseDecision {
 	if exitType != string(ExitTypeCompleted) {
 		return polecat.SlotReuseDecision{Reason: "exit-" + strings.ToLower(exitType)}
@@ -855,9 +1033,20 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 	_, fields, err := rigBeads.ForAgentBead().GetAgentBead(agentID)
 	input := polecat.SlotReuseInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupUnknown, GitCheckFailed: err != nil || fields == nil}
 	issueID := ""
+	hookSafe := true
+	hookTerminal := false
 	if fields != nil {
-		issueID = fields.HookBead
-		input.HookBead = fields.HookBead
+		issueID = fields.LastSourceIssue
+		if issueID == "" {
+			issueID = fields.HookBead
+		}
+		if fields.HookBead != "" {
+			hookTerminal = witnessIssueTerminal(rigBeads, fields.HookBead)
+			hookSafe = hookTerminal
+			if !hookSafe {
+				input.HookBead = fields.HookBead
+			}
+		}
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
 		input.ActiveMR = fields.ActiveMR
@@ -885,8 +1074,10 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 	} else {
 		input.GitCheckFailed = true
 	}
+	gitSafe := !input.GitCheckFailed && !input.GitDirty && input.StashCount == 0 && input.UnpushedCommits == 0
+	activeMRSafe := true
+	sourceTerminal := fields != nil && issueID != "" && witnessIssueTerminal(rigBeads, issueID)
 	if fields != nil && fields.ActiveMR != "" {
-		gitSafe := !input.GitCheckFailed && !input.GitDirty && input.StashCount == 0 && input.UnpushedCommits == 0
 		sourceHint := fields.LastSourceIssue
 		if sourceHint == "" {
 			sourceHint = fields.HookBead
@@ -894,13 +1085,18 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 		assessment := polecat.AssessActiveMR(beads.New(beads.ResolveBeadsDir(workDir)), polecat.ActiveMRInput{ActiveMR: fields.ActiveMR, SourceIssueHint: sourceHint, RequireGitSafe: true, GitSafe: gitSafe})
 		if assessment.Pending {
 			input.ActiveMRBlocker = assessment.Reason
-		} else if input.CleanupStatus == polecat.CleanupUnpushed {
-			input.IgnoreCleanupStatus = true
+		}
+		activeMRSafe = !assessment.Pending
+		if assessment.SourceTerminal {
+			sourceTerminal = true
 		}
 	}
 	input.MQCheckRequired = input.Branch != ""
 	input.HasSubmittableWork = witnessHasSubmittableWork(clonePath)
 	input.AssignedBeadTerminal = witnessIssueTerminal(rigBeads, issueID)
+	if polecat.CanIgnoreStaleCleanupStatus(input.CleanupStatus, input.AssignedBeadTerminal || sourceTerminal || hookTerminal, hookSafe, activeMRSafe, gitSafe) {
+		input.IgnoreCleanupStatus = true
+	}
 	input.MQNotRequired = witnessMQNotRequiredSource(rigBeads, issueID)
 	if input.MQCheckRequired && input.HasSubmittableWork && !input.AssignedBeadTerminal && !input.MQNotRequired {
 		mr, err := rigBeads.FindMRForBranchAny(input.Branch)
@@ -2604,14 +2800,139 @@ func getBeadStatus(bd *BdCli, workDir, beadID string) (string, bool) {
 	return issues[0].Status, true
 }
 
+// activeMayorDecisionForBead resolves the durable Mayor decision for a source bead.
+// It is a package-level variable so tests can substitute decision state without
+// writing files. Production callers use the mayor package directly.
+var activeMayorDecisionForBead = func(townRoot, beadID string) (*mayor.Decision, error) {
+	state, err := mayor.LoadDecisions(townRoot)
+	if err != nil {
+		return nil, err
+	}
+	return state.ActiveDecision(beadID)
+}
+
+// notifyMayorOfReworkBlocked surfaces a conflict between an active Mayor decision
+// (DEFER/HOLD/PARK) and an automated rework request to the Mayor. Both inputs are
+// included: the decision and the rework context (bead, polecat, status, threshold).
+// If router is nil, falls back to stderr logging and a direct nudge when possible.
+//
+// The (rig, bead, polecat, decision, source status) tuple is deduped/throttled
+// (gastown-cet.11): the first occurrence is emitted immediately, identical
+// repeats inside the throttle window are suppressed and counted, and a rollup
+// is emitted when the window elapses. Any change to the tuple emits
+// immediately. Suppressed counts are logged to stderr so evidence is not lost.
+func notifyMayorOfReworkBlocked(townRoot, rigName, hookBead, polecatName, beadStatus string, maxRespawns int, decision *mayor.Decision, router *mail.Router) {
+	if decision == nil {
+		// Defensive: callers already guard on decision != nil, but a nil here
+		// would dereference below. Log and skip.
+		fmt.Fprintf(os.Stderr, "witness: notifyMayorOfReworkBlocked called with nil decision for %s\n", hookBead)
+		return
+	}
+
+	throttleWindow := config.LoadOperationalConfig(townRoot).GetWitnessConfig().ReworkDeferredThrottleWindowD()
+	td := EvaluateReworkDeferred(townRoot, rigName, hookBead, polecatName, beadStatus, decision.Reason, decision.Type, throttleWindow)
+
+	if td.Action == ActionSuppress {
+		// Suppressed: log so the operator can see the count, but do not spam
+		// the Mayor. FirstSuppressedAt/SuppressedCount are in td.Record.
+		fmt.Fprintf(os.Stderr,
+			"witness: REWORK_DEFERRED suppressed for %s/%s bead=%s (suppressed_count=%d first_suppressed_at=%s window=%s)\n",
+			rigName, polecatName, hookBead,
+			td.Record.SuppressedCount,
+			td.Record.FirstSuppressedAt.Format(time.RFC3339),
+			throttleWindow,
+		)
+		return
+	}
+
+	subject := fmt.Sprintf("REWORK_DEFERRED %s (Mayor %s decision blocks rework)", hookBead, decision.Type)
+	if td.Action == ActionRollup {
+		subject = fmt.Sprintf("REWORK_DEFERRED %s (Mayor %s decision blocks rework, %d suppressed)",
+			hookBead, decision.Type, td.Record.SuppressedCount)
+	}
+
+	bodyPrefix := ""
+	if td.Action == ActionRollup {
+		// The rollup body makes the suppressed count visible so the Mayor can
+		// see the prior flood even though the prior individual messages were
+		// dropped.
+		suppressedWindow := ""
+		if !td.Record.FirstEmittedAt.IsZero() {
+			suppressedWindow = fmt.Sprintf(" (covers %s → %s)",
+				td.Record.FirstEmittedAt.Format(time.RFC3339),
+				reworkDeferredNow().UTC().Format(time.RFC3339))
+		}
+		bodyPrefix = fmt.Sprintf(`This is a rollup of %d identical REWORK_DEFERRED notices that were suppressed inside the %s throttle window%s.
+
+`, td.Record.SuppressedCount, throttleWindow, suppressedWindow)
+	}
+
+	body := bodyPrefix + fmt.Sprintf(`Automated rework for bead %s was blocked by an active Mayor decision.
+
+Mayor Decision
+==============
+Type: %s
+Reason: %s
+Mayor: %s
+Recorded: %s
+
+Rework Context
+==============
+Bead: %s
+Polecat: %s/%s
+Previous Status: %s
+Max Respawns Threshold: %d
+
+Action Required
+===============
+The bead was NOT reset and no polecat was spawned. To allow rework to resume,
+record an explicit override: gt mayor decision resume %s`,
+		hookBead,
+		decision.Type,
+		decision.Reason,
+		decision.MayorID,
+		decision.Timestamp.Format(time.RFC3339),
+		hookBead,
+		rigName, polecatName,
+		beadStatus,
+		maxRespawns,
+		hookBead,
+	)
+
+	if router != nil {
+		msg := &mail.Message{
+			From:     fmt.Sprintf("%s/witness", rigName),
+			To:       "mayor/",
+			Subject:  subject,
+			Priority: mail.PriorityHigh,
+			Body:     body,
+		}
+		if err := router.Send(msg); err != nil {
+			fmt.Fprintf(os.Stderr, "witness: failed to send %s mail for %s: %v, attempting nudge fallback\n", subject, hookBead, err)
+		} else {
+			return
+		}
+	}
+
+	// Nudge fallback when router is nil or mail failed.
+	t := tmux.NewTmux()
+	nudgeMsg := fmt.Sprintf("%s: bead=%s polecat=%s/%s status=%s mayor_decision=%s reason=%q",
+		subject, hookBead, rigName, polecatName, beadStatus, decision.Type, decision.Reason)
+	if nudgeErr := t.NudgeSession(session.MayorSessionName(), nudgeMsg); nudgeErr != nil {
+		fmt.Fprintf(os.Stderr, "witness: nudge fallback to mayor also failed for %s: %v\n", hookBead, nudgeErr)
+	}
+}
+
 // resetAbandonedBead resets a dead polecat's hooked bead so it can be re-dispatched.
 // If the bead is in "hooked" or "in_progress" status, it:
 //  0. Checks if the polecat's work is already on main — if so, closes
 //     the bead instead of resetting (prevents re-dispatch of completed work)
-//  1. Records the respawn in the witness spawn-count ledger
-//  2. Resets status to open
-//  3. Clears assignee
-//  4. Sends mail to deacon for re-dispatch (includes respawn count; SPAWN_STORM
+//  1. Checks the durable Mayor decision state; active DEFER/HOLD/PARK converts
+//     automated rework handling into HOLD/await-Mayor and does not start a polecat
+//  2. Records the respawn in the witness spawn-count ledger
+//  3. Resets status to open
+//  4. Clears assignee
+//  5. Sends mail to deacon for re-dispatch (includes respawn count; SPAWN_STORM
 //     prefix and Urgent priority when count exceeds max bead respawns config)
 //
 // Returns true if the bead was recovered.
@@ -2639,6 +2960,16 @@ func resetAbandonedBead(bd *BdCli, workDir, rigName, hookBead, polecatName strin
 		if err := bd.Run(workDir, "close", hookBead, "-r", reason); err != nil {
 			fmt.Fprintf(os.Stderr, "witness: failed to close bead %s (work already on main): %v\n", hookBead, err)
 		}
+		return false
+	}
+
+	// Binding Mayor decision precedence (gastown-cet.7 / hq-12zq): explicit
+	// DEFER/HOLD/PARK on the source bead prevents automated rework spawn/nudge.
+	// Conflicts are logged with both the decision and the rework inputs and
+	// surfaced to the Mayor. A newer explicit RESUME decision overrides the
+	// block and allows rework to resume.
+	if decision, err := activeMayorDecisionForBead(trRoot, hookBead); err == nil && decision != nil {
+		notifyMayorOfReworkBlocked(trRoot, rigName, hookBead, polecatName, status, maxRespawns, decision, router)
 		return false
 	}
 
