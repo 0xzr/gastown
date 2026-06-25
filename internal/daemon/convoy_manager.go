@@ -33,9 +33,18 @@ const (
 )
 
 // strandedConvoyInfo matches the JSON output of `gt convoy stranded --json`.
+//
+// Status is the convoy's current beads status at the time the JSON was
+// computed. The daemon uses it as a defensive gate: even if the upstream
+// `bd list --status=open` filter is bypassed by a stale read, race, or
+// future regression, the daemon will skip convoys whose status is
+// closed/deferred/staged and never feed or completion-check them. An empty
+// Status field (older producer) is treated as "unknown" and accepted, so
+// the daemon still works against older gt binaries. See gastown-cet.14.
 type strandedConvoyInfo struct {
 	ID           string    `json:"id"`
 	Title        string    `json:"title"`
+	Status       string    `json:"status,omitempty"`
 	TrackedCount int       `json:"tracked_count"`
 	ReadyCount   int       `json:"ready_count"`
 	ReadyIssues  []string  `json:"ready_issues"`
@@ -483,6 +492,19 @@ func (m *ConvoyManager) scan() {
 		case <-m.ctx.Done():
 			return
 		default:
+		}
+
+		// Defensive status gate. `gt convoy stranded --json` already filters
+		// via `bd list --status=open`, but a closed/deferred/staged convoy
+		// can still leak through: Dolt eventual consistency, race between
+		// Mayor's close and the scan tick, or a future regression in the
+		// upstream filter. Without this gate the daemon would log
+		// "tracked issues, 0 ready — checking completion" and call
+		// `gt convoy check` on a convoy that is already closed/deferred,
+		// wasting log lines and context. See gastown-cet.14.
+		if !convoy.IsActiveJSONStatus(c.Status) {
+			m.logger("Convoy %s: skipping inactive (status=%s)", c.ID, c.Status)
+			continue
 		}
 
 		if c.ReadyCount > 0 {

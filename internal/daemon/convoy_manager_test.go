@@ -1363,6 +1363,276 @@ func TestScanStranded_MixedReadyAndEmpty(t *testing.T) {
 	}
 }
 
+// --- gastown-cet.14: defensive status gate ---
+
+// TestScanStranded_SkipsClosedConvoy verifies the daemon never feeds or
+// completion-checks a convoy whose reported status is "closed", even when
+// `gt convoy stranded --json` happens to return it (race, stale Dolt read,
+// or future regression in the upstream `bd list --status=open` filter).
+//
+// Regression fixture: a closed gt:convoy (hq-cv-closed) with one tracked
+// child whose own status is open. Without the defensive gate the daemon
+// would log "tracked issues, 0 ready — checking completion" and call
+// `gt convoy check` on an already-closed convoy every cycle, wasting log
+// lines and confusing the operator.
+func TestScanStranded_SkipsClosedConvoy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	paths := mockGtForScanTest(t, scanTestOpts{
+		strandedJSON: `[
+			{"id":"hq-cv-closed","title":"Already Closed","status":"closed","tracked_count":1,"ready_count":0,"ready_issues":[]}
+		]`,
+	})
+
+	var logMu sync.Mutex
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logMu.Lock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+		logMu.Unlock()
+	}
+
+	m := NewConvoyManager(paths.townRoot, logger, "gt", 10*time.Minute, nil, nil, nil)
+	m.scan()
+
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	// Negative: convoy check must NOT have been called for a closed convoy.
+	if _, err := os.Stat(paths.checkLogPath); err == nil {
+		data, _ := os.ReadFile(paths.checkLogPath)
+		t.Errorf("closed convoy hq-cv-closed must not appear in check log: %q", data)
+	}
+
+	// Negative: sling must NOT have been called for a closed convoy.
+	if _, err := os.Stat(paths.slingLogPath); err == nil {
+		data, _ := os.ReadFile(paths.slingLogPath)
+		t.Errorf("closed convoy hq-cv-closed must not trigger sling: %q", data)
+	}
+
+	// Positive: skip log message must mention the convoy ID and its status.
+	found := false
+	for _, s := range logged {
+		if strings.Contains(s, "hq-cv-closed") && strings.Contains(s, "closed") && strings.Contains(s, "skipping") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected 'skipping inactive (status=closed)' log for hq-cv-closed, got: %v", logged)
+	}
+
+	// Negative: the historical "tracked issues, 0 ready — checking completion"
+	// log line must NOT appear for a closed convoy.
+	for _, s := range logged {
+		if strings.Contains(s, "checking completion") {
+			t.Errorf("must not log 'checking completion' for closed convoy, got: %s", s)
+		}
+	}
+}
+
+// TestScanStranded_SkipsDeferredConvoy covers the deferred branch of the
+// defensive status gate. Operators explicitly pause convoys by transitioning
+// them to "deferred" (see /docs/lifecycle.md); the daemon must not feed or
+// completion-check a deferred convoy either.
+func TestScanStranded_SkipsDeferredConvoy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	paths := mockGtForScanTest(t, scanTestOpts{
+		strandedJSON: `[
+			{"id":"hq-cv-deferred","title":"Deferred","status":"deferred","tracked_count":2,"ready_count":0,"ready_issues":[]}
+		]`,
+	})
+
+	var logMu sync.Mutex
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logMu.Lock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+		logMu.Unlock()
+	}
+
+	m := NewConvoyManager(paths.townRoot, logger, "gt", 10*time.Minute, nil, nil, nil)
+	m.scan()
+
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	if _, err := os.Stat(paths.checkLogPath); err == nil {
+		data, _ := os.ReadFile(paths.checkLogPath)
+		t.Errorf("deferred convoy hq-cv-deferred must not appear in check log: %q", data)
+	}
+	if _, err := os.Stat(paths.slingLogPath); err == nil {
+		data, _ := os.ReadFile(paths.slingLogPath)
+		t.Errorf("deferred convoy hq-cv-deferred must not trigger sling: %q", data)
+	}
+
+	found := false
+	for _, s := range logged {
+		if strings.Contains(s, "hq-cv-deferred") && strings.Contains(s, "deferred") && strings.Contains(s, "skipping") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected 'skipping inactive (status=deferred)' log, got: %v", logged)
+	}
+}
+
+// TestScanStranded_SkipsStagedConvoy covers staged_ready and staged_warnings.
+// Staged convoys have not been launched yet — they should never be fed by
+// the daemon's stranded scan loop.
+func TestScanStranded_SkipsStagedConvoy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	paths := mockGtForScanTest(t, scanTestOpts{
+		strandedJSON: `[
+			{"id":"hq-cv-staged1","title":"Staged Ready","status":"staged_ready","tracked_count":3,"ready_count":1,"ready_issues":["gt-issue1"]},
+			{"id":"hq-cv-staged2","title":"Staged Warn","status":"staged_warnings","tracked_count":2,"ready_count":0,"ready_issues":[]}
+		]`,
+		routes: `{"prefix":"gt-","path":"gt/.beads"}` + "\n",
+	})
+
+	var logMu sync.Mutex
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logMu.Lock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+		logMu.Unlock()
+	}
+
+	m := NewConvoyManager(paths.townRoot, logger, "gt", 10*time.Minute, nil, nil, nil)
+	m.scan()
+
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	if _, err := os.Stat(paths.checkLogPath); err == nil {
+		data, _ := os.ReadFile(paths.checkLogPath)
+		t.Errorf("staged convoy must not appear in check log: %q", data)
+	}
+	if _, err := os.Stat(paths.slingLogPath); err == nil {
+		data, _ := os.ReadFile(paths.slingLogPath)
+		t.Errorf("staged convoy must not trigger sling: %q", data)
+	}
+}
+
+// TestScanStranded_MixedOpenAndInactive is the canonical regression
+// fixture: one open convoy with a ready issue, plus one closed convoy and
+// one deferred convoy. The daemon must feed the open convoy and skip both
+// inactive ones in the same scan tick — proving the gate does not block
+// legitimate activity.
+func TestScanStranded_MixedOpenAndInactive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	paths := mockGtForScanTest(t, scanTestOpts{
+		strandedJSON: `[
+			{"id":"hq-cv-open","title":"Open","status":"open","tracked_count":1,"ready_count":1,"ready_issues":["gt-issue1"]},
+			{"id":"hq-cv-closed","title":"Closed","status":"closed","tracked_count":1,"ready_count":0,"ready_issues":[]},
+			{"id":"hq-cv-deferred","title":"Deferred","status":"deferred","tracked_count":2,"ready_count":0,"ready_issues":[]}
+		]`,
+		routes: `{"prefix":"gt-","path":"gt/.beads"}` + "\n",
+	})
+
+	var logMu sync.Mutex
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logMu.Lock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+		logMu.Unlock()
+	}
+
+	m := NewConvoyManager(paths.townRoot, logger, "gt", 10*time.Minute, nil, nil, nil)
+	m.scan()
+
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	// Positive: open convoy must be dispatched.
+	slingData, err := os.ReadFile(paths.slingLogPath)
+	if err != nil {
+		t.Fatalf("read sling log: %v (sling was never called for the open convoy)", err)
+	}
+	slingContent := string(slingData)
+	if !strings.Contains(slingContent, "gt-issue1") {
+		t.Errorf("expected sling for gt-issue1 (open convoy), got: %q", slingContent)
+	}
+
+	// Negative: inactive convoys must NOT be dispatched.
+	if strings.Contains(slingContent, "hq-cv-closed") {
+		t.Errorf("closed convoy must not appear in sling log: %q", slingContent)
+	}
+	if strings.Contains(slingContent, "hq-cv-deferred") {
+		t.Errorf("deferred convoy must not appear in sling log: %q", slingContent)
+	}
+
+	// Negative: closed/deferred must not trigger check completion either.
+	if _, err := os.Stat(paths.checkLogPath); err == nil {
+		data, _ := os.ReadFile(paths.checkLogPath)
+		t.Errorf("inactive convoys must not appear in check log: %q", data)
+	}
+
+	// Positive: skip log for each inactive convoy.
+	skippedClosed := false
+	skippedDeferred := false
+	for _, s := range logged {
+		if strings.Contains(s, "hq-cv-closed") && strings.Contains(s, "skipping") {
+			skippedClosed = true
+		}
+		if strings.Contains(s, "hq-cv-deferred") && strings.Contains(s, "skipping") {
+			skippedDeferred = true
+		}
+	}
+	if !skippedClosed {
+		t.Errorf("expected 'skipping inactive' log for hq-cv-closed, got: %v", logged)
+	}
+	if !skippedDeferred {
+		t.Errorf("expected 'skipping inactive' log for hq-cv-deferred, got: %v", logged)
+	}
+}
+
+// TestScanStranded_LegacyProducerWithoutStatus covers backward compatibility:
+// if an older `gt convoy stranded --json` producer omits the Status field
+// (legacy clients), the daemon must still process the convoy. Otherwise a
+// rolling upgrade would silently stop feeding for every polecat that hasn't
+// yet picked up the new binary.
+func TestScanStranded_LegacyProducerWithoutStatus(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	paths := mockGtForScanTest(t, scanTestOpts{
+		strandedJSON: `[
+			{"id":"hq-cv-legacy","title":"Legacy","tracked_count":1,"ready_count":1,"ready_issues":["gt-issue1"]}
+		]`,
+		routes: `{"prefix":"gt-","path":"gt/.beads"}` + "\n",
+	})
+
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+
+	m := NewConvoyManager(paths.townRoot, logger, "gt", 10*time.Minute, nil, nil, nil)
+	m.scan()
+
+	slingData, err := os.ReadFile(paths.slingLogPath)
+	if err != nil {
+		t.Fatalf("legacy convoy must still be fed: sling log missing: %v", err)
+	}
+	if !strings.Contains(string(slingData), "gt-issue1") {
+		t.Errorf("expected legacy convoy to be dispatched, got: %q", slingData)
+	}
+}
+
 // --- P0: Stop() closes lazily-opened stores ---
 
 func TestStop_ClosesLazilyOpenedStores(t *testing.T) {
