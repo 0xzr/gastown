@@ -435,17 +435,65 @@ func (m *SessionManager) agentBeadIDForSession(polecat string) string {
 	return beads.PolecatBeadIDWithPrefix(prefix, m.rig.Name, polecat)
 }
 
-// readPersistedAssignedAgent returns the runtime agent previously persisted for
+// modelAssignment is the durable wrapper assignment record written by
+// ~/.local/bin/gt for every sling. It survives nuke/restart and is the fallback
+// source for the polecat's model when the agent-bead assigned_agent is empty
+// (e.g., sessions started before the assigned_agent field was added).
+type modelAssignment struct {
+	Bead       string `json:"bead"`
+	Target     string `json:"target"`
+	Agent      string `json:"agent"`
+	Source     string `json:"source"`
+	AssignedAt string `json:"assigned_at"`
+}
+
+// readModelAssignment returns the agent recorded in the wrapper's durable
+// model-assignments file for the given bead, or "" if missing/unreadable.
+func readModelAssignment(townRoot, bead string) string {
+	path := filepath.Join(constants.TownRuntimePath(townRoot), "model-assignments", bead+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		debugSession(fmt.Sprintf("reading model-assignment %s", path), err)
+		return ""
+	}
+	var ma modelAssignment
+	if err := json.Unmarshal(data, &ma); err != nil {
+		debugSession(fmt.Sprintf("parsing model-assignment %s", path), err)
+		return ""
+	}
+	return strings.TrimSpace(ma.Agent)
+}
+
+// ReadPersistedAssignedAgent returns the runtime agent previously persisted for
 // this polecat, or "" if none (fresh slot or lookup failure). Best-effort and
 // non-fatal: a read failure must not block session start.
-func (m *SessionManager) readPersistedAssignedAgent(polecat string) string {
+//
+// Resolution order:
+//  1. The agent-bead assigned_agent field (authoritative for sessions that have
+//     already run under the new preservation logic).
+//  2. The wrapper's durable model-assignments/<bead>.json fallback, keyed by
+//     the polecat's current hook bead. This catches pre-preservation sessions
+//     and restart-only recovery paths where the wrapper did not rewrite the
+//     agent bead (gastown-hkd).
+func (m *SessionManager) ReadPersistedAssignedAgent(polecat string) string {
 	agentID := m.agentBeadIDForSession(polecat)
 	bd := beads.New(m.rig.Path).ForAgentBead()
 	_, fields, err := bd.GetAgentBead(agentID)
 	if err != nil || fields == nil {
 		return ""
 	}
-	return strings.TrimSpace(fields.AssignedAgent)
+	if agent := strings.TrimSpace(fields.AssignedAgent); agent != "" {
+		return agent
+	}
+
+	// Fallback: the wrapper writes model-assignments for every sling and those
+	// files survive nuke/restart. Use the current hook bead to locate the record.
+	hookBead := strings.TrimSpace(fields.HookBead)
+	if hookBead == "" {
+		return ""
+	}
+	townRoot := filepath.Dir(m.rig.Path)
+	return readModelAssignment(townRoot, hookBead)
 }
 
 // persistAssignedAgent stores the runtime agent this session is running so the
@@ -460,7 +508,7 @@ func (m *SessionManager) persistAssignedAgent(polecat, agent string) {
 }
 
 // readHookBead returns the bead ID currently hooked to this polecat, as stored
-// in the polecat's agent bead. It mirrors readPersistedAssignedAgent: best-
+// in the polecat's agent bead. It mirrors ReadPersistedAssignedAgent: best-
 // effort and non-fatal, because session start must degrade gracefully when
 // beads is temporarily unavailable.
 func (m *SessionManager) readHookBead(polecat string) string {
@@ -540,7 +588,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// to the rig default (claude), silently changing the assigned model.
 	effectiveAgent := opts.Agent
 	if effectiveAgent == "" {
-		if persisted := m.readPersistedAssignedAgent(polecat); persisted != "" {
+		if persisted := m.ReadPersistedAssignedAgent(polecat); persisted != "" {
 			effectiveAgent = persisted
 		}
 	}

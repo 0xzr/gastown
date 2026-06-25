@@ -649,9 +649,9 @@ func TestPromptlessFallbackIncludesPrimeAndWorkInstructions(t *testing.T) {
 // not auto-submitted; the condition triggers verifyStartupNudgeDelivery as a safety net.
 func TestModeABeaconVerificationCondition(t *testing.T) {
 	tests := []struct {
-		name            string
-		rc              *config.RuntimeConfig
-		wantModeA       bool // !SendBeaconNudge && !SendStartupNudge
+		name      string
+		rc        *config.RuntimeConfig
+		wantModeA bool // !SendBeaconNudge && !SendStartupNudge
 	}{
 		{
 			name: "Claude hook+prompt agent triggers Mode A verification",
@@ -902,11 +902,11 @@ func TestParseFreshBranchName_Rejects(t *testing.T) {
 		"master",
 		"develop",
 		"feature/x",
-		"polecat/",          // empty tail
-		"polecat/alpha",     // no ts or issue
-		"polecat/alpha-",    // trailing dash, no ts
-		"polecat//gt-abc@1", // empty polecat name
-		"polecat/alpha/@1",  // empty issue
+		"polecat/",              // empty tail
+		"polecat/alpha",         // no ts or issue
+		"polecat/alpha-",        // trailing dash, no ts
+		"polecat//gt-abc@1",     // empty polecat name
+		"polecat/alpha/@1",      // empty issue
 		"polecat/alpha/gt-abc@", // empty ts
 		"",
 	}
@@ -1101,5 +1101,69 @@ func TestEnsureCanonicalSessionBranch_PreservesSameIssueWithCommits(t *testing.T
 	}
 	if len(refs) != 0 {
 		t.Fatalf("unexpected quarantine refs: %v", refs)
+	}
+}
+
+// TestReadModelAssignment_PreservesGLMAndKimi proves the durable wrapper
+// fallback records are honored for both GLM and Kimi assignments. This is the
+// regression coverage for gastown-hkd: a GLM polecat must restart as GLM and a
+// Kimi polecat must restart as Kimi even when the agent-bead assigned_agent is
+// empty.
+func TestReadModelAssignment_PreservesGLMAndKimi(t *testing.T) {
+	tmpTown := t.TempDir()
+	maDir := filepath.Join(tmpTown, ".runtime", "model-assignments")
+	if err := os.MkdirAll(maDir, 0755); err != nil {
+		t.Fatalf("mkdir model-assignments: %v", err)
+	}
+
+	cases := []struct {
+		bead  string
+		agent string
+	}{
+		{"gastown-glm", "umans-glm"},
+		{"gastown-kimi", "umans-kimi"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.bead, func(t *testing.T) {
+			path := filepath.Join(maDir, tc.bead+".json")
+			data := fmt.Sprintf(`{"bead":%q,"target":"gastown","agent":%q,"source":"gt-wrapper","assigned_at":"2026-06-25T00:00:00-04:00"}`, tc.bead, tc.agent)
+			if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+				t.Fatalf("write model assignment: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Remove(path) })
+
+			got := readModelAssignment(tmpTown, tc.bead)
+			if got != tc.agent {
+				t.Errorf("readModelAssignment(%q) = %q, want %q", tc.bead, got, tc.agent)
+			}
+		})
+	}
+}
+
+// TestReadModelAssignment_MissingReturnsEmpty verifies that a missing or
+// unreadable model-assignments file degrades gracefully to an empty result
+// rather than blocking session restart.
+func TestReadModelAssignment_MissingReturnsEmpty(t *testing.T) {
+	tmpTown := t.TempDir()
+	if got := readModelAssignment(tmpTown, "gastown-missing"); got != "" {
+		t.Errorf("readModelAssignment(missing) = %q, want empty", got)
+	}
+}
+
+// TestReadModelAssignment_MalformedJSONReturnsEmpty verifies that a corrupt
+// model-assignments file degrades gracefully instead of crashing session start.
+func TestReadModelAssignment_MalformedJSONReturnsEmpty(t *testing.T) {
+	tmpTown := t.TempDir()
+	maDir := filepath.Join(tmpTown, ".runtime", "model-assignments")
+	if err := os.MkdirAll(maDir, 0755); err != nil {
+		t.Fatalf("mkdir model-assignments: %v", err)
+	}
+	path := filepath.Join(maDir, "gastown-bad.json")
+	if err := os.WriteFile(path, []byte("not json"), 0644); err != nil {
+		t.Fatalf("write malformed assignment: %v", err)
+	}
+	if got := readModelAssignment(tmpTown, "gastown-bad"); got != "" {
+		t.Errorf("readModelAssignment(bad json) = %q, want empty", got)
 	}
 }

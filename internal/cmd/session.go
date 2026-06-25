@@ -554,7 +554,7 @@ func runSessionRestart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	polecatMgr, _, err := getSessionManager(rigName)
+	polecatMgr, r, err := getSessionManager(rigName)
 	if err != nil {
 		return err
 	}
@@ -588,9 +588,24 @@ func runSessionRestart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Preserve the polecat's assigned model across restart. Pre-preservation
+	// sessions may have an empty assigned_agent field but still have a durable
+	// record in the wrapper's model-assignments/<bead>.json. ReadPersistedAssignedAgent
+	// checks both sources; when nothing can be recovered we emit an explicit reason
+	// instead of silently falling back to the town default (gastown-hkd).
+	restartAgent := polecatMgr.ReadPersistedAssignedAgent(polecatName)
+	if restartAgent == "" {
+		townRoot := filepath.Dir(r.Path)
+		defaultCfg := config.ResolveRoleAgentConfig("polecat", townRoot, r.Path)
+		style.PrintWarning("gt session restart %s/%s: no model assignment recovered; using default role agent %q (assigned_agent empty and model-assignments fallback missing or unreadable)",
+			rigName, polecatName, defaultCfg.ResolvedAgent)
+	}
+
 	// Start fresh session
 	fmt.Printf("Starting session for %s/%s...\n", rigName, polecatName)
-	opts := polecat.SessionStartOptions{}
+	opts := polecat.SessionStartOptions{
+		Agent: restartAgent,
+	}
 	if err := polecatMgr.Start(polecatName, opts); err != nil {
 		return fmt.Errorf("starting session: %w", err)
 	}
