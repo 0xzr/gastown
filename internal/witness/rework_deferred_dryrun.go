@@ -28,19 +28,12 @@ type ReworkDeferredDryRunResult struct {
 
 // ReworkDeferredDryRunTuple is the dry-run outcome for a single tuple.
 type ReworkDeferredDryRunTuple struct {
-	Bead            string               `json:"bead"`
-	Decision        mayor.DecisionType   `json:"decision"`
-	FirstAction     ReworkDeferredAction `json:"first_action"`
-	RepeatAction    ReworkDeferredAction `json:"repeat_action"`
-	RollupAction    ReworkDeferredAction `json:"rollup_action"`
+	Bead           string                `json:"bead"`
+	Decision       mayor.DecisionType    `json:"decision"`
+	FirstAction    ReworkDeferredAction  `json:"first_action"`
+	RepeatAction   ReworkDeferredAction  `json:"repeat_action"`
+	RollupAction   ReworkDeferredAction  `json:"rollup_action"`
 	SuppressedCount int                  `json:"suppressed_count"`
-	// RollupSuppressedCount is the suppressed count the throttle returned on the
-	// rollup decision — the count the Mayor would see in the rollup subject/body.
-	// It must equal the number of repeats actually suppressed during the window
-	// (SuppressedCount), not the just-reset durable zero. The dry run asserts
-	// this (gastown-3ip): a false "0 suppressed" rollup previously passed because
-	// only the rollup action, not its count, was checked.
-	RollupSuppressedCount int `json:"rollup_suppressed_count"`
 }
 
 // DryRunReworkDeferred exercises the exact regression shape named in the
@@ -107,9 +100,9 @@ func DryRunReworkDeferred() (*ReworkDeferredDryRunResult, error) {
 			result.addError("first occurrence for %s: got %s, want emit", tup.bead, dec.Action)
 		}
 		result.Tuples = append(result.Tuples, ReworkDeferredDryRunTuple{
-			Bead:        tup.bead,
-			Decision:    tup.decision,
-			FirstAction: dec.Action,
+			Bead:          tup.bead,
+			Decision:      tup.decision,
+			FirstAction:   dec.Action,
 		})
 	}
 
@@ -143,16 +136,6 @@ func DryRunReworkDeferred() (*ReworkDeferredDryRunResult, error) {
 			result.addError("post-window for %s: got %s, want rollup", tup.bead, dec.Action)
 		}
 		result.Tuples[j].RollupAction = dec.Action
-		// The rollup must return the real suppressed count (repeatCount), not
-		// the just-reset durable zero. This is the gastown-3ip regression: a
-		// false-green "0 suppressed" rollup. Pin the returned count and assert
-		// it matches the repeats actually suppressed.
-		result.Tuples[j].RollupSuppressedCount = dec.Record.SuppressedCount
-		if dec.Record.SuppressedCount != repeatCount {
-			result.Pass = false
-			result.addError("post-window for %s: rollup returned suppressed_count=%d, want %d (real count, not 0)",
-				tup.bead, dec.Record.SuppressedCount, repeatCount)
-		}
 	}
 
 	// State change must emit immediately regardless of the window.

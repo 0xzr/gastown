@@ -100,6 +100,23 @@ func TestDecideWorkstateLiveSignals(t *testing.T) {
 			wantSignalSubstrings: []string{"state=stalled", "heartbeat_fresh=false", "process_alive=false"},
 		},
 		{
+			name:                 "gastown-cet.16 regression: hooked with session_running only is WORKING",
+			in:                   WorkstateInput{State: StateStalled, HookBead: "gastown-cet.16", SessionRunning: true},
+			wantVerdict:          WorkstateVerdictWorking,
+			wantReason:           "live-hooked",
+			wantNeedsRecovery:    false,
+			wantConfidence:       WorkstateConfidenceMedium,
+			wantSignalSubstrings: []string{"state=stalled", "session_running=true", "hook_active"},
+		},
+		{
+			name:              "session_running alone without hook is live-review not recovery",
+			in:                WorkstateInput{State: StateReviewNeeded, SessionRunning: true},
+			wantVerdict:       WorkstateVerdictWorking,
+			wantReason:        "live-review",
+			wantNeedsRecovery: false,
+			wantConfidence:    WorkstateConfidenceMedium,
+		},
+		{
 			name:              "no liveness data preserves conservative not-idle fallback",
 			in:                WorkstateInput{State: StateStalled, HookBead: "gastown-cet.9"},
 			wantVerdict:       WorkstateVerdictNeedsRecovery,

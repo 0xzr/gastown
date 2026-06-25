@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/townlog"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -27,6 +28,7 @@ var (
 	crashAgent    string
 	crashSession  string
 	crashExitCode int
+	crashSignal   string
 )
 
 var logCmd = &cobra.Command{
@@ -67,7 +69,7 @@ The exit code determines if this was a crash or expected exit:
   - Exit code non-zero: Crash (logged as 'crash')
 
 Examples:
-  gt log crash --agent greenplace/Toast --session gt-greenplace-Toast --exit-code 1`,
+  gt log crash --agent greenplace/Toast --session gt-greenplace-Toast --exit-code 1 --signal TERM`,
 	RunE: runLogCrash,
 }
 
@@ -83,6 +85,7 @@ func init() {
 	logCrashCmd.Flags().StringVar(&crashAgent, "agent", "", "Agent ID (e.g., greenplace/Toast)")
 	logCrashCmd.Flags().StringVar(&crashSession, "session", "", "Tmux session name")
 	logCrashCmd.Flags().IntVar(&crashExitCode, "exit-code", -1, "Exit code from pane")
+	logCrashCmd.Flags().StringVar(&crashSignal, "signal", "", "Signal that terminated the pane, if known (e.g., TERM, KILL)")
 	_ = logCrashCmd.MarkFlagRequired("agent")
 
 	logCmd.AddCommand(logCrashCmd)
@@ -393,7 +396,18 @@ func runLogCrash(cmd *cobra.Command, args []string) error {
 		if crashSession != "" {
 			context += fmt.Sprintf(" (session: %s)", crashSession)
 		}
+		if crashSignal != "" {
+			context += fmt.Sprintf(" [signal: %s]", crashSignal)
+		}
 	}
+
+	// Persist structured exit telemetry for incident investigation. This is
+	// best-effort and runs alongside the human-readable town log.
+	exitReason := context
+	if eventType == townlog.EventDone {
+		exitReason = "exited-normally"
+	}
+	_ = polecat.RecordSessionExit(townRoot, crashSession, "pane-died", crashExitCode, crashSignal, exitReason)
 
 	// Log the event
 	logger := townlog.NewLogger(townRoot)
@@ -401,13 +415,13 @@ func runLogCrash(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("logging event: %w", err)
 	}
 	if eventType == townlog.EventCrash {
-		logCrashFeedEvent(townRoot, crashAgent, crashSession, crashExitCode)
+		logCrashFeedEvent(townRoot, crashAgent, crashSession, crashExitCode, crashSignal)
 	}
 
 	return nil
 }
 
-func logCrashFeedEvent(townRoot, agent, session string, exitCode int) {
+func logCrashFeedEvent(townRoot, agent, session string, exitCode int, signal string) {
 	if townRoot == "" {
 		return
 	}
@@ -424,8 +438,14 @@ func logCrashFeedEvent(townRoot, agent, session string, exitCode int) {
 	}
 
 	reason := fmt.Sprintf("crashed with exit code %d", exitCode)
+	if signal != "" {
+		reason += fmt.Sprintf(" (signal: %s)", signal)
+	}
 	payload := events.SessionDeathPayload(session, agent, reason, "gt log crash")
 	payload["exit_code"] = exitCode
+	if signal != "" {
+		payload["signal"] = signal
+	}
 	_ = events.LogFeed(events.TypeSessionDeath, agent, payload)
 }
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/steveyegge/gastown/internal/agentlog"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -714,6 +715,19 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		envVars[runtimeConfig.Session.ConfigDirEnv] = opts.RuntimeConfigDir
 	}
 
+	// Record durable session start evidence so exit telemetry can attribute
+	// crashes, signals, and last transcript tails to the spawning command and model.
+	transcriptDir, _ := agentlog.ClaudeProjectDirFor(workDir)
+	_ = WriteSessionStartTelemetry(townRoot, &SessionTelemetry{
+		SessionID:     sessionID,
+		PolecatName:   polecat,
+		RigName:       m.rig.Name,
+		HookBead:      opts.Issue,
+		Command:       command,
+		Model:         resolvedAgent,
+		TranscriptDir: transcriptDir,
+	})
+
 	// Create session with command and env vars via -e flags so the initial
 	// shell — and Claude's subprocesses (notably bd) — inherit them from the start.
 	// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)
@@ -878,10 +892,26 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 		return ErrSessionNotFound
 	}
 
+	townRoot := filepath.Dir(m.rig.Path)
+
 	// Try graceful shutdown first
+	reason := "force-stop"
+	exitCode := 1
 	if !force {
 		_ = m.tmux.SendKeysRaw(sessionID, "C-c")
-		session.WaitForSessionExit(m.tmux, sessionID, constants.GracefulShutdownTimeout)
+		if session.WaitForSessionExit(m.tmux, sessionID, constants.GracefulShutdownTimeout) {
+			reason = "graceful-stop"
+			exitCode = 0
+		} else {
+			reason = "graceful-stop-timed-out"
+		}
+	}
+
+	// Capture the last visible pane output before the session dies so crash
+	// investigation has a tail even when the transcript log is missing.
+	lastTail := ""
+	if tail, err := m.CaptureSession(sessionID, 50); err == nil {
+		lastTail = tail
 	}
 
 	// Use KillSessionWithProcesses to ensure all descendant processes are killed.
@@ -889,6 +919,10 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 	if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
 		return fmt.Errorf("killing session: %w", err)
 	}
+
+	// Record exit evidence. Best-effort: telemetry must never block cleanup.
+	_ = RecordSessionExit(townRoot, sessionID, "polecat-manager-stop", exitCode, "", reason)
+	_ = UpdateSessionTelemetryLastPaneTail(townRoot, sessionID, lastTail)
 
 	return nil
 }

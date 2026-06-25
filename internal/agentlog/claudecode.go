@@ -94,11 +94,17 @@ func (a *ClaudeCodeAdapter) Watch(ctx context.Context, sessionID, workDir string
 	return ch, nil
 }
 
-// claudeProjectDirFor returns the Claude Code project directory for workDir.
+// ClaudeProjectDirFor returns the Claude Code project directory for workDir.
 // Formula: $HOME/.claude/projects/<hash> where hash = workDir with '/' → '-'.
 // On Windows, backslashes are converted to forward slashes and the drive
 // letter (e.g. "C:") is stripped before hashing, matching Claude Code's
 // cross-platform behavior.
+func ClaudeProjectDirFor(workDir string) (string, error) {
+	return claudeProjectDirFor(workDir)
+}
+
+// claudeProjectDirFor is the internal implementation used by tests and the
+// exported wrapper.
 func claudeProjectDirFor(workDir string) (string, error) {
 	abs, err := filepath.Abs(workDir)
 	if err != nil {

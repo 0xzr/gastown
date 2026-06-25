@@ -1384,6 +1384,67 @@ func TestGetBeadStatus_EmptyBeadID(t *testing.T) {
 	}
 }
 
+// TestHandleZombieRestart_CleanDeadHookedLane verifies that a polecat with a
+// dead tmux session, an active hooked bead, and clean cleanup_status is
+// restarted without being left as a recovery-blocked capacity leak. This is the
+// gastown-cet.16 regression coverage for correlated session disappearance.
+func TestHandleZombieRestart_CleanDeadHookedLane(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+	rigName := "testrig"
+	polecatDir := filepath.Join(tmpDir, rigName, "polecats", "nux")
+	if err := os.MkdirAll(polecatDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, ".gt-root"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	bd, _ := mockBd(
+		func(args []string) (string, error) {
+			if len(args) == 0 {
+				return "", nil
+			}
+			switch args[0] {
+			case "list":
+				return "[]", nil
+			case "create":
+				return `{"id":"gt-wisp-001"}`, nil
+			}
+			return "{}", nil
+		},
+		func(args []string) error { return nil },
+	)
+
+	var restarted bool
+	orig := restartPolecatSessionFn
+	restartPolecatSessionFn = func(_, _, _ string) error {
+		restarted = true
+		return nil
+	}
+	t.Cleanup(func() { restartPolecatSessionFn = orig })
+
+	zombie := &ZombieResult{
+		PolecatName:    "nux",
+		AgentState:     "working",
+		Classification: ZombieSessionDeadActive,
+		HookBead:       "gt-work-001",
+		WasActive:      true,
+	}
+
+	handleZombieRestart(bd, tmpDir, rigName, "nux", "gt-work-001", "clean", zombie)
+
+	if !restarted {
+		t.Fatalf("expected dead hooked clean polecat to be restarted, got action=%q", zombie.Action)
+	}
+	if !strings.HasPrefix(zombie.Action, "restarted") {
+		t.Errorf("Action = %q, want 'restarted' prefix", zombie.Action)
+	}
+	if zombie.Error != nil {
+		t.Errorf("unexpected error: %v", zombie.Error)
+	}
+}
+
 func TestDetectZombie_BeadClosedStillRunning(t *testing.T) {
 	t.Parallel()
 	// Verify the logic: live session + agent alive + hooked bead closed → zombie

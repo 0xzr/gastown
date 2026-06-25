@@ -32,6 +32,41 @@ type StaleBinaryInfo struct {
 	Error         error  // Any error encountered during check
 }
 
+// IsStaleBeyond reports whether the binary is stale by more than the allowed
+// tested release delta. A zero or negative maxDelta means "no tolerance" — any
+// staleness blocks. The existing IsStale field is preserved for callers that
+// only want a warning.
+func (i *StaleBinaryInfo) IsStaleBeyond(maxDelta int) bool {
+	if !i.IsStale {
+		return false
+	}
+	if maxDelta <= 0 {
+		return true
+	}
+	if i.CommitsBehind <= 0 {
+		// Staleness confirmed but commit count unknown — be conservative.
+		return true
+	}
+	return i.CommitsBehind > maxDelta
+}
+
+// BlockingReason returns a human-readable reason the binary must not be relied
+// on, or "" if it is fresh enough. action names the automation gate
+// (e.g. "fleet fill", "recovery").
+func (i *StaleBinaryInfo) BlockingReason(action string, maxDelta int) string {
+	if i.Error != nil {
+		return fmt.Sprintf("cannot verify gt binary freshness for %s: %v", action, i.Error)
+	}
+	if !i.IsStaleBeyond(maxDelta) {
+		return ""
+	}
+	reason := i.Describe("gt binary")
+	if action != "" {
+		return fmt.Sprintf("%s — blocking %s until binary is rebuilt and reinstalled", reason, action)
+	}
+	return reason
+}
+
 type buildBranchRef struct {
 	ref     string
 	display string

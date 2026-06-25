@@ -125,20 +125,6 @@ type Daemon struct {
 	// mayorCriticalMailLastNotified throttles repeated critical-mail alerts.
 	mayorCriticalMailLastNotified time.Time
 
-	// witnessZombieCount tracks consecutive patrol cycles where the Witness
-	// heartbeat is missing OR the supervisor signals the Witness should be
-	// restarted (saturated + stalled). A count >= 3 triggers a supervised
-	// restart via the witness.Supervisor, debouncing transient gaps during
-	// normal handoffs. (gastown-o9d)
-	// Only accessed from heartbeat loop goroutine - no sync needed.
-	witnessZombieCount map[string]int
-
-	// witnessLastRestart records the last supervised witness restart time
-	// per rig. Used to honor the recovery cooldown configured in
-	// operational.witness.recovery_cooldown. (gastown-o9d)
-	// Only accessed from heartbeat loop goroutine - no sync needed.
-	witnessLastRestart map[string]time.Time
-
 	// rigPool runs per-rig heartbeat operations (witness checks, refinery checks,
 	// polecat health, idle reaping, branch pruning) with bounded concurrency and
 	// per-rig context timeouts so one slow rig cannot block all others.
@@ -408,22 +394,20 @@ func New(config *Config) (*Daemon, error) {
 	}
 
 	d := &Daemon{
-		config:             config,
-		patrolConfig:       patrolConfig,
-		disabledPatrols:    disabledPatrols,
-		tmux:               tmux.NewTmux(),
-		logger:             logger,
-		ctx:                ctx,
-		cancel:             cancel,
-		doltServer:         doltServer,
-		gtPath:             gtPath,
-		bdPath:             bdPath,
-		restartTracker:     restartTracker,
-		otelProvider:       otelProvider,
-		metrics:            dm,
-		rigPool:            newRigWorkerPool(0, 0, logger), // defaults: 10 workers, 30s timeout
-		witnessZombieCount: make(map[string]int),
-		witnessLastRestart: make(map[string]time.Time),
+		config:          config,
+		patrolConfig:    patrolConfig,
+		disabledPatrols: disabledPatrols,
+		tmux:            tmux.NewTmux(),
+		logger:          logger,
+		ctx:             ctx,
+		cancel:          cancel,
+		doltServer:      doltServer,
+		gtPath:          gtPath,
+		bdPath:          bdPath,
+		restartTracker:  restartTracker,
+		otelProvider:    otelProvider,
+		metrics:         dm,
+		rigPool:         newRigWorkerPool(0, 0, logger), // defaults: 10 workers, 30s timeout
 	}
 	return d, nil
 }
@@ -1745,9 +1729,6 @@ func (d *Daemon) hasPendingEvents(channel string) bool {
 
 // ensureWitnessRunning ensures the witness for a specific rig is running.
 // Discover, don't track: uses Manager.Start() which checks tmux directly (gt-zecmc).
-// Also runs the witness self-recovery supervisor (gastown-o9d) so a 100%-
-// context stalled Witness is restarted with a durable handoff rather than
-// sitting idle until Mayor intervention.
 func (d *Daemon) ensureWitnessRunning(rigName string) {
 	// Check rig operational state before auto-starting
 	if operational, reason := d.isRigOperational(rigName); !operational {
@@ -1782,12 +1763,8 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 
 	if err := mgr.Start(false, "", nil); err != nil {
 		if err == witness.ErrAlreadyRunning {
-			// Already running - this is the expected case. Run the
-			// self-recovery supervisor (gastown-o9d): if the existing
-			// Witness has reported a saturated+stalled heartbeat for
-			// >=3 consecutive cycles, trigger a supervised restart
-			// with a durable handoff.
-			d.checkWitnessStall(rigName, r, mgr)
+			// Already running - this is the expected case
+			d.logger.Printf("Witness for %s already running, skipping spawn", rigName)
 			return
 		}
 		d.logger.Printf("Error starting witness for %s: %v", rigName, err)
@@ -1797,70 +1774,6 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 	d.metrics.recordRestart(d.ctx, "witness")
 	telemetry.RecordDaemonRestart(d.ctx, "witness-"+rigName)
 	d.logger.Printf("Witness session for %s started successfully", rigName)
-}
-
-// checkWitnessStall is the daemon-side leg of the witness self-recovery
-// flow (gastown-o9d). It reads the per-rig witness heartbeat via
-// witness.Supervisor, asks the supervisor whether the Witness should
-// self-restart, and — after debouncing 3 consecutive cycles to filter
-// transient gaps during normal handoffs — invokes a supervised restart
-// that captures a durable handoff and preserves the rig's configured
-// model/agent assignment.
-//
-// Only the Witness is restarted. The refinery and polecat worktrees
-// are not touched; polecats that were stopped before the restart
-// remain stopped and are picked up by the post-restart Witness
-// (per the durable handoff's stopped-lanes list).
-func (d *Daemon) checkWitnessStall(rigName string, r *rig.Rig, mgr *witness.Manager) {
-	sup := witness.NewSupervisor(d.config.TownRoot, r.Path, rigName, d.gtPath)
-	should, reason := sup.ShouldRestart()
-	if !should {
-		// Healthy / fresh heartbeat — reset debounce counter and move on.
-		d.witnessZombieCount[rigName] = 0
-		return
-	}
-	// On-cooldown reasons are still informative but not actionable.
-	if strings.HasPrefix(reason, "on-cooldown-since-") {
-		if d.witnessZombieCount[rigName] == 0 {
-			d.logger.Printf("Witness %s stall detected but on cooldown (%s); waiting", rigName, reason)
-		}
-		d.witnessZombieCount[rigName] = 0
-		return
-	}
-
-	d.witnessZombieCount[rigName]++
-	d.logger.Printf("Witness %s stall signal (cycle %d/3): %s", rigName, d.witnessZombieCount[rigName], reason)
-	if d.witnessZombieCount[rigName] < 3 {
-		return
-	}
-
-	// Honor the configured recovery cooldown even if the supervisor's
-	// ledger says otherwise — defense in depth.
-	if last, ok := d.witnessLastRestart[rigName]; ok {
-		thresholds := sup.Thresholds()
-		if thresholds.RecoveryCooldown > 0 && time.Since(last) < thresholds.RecoveryCooldown {
-			d.logger.Printf("Witness %s restart suppressed: last restart was %s ago, cooldown is %s",
-				rigName, time.Since(last).Round(time.Second), thresholds.RecoveryCooldown)
-			return
-		}
-	}
-
-	d.logger.Printf("Witness %s: triggering supervised restart (%s)", rigName, reason)
-	attempt, err := sup.RestartWitness(mgr, reason)
-	d.witnessZombieCount[rigName] = 0
-	if err != nil {
-		d.logger.Printf("Witness %s supervised restart failed: %v", rigName, err)
-		d.notifySlack("admin", "high", fmt.Sprintf("Witness %s supervised restart failed: %v", rigName, err))
-		return
-	}
-	d.witnessLastRestart[rigName] = time.Now()
-	d.metrics.recordRestart(d.ctx, "witness-stall")
-	telemetry.RecordDaemonRestart(d.ctx, "witness-stall-"+rigName)
-	if attempt != nil && attempt.Verification != nil && !attempt.Verification.Verified && attempt.Verification.ExpectedAgent != "" {
-		d.logger.Printf("Witness %s post-restart model mismatch: expected=%s actual=%s",
-			rigName, attempt.Verification.ExpectedAgent, attempt.Verification.ActualAgent)
-	}
-	d.notifySlack("admin", "high", fmt.Sprintf("Witness %s restarted after stall (%s)", rigName, reason))
 }
 
 // ensureRefineriesRunning ensures refineries are running for configured rigs.
@@ -2076,10 +1989,10 @@ func (d *Daemon) restartMayor(mgr *mayor.Manager, cfg *agentconfig.MayorThreshol
 	modelVerify := sup.VerifyModel()
 	attempt := &mayor.RecoveryAttempt{
 		Timestamp:       time.Now().UTC(),
-		Reason:          reason,
-		ContextSnapshot: ctxSnap,
-		GitSnapshot:     gitSnap,
-		Verification:    modelVerify,
+		Reason:            reason,
+		ContextSnapshot:   ctxSnap,
+		GitSnapshot:       gitSnap,
+		Verification:      modelVerify,
 	}
 	if status != tmux.SessionHealthy {
 		attempt.Error = fmt.Sprintf("post-restart health check failed: %s", status.String())

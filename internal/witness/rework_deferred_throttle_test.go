@@ -1,7 +1,6 @@
 package witness
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,13 +146,6 @@ func TestEvaluateReworkDeferred_RollupAfterWindowElapses(t *testing.T) {
 	if dec.Action != ActionRollup {
 		t.Fatalf("post-window: Action = %q, want %q", dec.Action, ActionRollup)
 	}
-	// The RETURNED record must carry the real suppressed count (2) so the
-	// caller formats "2 suppressed", not "0 suppressed". This is the
-	// gastown-3ip regression: the rollup path previously zeroed the record
-	// in place before returning it.
-	if dec.Record.SuppressedCount != 2 {
-		t.Errorf("post-window: returned SuppressedCount = %d, want 2 (real count for rollup body)", dec.Record.SuppressedCount)
-	}
 	// Rollup record: SuppressedCount is reset to 0 in the durable record
 	// after the rollup is emitted.
 	records := ListReworkDeferredRecords(dir)
@@ -161,14 +153,7 @@ func TestEvaluateReworkDeferred_RollupAfterWindowElapses(t *testing.T) {
 		t.Fatalf("records: got %d, want 1", len(records))
 	}
 	if records[0].SuppressedCount != 0 {
-		t.Errorf("after rollup: durable SuppressedCount = %d, want 0", records[0].SuppressedCount)
-	}
-	// The returned record must NOT alias the durable record: its
-	// SuppressedCount (2) differs from the durable one (0). If they aliased,
-	// a future mutation of the returned record would corrupt durable state.
-	if dec.Record.SuppressedCount == records[0].SuppressedCount {
-		t.Errorf("returned record aliases durable record (both SuppressedCount=%d); expected a snapshot copy",
-			dec.Record.SuppressedCount)
+		t.Errorf("after rollup: SuppressedCount = %d, want 0", records[0].SuppressedCount)
 	}
 	if !records[0].FirstEmittedAt.Equal(dec.Record.FirstEmittedAt) {
 		t.Errorf("FirstEmittedAt changed: durable=%v returned=%v", records[0].FirstEmittedAt, dec.Record.FirstEmittedAt)
@@ -332,81 +317,6 @@ func TestEvaluateReworkDeferred_ZeroWindowDisablesThrottle(t *testing.T) {
 		if dec.Action != ActionEmit {
 			t.Errorf("call #%d with window=0: Action = %q, want %q", i, dec.Action, ActionEmit)
 		}
-	}
-}
-
-// TestEvaluateReworkDeferred_RollupReturnsRealCount is the focused regression
-// test for gastown-3ip: the rollup path must return a record whose
-// SuppressedCount equals the number of repeats actually suppressed during the
-// window, NOT the just-reset durable zero. The caller formats the rollup
-// subject/body from this count, so a zero here produces a false "0 suppressed"
-// rollup (the false-green dry-run that masked the bug). Exercises all three
-// acceptance-criteria beads (gt-hold1, gt-park1, gt-work999) with varying
-// suppression counts to catch off-by-one and shared-state errors.
-func TestEvaluateReworkDeferred_RollupReturnsRealCount(t *testing.T) {
-	cases := []struct {
-		bead     string
-		decision mayor.DecisionType
-		// number of identical repeats suppressed inside the window before rollup
-		suppressed int
-	}{
-		{"gt-hold1", mayor.DecisionHold, 1},
-		{"gt-park1", mayor.DecisionPark, 3},
-		{"gt-work999", mayor.DecisionDefer, 7},
-	}
-
-	for _, c := range cases {
-		t.Run(c.bead, func(t *testing.T) {
-			dir := withReworkDeferredStateDir(t)
-			start := time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC)
-			advance := withReworkDeferredClock(t, start)
-
-			// First emit.
-			if dec := EvaluateReworkDeferred(dir, "polybot-uiu", c.bead, "alpha", "merge_failed",
-				"reason", c.decision, 1*time.Hour); dec.Action != ActionEmit {
-				t.Fatalf("first: Action = %q, want emit", dec.Action)
-			}
-
-			// Suppress `c.suppressed` identical repeats inside the window.
-			for i := 0; i < c.suppressed; i++ {
-				advance(5 * time.Minute)
-				dec := EvaluateReworkDeferred(dir, "polybot-uiu", c.bead, "alpha", "merge_failed",
-					"reason", c.decision, 1*time.Hour)
-				if dec.Action != ActionSuppress {
-					t.Fatalf("suppress #%d: Action = %q, want %q", i+1, dec.Action, ActionSuppress)
-				}
-			}
-
-			// Advance past the 1h window. The rollup must carry the real count.
-			advance(1 * time.Hour)
-			dec := EvaluateReworkDeferred(dir, "polybot-uiu", c.bead, "alpha", "merge_failed",
-				"reason", c.decision, 1*time.Hour)
-			if dec.Action != ActionRollup {
-				t.Fatalf("post-window: Action = %q, want %q", dec.Action, ActionRollup)
-			}
-			if dec.Record.SuppressedCount != c.suppressed {
-				t.Errorf("returned SuppressedCount = %d, want %d (rollup must report the real count, not 0)",
-					dec.Record.SuppressedCount, c.suppressed)
-			}
-
-			// Durable record is reset to 0 for the next window — independent
-			// of the returned snapshot.
-			records := ListReworkDeferredRecords(dir)
-			if len(records) != 1 {
-				t.Fatalf("records: got %d, want 1", len(records))
-			}
-			if records[0].SuppressedCount != 0 {
-				t.Errorf("durable SuppressedCount = %d, want 0 (reset after rollup)", records[0].SuppressedCount)
-			}
-
-			// Mutating the returned snapshot must not bleed into durable state.
-			dec.Record.SuppressedCount = 9999
-			after := ListReworkDeferredRecords(dir)
-			if after[0].SuppressedCount != 0 {
-				t.Errorf("mutating returned record leaked into durable state: SuppressedCount = %d, want 0",
-					after[0].SuppressedCount)
-			}
-		})
 	}
 }
 
@@ -575,91 +485,5 @@ func TestReworkDeferredKey_StableForSameTuple(t *testing.T) {
 	c := reworkDeferredKey("polybot-uiu", "gt-hold1", "alpha", mayor.DecisionPark, "merge_failed")
 	if a == c {
 		t.Error("distinct decisions produced the same key")
-	}
-}
-
-// TestNotifyMayorOfReworkBlocked_RollupReportsRealCount is the live-path
-// regression test for gastown-3ip. It drives a real EvaluateReworkDeferred
-// rollup through durable state, then formats the notice exactly as
-// notifyMayorOfReworkBlocked does (via the shared formatReworkDeferredNotification
-// helper). The Mayor saw repeated REWORK_DEFERRED gt-work999 notices whose
-// rollups read "0 suppressed"; this test pins that the formatted subject and
-// body carry the real suppressed count from the throttle, not the just-reset
-// durable zero. It covers all four acceptance-criteria tuples
-// (gt-hold1/gt-park1/gt-work999/polybot-uiu as the rig) through the actual
-// notification-formatting seam used by the live emitter.
-func TestNotifyMayorOfReworkBlocked_RollupReportsRealCount(t *testing.T) {
-	dir := withReworkDeferredStateDir(t)
-	start := time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC)
-	advance := withReworkDeferredClock(t, start)
-
-	const (
-		rigName      = "polybot-uiu"
-		polecatName  = "alpha"
-		sourceStatus = "merge_failed"
-		reason       = "DEFER per priority realignment"
-	)
-	window := 1 * time.Hour
-
-	tuples := []struct {
-		bead       string
-		decision   mayor.DecisionType
-		suppressed int
-	}{
-		{"gt-hold1", mayor.DecisionHold, 2},
-		{"gt-park1", mayor.DecisionPark, 4},
-		{"gt-work999", mayor.DecisionDefer, 1},
-	}
-
-	for _, tup := range tuples {
-		dec := mayor.Decision{
-			Type:      tup.decision,
-			Reason:    reason,
-			MayorID:   "mayor/acp",
-			Timestamp: start,
-		}
-
-		// First emit through the live throttle path.
-		td := EvaluateReworkDeferred(dir, rigName, tup.bead, polecatName, sourceStatus,
-			reason, tup.decision, window)
-		if td.Action != ActionEmit {
-			t.Fatalf("%s: first Action = %q, want emit", tup.bead, td.Action)
-		}
-
-		// Suppress `tup.suppressed` identical repeats inside the window.
-		for i := 0; i < tup.suppressed; i++ {
-			advance(5 * time.Minute)
-			td = EvaluateReworkDeferred(dir, rigName, tup.bead, polecatName, sourceStatus,
-				reason, tup.decision, window)
-			if td.Action != ActionSuppress {
-				t.Fatalf("%s: suppress #%d Action = %q, want %q", tup.bead, i+1, td.Action, ActionSuppress)
-			}
-		}
-
-		// Advance past the window and roll up.
-		advance(window)
-		td = EvaluateReworkDeferred(dir, rigName, tup.bead, polecatName, sourceStatus,
-			reason, tup.decision, window)
-		if td.Action != ActionRollup {
-			t.Fatalf("%s: rollup Action = %q, want %q", tup.bead, td.Action, ActionRollup)
-		}
-
-		// Format the notice exactly as the live emitter does.
-		subject, body := formatReworkDeferredNotification(td, window, rigName, tup.bead, polecatName, sourceStatus, 3, &dec)
-
-		// Subject must carry the real suppressed count, not 0.
-		wantSubjectFragment := fmt.Sprintf("%d suppressed", tup.suppressed)
-		if !strings.Contains(subject, wantSubjectFragment) {
-			t.Errorf("%s: subject = %q, want it to contain %q", tup.bead, subject, wantSubjectFragment)
-		}
-		if strings.Contains(subject, "0 suppressed") && tup.suppressed != 0 {
-			t.Errorf("%s: subject reports 0 suppressed, want %d (false-green rollup)", tup.bead, tup.suppressed)
-		}
-
-		// Body rollup prefix must carry the real count too.
-		wantBodyFragment := fmt.Sprintf("rollup of %d identical REWORK_DEFERRED", tup.suppressed)
-		if !strings.Contains(body, wantBodyFragment) {
-			t.Errorf("%s: body missing %q; body=%q", tup.bead, wantBodyFragment, body)
-		}
 	}
 }

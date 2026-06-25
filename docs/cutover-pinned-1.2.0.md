@@ -22,8 +22,10 @@ required fixes.
   - `PINNED_RUNTIME_LINE=1.2.0` (surfaced by `gt version --verbose`)
   - `FEATURE_FLAGS=rework-deferred-throttle,hooked-polecats-working`
 - Performs an atomic safe-install to `~/.local/bin/gt`.
-- Backs up the previous binary to `~/.local/bin/gt.before-pinned-1.2.0-cutover`
-  so rollback is a single `cp`.
+- Backs up the previous binary to a predictable sibling path
+  (`~/.local/bin/gt-real-bin.before-pinned-1.2.0-cutover` when a wrapper is in
+  use, or `~/.local/bin/gt.before-pinned-1.2.0-cutover` in the legacy plain
+  topology) so rollback is a single `cp`.
 - Verifies the installed binary with `gt version --verbose` and `gt witness
   rework-deferred dry-run`.
 - Records cutover evidence (including backup path and pre-cutover version) in
@@ -52,16 +54,46 @@ scripts/cutover-pinned-1.2.0.sh --skip-forward-check
 
 ## Rolling back
 
-The cutover script now copies the currently installed binary to
-`~/.local/bin/gt.before-pinned-1.2.0-cutover` before installing the new one.
-To roll back immediately:
+The cutover script copies the currently installed binary to a predictable
+sibling backup path before installing the new one. The exact path is recorded in
+the cutover evidence file, because it depends on whether the host uses the
+wrapper topology.
+
+A dedicated rollback script performs the restore atomically, verifies the
+restored binary, and appends rollback metadata to the evidence record:
 
 ```bash
-cp ~/.local/bin/gt.before-pinned-1.2.0-cutover ~/.local/bin/gt
+scripts/rollback-pinned-1.2.0.sh
 ```
 
-The cutover evidence record (see below) also stores the backup path and the
-pre-cutover version string so operators can verify what was replaced.
+By default it reads `$GT_TOWN_ROOT/.runtime/pinned-1.2.0-cutover.json`. To use a
+different evidence file:
+
+```bash
+scripts/rollback-pinned-1.2.0.sh --evidence /path/to/cutover.json
+```
+
+The script refuses to restore a backup that does not look like an ELF binary,
+and it runs the same wrapper-topology assertion used by `gt doctor` after the
+restore.
+
+For manual rollback, copy the recorded backup to the recorded installed path:
+
+- Wrapper topology (normal): backup is `~/.local/bin/gt-real-bin.before-pinned-1.2.0-cutover`
+  and rollback restores the ELF behind the wrapper:
+  ```bash
+  cp ~/.local/bin/gt-real-bin.before-pinned-1.2.0-cutover ~/.local/bin/gt-real-bin
+  ```
+- Plain topology (legacy): backup is `~/.local/bin/gt.before-pinned-1.2.0-cutover`
+  and rollback restores the public binary:
+  ```bash
+  cp ~/.local/bin/gt.before-pinned-1.2.0-cutover ~/.local/bin/gt
+  ```
+
+The cutover evidence record (see below) stores `backup_binary`,
+`installed_binary`, and `public_path` so operators can verify exactly what was
+replaced, and the appended `rollback` object records when the restore happened
+and what version was active before/after.
 
 ## Post-cutover verification
 
@@ -108,55 +140,6 @@ After restart, confirm the processes are running the new binary by checking
 ```bash
 gt witness status <rig>
 ```
-
-### Why the restart matters for the throttle
-
-`safe-install` swaps the on-disk ELF but does **not** touch already-running
-processes. A daemon or witness started before the cutover keeps the old binary
-image in memory and will keep emitting un-throttled `REWORK_DEFERRED` notices —
-including rollups that read "0 suppressed" — until it is restarted. This is the
-operational root cause behind the gastown-3ip report: the fixed binary was
-installed at 09:33, but the GT daemon (started 07:57) was still running the
-pre-fix code, so `gt witness rework-deferred list` stayed empty and repeated
-`gt-work999` notices kept reaching the Mayor. Restarting the daemon at 13:42
-loaded the fixed binary and the symptom cleared.
-
-## Post-restart live verification
-
-The dry-run proves the throttle logic in a temp state directory; it does **not**
-prove the *live* emitter is wired through the throttle. After restarting the
-daemon/witness, verify the durable state actually populates from real patrol
-traffic and that a repeated blocked tuple is suppressed and rolled up correctly:
-
-1. **Trigger a real blocked-rework tuple** (or wait for the next patrol to
-   re-detect one). A tuple is any (rig, bead, polecat, decision, source status)
-   that an active DEFER/HOLD/PARK Mayor decision is blocking.
-
-2. **Confirm durable state was written:**
-   ```bash
-   gt witness rework-deferred list
-   ```
-   Expected: a row for the blocked tuple with `suppressed >= 0`. An empty list
-   after a known-blocked tuple means the live emitter is **not** routing through
-   `notifyMayorOfReworkBlocked` → `EvaluateReworkDeferred` (a regression). All
-   current emitters do route through it (handlers.go `HandleMergeFailed` at the
-   merge-failed path and `resetAbandonedBead` at the abandoned-bead path); there
-   is no parallel live emitter.
-
-3. **Confirm a repeat is suppressed** (run a patrol or re-trigger the same
-   tuple inside the 1-hour window): the stderr log line reads
-   `REWORK_DEFERRED suppressed for <rig>/<polecat> bead=<bead> (suppressed_count=N ...)`
-   and **no** new mail reaches the Mayor for that tuple.
-
-4. **Confirm a rollup reports the real count** (advance past the window, e.g. by
-   waiting or by re-triggering after the window elapses): the rollup subject and
-   body read `N suppressed` / `rollup of N identical REWORK_DEFERRED notices`
-   where `N` is the number actually suppressed — never `0 suppressed`. A `0
-   suppressed` rollup is the gastown-3ip regression and must be reported.
-
-The durable state file is `$GT_TOWN_ROOT/witness/rework-deferred-throttle.json`
-and survives daemon/witness restarts, so suppression continues correctly across
-cutover.
 
 ## Operational notes
 

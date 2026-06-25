@@ -510,31 +510,6 @@ type WitnessThresholds struct {
 	// The first occurrence and any change in the tuple emits immediately.
 	// (gastown-cet.11)
 	ReworkDeferredThrottleWindow string `json:"rework_deferred_throttle_window,omitempty"`
-
-	// HeartbeatStaleThreshold is the age at which a Witness heartbeat is
-	// considered stale. Default: "5m". (gastown-o9d)
-	HeartbeatStaleThreshold string `json:"heartbeat_stale_threshold,omitempty"`
-
-	// HeartbeatVeryStaleThreshold is the age at which a Witness heartbeat
-	// is considered very stale and the daemon should consider a supervised
-	// restart (subject to ContextSaturationThreshold + RecoveryCooldown).
-	// Default: "20m". (gastown-o9d)
-	HeartbeatVeryStaleThreshold string `json:"heartbeat_very_stale_threshold,omitempty"`
-
-	// ContextSaturationThreshold is the self-reported context saturation
-	// (0.0-1.0) at or above which the Witness considers itself too
-	// saturated to continue patrolling. Default: 0.85. (gastown-o9d)
-	ContextSaturationThreshold *float64 `json:"context_saturation_threshold,omitempty"`
-
-	// RecoveryCooldown is the minimum interval between supervised restarts
-	// of the same witness. Acts as a circuit breaker. Default: "10m".
-	// (gastown-o9d)
-	RecoveryCooldown string `json:"recovery_cooldown,omitempty"`
-
-	// MaxCommandDuration is the longest a single patrol command may run
-	// before the heartbeat reports a stuck signal. Default: "10m".
-	// (gastown-o9d)
-	MaxCommandDuration string `json:"max_command_duration,omitempty"`
 }
 
 // MayorThresholds configures mayor liveness and restart-supervision thresholds.

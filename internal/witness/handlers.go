@@ -1336,6 +1336,11 @@ func extractPolecatFromJSON(output string) string {
 	return ""
 }
 
+// restartPolecatSessionFn is the runtime implementation used by zombie
+// detection. It is overridable in tests so patrol logic can be exercised
+// without spawning real sessions.
+var restartPolecatSessionFn = RestartPolecatSession //nolint:gochecknoglobals
+
 // RestartPolecatSession restarts a polecat's tmux session without destroying
 // the worktree or branch. This preserves the polecat's work (commits, branches)
 // while giving it a fresh agent process.
@@ -1845,7 +1850,7 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		if alive, _ := t.HasSession(sessionName); !alive {
 			return ZombieResult{}, false
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if err := restartPolecatSessionFn(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-stuck-session-failed: %v", err)
 		}
@@ -1868,7 +1873,7 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		if alive, _ := t.HasSession(sessionName); !alive {
 			return ZombieResult{}, false
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if err := restartPolecatSessionFn(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-agent-dead-session-failed: %v", err)
 		}
@@ -1892,7 +1897,7 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		if alive, _ := t.HasSession(sessionName); !alive {
 			return ZombieResult{}, false
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if err := restartPolecatSessionFn(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-bead-closed-failed: %v", err)
 		}
@@ -2074,7 +2079,7 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			WasActive:      true,
 			Action:         fmt.Sprintf("restarted (done-intent age=%v, type=%s)", age.Round(time.Second), doneIntent.ExitType),
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if err := restartPolecatSessionFn(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-failed (done-intent): %v", err)
 		}
@@ -2256,7 +2261,7 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 	}
 
 	// Restart regardless of cleanup state — the worktree is preserved.
-	if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+	if err := restartPolecatSessionFn(workDir, rigName, polecatName); err != nil {
 		if zombie.Error == nil {
 			zombie.Error = fmt.Errorf("restart: %w", err)
 		} else {
@@ -2811,71 +2816,6 @@ var activeMayorDecisionForBead = func(townRoot, beadID string) (*mayor.Decision,
 	return state.ActiveDecision(beadID)
 }
 
-// formatReworkDeferredNotification composes the subject and body for a
-// REWORK_DEFERRED notice from the throttle decision and the surrounding
-// rework context. It is the single place that reads td.Record.SuppressedCount
-// for formatting, which keeps the live notification path (notifyMayorOfReworkBlocked)
-// and the throttle's returned record in lockstep: a rollup must format "N
-// suppressed" with the real count, never "0 suppressed" (gastown-3ip). Extracted
-// to a pure helper so the formatting can be exercised directly in tests without
-// a mail router or tmux session.
-func formatReworkDeferredNotification(td ReworkDeferredDecision, throttleWindow time.Duration, rigName, hookBead, polecatName, beadStatus string, maxRespawns int, decision *mayor.Decision) (subject, body string) {
-	subject = fmt.Sprintf("REWORK_DEFERRED %s (Mayor %s decision blocks rework)", hookBead, decision.Type)
-	if td.Action == ActionRollup {
-		subject = fmt.Sprintf("REWORK_DEFERRED %s (Mayor %s decision blocks rework, %d suppressed)",
-			hookBead, decision.Type, td.Record.SuppressedCount)
-	}
-
-	bodyPrefix := ""
-	if td.Action == ActionRollup {
-		// The rollup body makes the suppressed count visible so the Mayor can
-		// see the prior flood even though the prior individual messages were
-		// dropped.
-		suppressedWindow := ""
-		if !td.Record.FirstEmittedAt.IsZero() {
-			suppressedWindow = fmt.Sprintf(" (covers %s → %s)",
-				td.Record.FirstEmittedAt.Format(time.RFC3339),
-				reworkDeferredNow().UTC().Format(time.RFC3339))
-		}
-		bodyPrefix = fmt.Sprintf(`This is a rollup of %d identical REWORK_DEFERRED notices that were suppressed inside the %s throttle window%s.
-
-`, td.Record.SuppressedCount, throttleWindow, suppressedWindow)
-	}
-
-	body = bodyPrefix + fmt.Sprintf(`Automated rework for bead %s was blocked by an active Mayor decision.
-
-Mayor Decision
-==============
-Type: %s
-Reason: %s
-Mayor: %s
-Recorded: %s
-
-Rework Context
-==============
-Bead: %s
-Polecat: %s/%s
-Previous Status: %s
-Max Respawns Threshold: %d
-
-Action Required
-===============
-The bead was NOT reset and no polecat was spawned. To allow rework to resume,
-record an explicit override: gt mayor decision resume %s`,
-		hookBead,
-		decision.Type,
-		decision.Reason,
-		decision.MayorID,
-		decision.Timestamp.Format(time.RFC3339),
-		hookBead,
-		rigName, polecatName,
-		beadStatus,
-		maxRespawns,
-		hookBead,
-	)
-	return subject, body
-}
-
 // notifyMayorOfReworkBlocked surfaces a conflict between an active Mayor decision
 // (DEFER/HOLD/PARK) and an automated rework request to the Mayor. Both inputs are
 // included: the decision and the rework context (bead, polecat, status, threshold).
@@ -2910,7 +2850,59 @@ func notifyMayorOfReworkBlocked(townRoot, rigName, hookBead, polecatName, beadSt
 		return
 	}
 
-	subject, body := formatReworkDeferredNotification(td, throttleWindow, rigName, hookBead, polecatName, beadStatus, maxRespawns, decision)
+	subject := fmt.Sprintf("REWORK_DEFERRED %s (Mayor %s decision blocks rework)", hookBead, decision.Type)
+	if td.Action == ActionRollup {
+		subject = fmt.Sprintf("REWORK_DEFERRED %s (Mayor %s decision blocks rework, %d suppressed)",
+			hookBead, decision.Type, td.Record.SuppressedCount)
+	}
+
+	bodyPrefix := ""
+	if td.Action == ActionRollup {
+		// The rollup body makes the suppressed count visible so the Mayor can
+		// see the prior flood even though the prior individual messages were
+		// dropped.
+		suppressedWindow := ""
+		if !td.Record.FirstEmittedAt.IsZero() {
+			suppressedWindow = fmt.Sprintf(" (covers %s → %s)",
+				td.Record.FirstEmittedAt.Format(time.RFC3339),
+				reworkDeferredNow().UTC().Format(time.RFC3339))
+		}
+		bodyPrefix = fmt.Sprintf(`This is a rollup of %d identical REWORK_DEFERRED notices that were suppressed inside the %s throttle window%s.
+
+`, td.Record.SuppressedCount, throttleWindow, suppressedWindow)
+	}
+
+	body := bodyPrefix + fmt.Sprintf(`Automated rework for bead %s was blocked by an active Mayor decision.
+
+Mayor Decision
+==============
+Type: %s
+Reason: %s
+Mayor: %s
+Recorded: %s
+
+Rework Context
+==============
+Bead: %s
+Polecat: %s/%s
+Previous Status: %s
+Max Respawns Threshold: %d
+
+Action Required
+===============
+The bead was NOT reset and no polecat was spawned. To allow rework to resume,
+record an explicit override: gt mayor decision resume %s`,
+		hookBead,
+		decision.Type,
+		decision.Reason,
+		decision.MayorID,
+		decision.Timestamp.Format(time.RFC3339),
+		hookBead,
+		rigName, polecatName,
+		beadStatus,
+		maxRespawns,
+		hookBead,
+	)
 
 	if router != nil {
 		msg := &mail.Message{

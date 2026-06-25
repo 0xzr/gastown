@@ -2182,6 +2182,17 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
 
 func (m *Manager) workstateInputForPolecat(name string, state State, issue string) WorkstateInput {
 	input := WorkstateInput{State: state, CleanupStatus: CleanupUnknown}
+
+	// Feed direct tmux/heartbeat/process evidence into the workstate classifier so
+	// capacity and recovery decisions do not treat a live session as stale just
+	// because its persisted agent_state lags (gastown-cet.16).
+	if sessionRunning, heartbeatFresh, heartbeatExists, processAlive, _ := m.LivenessSignals(name); true {
+		input.SessionRunning = sessionRunning
+		input.HeartbeatFresh = heartbeatFresh
+		input.HeartbeatExists = heartbeatExists
+		input.ProcessAlive = processAlive
+	}
+
 	agentID := m.agentBeadID(name)
 	activeMR := ""
 	sourceHint := ""

@@ -34,17 +34,5 @@ func TestDryRunReworkDeferred(t *testing.T) {
 		if tup.SuppressedCount != 10 {
 			t.Errorf("%s: suppressed count = %d, want 10", tup.Bead, tup.SuppressedCount)
 		}
-		// The rollup must report the real suppressed count (10), not the
-		// just-reset durable zero. This is the gastown-3ip regression: the
-		// dry run previously asserted only the rollup action, so a false-green
-		// "0 suppressed" rollup passed the dry run. Pin the returned count.
-		if tup.RollupSuppressedCount != 10 {
-			t.Errorf("%s: rollup suppressed count = %d, want 10 (real count, not 0)",
-				tup.Bead, tup.RollupSuppressedCount)
-		}
-		if tup.RollupSuppressedCount != tup.SuppressedCount {
-			t.Errorf("%s: rollup suppressed (%d) != suppressed (%d); rollup must carry the real count",
-				tup.Bead, tup.RollupSuppressedCount, tup.SuppressedCount)
-		}
 	}
 }

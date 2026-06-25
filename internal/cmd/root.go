@@ -3,10 +3,12 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,6 +97,18 @@ var branchCheckExemptCommands = map[string]bool{
 	"scheduler":   true, // Daemon hot path; scheduler handles beads internally
 }
 
+// automationStaleBlockingCommands are commands that must refuse to run when the
+// installed gt binary is behind the source repo by more than the allowed tested
+// release delta. Fleet-fill and recovery automation cannot safely act on stale
+// behavior (gastown-cet.16).
+var automationStaleBlockingCommands = map[string]bool{
+	"scheduler": true,
+	"witness":   true,
+	"patrol":    true,
+	"recovery":  true,
+	"refinery":  true,
+}
+
 // persistentPreRun runs before every command.
 func persistentPreRun(cmd *cobra.Command, args []string) error {
 	// Check if binary was built properly (via make build, not raw go build).
@@ -131,9 +145,13 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	beadsExempt := isCommandOrAncestorExempt(cmd, beadsExemptCommands)
 	branchExempt := isCommandOrAncestorExempt(cmd, branchCheckExemptCommands)
 
-	// Check for stale binary (warning only, doesn't block)
+	// Check for stale binary (warning for everyone; hard block for fleet-fill/
+	// recovery automation if the binary lags the allowed tested release delta).
 	if !beadsExempt {
 		checkStaleBinaryWarning()
+		if err := checkStaleBinaryGate(cmd); err != nil {
+			return err
+		}
 	}
 
 	// Check town root branch (warning only, non-blocking)
@@ -162,8 +180,14 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 }
 
 func isCommandOrAncestorExempt(cmd *cobra.Command, exemptions map[string]bool) bool {
+	return isCommandOrAncestorInSet(cmd, exemptions)
+}
+
+// isCommandOrAncestorInSet reports whether cmd or any ancestor matches a
+// command name in the given set.
+func isCommandOrAncestorInSet(cmd *cobra.Command, names map[string]bool) bool {
 	for c := cmd; c != nil; c = c.Parent() {
-		if exemptions[c.Name()] {
+		if names[c.Name()] {
 			return true
 		}
 	}
@@ -297,6 +321,51 @@ func checkStaleBinaryWarning() {
 			fmt.Fprintf(os.Stderr, "    %s Run 'gt stale' for details; switch to a build branch before rebuilding\n", style.ArrowPrefix)
 		}
 	}
+}
+
+// maxAllowedBinaryReleaseDelta returns the maximum number of commits the
+// installed binary may lag the source repo before fleet-fill/recovery
+// automation is blocked. Defaults to 0 (no tolerance); override with
+// GT_STALE_BINARY_MAX_DELTA.
+func maxAllowedBinaryReleaseDelta() int {
+	raw := os.Getenv("GT_STALE_BINARY_MAX_DELTA")
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// checkStaleBinaryGate blocks automation commands (scheduler, witness, patrol,
+// recovery, refinery) when the installed gt binary is stale beyond the allowed
+// tested release delta. This prevents fleet-fill and recovery automation from
+// relying on a stale binary's behavior (gastown-cet.16).
+func checkStaleBinaryGate(cmd *cobra.Command) error {
+	if !isCommandOrAncestorInSet(cmd, automationStaleBlockingCommands) {
+		return nil
+	}
+
+	repoRoot, err := version.GetRepoRoot()
+	if err != nil {
+		// Not a development environment or source repo unavailable - cannot
+		// verify freshness, so fail closed only if we can confirm staleness.
+		return nil
+	}
+
+	info := version.CheckStaleBinary(repoRoot)
+	if info.Error != nil || info.Skipped {
+		// Cannot confirm staleness; don't block.
+		return nil
+	}
+
+	maxDelta := maxAllowedBinaryReleaseDelta()
+	if reason := info.BlockingReason("fleet-fill/recovery automation", maxDelta); reason != "" {
+		return errors.New(reason)
+	}
+	return nil
 }
 
 // Execute runs the root command and returns an exit code.

@@ -164,7 +164,7 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 			return getReadySlingContexts(townRoot)
 		},
 		Validate: func(b capacity.PendingBead) error {
-			return validatePendingBeadForDispatch(townRoot, b, true, schedulerCfg)
+			return validatePendingBeadForDispatch(townRoot, b, true)
 		},
 		Execute: func(b capacity.PendingBead) error {
 			result, err := dispatchSingleBead(b, townRoot, actor)
@@ -228,7 +228,7 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		if planErr != nil {
 			return 0, fmt.Errorf("planning dispatch: %w", planErr)
 		}
-		plan = validateDryRunDispatchPlan(townRoot, plan, schedulerCfg)
+		plan = validateDryRunDispatchPlan(townRoot, plan)
 		printDryRunPlan(plan, lastCapacitySnapshot, batchSize)
 		return 0, nil
 	}
@@ -610,13 +610,13 @@ func dispatchSingleBead(b capacity.PendingBead, townRoot, _ string) (*SlingResul
 	return result, nil
 }
 
-func validateDryRunDispatchPlan(townRoot string, plan capacity.DispatchPlan, schedulerCfg *capacity.SchedulerConfig) capacity.DispatchPlan {
+func validateDryRunDispatchPlan(townRoot string, plan capacity.DispatchPlan) capacity.DispatchPlan {
 	if len(plan.ToDispatch) == 0 {
 		return plan
 	}
 	validated := make([]capacity.PendingBead, 0, len(plan.ToDispatch))
 	for _, b := range plan.ToDispatch {
-		if err := validatePendingBeadForDispatch(townRoot, b, false, schedulerCfg); err != nil {
+		if err := validatePendingBeadForDispatch(townRoot, b, false); err != nil {
 			fmt.Fprintf(os.Stderr, "%s dry-run_skip reason=validation bead=%s target_rig=%s: %v\n",
 				style.Dim.Render("○"), b.WorkBeadID, b.TargetRig, err)
 			plan.Skipped++
@@ -645,15 +645,7 @@ func validateDryRunDispatchPlan(townRoot string, plan capacity.DispatchPlan, sch
 	return plan
 }
 
-// ErrMixCapsNoExplicitAgent is returned when model-mix caps are active and a
-// queued bead has no explicit Agent in its sling context. Dispatching it via
-// the native scheduler would fall back to Claude Code's default Kimi path and
-// silently drift the fleet mix (gastown-cet.16.2). The bead must be drained
-// through `gt sling --agent <model> --merge=mr` or via the model-mix
-// maintainer instead.
-var ErrMixCapsNoExplicitAgent = errors.New("queued bead has no explicit model assignment under model-mix caps")
-
-func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, escalate bool, schedulerCfg *capacity.SchedulerConfig) error {
+func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, escalate bool) error {
 	// Cross-rig prefix guard (gt-el4). A bead whose ID prefix does not match the
 	// target rig's registered prefix must not be dispatched — the polecat would
 	// land in a rig DB that cannot resolve the bead and hang in prime.
@@ -663,44 +655,16 @@ func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, esc
 	rigPath := filepath.Join(townRoot, b.TargetRig)
 	rigPrefix := rigBeadsPrefix(townRoot, rigPath, b.TargetRig)
 	if capacity.AcceptsPrefix(rigPrefix, b.WorkBeadID) {
-		// fall through to mix-caps guard below
-	} else {
-		gotPrefix := capacity.BeadIDPrefix(b.WorkBeadID)
-		fmt.Fprintf(os.Stderr,
-			"%s dispatch_refused reason=cross_rig_prefix bead=%s target_rig=%s rig_prefix=%s bead_prefix=%s\n",
-			style.Warning.Render("⚠"), b.WorkBeadID, b.TargetRig, rigPrefix, gotPrefix)
-		if escalate && shouldFireCrossRigEscalation(b.TargetRig, gotPrefix, time.Now()) {
-			fireCrossRigEscalation(b.TargetRig, gotPrefix, b.WorkBeadID)
-		}
-		return capacity.ErrCrossRigPrefix
+		return nil
 	}
-
-	// Model-mix caps guard (gastown-cet.16.2). When caps are active and the
-	// scheduler is configured to require explicit agent assignment, refuse to
-	// dispatch queued beads that lack a durable model assignment. Native
-	// dispatch of such beads falls back to Claude Code's default Kimi path and
-	// silently drifts the fleet mix; the right path is to drain queued work
-	// through `gt sling --agent <model> --merge=mr` or via the model-mix
-	// maintainer so each lane records a durable assignment.
-	if err := ValidateExplicitAgentForMixCaps(explicitAgentFromContext(b), schedulerCfg); err != nil {
-		agentLog := explicitAgentFromContext(b)
-		fmt.Fprintf(os.Stderr,
-			"%s dispatch_refused reason=mix_caps_no_explicit_agent bead=%s target_rig=%s agent=%q — drain via `gt sling --agent <model> --merge=mr` or the model-mix maintainer (gastown-cet.16.2)\n",
-			style.Warning.Render("⚠"), b.WorkBeadID, b.TargetRig, agentLog)
-		return fmt.Errorf("%w: %v", ErrMixCapsNoExplicitAgent, err)
+	gotPrefix := capacity.BeadIDPrefix(b.WorkBeadID)
+	fmt.Fprintf(os.Stderr,
+		"%s dispatch_refused reason=cross_rig_prefix bead=%s target_rig=%s rig_prefix=%s bead_prefix=%s\n",
+		style.Warning.Render("⚠"), b.WorkBeadID, b.TargetRig, rigPrefix, gotPrefix)
+	if escalate && shouldFireCrossRigEscalation(b.TargetRig, gotPrefix, time.Now()) {
+		fireCrossRigEscalation(b.TargetRig, gotPrefix, b.WorkBeadID)
 	}
-
-	return nil
-}
-
-// explicitAgentFromContext returns the Agent value from the bead's sling
-// context fields, or "" when no context is attached. Centralized here so
-// callers don't have to nil-check b.Context repeatedly.
-func explicitAgentFromContext(b capacity.PendingBead) string {
-	if b.Context == nil {
-		return ""
-	}
-	return b.Context.Agent
+	return capacity.ErrCrossRigPrefix
 }
 
 // isDaemonDispatch returns true when dispatch is triggered by the daemon heartbeat.

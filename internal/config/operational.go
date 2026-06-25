@@ -120,20 +120,13 @@ const (
 	// rollup. This protects the Mayor's context from notification floods when
 	// rework attempts loop against an active defer/hold/park decision.
 	DefaultReworkDeferredThrottleWindow = 1 * time.Hour
-
-	// Witness self-recovery defaults (gastown-o9d).
-	DefaultWitnessHeartbeatStaleThreshold     = 5 * time.Minute
-	DefaultWitnessHeartbeatVeryStaleThreshold = 20 * time.Minute
-	DefaultWitnessContextSaturationThreshold  = 0.85
-	DefaultWitnessRecoveryCooldown            = 10 * time.Minute
-	DefaultWitnessMaxCommandDuration          = 10 * time.Minute
 )
 
 // Mayor defaults.
 const (
-	DefaultMayorHeartbeatStaleThreshold      = 5 * time.Minute
-	DefaultMayorHeartbeatVeryStaleThreshold  = 20 * time.Minute
-	DefaultMayorHungSessionThreshold         = 30 * time.Minute
+	DefaultMayorHeartbeatStaleThreshold       = 5 * time.Minute
+	DefaultMayorHeartbeatVeryStaleThreshold   = 20 * time.Minute
+	DefaultMayorHungSessionThreshold          = 30 * time.Minute
 	DefaultMayorCriticalMailBacklogThreshold = 5
 )
 
@@ -786,51 +779,6 @@ func (wt *WitnessThresholds) ReworkDeferredThrottleWindowD() time.Duration {
 		return ParseDurationOrDefault(wt.ReworkDeferredThrottleWindow, DefaultReworkDeferredThrottleWindow)
 	}
 	return DefaultReworkDeferredThrottleWindow
-}
-
-// HeartbeatStaleThresholdD returns the configured or default Witness
-// heartbeat stale threshold. (gastown-o9d)
-func (wt *WitnessThresholds) HeartbeatStaleThresholdD() time.Duration {
-	if wt != nil {
-		return ParseDurationOrDefault(wt.HeartbeatStaleThreshold, DefaultWitnessHeartbeatStaleThreshold)
-	}
-	return DefaultWitnessHeartbeatStaleThreshold
-}
-
-// HeartbeatVeryStaleThresholdD returns the configured or default Witness
-// heartbeat very-stale threshold. (gastown-o9d)
-func (wt *WitnessThresholds) HeartbeatVeryStaleThresholdD() time.Duration {
-	if wt != nil {
-		return ParseDurationOrDefault(wt.HeartbeatVeryStaleThreshold, DefaultWitnessHeartbeatVeryStaleThreshold)
-	}
-	return DefaultWitnessHeartbeatVeryStaleThreshold
-}
-
-// ContextSaturationThresholdV returns the configured or default Witness
-// context saturation threshold (0.0-1.0). (gastown-o9d)
-func (wt *WitnessThresholds) ContextSaturationThresholdV() float64 {
-	if wt != nil && wt.ContextSaturationThreshold != nil {
-		return *wt.ContextSaturationThreshold
-	}
-	return DefaultWitnessContextSaturationThreshold
-}
-
-// RecoveryCooldownD returns the configured or default Witness recovery
-// cooldown (used as a restart circuit breaker). (gastown-o9d)
-func (wt *WitnessThresholds) RecoveryCooldownD() time.Duration {
-	if wt != nil {
-		return ParseDurationOrDefault(wt.RecoveryCooldown, DefaultWitnessRecoveryCooldown)
-	}
-	return DefaultWitnessRecoveryCooldown
-}
-
-// MaxCommandDurationD returns the configured or default maximum
-// duration for a single Witness patrol command. (gastown-o9d)
-func (wt *WitnessThresholds) MaxCommandDurationD() time.Duration {
-	if wt != nil {
-		return ParseDurationOrDefault(wt.MaxCommandDuration, DefaultWitnessMaxCommandDuration)
-	}
-	return DefaultWitnessMaxCommandDuration
 }
 
 // --- Mayor accessors ---

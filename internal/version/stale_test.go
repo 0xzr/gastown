@@ -1,6 +1,7 @@
 package version
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -422,6 +423,85 @@ func TestResolveBuildBranchRef(t *testing.T) {
 			t.Errorf("got (%+v,%v), want remote origin/main at %s", ref, ok, fresh)
 		}
 	})
+}
+
+func TestStaleBinaryInfo_IsStaleBeyond(t *testing.T) {
+	tests := []struct {
+		name      string
+		info      StaleBinaryInfo
+		maxDelta  int
+		wantStale bool
+	}{
+		{
+			name:      "fresh binary is never beyond",
+			info:      StaleBinaryInfo{IsStale: false, CommitsBehind: 100},
+			maxDelta:  10,
+			wantStale: false,
+		},
+		{
+			name:      "stale within delta is allowed",
+			info:      StaleBinaryInfo{IsStale: true, CommitsBehind: 3},
+			maxDelta:  5,
+			wantStale: false,
+		},
+		{
+			name:      "stale beyond delta blocks",
+			info:      StaleBinaryInfo{IsStale: true, CommitsBehind: 7},
+			maxDelta:  5,
+			wantStale: true,
+		},
+		{
+			name:      "zero delta means no tolerance",
+			info:      StaleBinaryInfo{IsStale: true, CommitsBehind: 1},
+			maxDelta:  0,
+			wantStale: true,
+		},
+		{
+			name:      "stale with unknown count and positive delta blocks",
+			info:      StaleBinaryInfo{IsStale: true, CommitsBehind: 0},
+			maxDelta:  5,
+			wantStale: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.info.IsStaleBeyond(tt.maxDelta); got != tt.wantStale {
+				t.Errorf("IsStaleBeyond(%d) = %v, want %v", tt.maxDelta, got, tt.wantStale)
+			}
+		})
+	}
+}
+
+func TestStaleBinaryInfo_BlockingReason(t *testing.T) {
+	info := StaleBinaryInfo{
+		IsStale:       true,
+		CommitsBehind: 10,
+		CompareRef:    "main",
+		BinaryCommit:  "abc123def456",
+		RepoCommit:    "fed098765432",
+	}
+
+	if got := info.BlockingReason("fleet fill", 20); got != "" {
+		t.Errorf("BlockingReason within delta = %q, want empty", got)
+	}
+
+	if got := info.BlockingReason("fleet fill", 5); got == "" {
+		t.Error("BlockingReason beyond delta returned empty, want non-empty")
+	} else if !strings.Contains(got, "fleet fill") {
+		t.Errorf("BlockingReason = %q, want to mention action", got)
+	}
+
+	errInfo := StaleBinaryInfo{Error: fmt.Errorf("git unavailable")}
+	if got := errInfo.BlockingReason("recovery", 0); got == "" {
+		t.Error("BlockingReason for error info returned empty, want non-empty")
+	} else if !strings.Contains(got, "cannot verify") {
+		t.Errorf("BlockingReason = %q, want 'cannot verify'", got)
+	}
+
+	fresh := StaleBinaryInfo{}
+	if got := fresh.BlockingReason("fleet fill", 0); got != "" {
+		t.Errorf("fresh BlockingReason = %q, want empty", got)
+	}
 }
 
 func TestStaleBinaryInfo_Describe(t *testing.T) {

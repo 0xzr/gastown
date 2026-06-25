@@ -200,7 +200,13 @@ func decideNonIdleWorkstate(in WorkstateInput) WorkstateDisposition {
 		d.Reason = "working"
 		d.Signals = []string{stateSignal}
 		if live {
-			d.Confidence = WorkstateConfidenceHigh
+			if hasStrongLiveSignal(in) {
+				d.Confidence = WorkstateConfidenceHigh
+			} else {
+				// Session exists but we lack a process/heartbeat confirmation.
+				// Treat as live with medium confidence (gastown-cet.16).
+				d.Confidence = WorkstateConfidenceMedium
+			}
 			d.Signals = append(d.Signals, liveSignals(in)...)
 		} else if hasAnyLiveSignal(in) {
 			d.Confidence = WorkstateConfidenceMedium
@@ -214,7 +220,13 @@ func decideNonIdleWorkstate(in WorkstateInput) WorkstateDisposition {
 			// review-needed, stalled, done, etc. This is the gastown-cet.9 fix.
 			d.Verdict = WorkstateVerdictWorking
 			d.Reason = "live-hooked"
-			d.Confidence = WorkstateConfidenceHigh
+			if hasStrongLiveSignal(in) {
+				d.Confidence = WorkstateConfidenceHigh
+			} else {
+				// Running session is enough to avoid recovery, but medium
+				// confidence reflects the weaker signal (gastown-cet.16).
+				d.Confidence = WorkstateConfidenceMedium
+			}
 			d.Signals = append([]string{stateSignal}, liveSignals(in)...)
 			d.Signals = append(d.Signals, "hook_active")
 		} else if live {
@@ -244,11 +256,20 @@ func decideNonIdleWorkstate(in WorkstateInput) WorkstateDisposition {
 }
 
 // isPolecatLive returns true when direct liveness evidence confirms the agent
-// process is alive. ProcessAlive already incorporates heartbeat freshness when
-// a heartbeat file exists (isSessionProcessDead), so an alive process implies a
-// fresh heartbeat or a pre-heartbeat session.
+// is running. A live tmux session is enough to consider the polecat active:
+// heartbeats and process probes can lag during heavy agent startup or fork
+// churn, but a running session means the lane still holds capacity. This is
+// the gastown-cet.16 regression fix — session_running=true must not produce
+// NEEDS_RECOVERY solely because a hooked agent is not idle.
 func isPolecatLive(in WorkstateInput) bool {
-	return in.ProcessAlive || (in.SessionRunning && in.HeartbeatFresh)
+	return in.ProcessAlive || in.SessionRunning
+}
+
+// hasStrongLiveSignal returns true when we have a high-confidence liveness
+// predicate (agent process alive or a fresh heartbeat) as opposed to merely a
+// tmux session that may be stale.
+func hasStrongLiveSignal(in WorkstateInput) bool {
+	return in.ProcessAlive || in.HeartbeatFresh
 }
 
 // hasAnyLiveSignal returns true if any liveness predicate was supplied.
