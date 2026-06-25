@@ -1013,6 +1013,9 @@ type RecoveryStatus struct {
 	Blockers             []string              `json:"blockers,omitempty"`
 	Diagnostics          []string              `json:"diagnostics,omitempty"`
 	Reconciled           bool                  `json:"reconciled,omitempty"`
+	// RecoveryActions describes operator-actionable next steps derived from
+	// the current Blockers. Empty when no action is required.
+	RecoveryActions []string `json:"recovery_actions,omitempty"`
 	// Confidence reflects how much direct liveness evidence supported the verdict.
 	Confidence string `json:"confidence,omitempty"`
 	// Signals lists the liveness predicates that triggered the verdict.
@@ -1288,6 +1291,19 @@ func applyWorkstateDispositionToRecoveryStatus(status *RecoveryStatus, dispositi
 	status.RecoveryActions = recoveryActionsForBlockers(disposition.Blockers)
 	status.Confidence = disposition.Confidence
 	status.Signals = disposition.Signals
+}
+
+// recoveryActionsForBlockers maps a set of recovery blockers to one
+// operator-actionable next step. It returns nil when no specific action is
+// required (e.g., blockers are purely informational or already handled by an
+// automatic path).
+func recoveryActionsForBlockers(blockers []string) []string {
+	for _, blocker := range blockers {
+		if strings.HasPrefix(blocker, "git_state=has_stash") {
+			return []string{"preserve branch-owned stash entries to auditable recovery refs before cleanup, then rerun check-recovery"}
+		}
+	}
+	return nil
 }
 
 type issueShower interface {
