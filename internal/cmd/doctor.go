@@ -44,6 +44,7 @@ Town root protection:
 
 Infrastructure checks:
   - stale-binary             Check if gt binary is up to date with repo
+  - wrapper-topology         Verify ~/.local/bin/gt operational wrapper is intact
   - beads-binary             Check that beads (bd) is installed and meets minimum version
   - daemon                   Check if daemon is running (fixable)
   - boot-health              Check Boot watchdog health (vet mode)
@@ -165,10 +166,12 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	// Infrastructure prerequisites — these must pass before any check that
 	// shells out to bd/dolt or queries the database. Order matters:
 	// 1. gt binary freshness
-	// 2. bd binary exists
-	// 3. dolt binary exists
-	// 4. Dolt server is reachable (everything downstream depends on this)
+	// 2. gt wrapper topology (operational model-mix wrapper preserved)
+	// 3. bd binary exists
+	// 4. dolt binary exists
+	// 5. Dolt server is reachable (everything downstream depends on this)
 	d.Register(doctor.NewStaleBinaryCheck())
+	d.Register(doctor.NewWrapperTopologyCheck())
 	d.Register(doctor.NewBeadsBinaryCheck())
 	d.Register(doctor.NewDoltBinaryCheck())
 	d.Register(doctor.NewClaudeBinaryCheck())

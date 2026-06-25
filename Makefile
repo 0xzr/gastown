@@ -111,10 +111,23 @@ check-install-path:
 		echo '  export PATH="$(INSTALL_DIR):$$PATH"'; \
 	fi
 
+# Shared wrapper-preservation logic for install + safe-install. Sources the
+# lib and exports INSTALL_DIR / BINARY into its namespace so that
+# `gt_install_preserve_wrapper` and `gt_install_assert_wrapper_topology`
+# know where to look. See scripts/lib/wrapper-preserve.sh for the contract.
+WRAPPER_PRESERVE_SH := $(CURDIR)/scripts/lib/wrapper-preserve.sh
+
+define gt_install_with_wrapper
+	@bash -c 'set -e; \
+		INSTALL_DIR="$(INSTALL_DIR)" BINARY="$(BINARY)" \
+		source "$(WRAPPER_PRESERVE_SH)"; \
+		gt_install_preserve_wrapper "$(BUILD_DIR)/$(BINARY)"; \
+		gt_install_assert_wrapper_topology'
+endef
+
 install: check-up-to-date build
 	@mkdir -p $(INSTALL_DIR)
-	@rm -f $(INSTALL_DIR)/$(BINARY)
-	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
+	$(gt_install_with_wrapper)
 	@# Nuke any stale go-install binaries that shadow the canonical location
 	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
 		if [ -f "$$bad" ]; then \
@@ -122,7 +135,7 @@ install: check-up-to-date build
 			rm -f "$$bad"; \
 		fi; \
 	done
-	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY)"
+	@echo "Installed $(BINARY) to $(INSTALL_DIR) (wrapper topology preserved)"
 	@$(MAKE) --no-print-directory check-install-path
 	@# Restart daemon so it picks up the new binary.
 	@# A stale daemon is a recurring source of bugs (wrong session prefixes, etc.)
@@ -141,12 +154,14 @@ install: check-up-to-date build
 
 # safe-install: Replace binary WITHOUT restarting daemon or killing sessions.
 # Use this for automated rebuilds (e.g., rebuild-gt plugin). Sessions pick up
-# the new binary on their next natural cycle/handoff.
+# the new binary on their next natural cycle/handoff. When a wrapper script
+# is present at $(INSTALL_DIR)/$(BINARY), the ELF is installed behind it as
+# $(INSTALL_DIR)/$(BINARY)-real-bin so the wrapper survives (see
+# scripts/lib/wrapper-preserve.sh for the contract; see gastown-cet.16.1 for
+# the incident that motivated this guard).
 safe-install: check-up-to-date check-forward-only build
 	@mkdir -p $(INSTALL_DIR)
-	@# Atomic-ish replace: copy to temp then move (move is atomic on same filesystem)
-	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY).new
-	@mv $(INSTALL_DIR)/$(BINARY).new $(INSTALL_DIR)/$(BINARY)
+	$(gt_install_with_wrapper)
 	@# Nuke any stale go-install binaries that shadow the canonical location
 	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
 		if [ -f "$$bad" ]; then \
@@ -154,7 +169,7 @@ safe-install: check-up-to-date check-forward-only build
 			rm -f "$$bad"; \
 		fi; \
 	done
-	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY) (daemon NOT restarted)"
+	@echo "Installed $(BINARY) to $(INSTALL_DIR) (wrapper topology preserved, daemon NOT restarted)"
 	@$(MAKE) --no-print-directory check-install-path
 	@echo "Sessions will pick up new binary on next cycle."
 
@@ -196,6 +211,7 @@ test: test-makefile
 
 test-makefile:
 	bash scripts/check-install-path_test.sh
+	bash scripts/test-wrapper-topology.sh
 	bash -n plugins/stuck-agent-dog/run.sh
 	bash -n plugins/stuck-agent-dog/run_test.sh
 	bash plugins/stuck-agent-dog/run_test.sh
