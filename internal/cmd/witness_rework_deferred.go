@@ -94,8 +94,8 @@ func runWitnessReworkDeferredDryRun(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("  Window: %s\n", result.Window)
 	for _, t := range result.Tuples {
-		fmt.Printf("  - %s (%s): first=%s repeat=%s rollup=%s suppressed=%d\n",
-			t.Bead, t.Decision, t.FirstAction, t.RepeatAction, t.RollupAction, t.SuppressedCount)
+		fmt.Printf("  - %s (%s): first=%s repeat=%s rollup=%s suppressed=%d rollup_suppressed=%d\n",
+			t.Bead, t.Decision, t.FirstAction, t.RepeatAction, t.RollupAction, t.SuppressedCount, t.RollupSuppressedCount)
 	}
 	for _, e := range result.Errors {
 		fmt.Printf("    %s %s\n", style.ErrorPrefix, e)

@@ -182,9 +182,11 @@ type ReworkDeferredDecision struct {
 }
 
 // EvaluateReworkDeferred applies the throttle and returns the action the caller
-// should take. The durable state is updated in place; on success the record
-// reflects what the caller should report (e.g., the suppressed count for a
-// rollup). Errors loading or saving state are non-fatal: on read failure the
+// should take. The durable state is updated in place; the returned Record is a
+// snapshot describing what the caller should report. For a rollup the snapshot
+// carries the suppressed count from the just-closed window (so rollup messages
+// read "N suppressed"), while the durable record is reset to zero for the next
+// window. Errors loading or saving state are non-fatal: on read failure the
 // throttle is open (the caller emits) and on save failure the in-memory update
 // is still visible to the caller.
 //
@@ -252,23 +254,27 @@ func EvaluateReworkDeferred(townRoot, rigName, beadID, polecatName, sourceStatus
 	// Window elapsed. Roll up: emit a message that includes the suppressed
 	// count and reset the counter. The rollup is itself an emit, so
 	// LastEmittedReason is preserved for audit.
-	rollupRec := &ReworkDeferredRecord{
-		Key:               rec.Key,
-		RigName:           rec.RigName,
-		BeadID:            rec.BeadID,
-		PolecatName:       rec.PolecatName,
-		MayorDecision:     rec.MayorDecision,
-		SourceStatus:      rec.SourceStatus,
-		FirstEmittedAt:    rec.FirstEmittedAt,
-		LastEmittedAt:     now,
-		LastEmittedReason: rec.LastEmittedReason,
-		SuppressedCount:   0,
-	}
-	// Replace the record in place so the tuple stays the same; FirstEmittedAt
-	// and LastEmittedReason carry forward.
-	*rec = *rollupRec
+	//
+	// The caller formats the rollup subject/body from the returned record's
+	// SuppressedCount, so that count must reflect the number actually
+	// suppressed during the just-closed window. We therefore snapshot the
+	// pre-reset count, reset the durable counter in place (SuppressedCount=0,
+	// FirstSuppressedAt zeroed, LastEmittedAt advanced to now), and return a
+	// copy that carries the real count. Resetting the durable record in place
+	// — rather than swapping in a fresh struct — preserves the slice slot and
+	// key so the tuple's identity stays stable across windows.
+	suppressedForRollup := rec.SuppressedCount
+	rec.LastEmittedAt = now
+	rec.SuppressedCount = 0
+	rec.FirstSuppressedAt = time.Time{}
 	_ = saveReworkDeferredState(townRoot, state) // non-fatal
-	return ReworkDeferredDecision{Action: ActionRollup, Record: rec, Window: window}
+
+	// Returned record is a copy so callers cannot observe the just-reset
+	// durable counter through it. It carries the real suppressed count so
+	// "N suppressed" rollups are accurate (gastown-3ip).
+	reported := *rec
+	reported.SuppressedCount = suppressedForRollup
+	return ReworkDeferredDecision{Action: ActionRollup, Record: &reported, Window: window}
 }
 
 // ListReworkDeferredRecords returns a snapshot of all throttle records, sorted

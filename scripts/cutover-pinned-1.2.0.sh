@@ -55,6 +55,7 @@ fi
 
 RECORD_DIR="${TOWN_ROOT}/.runtime"
 RECORD_FILE="${RECORD_DIR}/pinned-1.2.0-cutover.json"
+BACKUP_BINARY="${BINARY}.before-pinned-1.2.0-cutover"
 
 # Resolve paths once for the whole script. The cutover must respect the
 # wrapper topology: the public path is the wrapper (a script) and the real
@@ -99,6 +100,15 @@ PRE_VERSION="$(${REAL_BIN_PATH} version --verbose 2>/dev/null || ${WRAPPER_PATH}
 echo "Pre-cutover binary version:"
 echo "${PRE_VERSION}" | sed 's/^/  /'
 echo ""
+
+# Keep a rollback-capable backup of the currently installed binary so a bad
+# cutover can be undone. Back up the real ELF (not the wrapper) since that is
+# what safe-install will replace behind the wrapper.
+if [ -f "${REAL_BIN_PATH}" ]; then
+  cp "${REAL_BIN_PATH}" "${BACKUP_BINARY}"
+  echo "Backed up current binary to: ${BACKUP_BINARY}"
+  echo ""
+fi
 
 # Build the pinned 1.2.0 runtime binary from current source. The Makefile
 # safe-install target honors scripts/lib/wrapper-preserve.sh: if the public
@@ -192,6 +202,7 @@ cat > "${RECORD_FILE}" <<EOF
   "installed_binary": "${REAL_BIN_PATH}",
   "public_path": "${WRAPPER_PATH}",
   "wrapper_topology": "${WRAPPER_TOPOLOGY}",
+  "backup_binary": "${BACKUP_BINARY}",
   "build_commit": "${BUILD_COMMIT:-unknown}",
   "build_time": "${BUILD_TIME:-unknown}",
   "pre_version": $(printf '%s' "${PRE_VERSION}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '"<<unavailable>>"'),
@@ -202,6 +213,7 @@ EOF
 
 echo "=== Cutover complete ==="
 echo "Evidence recorded: ${RECORD_FILE}"
+echo "Rollback binary:    ${BACKUP_BINARY}"
 echo ""
 echo "Next steps:"
 echo "  1. Restart any running witness / daemon if you want the new binary"
@@ -211,3 +223,6 @@ echo "     or for a single rig: ${WRAPPER_PATH} witness restart <rig>"
 echo "  2. Verify the live witness uses the new binary: ${WRAPPER_PATH} witness status <rig>"
 echo "  3. Inspect throttle records after the next patrol: ${WRAPPER_PATH} witness rework-deferred list"
 echo "  4. Run 'gt doctor' to confirm the wrapper-topology check is OK."
+echo ""
+echo "To roll back to the pre-cutover binary:"
+echo "  cp '${BACKUP_BINARY}' '${REAL_BIN_PATH}'"
