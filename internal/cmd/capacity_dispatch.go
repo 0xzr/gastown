@@ -558,6 +558,25 @@ func dispatchSingleBead(b capacity.PendingBead, townRoot, _ string) (*SlingResul
 		return nil, fmt.Errorf("missing sling context for %s", b.ID)
 	}
 
+	// Agent-role mismatch guard (gt-c76 / gastownhall/gastown#3852).
+	// Fetch the work bead's current title/description and reject dispatch when
+	// the bead clearly belongs to a different agent role than the target formula.
+	info, err := getBeadInfoFromTownRoot(townRoot, b.WorkBeadID)
+	if err != nil {
+		return nil, fmt.Errorf("could not get bead info for dispatch validation: %w", err)
+	}
+	if !b.Context.HookRawBead {
+		formulaForGuard := b.Context.Formula
+		if formulaForGuard == "" {
+			formulaForGuard = resolveFormula("", false, townRoot, b.TargetRig)
+		}
+		if err := ValidateBeadContentForFormula(info.Title, info.Description, formulaForGuard); err != nil {
+			// Close the sling context so the mis-routed bead is not retried.
+			_ = beadsForPendingContext(townRoot, b).CloseSlingContext(b.ID, "invalid-agent-target")
+			return nil, fmt.Errorf("refusing dispatch of %s: %w", b.WorkBeadID, err)
+		}
+	}
+
 	dp := capacity.ReconstructFromContext(b.Context)
 	params := SlingParams{
 		BeadID:           dp.BeadID,

@@ -132,6 +132,19 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		}
 	}
 
+	// Agent-role mismatch guard (gt-c76 / gastownhall/gastown#3852).
+	// A bead whose body references another agent's tools/formula (e.g., Deacon
+	// patrol commands) must not be scheduled under a polecat formula.
+	if !opts.HookRawBead {
+		formulaForGuard := opts.Formula
+		if formulaForGuard == "" {
+			formulaForGuard = resolveFormula("", opts.HookRawBead, townRoot, rigName)
+		}
+		if err := ValidateBeadContentForFormula(info.Title, info.Description, formulaForGuard); err != nil {
+			return fmt.Errorf("refusing to schedule %s under %s: %w", beadID, formulaForGuard, err)
+		}
+	}
+
 	if opts.DryRun {
 		fmt.Printf("Would schedule %s → %s\n", beadID, rigName)
 		fmt.Printf("  Would create sling context bead\n")
