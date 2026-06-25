@@ -337,6 +337,102 @@ esac
 	return logPath
 }
 
+// mockBdCommandWithDirLog creates a fake bd binary that records the
+// BEADS_DIR environment variable for every command, in addition to logging
+// create arguments. This lets tests verify which database a bd operation
+// actually targeted.
+func mockBdCommandWithDirLog(t *testing.T) (cmdLogPath, dirLogPath string) {
+	t.Helper()
+
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	cmdLogPath = filepath.Join(binDir, "bd.log")
+	dirLogPath = filepath.Join(binDir, "bd-dir.log")
+
+	script := `#!/bin/sh
+# Mock bd for testing; records BEADS_DIR for every invocation.
+CMD_LOG="` + cmdLogPath + `"
+DIR_LOG="` + dirLogPath + `"
+
+# Log BEADS_DIR so tests can verify the targeted database.
+echo "${BEADS_DIR:-<unset>}" >> "$DIR_LOG"
+
+# Find the actual command (skip global flags like --allow-stale)
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+
+case "$cmd" in
+  init)
+    mkdir -p .beads
+    prefix="gt"
+    next_is_prefix=false
+    for arg in "$@"; do
+      if [ "$next_is_prefix" = true ]; then
+        prefix="$arg"
+        next_is_prefix=false
+      else
+        case "$arg" in
+          --prefix=*) prefix="${arg#--prefix=}" ;;
+          --prefix) next_is_prefix=true ;;
+        esac
+      fi
+    done
+    echo "prefix: $prefix" > .beads/config.yaml
+    exit 0
+    ;;
+  migrate)
+    exit 0
+    ;;
+  show)
+    echo '{"error":"not found"}' >&2
+    exit 1
+    ;;
+  create)
+    # Log the command on a single line, prefixed with BEADS_DIR so the
+    # test can verify each create targeted the correct database.  Some
+    # arguments (notably --description) contain newlines, so we escape
+    # them to keep one entry per bd invocation.
+    log_line=""
+    for arg in "$@"; do
+      arg_nl=$(printf '%s' "$arg" | tr '\n' ' ')
+      if [ -z "$log_line" ]; then
+        log_line="$arg_nl"
+      else
+        log_line="$log_line $arg_nl"
+      fi
+    done
+    printf 'BEADS_DIR=%s %s\n' "${BEADS_DIR:-<unset>}" "$log_line" >> "$CMD_LOG"
+    bead_id=""
+    for arg in "$@"; do
+      case "$arg" in
+        --id=*) bead_id="${arg#--id=}" ;;
+      esac
+    done
+    echo "{\"id\":\"$bead_id\",\"status\":\"open\",\"created_at\":\"2025-01-01T00:00:00Z\"}"
+    exit 0
+    ;;
+  mol|list|config|slot)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	return cmdLogPath, dirLogPath
+}
+
 // TestRigAddCreatesCorrectStructure verifies that gt rig add creates
 // the expected directory structure.
 func TestRigAddCreatesCorrectStructure(t *testing.T) {
@@ -1063,6 +1159,119 @@ func TestRigAddCreatesAgentBeads(t *testing.T) {
 	// Verify correct prefix is used (ab-)
 	if !strings.Contains(logStr, "ab-") {
 		t.Errorf("bd create log should contain prefix 'ab-', got:\n%s", logStr)
+	}
+}
+
+// TestRigAdd_SeedsRigScopedBeadsInRigDatabase is a regression guard for
+// gastown-cet.1.1. It runs the full gt rig add command and verifies that the
+// rig identity bead and the witness/refinery agent beads are created in the
+// rig's own beads database, not the town/HQ database.
+func TestRigAdd_SeedsRigScopedBeadsInRigDatabase(t *testing.T) {
+	requireDoltServer(t)
+	cmdLogPath, _ := mockBdCommandWithDirLog(t)
+
+	// Source repository that AddRig will clone.
+	sourceRepo := createTestGitRepo(t, "rigscopedsource")
+
+	// Town root must be a valid Gas Town workspace and a git repo so that
+	// runRigAdd can find it and commit town-level config changes.
+	townRoot := setupTestTown(t)
+	bridgeDoltPidToTown(t, townRoot)
+
+	// Create the primary workspace marker.
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test-town"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+
+	// Initialize a git repo in the town root so commitTownConfigChanges can run.
+	for _, args := range [][]string{
+		{"git", "init", "--initial-branch", "main"},
+		{"git", "config", "user.email", "test@test.com"},
+		{"git", "config", "user.name", "Test User"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = townRoot
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+
+	// Reset global command flags to their zero values; other tests may leave
+	// them set.
+	rigAddPrefix = ""
+	rigAddLocalRepo = ""
+	rigAddBranch = ""
+	rigAddPushURL = ""
+	rigAddUpstreamURL = ""
+	rigAddAdopt = false
+	rigAddAdoptURL = ""
+	rigAddAdoptForce = false
+	rigAddFilter = ""
+	rigAddSparseCheckout = nil
+
+	oldCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(oldCwd)
+	}()
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatalf("chdir to townRoot: %v", err)
+	}
+
+	rigName := "rigscopedtest"
+	gitURL := "file://" + sourceRepo
+	if err := runRigAdd(nil, []string{rigName, gitURL}); err != nil {
+		t.Fatalf("runRigAdd: %v", err)
+	}
+
+	cmdLog, err := os.ReadFile(cmdLogPath)
+	if err != nil {
+		t.Fatalf("reading cmd log: %v", err)
+	}
+
+	rigBeadsDir := filepath.Join(townRoot, rigName, ".beads")
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+
+	rigBeadID := beads.RigBeadIDWithPrefix("ri", rigName)
+	witnessID := beads.WitnessBeadIDWithPrefix("ri", rigName)
+	refineryID := beads.RefineryBeadIDWithPrefix("ri", rigName)
+
+	found := map[string]bool{
+		rigBeadID:  false,
+		witnessID:  false,
+		refineryID: false,
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(string(cmdLog)), "\n") {
+		// Each create log line has the form:
+		//   BEADS_DIR=<dir> create --json --id=<id> ...
+		beadsDir, cmdLine, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		beadsDir = strings.TrimPrefix(beadsDir, "BEADS_DIR=")
+
+		for id := range found {
+			if strings.Contains(cmdLine, "--id="+id) {
+				found[id] = true
+				if beadsDir == "<unset>" {
+					t.Errorf("create for %s ran with unset BEADS_DIR", id)
+				} else if !strings.HasPrefix(beadsDir, rigBeadsDir) {
+					t.Errorf("create for %s targeted wrong database: got %q, want prefix %q", id, beadsDir, rigBeadsDir)
+				}
+				if strings.HasPrefix(beadsDir, townBeadsDir) && beadsDir != rigBeadsDir {
+					t.Errorf("create for %s targeted town/HQ database %q", id, beadsDir)
+				}
+			}
+		}
+	}
+
+	for id, ok := range found {
+		if !ok {
+			t.Errorf("expected create command for %s not found in bd log:\n%s", id, string(cmdLog))
+		}
 	}
 }
 

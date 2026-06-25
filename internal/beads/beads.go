@@ -378,6 +378,23 @@ func NewWithBeadsDir(workDir, beadsDir string) *Beads {
 	return &Beads{workDir: workDir, beadsDir: beadsDir}
 }
 
+// WithNoRoute returns a new Beads wrapper that disables prefix-based routing.
+// Operations target the wrapper's resolved beads directory directly, ignoring
+// routes.jsonl. This is required when creating rig-scoped agent beads (witness,
+// refinery) whose IDs share the rig prefix but must live in the rig's own
+// database, not the town/HQ database.
+func (b *Beads) WithNoRoute() *Beads {
+	return &Beads{
+		workDir:    b.workDir,
+		beadsDir:   b.beadsDir,
+		isolated:   b.isolated,
+		serverPort: b.serverPort,
+		store:      b.store,
+		townRoot:   b.townRoot,
+		noRoute:    true,
+	}
+}
+
 // ForAgentBead returns a Beads wrapper suitable for operating on agent beads.
 //
 // Agent beads (labeled gt:agent) live in the TOWN database, but their IDs

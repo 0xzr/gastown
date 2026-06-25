@@ -616,11 +616,13 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  Created rig identity bead: %s\n", rigBeadID)
 		}
 
-		// Create agent beads for the rig (witness, refinery)
-		// This ensures they exist before the daemon tries to start them
+		// Create agent beads for the rig (witness, refinery).
+		// These are rig-scoped, so disable prefix routing to keep them in the
+		// rig's beads database instead of the town/HQ database.
 		prefix := newRig.Config.Prefix
+		agentBd := bd.WithNoRoute()
 		witnessID := beads.WitnessBeadIDWithPrefix(prefix, name)
-		if _, err := bd.CreateAgentBead(witnessID,
+		if _, err := agentBd.CreateAgentBead(witnessID,
 			fmt.Sprintf("Witness for %s - monitors polecat health and progress.", name),
 			&beads.AgentFields{RoleType: "witness", Rig: name, AgentState: "idle"},
 		); err != nil {
@@ -630,7 +632,7 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 		}
 
 		refineryID := beads.RefineryBeadIDWithPrefix(prefix, name)
-		if _, err := bd.CreateAgentBead(refineryID,
+		if _, err := agentBd.CreateAgentBead(refineryID,
 			fmt.Sprintf("Refinery for %s - processes merge queue.", name),
 			&beads.AgentFields{RoleType: "refinery", Rig: name, AgentState: "idle"},
 		); err != nil {
@@ -1336,12 +1338,14 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 			}
 		}
 
-		// Create agent beads for the rig (witness, refinery)
-		// This ensures they exist before the daemon tries to start them
+		// Create agent beads for the rig (witness, refinery).
+		// These are rig-scoped, so disable prefix routing to keep them in the
+		// rig's beads database instead of the town/HQ database.
 		prefix := result.BeadsPrefix
+		agentBd := bd.WithNoRoute()
 		witnessID := beads.WitnessBeadIDWithPrefix(prefix, name)
-		if _, err := bd.Show(witnessID); err != nil {
-			if _, err := bd.CreateAgentBead(witnessID,
+		if _, err := agentBd.Show(witnessID); err != nil {
+			if _, err := agentBd.CreateAgentBead(witnessID,
 				fmt.Sprintf("Witness for %s - monitors polecat health and progress.", name),
 				&beads.AgentFields{RoleType: "witness", Rig: name, AgentState: "idle"},
 			); err != nil {
@@ -1352,8 +1356,8 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 		}
 
 		refineryID := beads.RefineryBeadIDWithPrefix(prefix, name)
-		if _, err := bd.Show(refineryID); err != nil {
-			if _, err := bd.CreateAgentBead(refineryID,
+		if _, err := agentBd.Show(refineryID); err != nil {
+			if _, err := agentBd.CreateAgentBead(refineryID,
 				fmt.Sprintf("Refinery for %s - processes merge queue.", name),
 				&beads.AgentFields{RoleType: "refinery", Rig: name, AgentState: "idle"},
 			); err != nil {

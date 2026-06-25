@@ -1289,7 +1289,9 @@ func (m *Manager) initAgentBeads(rigPath, rigName, prefix string) error {
 	// Town-level agents (Mayor, Deacon) are created by gt install in town beads.
 	// Use ResolveBeadsDir to follow redirect files for tracked beads.
 	rigBeadsDir := beads.ResolveBeadsDir(rigPath)
-	bd := beads.NewWithBeadsDir(rigPath, rigBeadsDir)
+	// Rig-level agents (witness, refinery) must be created in the rig's own
+	// beads database, not routed to the town/HQ database via prefix routing.
+	bd := beads.NewWithBeadsDir(rigPath, rigBeadsDir).WithNoRoute()
 
 	// Define rig-level agents to create
 	type agentDef struct {

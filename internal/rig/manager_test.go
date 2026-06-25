@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
@@ -929,6 +930,110 @@ esac
 			t.Errorf("expected agent %s was not created", id)
 		}
 	}
+	assertBeadsDirLog(t, beadsDirLog, rigBeadsDir)
+}
+
+// TestInitAgentBeads_RigScopedNotHQ is a regression guard for the bootstrap
+// defect where rig-prefixed agent beads were written to the town/HQ database
+// instead of the rig's own beads database (gastown-cet.1.1). It sets up a
+// realistic town root with routes.jsonl and verifies that initAgentBeads
+// targets the rig beads directory for all bd commands.
+func TestInitAgentBeads_RigScopedNotHQ(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake bd stub is not compatible with multiline descriptions on Windows")
+	}
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "demo")
+	rigBeadsDir := filepath.Join(rigPath, ".beads")
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+
+	for _, dir := range []string{filepath.Join(townRoot, "mayor"), townBeadsDir, rigBeadsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+
+	// Register a route so that normal prefix-based routing would resolve the
+	// gt- prefix to the rig's beads directory.
+	if err := beads.WriteRoutes(townBeadsDir, []beads.Route{{Prefix: "gt-", Path: "demo"}}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	script := `#!/usr/bin/env bash
+set -e
+if [[ -n "$BEADS_DIR_LOG" ]]; then
+  echo "${BEADS_DIR:-<unset>}" >> "$BEADS_DIR_LOG"
+fi
+if [[ "$1" == "--allow-stale" ]]; then
+  shift
+fi
+cmd="$1"
+shift
+case "$cmd" in
+  show)
+    # Return empty to indicate agent doesn't exist yet
+    echo "[]"
+    ;;
+  create)
+    id=""
+    title=""
+    for arg in "$@"; do
+      case "$arg" in
+        --id=*) id="${arg#--id=}" ;;
+        --title=*) title="${arg#--title=}" ;;
+      esac
+    done
+    echo "$id" >> "$AGENT_LOG"
+    printf '{"id":"%s","title":"%s","description":"","issue_type":"agent"}' "$id" "$title"
+    ;;
+  slot|config|init)
+    ;;
+  *)
+    echo "unexpected command: $cmd" >&2
+    exit 1
+    ;;
+esac
+`
+	binDir := writeFakeBD(t, script, "")
+	agentLog := filepath.Join(t.TempDir(), "agents.log")
+	beadsDirLog := filepath.Join(t.TempDir(), "beads-dir.log")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AGENT_LOG", agentLog)
+	t.Setenv("BEADS_DIR_LOG", beadsDirLog)
+	t.Setenv("BEADS_DIR", "") // Clear inherited BEADS_DIR
+
+	manager := &Manager{townRoot: townRoot}
+	if err := manager.initAgentBeads(rigPath, "demo", "gt"); err != nil {
+		t.Fatalf("initAgentBeads: %v", err)
+	}
+
+	// Verify the expected rig-level agents were created with the rig prefix.
+	data, err := os.ReadFile(agentLog)
+	if err != nil {
+		t.Fatalf("reading agent log: %v", err)
+	}
+	createdAgents := strings.Split(strings.TrimSpace(string(data)), "\n")
+	expectedAgents := map[string]bool{
+		"gt-demo-witness":  false,
+		"gt-demo-refinery": false,
+	}
+	for _, id := range createdAgents {
+		if _, ok := expectedAgents[id]; ok {
+			expectedAgents[id] = true
+		}
+	}
+	for id, found := range expectedAgents {
+		if !found {
+			t.Errorf("expected agent %s was not created", id)
+		}
+	}
+
+	// All bd commands (Show and CreateAgentBead) must target the rig's own
+	// beads directory, not the town/HQ beads directory.
 	assertBeadsDirLog(t, beadsDirLog, rigBeadsDir)
 }
 
