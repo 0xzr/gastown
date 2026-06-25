@@ -2445,7 +2445,14 @@ func TestJSONOutput_NoHumanReadableText(t *testing.T) {
 	convoyStageJSON = true
 	defer func() { convoyStageJSON = false }()
 
-	_ = runConvoyStage(nil, []string{"gt-j1", "gt-j2"})
+	if err := runConvoyStage(nil, []string{"gt-j1", "gt-j2"}); err != nil {
+		// Restore streams before failing so test diagnostics are readable.
+		w.Close()
+		wErr.Close()
+		os.Stdout = oldStdout
+		os.Stderr = oldStderr
+		t.Fatalf("runConvoyStage returned error: %v", err)
+	}
 	w.Close()
 	wErr.Close()
 	os.Stdout = oldStdout
