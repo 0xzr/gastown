@@ -19,6 +19,7 @@ package fleet
 import (
 	"errors"
 	"sort"
+	"sync"
 )
 
 // ErrNoEligibleAgent is returned when every config agent is either at cap
@@ -141,4 +142,214 @@ func ChooseAgent(caps MixCaps, counts LiveCounts, healthy HealthyAgents, pickInd
 type LaneCounts struct {
 	Counts LiveCounts
 	Total  int // total occupied lanes across all models
+}
+
+// LaneCounter is a thread-safe wrapper around LiveCounts. It is the
+// authoritative source of truth for live lane counts: pick-and-reserve is
+// atomic against the counter, so the check-then-act race that pure
+// ChooseAgent cannot prevent (two concurrent dispatches both observe the
+// same count snapshot and pick the same model before either increments)
+// cannot occur here.
+//
+// LaneCounter addresses gastown-cet.12.10: cap enforcement was correct for a
+// single ChooseAgent call against a static counts snapshot, but the
+// dispatcher-side pattern of "pick then increment" had no atomicity, so
+// concurrent dispatchers could exceed the configured per-model cap. The
+// fix is to push the increment inside the counter under a lock so the cap
+// becomes authoritative.
+type LaneCounter struct {
+	mu     sync.Mutex
+	counts LiveCounts
+}
+
+// NewLaneCounter wraps the given counts. A nil map is treated as empty.
+// The wrapper does not take ownership of the input map; callers may keep
+// reading the original map for snapshot reporting, but concurrent writes
+// must go through the counter.
+func NewLaneCounter(counts LiveCounts) *LaneCounter {
+	if counts == nil {
+		counts = LiveCounts{}
+	}
+	return &LaneCounter{counts: counts}
+}
+
+// Counts returns a snapshot of the current counts under the lock. The
+// returned map is owned by the caller and may be mutated freely.
+func (c *LaneCounter) Counts() LiveCounts {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(LiveCounts, len(c.counts))
+	for k, v := range c.counts {
+		out[k] = v
+	}
+	return out
+}
+
+// Set replaces the wrapped counts under the lock. Useful when a caller
+// refreshes the counter from a fresh town-wide session enumeration (e.g.
+// after the daemon observes new legacy lanes). The replacement is atomic
+// from the perspective of Reserve / Release.
+func (c *LaneCounter) Set(counts LiveCounts) {
+	if counts == nil {
+		counts = LiveCounts{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.counts = counts
+}
+
+// Reserve attempts to reserve one lane for agent under caps. Returns true
+// on success (counts[agent] was incremented) and false if the model is at
+// or above its cap, missing from caps, or the counter is nil.
+//
+// Models missing from caps are treated as cap=0 (never picked), matching
+// ChooseAgent's contract.
+func (c *LaneCounter) Reserve(caps MixCaps, agent string) bool {
+	if c == nil {
+		return false
+	}
+	cap, ok := caps[agent]
+	if !ok || cap <= 0 {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.counts[agent] >= cap {
+		return false
+	}
+	c.counts[agent]++
+	return true
+}
+
+// Release returns one reserved lane to the pool for agent. Idempotent:
+// only the first call decrements, and only when the count is positive.
+// Calling Release on a counter that was never Reserved, or on an unknown
+// agent, is a safe no-op.
+func (c *LaneCounter) Release(agent string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.counts[agent] > 0 {
+		c.counts[agent]--
+	}
+}
+
+// Reservation is the result of a successful ChooseAndReserveAgent call. The
+// reservation holds one lane in the originating counter; on dispatch
+// failure the caller MUST call Release so the slot returns to the pool.
+// On dispatch success the reservation is intentionally retained — the
+// live count now reflects the new lane until the polecat exits.
+type Reservation struct {
+	Agent     string // model that was reserved
+	NextIndex int    // rotation index to pass back on the next call
+
+	counter  *LaneCounter // unexported; cleared on Release
+	released bool         // idempotency guard
+}
+
+// Release returns the reserved lane to the pool. Call this when the
+// dispatch downstream of ChooseAndReserveAgent fails. Safe on a zero-value
+// or nil Reservation; safe to call multiple times (only the first call
+// decrements).
+func (r *Reservation) Release() {
+	if r == nil || r.released {
+		return
+	}
+	r.released = true
+	if r.counter != nil && r.Agent != "" {
+		r.counter.Release(r.Agent)
+	}
+	r.counter = nil
+}
+
+// ChooseAndReserveAgent is the race-safe variant of ChooseAgent. It walks
+// the rotation from pickIndex under the counter's lock, attempting to
+// reserve a lane for each candidate. The first candidate whose Reserve()
+// succeeds is returned with an advance to the next rotation index; if no
+// candidate has headroom, ErrNoEligibleAgent is returned.
+//
+// The reservation is part of the pick — there is no check-then-act window
+// between "pick this model" and "increment its count". Two concurrent
+// callers against the same counter cannot both reserve the same lane; at
+// most `cap[agent]` reservations can succeed for any single model.
+//
+// On dispatch failure, call the returned Reservation.Release() to free the
+// slot. On dispatch success, retain the reservation: the lane stays
+// counted until the polecat exits and the caller decrements via
+// LaneCounter.Release directly.
+//
+// ChooseAndReserveAgent is the dispatcher's authoritative entry point.
+// ChooseAgent (the pure variant) remains available for callers that
+// already hold a single-threaded reservation scheme of their own.
+func ChooseAndReserveAgent(caps MixCaps, counter *LaneCounter, healthy HealthyAgents, pickIndex int) (Reservation, error) {
+	if counter == nil {
+		return Reservation{}, ErrNoEligibleAgent
+	}
+	if len(caps) == 0 {
+		return Reservation{}, ErrNoEligibleAgent
+	}
+	rot := NewRotationFromCaps(caps)
+	if pickIndex < 0 {
+		pickIndex = 0
+	}
+
+	// Take the counter lock for the whole pick-then-reserve sequence.
+	// This is the core of the gastown-cet.12.10 fix: pick and reserve are
+	// atomic against the counter, so no two goroutines can both observe
+	// the same headroom and both claim it.
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+
+	eligible := make(map[string]bool, len(caps))
+	for agent, cap := range caps {
+		if cap <= 0 {
+			continue
+		}
+		if counter.counts[agent] >= cap {
+			continue
+		}
+		if !healthy[agent] {
+			continue // default to "healthy" when unset
+		}
+		eligible[agent] = true
+	}
+	if len(eligible) == 0 {
+		return Reservation{}, ErrNoEligibleAgent
+	}
+
+	if len(rot) == 0 {
+		// Defensive: caps non-empty but every cap is <= 0 yields no
+		// rotation entries. Should be impossible given the eligible set
+		// above required cap > 0, but fall back to the alphabetically
+		// smallest eligible agent to preserve ChooseAgent's contract.
+		names := make([]string, 0, len(eligible))
+		for name := range eligible {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		agent := names[0]
+		counter.counts[agent]++
+		return Reservation{
+			Agent:     agent,
+			NextIndex: 0,
+			counter:   counter,
+		}, nil
+	}
+
+	for offset := 0; offset < len(rot); offset++ {
+		idx := (pickIndex + offset) % len(rot)
+		agent := rot[idx]
+		if !eligible[agent] {
+			continue
+		}
+		counter.counts[agent]++
+		return Reservation{
+			Agent:     agent,
+			NextIndex: (idx + 1) % len(rot),
+			counter:   counter,
+		}, nil
+	}
+	return Reservation{}, ErrNoEligibleAgent
 }
