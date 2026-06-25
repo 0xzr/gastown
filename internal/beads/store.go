@@ -106,6 +106,7 @@ func sdkIssueToIssue(si *beadsdk.Issue) *Issue {
 		Ephemeral:          si.Ephemeral,
 		AcceptanceCriteria: si.AcceptanceCriteria,
 		Metadata:           si.Metadata,
+		CloseReason:        si.CloseReason,
 	}
 
 	if si.ClosedAt != nil {

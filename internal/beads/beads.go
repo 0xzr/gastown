@@ -184,6 +184,11 @@ type Issue struct {
 	CreatedBy   string   `json:"created_by,omitempty"`
 	UpdatedAt   string   `json:"updated_at"`
 	ClosedAt    string   `json:"closed_at,omitempty"`
+	// CloseReason holds the reason recorded at close time (bd close --reason).
+	// For a successful merge this carries the durable attestation proof
+	// (attested_tree + attestation: verified) written by the refinery
+	// (gastown-7g4), making it readable back by the gt attestation report.
+	CloseReason string   `json:"close_reason,omitempty"`
 	Parent      string   `json:"parent,omitempty"`
 	Assignee    string   `json:"assignee,omitempty"`
 	Children    []string `json:"children,omitempty"`

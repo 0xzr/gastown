@@ -661,6 +661,13 @@ type MRFields struct {
 
 	// Reviewer rejection tracking (gastown-cet.8).
 	ReviewerRejectionCause string // Machine-readable cause key, e.g. "race_condition"
+
+	// Multi-model attestation (gastown-7g4). The reviewed git tree SHA
+	// (HEAD^{tree}) for which a valid attestation token was verified before
+	// push. Its presence on a closed MR bead is durable proof that the full
+	// multi-model review cleared this exact tree; the gt attestation report
+	// scans for completed MRs that lack it (or whose token no longer verifies).
+	AttestedTree string
 }
 
 // ParseMRFields extracts structured merge-request fields from an issue's description.
@@ -784,6 +791,9 @@ func ParseMRFields(issue *Issue) *MRFields {
 		case "reviewer_rejection_cause", "reviewer-rejection-cause", "reviewerrejectioncause":
 			fields.ReviewerRejectionCause = value
 			hasFields = true
+		case "attested_tree", "attested-tree", "attestedtree":
+			fields.AttestedTree = value
+			hasFields = true
 		}
 	}
 
@@ -892,6 +902,9 @@ func FormatMRFields(fields *MRFields) string {
 	}
 	if fields.ReviewerRejectionCause != "" {
 		lines = append(lines, "reviewer_rejection_cause: "+fields.ReviewerRejectionCause)
+	}
+	if fields.AttestedTree != "" {
+		lines = append(lines, "attested_tree: "+fields.AttestedTree)
 	}
 
 	return strings.Join(lines, "\n")

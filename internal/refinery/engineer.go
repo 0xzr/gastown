@@ -35,6 +35,14 @@ func shortSHA(sha string) string {
 	return sha
 }
 
+// orDefault returns s when non-empty, else d. Small helper for readable fallbacks.
+func orDefault(s, d string) string {
+	if s != "" {
+		return s
+	}
+	return d
+}
+
 // DefaultStaleClaimTimeout is the default duration after which a claimed MR
 // is considered abandoned and eligible for re-claim. This is conservative
 // to avoid re-claiming MRs that are legitimately processing long test suites.
@@ -579,6 +587,20 @@ type ProcessResult struct {
 	// this field remains empty. Consumers (HandleMRInfoSuccess) use it to decide
 	// whether the source bead may be closed.
 	PublishedCommit string
+
+	// AttestedTree is the reviewed git tree SHA (HEAD^{tree}) for which a valid
+	// multi-model attestation token was verified before push. It is the durable
+	// link from the merged commit back to the review verdicts that cleared it.
+	// Empty only when the merge did not reach the attestation check.
+	AttestedTree string
+
+	// AttestationMissing is true when the merge was blocked because no valid
+	// attestation token existed for the merge-candidate tree. This is a fail-closed
+	// outcome: the MR stays in the queue (deferred) with an audit bead rather than
+	// merging or closing the source bead. It is distinct from TestsFailed so the
+	// refinery classifies it as a reviewer-unavailability deferral, not a build
+	// failure that bounces to a fixer polecat.
+	AttestationMissing bool
 }
 
 // isWIPCommitMessage reports whether a commit message is a work-in-progress
@@ -800,6 +822,49 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 		}
 	}
 
+	// Step 6.5: Multi-model attestation gate (fail-closed).
+	//
+	// A merge may only be pushed when a valid attestation token exists for the
+	// exact tree being merged (HEAD^{tree} after squash). The token is durable
+	// proof that the full multi-model review (deterministic gate +
+	// writer-excluded core peers + Opus/final verifier) cleared this exact tree.
+	//
+	// This covers BOTH merge paths:
+	//   - Normal path: the post-squash gate (refinery-gate.sh Phase 4, run above)
+	//     just wrote the token for this tree on success.
+	//   - Pre-verified path: skipGates skipped the post-squash gate, so no token
+	//     was written here — but a pre-verified MR must point to a verified review
+	//     attestation for the EXACT tree it is merging. Without one, the
+	//     pre-verified fast-path must NOT bypass attestation (gastown-7g4).
+	//
+	// A missing/invalid token fails closed: reset the local squash, defer the MR,
+	// and file an audit bead. The source bead is never closed on this path.
+	attestedTree, err := e.git.Rev("HEAD^{tree}")
+	if err != nil {
+		return ProcessResult{
+			Success: false,
+			Error:   fmt.Sprintf("failed to resolve merge tree for attestation: %v", err),
+		}
+	}
+	if err := VerifyAttestation(attestedTree); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Attestation gate FAILED for tree %s: %v — deferring merge (fail closed)\n", shortSHA(attestedTree), err)
+		if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after attestation failure: %v\n", target, resetErr)
+		}
+		// File an audit bead so the missing review is tracked explicitly rather
+		// than silently completing. Best-effort: a beads failure must not mask the
+		// attestation failure (the merge is already blocked).
+		auditID := e.fileAttestationAuditBead(mr, attestedTree, err)
+		return ProcessResult{
+			Success:            false,
+			AttestationMissing: true,
+			AttestedTree:       attestedTree,
+			AuditBead:          auditID,
+			Error:              fmt.Sprintf("attestation token missing/invalid for tree %s: %v", shortSHA(attestedTree), err),
+		}
+	}
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Attestation gate passed for tree %s\n", shortSHA(attestedTree))
+
 	// Step 7-8: Push to origin (when auto_push is enabled).
 	if e.config.AutoPush {
 		// Acquire merge slot before push to serialize writes to the default branch.
@@ -863,8 +928,9 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Successfully merged: %s\n", shortSHA(mergeCommit))
 
 	result := ProcessResult{
-		Success:     true,
-		MergeCommit: mergeCommit,
+		Success:      true,
+		MergeCommit:  mergeCommit,
+		AttestedTree: attestedTree,
 	}
 	// If auto_push was enabled and the push was verified, the merge commit is
 	// durably published to the configured upstream. Record that so the source
@@ -1072,6 +1138,59 @@ Verify whether a retroactive review is needed and close this task when audited.`
 	}
 
 	return task.ID, nil
+}
+
+// fileAttestationAuditBead records an explicit audit task when a merge was
+// blocked by the attestation gate (missing/invalid token for the reviewed
+// tree). This makes reviewer-unavailability or a skipped panel visible and
+// trackable instead of silently completing — the work stays deferred, never
+// closed, until a valid attestation is produced. Best-effort: a beads failure
+// does not mask the attestation failure (the merge is already blocked).
+func (e *Engineer) fileAttestationAuditBead(mr *MRInfo, treeSHA string, cause error) string {
+	mrID, branch, source, worker := "unknown", "unknown", "unknown", "unknown"
+	priority := 2
+	if mr != nil {
+		mrID = orDefault(mr.ID, mrID)
+		branch = orDefault(mr.Branch, branch)
+		source = orDefault(mr.SourceIssue, source)
+		worker = orDefault(mr.Worker, worker)
+		priority = mr.Priority
+	}
+	description := fmt.Sprintf(`Multi-model attestation missing — merge deferred (fail closed)
+
+## Metadata
+- MR: %s
+- Branch: %s
+- Source issue: %s
+- Worker: %s
+- Reviewed tree: %s
+- Cause: %v
+
+## Notes
+The refinery blocked this merge because no valid multi-model attestation token
+exists for the exact tree being merged. This means the full review panel
+(deterministic gate + writer-excluded core peers + Opus/final verifier) did not
+produce durable proof for this tree.
+
+Re-run the refinery gate for this tree to produce a valid attestation token,
+then re-queue the merge. Do NOT close the source bead or push without a valid
+attestation. Auto-filed by the Go-side attestation gate (gastown-7g4).`,
+		mrID, branch, source, worker, treeSHA, cause)
+
+	task, err := e.beads.Create(beads.CreateOptions{
+		Title:       fmt.Sprintf("Attestation missing: tree %s (%s)", shortSHA(treeSHA), mrID),
+		Labels:      []string{"gt:audit", "attestation-required", "gt:task"},
+		Priority:    priority,
+		Description: description,
+		Actor:       e.rig.Name + "/refinery",
+		Rig:         e.rig.Name,
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to file attestation audit bead: %v\n", err)
+		return ""
+	}
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Filed attestation audit bead: %s\n", task.ID)
+	return task.ID
 }
 
 func (e *Engineer) acquireMainPushSlot(ctx context.Context) (string, error) {
@@ -1578,6 +1697,13 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 			}
 			mrFields.MergeCommit = result.MergeCommit
 			mrFields.CloseReason = "merged"
+			// Durable attestation proof on the MR bead (gastown-7g4): map the
+			// merged tree to the verified review attestation. The gt attestation
+			// report scans closed MRs for this field to list completed work
+			// lacking proof. doMerge already enforced this before push.
+			if result.AttestedTree != "" {
+				mrFields.AttestedTree = result.AttestedTree
+			}
 			if result.PublishedCommit != "" {
 				mrFields.PublishedCommit = result.PublishedCommit
 				mrFields.PublishedRemote = "origin"
@@ -1624,6 +1750,14 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 			closeReason := fmt.Sprintf("Merged in %s", mr.ID)
 			if result.MergeCommit != "" {
 				closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, result.MergeCommit)
+			}
+			// Durable multi-model attestation proof (gastown-7g4): map the merged
+			// tree to the verified review attestation token. The token's existence
+			// is the machine-checkable proof that the full review panel cleared
+			// this exact tree. doMerge already enforced this before push; recording
+			// it on the close reason makes the proof durable on the source bead.
+			if result.AttestedTree != "" {
+				closeReason = fmt.Sprintf("%s\nattested_tree: %s\nattestation: verified", closeReason, result.AttestedTree)
 			}
 			if result.DegradedQuorum {
 				closeReason = fmt.Sprintf("%s\nreview_state: degraded_quorum", closeReason)
