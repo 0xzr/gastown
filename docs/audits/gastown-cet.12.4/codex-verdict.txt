@@ -1,0 +1,243 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.0
+--------
+workdir: /tmp/gtviz-audit/gtviz
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019eff4a-4741-7723-9e59-52bb255b7f1e
+--------
+user
+Strict core reviewer. Audit commit 2abdc645 in gtviz rig. Commit ONLY adds README.md (3 lines). Rig setup files (config.json, CLAUDE.md, AGENTS.md) live at /home/ubuntu/gt-town/gtviz/ but NOT in commit. Output JSON: {"verdict":"PASS|FAIL|DEFER","findings":[{"classification":"BLOCKING|MAJOR|MINOR","citation":"README.md:N","explanation":"one sentence"}],"summary":"one sentence"}. Max 2 findings. JSON only.
+exec
+/bin/bash -lc 'git status --short && git rev-parse --show-toplevel && git ls-tree --name-only 2abdc645' in /tmp/gtviz-audit/gtviz
+ succeeded in 0ms:
+?? .codegraph/
+/tmp/gtviz-audit/gtviz
+README.md
+
+exec
+/bin/bash -lc 'git show --stat --oneline --decorate --no-renames 2abdc645 && git show --format=fuller --no-renames -- README.md 2abdc645' in /tmp/gtviz-audit/gtviz
+exec
+/bin/bash -lc "sed -n '1,160p' /home/ubuntu/gt-town/gtviz/config.json; sed -n '1,160p' /home/ubuntu/gt-town/gtviz/CLAUDE.md; sed -n '1,160p' /home/ubuntu/gt-town/gtviz/AGENTS.md" in /tmp/gtviz-audit/gtviz
+ succeeded in 0ms:
+{
+  "type": "rig",
+  "version": 1,
+  "name": "gtviz",
+  "git_url": "file:///home/ubuntu/gt-town-backups/gtviz-origin.git",
+  "default_branch": "main",
+  "created_at": "2026-06-24T15:18:44.866393515-04:00",
+  "beads": {
+    "prefix": "gtviz"
+  },
+  "merge_queue": {
+    "enabled": true,
+    "run_tests": false,
+    "gates_parallel": false,
+    "gates": {
+      "four-model-refinery-review": {
+        "cmd": "GT_REFINERY_RUN_ALL_GATES_FALLBACK=/home/ubuntu/gt-town/gtviz/mayor/rig/scripts/run-all-gates.sh METASWARM_ADAPTERS=/home/ubuntu/gt-town/polybot/refinery/rig/.metaswarm/adapters /home/ubuntu/gastown-spike/dropin/refinery-gate.sh --worktree \"$PWD\" --writer unknown --timeout 900",
+        "timeout": "45m",
+        "phase": "post-squash"
+      }
+    }
+  }
+}
+# Project Instructions for AI Agents
+
+This file provides instructions and context for AI coding agents working on this project.
+
+<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
+## Beads Issue Tracker
+
+This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+
+### Quick Reference
+
+```bash
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --claim  # Claim work
+bd close <id>         # Complete work
+```
+
+### Rules
+
+- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Run `bd prime` for detailed command reference and session close protocol
+- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+
+**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
+
+## Session Completion
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+<!-- END BEADS INTEGRATION -->
+
+
+## Build & Test
+
+_Add your build and test commands here_
+
+```bash
+# Example:
+# npm install
+# npm test
+```
+
+## Architecture Overview
+
+_Add a brief overview of your project architecture_
+
+## Conventions & Patterns
+
+_Add your project-specific conventions here_
+# Agent Instructions
+
+This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+
+> **Architecture in one line:** Issues live in a local Dolt database
+> (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
+> git-compatible protocol), stored under `refs/dolt/data` on your git
+> remote — separate from `refs/heads/*` where your code lives.
+> `.beads/issues.jsonl` is a passive export, not the wire protocol.
+>
+> See [SYNC_CONCEPTS.md](https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md)
+> for the one-screen overview and anti-patterns (don't treat JSONL as the
+> source of truth; don't `bd import` during normal operation; don't
+> reach for third-party Dolt hosting before trying the default).
+
+## Quick Reference
+
+```bash
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --claim  # Claim work atomically
+bd close <id>         # Complete work
+bd dolt push          # Push beads data to remote
+```
+
+## Non-Interactive Shell Commands
+
+**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
+
+Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
+
+**Use these forms instead:**
+```bash
+# Force overwrite without prompting
+cp -f source dest           # NOT: cp source dest
+mv -f source dest           # NOT: mv source dest
+rm -f file                  # NOT: rm file
+
+# For recursive operations
+rm -rf directory            # NOT: rm -r directory
+cp -rf source dest          # NOT: cp -r source dest
+```
+
+**Other commands that may prompt:**
+- `scp` - use `-o BatchMode=yes` for non-interactive
+- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
+- `apt-get` - use `-y` flag
+- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
+
+<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
+## Beads Issue Tracker
+
+This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+
+### Quick Reference
+
+```bash
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --claim  # Claim work
+bd close <id>         # Complete work
+```
+
+### Rules
+
+- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Run `bd prime` for detailed command reference and session close protocol
+- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+
+**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
+
+## Session Completion
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+<!-- END BEADS INTEGRATION -->
+
+ succeeded in 255ms:
+2abdc64 (grafted, HEAD -> main, origin/main, origin/HEAD) Initial commit
+ README.md | 3 +++
+ 1 file changed, 3 insertions(+)
+commit 2abdc645d10a3c8ca35d301d6e9e3e0a215bf062
+Author:     jasper <andrewrsm@gmail.com>
+AuthorDate: Wed Jun 24 15:18:41 2026 -0400
+Commit:     Andrew <andrewrsm@gmail.com>
+CommitDate: Wed Jun 24 15:18:41 2026 -0400
+
+    Initial commit
+
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..a57ea9b
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,3 @@
++# gtviz
++
++Gas Town dependency/progress visualization rig for BEADS-VIZ TUI development.
+
+codex
+{"verdict":"PASS","findings":[],"summary":"README.md is a minimal project description and introduces no blocking, major, or minor issues."}
+tokens used
+14,373
+{"verdict":"PASS","findings":[],"summary":"README.md is a minimal project description and introduces no blocking, major, or minor issues."}
