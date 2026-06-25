@@ -624,6 +624,8 @@ type MRFields struct {
 	Worker      string // Who did the work
 	Rig         string // Which rig
 	CommitSHA   string // HEAD commit SHA at submission time (GH#3032: dedup key)
+	BaseSHA     string // Merge-base SHA at submission time (gastown-cet.2.3: full-diff scope key)
+	CommitsAhead int   // Commits on the branch ahead of the merge-base (gastown-cet.2.3)
 	MergeCommit string // SHA of merge commit (set on close)
 	CloseReason string // Reason for closing: merged, rejected, conflict, superseded
 	AgentBead   string // Agent bead ID that created this MR (for traceability)
@@ -710,6 +712,14 @@ func ParseMRFields(issue *Issue) *MRFields {
 		case "commit_sha", "commit-sha", "commitsha":
 			fields.CommitSHA = value
 			hasFields = true
+		case "base_sha", "base-sha", "basesha":
+			fields.BaseSHA = value
+			hasFields = true
+		case "commits_ahead", "commits-ahead", "commitsahead":
+			if n, err := parseIntField(value); err == nil {
+				fields.CommitsAhead = n
+				hasFields = true
+			}
 		case "merge_commit", "merge-commit", "mergecommit":
 			fields.MergeCommit = value
 			hasFields = true
@@ -817,6 +827,12 @@ func FormatMRFields(fields *MRFields) string {
 	if fields.CommitSHA != "" {
 		lines = append(lines, "commit_sha: "+fields.CommitSHA)
 	}
+	if fields.BaseSHA != "" {
+		lines = append(lines, "base_sha: "+fields.BaseSHA)
+	}
+	if fields.CommitsAhead > 0 {
+		lines = append(lines, fmt.Sprintf("commits_ahead: %d", fields.CommitsAhead))
+	}
 	if fields.MergeCommit != "" {
 		lines = append(lines, "merge_commit: "+fields.MergeCommit)
 	}
@@ -901,6 +917,12 @@ func SetMRFields(issue *Issue, fields *MRFields) string {
 		"commit_sha":               true,
 		"commit-sha":               true,
 		"commitsha":                true,
+		"base_sha":                 true,
+		"base-sha":                 true,
+		"basesha":                  true,
+		"commits_ahead":            true,
+		"commits-ahead":            true,
+		"commitsahead":             true,
 		"merge_commit":             true,
 		"merge-commit":             true,
 		"mergecommit":              true,

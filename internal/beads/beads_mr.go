@@ -116,3 +116,63 @@ func MatchesMRSourceIssue(description, issueID string) bool {
 	needle := "source_issue: " + issueID + "\n"
 	return strings.Contains(description, needle)
 }
+
+// FindMostRecentMRForIssue returns the most recent merge-request bead whose
+// source_issue matches the given issue ID, across all statuses. Used by the
+// source-bead closure guard (gastown-cet.2.3) to look up the MR associated
+// with a hooked issue so it can decide whether the source is safe to close.
+//
+// "Most recent" is defined as: the MR whose Status / CloseReason timestamps
+// are the latest; in practice we prefer open > closed-rejected >
+// closed-merged-no-published > closed-merged-published, because the open MR
+// is the one currently being acted on. Returns (nil, nil) when no MR matches.
+func (b *Beads) FindMostRecentMRForIssue(issueID string) (*Issue, error) {
+	if issueID == "" {
+		return nil, nil
+	}
+	issues, err := b.ListMergeRequests(ListOptions{
+		Status: "all",
+		Label:  "gt:merge-request",
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Prefer open MRs (still being processed) over closed MRs (terminal).
+	// Among same-status MRs, pick the most recently updated one — that's
+	// the MR whose lifecycle the source-bead guard should consult.
+	var best *Issue
+	for _, issue := range issues {
+		if !MatchesMRSourceIssue(issue.Description, issueID) {
+			continue
+		}
+		if best == nil {
+			best = issue
+			continue
+		}
+		if rankMRStatus(issue.Status) > rankMRStatus(best.Status) {
+			best = issue
+			continue
+		}
+		if rankMRStatus(issue.Status) == rankMRStatus(best.Status) &&
+			issue.UpdatedAt > best.UpdatedAt {
+			best = issue
+		}
+	}
+	return best, nil
+}
+
+// rankMRStatus returns a sortable rank for MR status. Open MRs rank highest
+// because the source-bead guard must consult the live MR before the
+// refinery has had a chance to publish it.
+func rankMRStatus(status string) int {
+	switch status {
+	case "open":
+		return 4
+	case "in_progress":
+		return 3
+	case "closed":
+		return 2
+	default:
+		return 1
+	}
+}

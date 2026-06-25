@@ -4612,3 +4612,260 @@ func TestResolveBdSubprocessTimeout(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// gastown-cet.2.3 / gastown-73a: stacked-branch scope keys (base_sha,
+// commits_ahead). These fields record the merge-base and commit count on the
+// MR bead so the refinery and reviewers can verify the branch was packaged as
+// a complete diff rather than a single tip commit (hq-try2).
+// ---------------------------------------------------------------------------
+
+// TestParseMRFields_StackedBranchScopeKeys covers acceptance criterion #1: an
+// MR whose description carries `base_sha` and `commits_ahead` must round-trip
+// through ParseMRFields so the refinery and source-bead guards can read them.
+func TestParseMRFields_StackedBranchScopeKeys(t *testing.T) {
+	issue := &Issue{
+		Description: `branch: polecat/quartz/polybot-stack
+target: main
+source_issue: gastown-73a
+commit_sha: b5a6a81600000000000000000000000000000000
+base_sha: deadbeef00000000000000000000000000000000
+commits_ahead: 3`,
+	}
+	fields := ParseMRFields(issue)
+	if fields == nil {
+		t.Fatal("ParseMRFields returned nil for an MR description with scope keys")
+	}
+	if fields.BaseSHA != "deadbeef00000000000000000000000000000000" {
+		t.Errorf("BaseSHA=%q, want deadbeef…", fields.BaseSHA)
+	}
+	if fields.CommitsAhead != 3 {
+		t.Errorf("CommitsAhead=%d, want 3", fields.CommitsAhead)
+	}
+}
+
+// TestParseMRFields_AlternateScopeKeyFormats confirms the dash-form and
+// concatenated forms of the scope keys (matching the existing convention for
+// commit_sha/merge_commit). The refinery writes snake_case; legacy fields and
+// user prose may use other forms.
+func TestParseMRFields_AlternateScopeKeyFormats(t *testing.T) {
+	tests := []struct {
+		name        string
+		desc        string
+		wantBaseSHA string
+		wantAhead   int
+	}{
+		{
+			name:        "snake_case",
+			desc:        "base_sha: aaaa\ncommits_ahead: 2",
+			wantBaseSHA: "aaaa",
+			wantAhead:   2,
+		},
+		{
+			name:        "dash form",
+			desc:        "base-sha: bbbb\ncommits-ahead: 5",
+			wantBaseSHA: "bbbb",
+			wantAhead:   5,
+		},
+		{
+			name:        "concatenated",
+			desc:        "basesha: cccc\ncommitsahead: 7",
+			wantBaseSHA: "cccc",
+			wantAhead:   7,
+		},
+		{
+			name:        "case-insensitive",
+			desc:        "BASE_SHA: dddd\nCOMMITS_AHEAD: 9",
+			wantBaseSHA: "dddd",
+			wantAhead:   9,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fields := ParseMRFields(&Issue{Description: tt.desc})
+			if fields == nil {
+				t.Fatal("ParseMRFields returned nil")
+			}
+			if fields.BaseSHA != tt.wantBaseSHA {
+				t.Errorf("BaseSHA=%q, want %q", fields.BaseSHA, tt.wantBaseSHA)
+			}
+			if fields.CommitsAhead != tt.wantAhead {
+				t.Errorf("CommitsAhead=%d, want %d", fields.CommitsAhead, tt.wantAhead)
+			}
+		})
+	}
+}
+
+// TestParseMRFields_NullScopeKeysIgnored: the convention in fields.go is to
+// ignore "key: null" lines (legacy cleanup marker). Stacked-branch scope keys
+// must obey the same rule so a refinery can write `base_sha: null` to clear
+// a value without leaving an empty string behind.
+func TestParseMRFields_NullScopeKeysIgnored(t *testing.T) {
+	fields := ParseMRFields(&Issue{
+		Description: `base_sha: null
+commits_ahead: null
+branch: polecat/quartz/gt-x
+target: main`,
+	})
+	if fields == nil {
+		t.Fatal("ParseMRFields returned nil")
+	}
+	if fields.BaseSHA != "" {
+		t.Errorf("BaseSHA=%q, want empty (null should be ignored)", fields.BaseSHA)
+	}
+	if fields.CommitsAhead != 0 {
+		t.Errorf("CommitsAhead=%d, want 0 (null should be ignored)", fields.CommitsAhead)
+	}
+	if fields.Branch != "polecat/quartz/gt-x" {
+		t.Errorf("Branch=%q, want polecat/quartz/gt-x (other fields should still parse)", fields.Branch)
+	}
+}
+
+// TestFormatMRFields_StackedBranchScopeKeys confirms FormatMRFields emits the
+// scope keys in snake_case form. This is the wire format the refinery reads.
+func TestFormatMRFields_StackedBranchScopeKeys(t *testing.T) {
+	got := FormatMRFields(&MRFields{
+		Branch:       "polecat/quartz/polybot-stack",
+		Target:       "main",
+		SourceIssue:  "gastown-73a",
+		CommitSHA:    "b5a6a81600000000000000000000000000000000",
+		BaseSHA:      "deadbeef00000000000000000000000000000000",
+		CommitsAhead: 3,
+	})
+	want := `branch: polecat/quartz/polybot-stack
+target: main
+source_issue: gastown-73a
+commit_sha: b5a6a81600000000000000000000000000000000
+base_sha: deadbeef00000000000000000000000000000000
+commits_ahead: 3`
+	if got != want {
+		t.Errorf("FormatMRFields() =\n%q\nwant\n%q", got, want)
+	}
+}
+
+// TestFormatMRFields_OmitsEmptyScopeKeys: FormatMRFields must skip empty
+// BaseSHA and zero CommitsAhead so the description stays clean for branches
+// that the stacked-branch guard never ran on (e.g. legacy MRs).
+func TestFormatMRFields_OmitsEmptyScopeKeys(t *testing.T) {
+	got := FormatMRFields(&MRFields{
+		Branch: "polecat/quartz/gt-clean",
+		Target: "main",
+	})
+	if strings.Contains(got, "base_sha:") {
+		t.Errorf("FormatMRFields emitted base_sha when BaseSHA was empty:\n%s", got)
+	}
+	if strings.Contains(got, "commits_ahead:") {
+		t.Errorf("FormatMRFields emitted commits_ahead when CommitsAhead was 0:\n%s", got)
+	}
+}
+
+// TestSetMRFields_ReplacesScopeKeys covers the in-place update path used by
+// the refinery when it observes the upstream-published commit. The scope keys
+// must be replaceable so the refinery can stamp a fresh base_sha after
+// re-targeting an MR, without leaving the old SHA behind.
+func TestSetMRFields_ReplacesScopeKeys(t *testing.T) {
+	issue := &Issue{
+		Description: `branch: polecat/quartz/gt-x
+target: main
+source_issue: gt-x
+commit_sha: aaaa
+base_sha: bbbb
+commits_ahead: 3`,
+	}
+	got := SetMRFields(issue, &MRFields{
+		Branch:       "polecat/quartz/gt-x",
+		Target:       "main",
+		SourceIssue:  "gt-x",
+		CommitSHA:    "cccc",
+		BaseSHA:      "dddd",
+		CommitsAhead: 1,
+	})
+	for _, want := range []string{
+		"commit_sha: cccc",
+		"base_sha: dddd",
+		"commits_ahead: 1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("SetMRFields missing %q in:\n%s", want, got)
+		}
+	}
+	// Old values must be gone.
+	for _, stale := range []string{
+		"commit_sha: aaaa",
+		"base_sha: bbbb",
+		"commits_ahead: 3",
+	} {
+		if strings.Contains(got, stale) {
+			t.Errorf("SetMRFields left stale %q in:\n%s", stale, got)
+		}
+	}
+}
+
+// TestMRFieldsRoundTrip_StackedBranchScopeKeys exercises the full
+// parse → set → format cycle to ensure the scope keys survive description
+// rewrite without truncation or reordering surprises.
+func TestMRFieldsRoundTrip_StackedBranchScopeKeys(t *testing.T) {
+	original := &MRFields{
+		Branch:       "polecat/quartz/gt-73a",
+		Target:       "main",
+		SourceIssue:  "gastown-73a",
+		CommitSHA:    "b5a6a81600000000000000000000000000000000",
+		BaseSHA:      "deadbeef00000000000000000000000000000000",
+		CommitsAhead: 3,
+	}
+	issue := &Issue{Description: FormatMRFields(original)}
+	parsed := ParseMRFields(issue)
+	if parsed == nil {
+		t.Fatal("ParseMRFields returned nil")
+	}
+	if parsed.BaseSHA != original.BaseSHA {
+		t.Errorf("BaseSHA=%q, want %q", parsed.BaseSHA, original.BaseSHA)
+	}
+	if parsed.CommitsAhead != original.CommitsAhead {
+		t.Errorf("CommitsAhead=%d, want %d", parsed.CommitsAhead, original.CommitsAhead)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// gastown-cet.2.3: rankMRStatus ordering for source-bead guard.
+// The source-bead guard must consult the live (open) MR before any closed MR
+// — without this ordering, a closed MR with stale data would be returned for
+// a hooked issue and the source bead could be closed prematurely.
+// ---------------------------------------------------------------------------
+
+// TestRankMRStatus_OpenBeatsClosed pins the ranking used by
+// FindMostRecentMRForIssue. Open MRs must outrank any closed MR; closed MRs
+// outrank unknown statuses.
+func TestRankMRStatus_OpenBeatsClosed(t *testing.T) {
+	if rankMRStatus("open") <= rankMRStatus("in_progress") {
+		t.Errorf("open (%d) should outrank in_progress (%d)", rankMRStatus("open"), rankMRStatus("in_progress"))
+	}
+	if rankMRStatus("in_progress") <= rankMRStatus("closed") {
+		t.Errorf("in_progress (%d) should outrank closed (%d)", rankMRStatus("in_progress"), rankMRStatus("closed"))
+	}
+	if rankMRStatus("closed") <= rankMRStatus("") {
+		t.Errorf("closed (%d) should outrank unknown status (%d)", rankMRStatus("closed"), rankMRStatus(""))
+	}
+	if rankMRStatus("closed") <= rankMRStatus("weather-is-nice") {
+		t.Errorf("closed (%d) should outrank unrecognized status (%d)", rankMRStatus("closed"), rankMRStatus("weather-is-nice"))
+	}
+}
+
+// TestRankMRStatus_StableForKnownStatuses pins the numeric values so external
+// consumers (downstream tooling, refinery heuristics) can rely on them.
+// These values are part of the wire contract; do not change without bumping
+// a compatibility version.
+func TestRankMRStatus_StableForKnownStatuses(t *testing.T) {
+	cases := map[string]int{
+		"open":        4,
+		"in_progress": 3,
+		"closed":      2,
+		"":            1,
+		"unknown":     1,
+	}
+	for status, want := range cases {
+		if got := rankMRStatus(status); got != want {
+			t.Errorf("rankMRStatus(%q)=%d, want %d", status, got, want)
+		}
+	}
+}

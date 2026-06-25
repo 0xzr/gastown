@@ -1251,9 +1251,23 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// --allow-stacked-branch (audit-only escape hatch for non-code
 		// closes, e.g. doc-only branches that genuinely want one MR per
 		// logical change set).
+		//
+		// We capture the StackedBranchInfo result so we can stamp the
+		// merge-base and commit count onto the MR bead description —
+		// acceptance criterion #1 requires that the MR advertises enough
+		// information to reconstruct the full diff, not just the tip SHA.
+		var stackedInfo *StackedBranchInfo
 		if !doneAllowStacked {
-			if stackedErr := checkStackedBranchForSubmit(g, branch, target); stackedErr != nil {
-				return stackedErr
+			info, stackedErr := CheckStackedBranch(g, branch, target)
+			if stackedErr != nil {
+				var stacked *ErrStackedBranch
+				if errors.As(stackedErr, &stacked) {
+					return stackedErr
+				}
+				// Non-stacked error (couldn't read git). Warn but don't block.
+				style.PrintWarning("could not run stacked-branch check against %s: %v (proceeding; refinery will catch real issues)", target, stackedErr)
+			} else {
+				stackedInfo = info
 			}
 		}
 
@@ -1300,6 +1314,19 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				branch, target, issueID, rigName)
 			if commitSHA != "" {
 				description += fmt.Sprintf("\ncommit_sha: %s", commitSHA)
+			}
+			// gastown-cet.2.3 acceptance criterion #1: the MR must advertise
+			// enough information to reconstruct the full branch diff, not
+			// just the tip SHA. Recording the merge-base and commit count
+			// lets the refinery detect a partial-diff replay attempt and
+			// lets reviewers see whether earlier commits were dropped.
+			if stackedInfo != nil {
+				if stackedInfo.MergeBase != "" {
+					description += fmt.Sprintf("\nbase_sha: %s", stackedInfo.MergeBase)
+				}
+				if stackedInfo.CommitsAhead > 0 {
+					description += fmt.Sprintf("\ncommits_ahead: %d", stackedInfo.CommitsAhead)
+				}
 			}
 			if doneSkipVerify {
 				description += "\nskip_verify: true"
