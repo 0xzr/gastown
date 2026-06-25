@@ -292,13 +292,20 @@ func boolString(b bool) string {
 // cleanup_status is older than the direct predicates proving no work is at risk.
 // The status remains unsafe globally; callers must opt into this reconciliation
 // path only after gathering live git, hook, work, and active-MR facts.
-func CanIgnoreStaleCleanupStatus(status CleanupStatus, workTerminal, hookSafe, activeMRSafe, gitSafe bool) bool {
-	if !workTerminal || !hookSafe || !activeMRSafe || !gitSafe {
+//
+// gitClean means the worktree has no uncommitted changes and no stashes.
+// unpushedCommits is the number of unpreserved unpushed commits (from
+// BranchPreservationStatus), not the raw count from git status. For CleanupUnpushed
+// to be ignorable, unpushedCommits must be 0 so we do not discard real work.
+func CanIgnoreStaleCleanupStatus(status CleanupStatus, workTerminal, hookSafe, activeMRSafe, gitClean bool, unpushedCommits int) bool {
+	if !workTerminal || !hookSafe || !activeMRSafe || !gitClean {
 		return false
 	}
 	switch status {
-	case CleanupUncommitted, CleanupStash, CleanupUnpushed:
+	case CleanupUncommitted, CleanupStash:
 		return true
+	case CleanupUnpushed:
+		return unpushedCommits == 0
 	default:
 		return false
 	}

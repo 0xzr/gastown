@@ -55,6 +55,77 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 	}
 }
 
+func TestCanIgnoreStaleCleanupStatus(t *testing.T) {
+	cases := []struct {
+		name            string
+		status          CleanupStatus
+		workTerminal    bool
+		hookSafe        bool
+		activeMRSafe    bool
+		gitClean        bool
+		unpushedCommits int
+		want            bool
+	}{
+		{
+			name:         "all safe clean ignores uncommitted",
+			status:       CleanupUncommitted,
+			workTerminal: true, hookSafe: true, activeMRSafe: true, gitClean: true,
+			want: true,
+		},
+		{
+			name:         "unpushed preserved can be ignored when terminal",
+			status:       CleanupUnpushed,
+			workTerminal: true, hookSafe: true, activeMRSafe: true, gitClean: true, unpushedCommits: 0,
+			want: true,
+		},
+		{
+			name:         "unpushed with unpreserved commits cannot be ignored",
+			status:       CleanupUnpushed,
+			workTerminal: true, hookSafe: true, activeMRSafe: true, gitClean: true, unpushedCommits: 2,
+			want: false,
+		},
+		{
+			name:         "unpushed with dirty tree cannot be ignored",
+			status:       CleanupUnpushed,
+			workTerminal: true, hookSafe: true, activeMRSafe: true, gitClean: false, unpushedCommits: 0,
+			want: false,
+		},
+		{
+			name:         "non-terminal work cannot be ignored",
+			status:       CleanupUnpushed,
+			workTerminal: false, hookSafe: true, activeMRSafe: true, gitClean: true, unpushedCommits: 0,
+			want: false,
+		},
+		{
+			name:         "unsafe hook cannot be ignored",
+			status:       CleanupUncommitted,
+			workTerminal: true, hookSafe: false, activeMRSafe: true, gitClean: true,
+			want: false,
+		},
+		{
+			name:         "pending active MR cannot be ignored",
+			status:       CleanupUncommitted,
+			workTerminal: true, hookSafe: true, activeMRSafe: false, gitClean: true,
+			want: false,
+		},
+		{
+			name:         "clean status needs no ignore",
+			status:       CleanupClean,
+			workTerminal: true, hookSafe: true, activeMRSafe: true, gitClean: true,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := CanIgnoreStaleCleanupStatus(tc.status, tc.workTerminal, tc.hookSafe, tc.activeMRSafe, tc.gitClean, tc.unpushedCommits)
+			if got != tc.want {
+				t.Errorf("CanIgnoreStaleCleanupStatus(%v, %v, %v, %v, %v, %d) = %v, want %v",
+					tc.status, tc.workTerminal, tc.hookSafe, tc.activeMRSafe, tc.gitClean, tc.unpushedCommits, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDecideWorkstateLiveSignals(t *testing.T) {
 	tests := []struct {
 		name                 string

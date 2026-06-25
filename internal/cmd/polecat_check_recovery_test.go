@@ -252,13 +252,14 @@ func TestCleanupStatusBlockerForRecovery_PartialSpawnWithoutHook(t *testing.T) {
 
 func TestStaleCleanupStatusCanBeIgnoredForRecovery(t *testing.T) {
 	tests := []struct {
-		name         string
-		status       polecat.CleanupStatus
-		workTerminal bool
-		hookSafe     bool
-		activeMRSafe bool
-		gitSafe      bool
-		wantCanSkip  bool
+		name            string
+		status          polecat.CleanupStatus
+		workTerminal    bool
+		hookSafe        bool
+		activeMRSafe    bool
+		gitClean        bool
+		unpushedCommits int
+		wantCanSkip     bool
 	}{
 		{
 			name:         "closed source with clean git ignores stale unpushed cleanup",
@@ -266,7 +267,7 @@ func TestStaleCleanupStatusCanBeIgnoredForRecovery(t *testing.T) {
 			workTerminal: true,
 			hookSafe:     true,
 			activeMRSafe: true,
-			gitSafe:      true,
+			gitClean:     true,
 			wantCanSkip:  true,
 		},
 		{
@@ -274,21 +275,21 @@ func TestStaleCleanupStatusCanBeIgnoredForRecovery(t *testing.T) {
 			status:       polecat.CleanupUnpushed,
 			hookSafe:     true,
 			activeMRSafe: true,
-			gitSafe:      true,
+			gitClean:     true,
 		},
 		{
 			name:         "hooked work still blocks",
 			status:       polecat.CleanupUnpushed,
 			workTerminal: true,
 			activeMRSafe: true,
-			gitSafe:      true,
+			gitClean:     true,
 		},
 		{
 			name:         "active MR still blocks",
 			status:       polecat.CleanupUnpushed,
 			workTerminal: true,
 			hookSafe:     true,
-			gitSafe:      true,
+			gitClean:     true,
 		},
 		{
 			name:         "dirty git still blocks",
@@ -305,12 +306,21 @@ func TestStaleCleanupStatusCanBeIgnoredForRecovery(t *testing.T) {
 			activeMRSafe: true,
 		},
 		{
+			name:            "unpushed with unpreserved commits still blocks",
+			status:          polecat.CleanupUnpushed,
+			workTerminal:    true,
+			hookSafe:        true,
+			activeMRSafe:    true,
+			gitClean:        true,
+			unpushedCommits: 2,
+		},
+		{
 			name:         "closed source with clean git ignores stale stash cleanup",
 			status:       polecat.CleanupStash,
 			workTerminal: true,
 			hookSafe:     true,
 			activeMRSafe: true,
-			gitSafe:      true,
+			gitClean:     true,
 			wantCanSkip:  true,
 		},
 		{
@@ -319,7 +329,7 @@ func TestStaleCleanupStatusCanBeIgnoredForRecovery(t *testing.T) {
 			workTerminal: true,
 			hookSafe:     true,
 			activeMRSafe: true,
-			gitSafe:      true,
+			gitClean:     true,
 			wantCanSkip:  true,
 		},
 		{
@@ -328,7 +338,7 @@ func TestStaleCleanupStatusCanBeIgnoredForRecovery(t *testing.T) {
 			workTerminal: true,
 			hookSafe:     true,
 			activeMRSafe: true,
-			gitSafe:      true,
+			gitClean:     true,
 		},
 		{
 			name:         "terminal hook can satisfy work terminal predicate",
@@ -336,14 +346,14 @@ func TestStaleCleanupStatusCanBeIgnoredForRecovery(t *testing.T) {
 			workTerminal: true,
 			hookSafe:     true,
 			activeMRSafe: true,
-			gitSafe:      true,
+			gitClean:     true,
 			wantCanSkip:  true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := polecat.CanIgnoreStaleCleanupStatus(tt.status, tt.workTerminal, tt.hookSafe, tt.activeMRSafe, tt.gitSafe)
+			got := polecat.CanIgnoreStaleCleanupStatus(tt.status, tt.workTerminal, tt.hookSafe, tt.activeMRSafe, tt.gitClean, tt.unpushedCommits)
 			if got != tt.wantCanSkip {
 				t.Fatalf("CanIgnoreStaleCleanupStatus() = %v, want %v", got, tt.wantCanSkip)
 			}

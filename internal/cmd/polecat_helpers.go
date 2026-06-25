@@ -168,13 +168,17 @@ func checkPolecatSafety(target polecatTarget) *SafetyCheckResult {
 			if result.CleanupStatus == polecat.CleanupUnpushed {
 				loadGitState()
 			}
-			gitSafe := false
+			gitClean := false
 			if polecatInfo != nil {
-				gitSafe = activeMRGitSafeForWorktree(polecatInfo.ClonePath)
+				gitClean = activeMRGitCleanForWorktree(polecatInfo.ClonePath)
+			}
+			unpushed := 0
+			if gitState != nil {
+				unpushed = gitState.UnpushedCommits
 			}
 			hookSafe, hookTerminal, _ := hookBeadSafeForCleanup(bd, hookBead)
 			activeMRSafe := !activeMRAssessment.Pending
-			if polecat.CanIgnoreStaleCleanupStatus(result.CleanupStatus, beadTerminal || hookTerminal, hookSafe, activeMRSafe, gitSafe) {
+			if polecat.CanIgnoreStaleCleanupStatus(result.CleanupStatus, beadTerminal || hookTerminal, hookSafe, activeMRSafe, gitClean, unpushed) {
 				// OK: stale self-report after terminal source and direct clean git.
 			} else {
 				result.Reasons = append(result.Reasons, cleanupStatusBlocker(result.CleanupStatus))

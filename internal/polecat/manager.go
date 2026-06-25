@@ -2238,7 +2238,8 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 	// Legacy/test polecats can lack agent cleanup metadata. If git proves there is
 	// no local work at risk, treat the missing cleanup_status as clean; otherwise
 	// DecideSlotReuse will continue to fail closed on CleanupUnknown.
-	gitSafe := !input.GitCheckFailed && !input.GitDirty && input.StashCount == 0 && input.UnpushedCommits == 0
+	gitClean := !input.GitCheckFailed && !input.GitDirty && input.StashCount == 0
+	gitSafe := gitClean && input.UnpushedCommits == 0
 	if input.CleanupStatus == CleanupUnknown && gitSafe {
 		input.CleanupStatus = CleanupClean
 	}
@@ -2258,7 +2259,7 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 	input.HasSubmittableWork = hasSubmittableWorkForWorkstate(clonePath)
 	input.AssignedBeadTerminal = m.assignedBeadTerminal(issue)
 	workTerminal := input.AssignedBeadTerminal || sourceTerminal || hookTerminal
-	if CanIgnoreStaleCleanupStatus(input.CleanupStatus, workTerminal, hookSafe, activeMRSafe, gitSafe) {
+	if CanIgnoreStaleCleanupStatus(input.CleanupStatus, workTerminal, hookSafe, activeMRSafe, gitClean, input.UnpushedCommits) {
 		input.IgnoreCleanupStatus = true
 	}
 	input.MQNotRequired = m.mqNotRequiredSource(issue)

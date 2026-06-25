@@ -1164,8 +1164,12 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			if input.CleanupStatus == polecat.CleanupUnpushed {
 				loadGitState()
 			}
-			gitSafe := activeMRGitSafeForWorktree(p.ClonePath)
-			if polecat.CanIgnoreStaleCleanupStatus(input.CleanupStatus, workTerminal, hookSafe, !activeMRAssessment.Pending, gitSafe) {
+			gitClean := activeMRGitCleanForWorktree(p.ClonePath)
+			unpushed := 0
+			if gitState != nil {
+				unpushed = gitState.UnpushedCommits
+			}
+			if polecat.CanIgnoreStaleCleanupStatus(input.CleanupStatus, workTerminal, hookSafe, !activeMRAssessment.Pending, gitClean, unpushed) {
 				input.IgnoreCleanupStatus = true
 				status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("ignored_stale_cleanup_status=%s direct_git_state=safe work_ref=terminal", input.CleanupStatus))
 			}
@@ -1369,6 +1373,19 @@ func activeMRGitSafeForWorktree(worktreePath string) bool {
 		return false
 	}
 	return pushed && unpushed == 0
+}
+
+// activeMRGitCleanForWorktree reports whether the worktree has no uncommitted
+// changes and no stashes. Unlike activeMRGitSafeForWorktree, it intentionally
+// ignores unpushed commits because callers use BranchPreservationStatus to
+// distinguish stale has_unpushed metadata from real unpreserved work.
+func activeMRGitCleanForWorktree(worktreePath string) bool {
+	g := git.NewGit(worktreePath)
+	status, err := g.CheckUncommittedWork()
+	if err != nil {
+		return false
+	}
+	return status.CleanExcludingRuntime() && status.StashCount == 0
 }
 
 func hookBeadSafeForCleanup(bd issueShower, hookBead string) (safe bool, terminal bool, blocker string) {
