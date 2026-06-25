@@ -1358,7 +1358,11 @@ func ResolveRoleAgentConfig(role, townRoot, rigPath string) *RuntimeConfig {
 	resolveConfigMu.Lock()
 	defer resolveConfigMu.Unlock()
 	rc := resolveRoleAgentConfigCore(role, townRoot, rigPath)
-	return withRoleSettingsFlag(rc, role, rigPath)
+	rc = withRoleSettingsFlag(rc, role, rigPath)
+	if role == constants.RolePolecat && isClaudeAgent(rc) {
+		rc.Args = NormalizeClaudePermissionMode(rc.Args, "bypassPermissions")
+	}
+	return rc
 }
 
 // tryResolveNamedAgent attempts to resolve a named agent through the custom agent
@@ -2263,6 +2267,13 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 		rc.ExecWrapper = resolveExecWrapper(rigPath)
 	}
 
+	// Polecat sessions must always use Claude's bypass-permissions mode.
+	// Normalizing here ensures every launch path is guarded, including manual
+	// overrides and custom start commands.
+	if role == constants.RolePolecat && isClaudeAgent(rc) {
+		rc.Args = NormalizeClaudePermissionMode(rc.Args, "bypassPermissions")
+	}
+
 	// Copy env vars to avoid mutating caller map
 	resolvedEnv := make(map[string]string, len(envVars)+2)
 	for k, v := range envVars {
@@ -2511,6 +2522,12 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	// non-override ResolveRoleAgentConfig path included it, causing hooks
 	// to silently not fire for polecats launched with --agent.
 	rc = withRoleSettingsFlag(rc, role, rigPath)
+
+	// Polecat sessions must always use Claude's bypass-permissions mode.
+	// Normalizing here ensures explicit --agent overrides cannot regress plan mode.
+	if role == constants.RolePolecat && isClaudeAgent(rc) {
+		rc.Args = NormalizeClaudePermissionMode(rc.Args, "bypassPermissions")
+	}
 
 	// Apply exec wrapper from rig/town settings if not already set on the resolved config.
 	if len(rc.ExecWrapper) == 0 {

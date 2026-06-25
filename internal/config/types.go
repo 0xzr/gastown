@@ -963,6 +963,56 @@ func (rc *RuntimeConfig) BuildCommandWithPrompt(prompt string) string {
 	return base + " " + quoteForShell(p)
 }
 
+// NormalizeClaudePermissionMode returns a copy of Claude command-line args with
+// any existing --permission-mode flag removed and the required mode appended.
+// It is idempotent. Callers should only use this for Claude-compatible runtimes.
+func NormalizeClaudePermissionMode(args []string, required string) []string {
+	if required == "" {
+		return args
+	}
+
+	result := make([]string, 0, len(args)+2)
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--permission-mode" {
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "--permission-mode=") {
+			continue
+		}
+		result = append(result, a)
+	}
+
+	// Append the required mode unless it is already present.
+	for _, a := range result {
+		if a == "--permission-mode" || strings.HasPrefix(a, "--permission-mode=") {
+			return result
+		}
+	}
+	return append(result, "--permission-mode", required)
+}
+
+// ExtractClaudePermissionMode returns the value of the first --permission-mode
+// flag in the argument slice, and true if one was found.
+func ExtractClaudePermissionMode(args []string) (string, bool) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--permission-mode" {
+			if i+1 < len(args) {
+				return args[i+1], true
+			}
+			return "", true
+		}
+		if strings.HasPrefix(a, "--permission-mode=") {
+			return strings.TrimPrefix(a, "--permission-mode="), true
+		}
+	}
+	return "", false
+}
+
 // BuildArgsWithPrompt returns the runtime command and args suitable for exec.
 func (rc *RuntimeConfig) BuildArgsWithPrompt(prompt string) []string {
 	resolved := normalizeRuntimeConfig(rc)

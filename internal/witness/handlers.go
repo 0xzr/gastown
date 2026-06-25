@@ -1617,6 +1617,10 @@ const (
 	// session stayed alive with an open hook and no fresh heartbeat. This catches
 	// the post-submit/pre-exit ghost idle gap from GH#3055.
 	ZombieSubmittedStillRunning ZombieClassification = "submitted-still-running"
+	// ZombiePlanMode: live polecat running Claude in plan mode. Autonomous
+	// polecats must use bypassPermissions; plan mode is a recoverable
+	// misconfiguration that stalls implementation work.
+	ZombiePlanMode ZombieClassification = "plan-mode"
 )
 
 // ImpliesActiveWork returns true if this classification indicates the polecat
@@ -1627,7 +1631,7 @@ func (c ZombieClassification) ImpliesActiveWork() bool {
 	switch c {
 	case ZombieStuckInDone, ZombieAgentDeadInSession, ZombieBeadClosedStillRunning,
 		ZombieDoneIntentDead, ZombieSessionDeadActive, ZombieAgentSelfReportedStuck,
-		ZombieNeverHeartbeated:
+		ZombieNeverHeartbeated, ZombiePlanMode:
 		return true
 	default:
 		return false
@@ -1782,6 +1786,23 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 	return result
 }
 
+// detectPolecatPlanMode inspects the live polecat's process arguments for
+// --permission-mode plan. It only works on Linux where /proc/<pid>/cmdline is
+// available. Returns the mode value and true when plan mode is observed.
+func detectPolecatPlanMode(sessionName string, t *tmux.Tmux) (string, bool) {
+	pid, err := t.GetPanePID(sessionName)
+	if err != nil {
+		return "", false
+	}
+	data, err := os.ReadFile("/proc/" + pid + "/cmdline")
+	if err != nil {
+		return "", false
+	}
+	args := strings.Split(string(data), "\x00")
+	mode, ok := config.ExtractClaudePermissionMode(args)
+	return mode, ok && mode == "plan"
+}
+
 // detectZombieLiveSession checks a polecat with a live tmux session for zombie indicators:
 // stuck done-intent, dead agent process, or closed bead while still running.
 //
@@ -1872,6 +1893,30 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-agent-dead-session-failed: %v", err)
+		}
+		return zombie, true
+	}
+
+	// Plan-mode guard: Claude polecats must run with bypassPermissions.
+	// If a polecat is observed in plan mode, restart it so the next launch
+	// applies the normalized permission mode. This produces a typed receipt
+	// with the exact mode value for Mayor/Witness evidence.
+	if mode, inPlanMode := detectPolecatPlanMode(sessionName, t); inPlanMode {
+		zombie := ZombieResult{
+			PolecatName:    polecatName,
+			AgentState:     snapState,
+			Classification: ZombiePlanMode,
+			HookBead:       snapHook,
+			WasActive:      true,
+			Action:         fmt.Sprintf("restarted-plan-mode-polecat (permission-mode=%s)", mode),
+		}
+		// TOCTOU guard: re-check session liveness before restarting.
+		if alive, _ := t.HasSession(sessionName); !alive {
+			return ZombieResult{}, false
+		}
+		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+			zombie.Error = err
+			zombie.Action = fmt.Sprintf("restart-plan-mode-polecat-failed: %v", err)
 		}
 		return zombie, true
 	}

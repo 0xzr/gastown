@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -5829,5 +5830,122 @@ func TestBuildStartupCommandWithAgentOverrideSetsGTAgentForOpenCode(t *testing.T
 	}
 	if strings.Contains(cmd, "--settings") {
 		t.Errorf("opencode should not get Claude --settings, got: %q", cmd)
+	}
+}
+
+func TestResolveRoleAgentConfig_PolecatPermissionMode(t *testing.T) {
+	// Cannot use t.Parallel — uses t.Setenv
+	binDir := t.TempDir()
+	writeAgentStub(t, binDir, "claude")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	townSettings := NewTownSettings()
+	townSettings.DefaultAgent = "claude"
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	t.Run("polecat without permission mode gets bypassPermissions", func(t *testing.T) {
+		rc := ResolveRoleAgentConfig(constants.RolePolecat, townRoot, rigPath)
+		if !isClaudeCommand(rc.Command) {
+			t.Fatalf("Command = %q, want claude", rc.Command)
+		}
+		mode, ok := ExtractClaudePermissionMode(rc.Args)
+		if !ok || mode != "bypassPermissions" {
+			t.Errorf("permission mode = %q, want bypassPermissions; rc.Args = %v", mode, rc.Args)
+		}
+	})
+
+	t.Run("polecat explicit plan mode is overridden", func(t *testing.T) {
+		rigSettings := NewRigSettings()
+		rigSettings.RoleAgents = map[string]string{
+			constants.RolePolecat: "claude-planner",
+		}
+		rigSettings.Agents = map[string]*RuntimeConfig{
+			"claude-planner": {
+				Command: "claude",
+				Args:    []string{"--permission-mode", "plan", "--model", "sonnet"},
+			},
+		}
+		if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
+			t.Fatalf("SaveRigSettings: %v", err)
+		}
+
+		rc := ResolveRoleAgentConfig(constants.RolePolecat, townRoot, rigPath)
+		if !isClaudeCommand(rc.Command) {
+			t.Fatalf("Command = %q, want claude", rc.Command)
+		}
+		mode, ok := ExtractClaudePermissionMode(rc.Args)
+		if !ok || mode != "bypassPermissions" {
+			t.Errorf("permission mode = %q, want bypassPermissions; rc.Args = %v", mode, rc.Args)
+		}
+		if slices.Contains(rc.Args, "plan") {
+			t.Errorf("plan mode arg still present in rc.Args = %v", rc.Args)
+		}
+	})
+
+	t.Run("non-polecat planner keeps explicit plan mode", func(t *testing.T) {
+		rigSettings := NewRigSettings()
+		rigSettings.RoleAgents = map[string]string{
+			constants.RoleMayor: "claude-planner",
+		}
+		rigSettings.Agents = map[string]*RuntimeConfig{
+			"claude-planner": {
+				Command: "claude",
+				Args:    []string{"--permission-mode", "plan"},
+			},
+		}
+		if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
+			t.Fatalf("SaveRigSettings: %v", err)
+		}
+
+		rc := ResolveRoleAgentConfig(constants.RoleMayor, townRoot, rigPath)
+		mode, ok := ExtractClaudePermissionMode(rc.Args)
+		if !ok || mode != "plan" {
+			t.Errorf("permission mode = %q, want plan; rc.Args = %v", mode, rc.Args)
+		}
+	})
+}
+
+func TestBuildStartupCommandWithAgentOverride_PolecatBlocksPlanMode(t *testing.T) {
+	// Cannot use t.Parallel — uses t.Setenv
+	binDir := t.TempDir()
+	writeAgentStub(t, binDir, "claude")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	rigSettings := NewRigSettings()
+	rigSettings.Agents = map[string]*RuntimeConfig{
+		"claude-planner": {
+			Command: "claude",
+			Args:    []string{"--permission-mode", "plan"},
+		},
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd, err := BuildStartupCommandWithAgentOverride(
+		map[string]string{"GT_ROLE": constants.RolePolecat},
+		rigPath,
+		"[GAS TOWN] test polecat",
+		"claude-planner",
+	)
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
+	}
+	if !strings.Contains(cmd, "--permission-mode bypassPermissions") {
+		t.Errorf("expected --permission-mode bypassPermissions in command, got: %q", cmd)
+	}
+	if strings.Contains(cmd, "--permission-mode plan") {
+		t.Errorf("plan mode survived override normalization: %q", cmd)
 	}
 }

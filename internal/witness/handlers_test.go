@@ -2691,6 +2691,16 @@ func TestZombieSubmittedStillRunning_Classification(t *testing.T) {
 	}
 }
 
+func TestZombiePlanMode_Classification(t *testing.T) {
+	t.Parallel()
+	if ZombiePlanMode != "plan-mode" {
+		t.Errorf("ZombiePlanMode = %q, want %q", ZombiePlanMode, "plan-mode")
+	}
+	if !ZombiePlanMode.ImpliesActiveWork() {
+		t.Error("ZombiePlanMode should imply active work so it is reported as stale/implementable")
+	}
+}
+
 func TestNotifyRefineryMergeReady_EmitsChannelEvent(t *testing.T) {
 	// Create a fake town root with the workspace marker so workspace.Find recognizes it
 	townRoot := t.TempDir()
