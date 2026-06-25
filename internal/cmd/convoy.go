@@ -2197,11 +2197,37 @@ func readConvoyIssues(townBeads string, args ...string) ([]convoyListIssue, erro
 	if err != nil {
 		return nil, err
 	}
+	// bd list --json may return empty output (e.g. no convoys exist) or plain
+	// text like "No issues found." instead of an empty JSON array. Treat those
+	// as "no issues" rather than a fatal parse error, matching the canonical
+	// bd list/query consumers in internal/beads. Without this guard, an empty
+	// result surfaces as "unexpected end of JSON input" and aborts the staging
+	// pipeline before JSON mode can emit its result (see gastown-ydt).
+	if !looksLikeJSON(out) {
+		return nil, nil
+	}
 	var issues []convoyListIssue
 	if err := json.Unmarshal(out, &issues); err != nil {
 		return nil, err
 	}
 	return issues, nil
+}
+
+// looksLikeJSON reports whether b begins (after leading whitespace) with the
+// start of a JSON array or object. It mirrors beads.isJSONBytes so the cmd
+// package can detect empty/non-JSON bd output without importing the helper.
+func looksLikeJSON(b []byte) bool {
+	for _, c := range b {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '[', '{':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 func hasAllLabels(labels, required []string) bool {
