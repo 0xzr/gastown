@@ -1,7 +1,7 @@
 // Package fleet provides town-wide fleet fill primitives: model-mix
 // reconciliation across all active rigs and live lane counting.
 //
-// Background
+// # Background
 //
 // gastown-1l8 surfaced a fleet-fill gap: a configured six-polecat pool with
 // caps (umans-glm=2, umans-kimi=2, m3=2) drifted to 2 GLM / 3 Kimi / 1 M3 and
