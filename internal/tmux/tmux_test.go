@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -2544,4 +2545,109 @@ func TestValidateCommandBinary(t *testing.T) {
 			}
 		})
 	}
+}
+
+// longNamedProcess spawns a binary whose basename exceeds 15 characters and
+// returns its PID and basename. On Linux the kernel truncates the process
+// "comm" to 15 chars (TASK_COMM_LEN), so ps -o comm= and pgrep's reported name
+// are truncated while /proc/PID/cmdline argv[0] retains the full basename.
+// Returns ok=false on non-Linux or if sleep cannot be located. This is the
+// reproduction harness for the false-dead regression (gastown-wso).
+func longNamedProcess(t *testing.T) (pid int, basename string, ok bool) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return 0, "", false
+	}
+	sleepPath, err := exec.LookPath("sleep")
+	if err != nil {
+		return 0, "", false
+	}
+	// 23 chars: longer than the 15-char comm limit.
+	basename = "gt-wso-runner-binary"
+	binPath := filepath.Join(t.TempDir(), basename)
+	if err := copyFile(sleepPath, binPath); err != nil {
+		return 0, "", false
+	}
+	cmd := exec.Command(binPath, "30")
+	if err := cmd.Start(); err != nil {
+		return 0, "", false
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	// Give the process a moment to be visible to ps/procfs.
+	time.Sleep(150 * time.Millisecond)
+	return cmd.Process.Pid, basename, true
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, in, 0o755)
+}
+
+// TestProcessMatchesNames_LongBinaryCmdlineFallback ensures a process whose
+// configured name is longer than the 15-char comm limit is still matched via the
+// /proc/PID/cmdline argv[0] fallback. Without this fallback, CheckSessionHealth
+// would report a live agent as AgentDead (false-dead, gastown-wso).
+func TestProcessMatchesNames_LongBinaryCmdlineFallback(t *testing.T) {
+	pid, name, ok := longNamedProcess(t)
+	if !ok {
+		t.Skip("long-named binary reproduction requires Linux + sleep")
+	}
+	pidStr := fmt.Sprintf("%d", pid)
+
+	// Sanity: confirm the truncation premise actually holds on this kernel.
+	// If comm is NOT truncated, the fallback is unnecessary here but must still
+	// not cause a false negative.
+	comm := commName(t, pidStr)
+	if comm == name {
+		t.Logf("note: comm %q is untruncated on this kernel; fallback still exercises the happy path", comm)
+	} else if comm == name[:15] {
+		t.Logf("confirmed 15-char truncation: comm=%q, full=%q", comm, name)
+	} else {
+		t.Logf("comm=%q full=%q (unexpected, but proceeding)", comm, name)
+	}
+
+	if !processMatchesNames(pidStr, []string{name}) {
+		t.Errorf("processMatchesNames failed to match long-named binary %q via cmdline fallback (comm=%q)", name, comm)
+	}
+	// A name that does not correspond to the process must still not match.
+	if processMatchesNames(pidStr, []string{"not-the-real-binary"}) {
+		t.Error("processMatchesNames should not match an unrelated name")
+	}
+}
+
+// TestCmdlineBaseName_LongBinary verifies the untruncated argv[0] basename is
+// returned for a long-named process, and that the helper degrades gracefully on
+// bad/missing PIDs and non-Linux platforms.
+func TestCmdlineBaseName_LongBinary(t *testing.T) {
+	pid, name, ok := longNamedProcess(t)
+	if !ok {
+		t.Skip("long-named binary reproduction requires Linux + sleep")
+	}
+	got := cmdlineBaseName(fmt.Sprintf("%d", pid))
+	if got != name {
+		t.Errorf("cmdlineBaseName = %q, want %q", got, name)
+	}
+
+	// Degraded inputs must return "" rather than panic or false-match.
+	for _, bad := range []string{"", "0", "999999999"} {
+		if g := cmdlineBaseName(bad); g != "" {
+			t.Errorf("cmdlineBaseName(%q) = %q, want empty", bad, g)
+		}
+	}
+}
+
+// commName returns the ps -o comm= value for a PID (the 15-char-truncated name).
+func commName(t *testing.T, pid string) string {
+	t.Helper()
+	out, err := exec.Command("ps", "-p", pid, "-o", "comm=").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }

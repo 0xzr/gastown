@@ -2347,6 +2347,14 @@ func (t *Tmux) CheckSessionHealth(session string, maxInactivity time.Duration) Z
 // processMatchesNames checks if a process's binary name matches any of the given names.
 // Uses ps to get the actual command name from the process's executable path.
 // This handles cases where argv[0] is modified (e.g., Claude showing version "2.1.30").
+//
+// On Linux the kernel truncates the process "comm" name (ps -o comm=, /proc/PID/comm,
+// and pgrep's reported name) to 15 characters (TASK_COMM_LEN). A binary whose name is
+// longer than 15 chars therefore NEVER matches its configured ProcessName via comm alone,
+// which makes CheckSessionHealth report a live agent as AgentDead — a false-dead result
+// (gastown-wso). As a fallback we read /proc/PID/cmdline, whose argv[0] is untruncated,
+// and compare its basename. /proc is Linux-only; on other platforms comm remains the
+// sole signal.
 func processMatchesNames(pid string, names []string) bool {
 	if len(names) == 0 {
 		return false
@@ -2367,7 +2375,39 @@ func processMatchesNames(pid string, names []string) bool {
 			return true
 		}
 	}
+	// Fallback: match against the untruncated argv[0] from /proc/PID/cmdline.
+	// This catches binaries whose comm is 15-char truncated (e.g. "cursor-agent-ru"
+	// for "cursor-agent-runner") so a live agent is not falsely reported dead.
+	if name := cmdlineBaseName(pid); name != "" {
+		for _, n := range names {
+			if name == n {
+				return true
+			}
+		}
+	}
 	return false
+}
+
+// cmdlineBaseName reads /proc/PID/cmdline on Linux and returns the basename of
+// argv[0] (the executable path as the process was invoked), untruncated. Returns
+// "" on any error or on non-Linux platforms where /proc is unavailable. NUL-safe:
+// /proc/PID/cmdline is a NUL-separated argv with a trailing NUL.
+func cmdlineBaseName(pid string) string {
+	if runtime.GOOS != "linux" || pid == "" {
+		return ""
+	}
+	data, err := os.ReadFile("/proc/" + pid + "/cmdline")
+	if err != nil {
+		return ""
+	}
+	// argv[0] is everything up to the first NUL byte.
+	if i := bytes.IndexByte(data, 0); i >= 0 {
+		data = data[:i]
+	}
+	if len(data) == 0 {
+		return ""
+	}
+	return filepath.Base(string(data))
 }
 
 // hasDescendantWithNames checks if a process has any descendant (child, grandchild, etc.)
@@ -2415,6 +2455,13 @@ func hasDescendantWithNamesPosix(pid string, names []string, depth int) bool {
 			childName := parts[1]
 			// Direct match
 			if nameSet[childName] {
+				return true
+			}
+			// Fallback: pgrep's reported name is 15-char truncated on Linux
+			// (TASK_COMM_LEN), so a long-named agent child (e.g. "cursor-agent-runner")
+			// won't match childName. Re-check via the untruncated argv[0] from
+			// /proc/PID/cmdline before descending (gastown-wso false-dead fix).
+			if name := cmdlineBaseName(childPid); name != "" && nameSet[name] {
 				return true
 			}
 			// Recursive check of descendants
