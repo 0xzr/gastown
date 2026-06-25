@@ -1715,6 +1715,40 @@ func TestBuildAgentStartupCommand_DogUsesClaudeCompatibleRoleAgentOverride(t *te
 	}
 }
 
+func TestBuildAgentStartupCommand_DogUsesRuntimeTmuxProcessNames(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+
+	townSettings := NewTownSettings()
+	townSettings.DefaultAgent = "claude-opus"
+	townSettings.Agents = map[string]*RuntimeConfig{
+		"claude-opus": {
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions", "--model", "opus"},
+		},
+		"umans-flash-dog-wrapper": {
+			Command: "/home/ubuntu/.local/bin/gt-umans-flash-dog",
+			Tmux: &RuntimeTmuxConfig{
+				ProcessNames: []string{"node", "claude", "gt-umans-flash-dog"},
+			},
+		},
+	}
+	townSettings.RoleAgents = map[string]string{
+		"dog": "umans-flash-dog-wrapper",
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	cmd := BuildAgentStartupCommand("dog", "", townRoot, "", "")
+	if !strings.Contains(cmd, "GT_AGENT=umans-flash-dog-wrapper") {
+		t.Fatalf("expected GT_AGENT=umans-flash-dog-wrapper in command, got: %q", cmd)
+	}
+	if !strings.Contains(cmd, "GT_PROCESS_NAMES=node,claude,gt-umans-flash-dog") {
+		t.Fatalf("expected runtime tmux process names in command, got: %q", cmd)
+	}
+}
+
 func TestValidateAgentConfig(t *testing.T) {
 	t.Parallel()
 
@@ -4949,6 +4983,43 @@ func TestBuildStartupCommandWithAgentOverride_SetsGTProcessNames(t *testing.T) {
 	// Should include GT_PROCESS_NAMES with gemini's process names
 	if !strings.Contains(cmd, "GT_PROCESS_NAMES=gemini") {
 		t.Errorf("expected GT_PROCESS_NAMES=gemini in command, got: %q", cmd)
+	}
+}
+
+func TestBuildStartupCommandWithAgentOverride_UsesRuntimeTmuxProcessNames(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	townSettings := NewTownSettings()
+	townSettings.Agents["umans-flash-dog-wrapper"] = &RuntimeConfig{
+		Command: "/home/ubuntu/.local/bin/gt-umans-flash-dog",
+		Tmux: &RuntimeTmuxConfig{
+			ProcessNames: []string{"node", "claude", "gt-umans-flash-dog"},
+		},
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd, err := BuildStartupCommandWithAgentOverride(
+		map[string]string{"GT_ROLE": constants.RoleWitness},
+		rigPath,
+		"",
+		"umans-flash-dog-wrapper",
+	)
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
+	}
+
+	if !strings.Contains(cmd, "GT_AGENT=umans-flash-dog-wrapper") {
+		t.Fatalf("expected GT_AGENT=umans-flash-dog-wrapper in command, got: %q", cmd)
+	}
+	if !strings.Contains(cmd, "GT_PROCESS_NAMES=node,claude,gt-umans-flash-dog") {
+		t.Fatalf("expected runtime tmux process names in command, got: %q", cmd)
 	}
 }
 

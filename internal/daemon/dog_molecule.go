@@ -272,10 +272,16 @@ func parseChildrenJSON(raw string) ([]childInfo, error) {
 		return arr, nil
 	}
 
-	var wrapped map[string][]childInfo
+	var wrapped map[string]json.RawMessage
 	if err := json.Unmarshal(data, &wrapped); err == nil {
-		for _, children := range wrapped {
-			return children, nil
+		for key, rawChildren := range wrapped {
+			if key == "schema_version" {
+				continue
+			}
+			var children []childInfo
+			if err := json.Unmarshal(rawChildren, &children); err == nil {
+				return children, nil
+			}
 		}
 		return nil, nil
 	}

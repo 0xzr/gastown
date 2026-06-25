@@ -2226,6 +2226,16 @@ func ExtractSimpleRole(gtRole string) string {
 	}
 }
 
+func RuntimeProcessNames(rc *RuntimeConfig, agentName string) []string {
+	if rc != nil && rc.Tmux != nil && len(rc.Tmux.ProcessNames) > 0 {
+		return append([]string(nil), rc.Tmux.ProcessNames...)
+	}
+	if rc == nil {
+		return ResolveProcessNames(agentName, "")
+	}
+	return ResolveProcessNames(agentName, rc.Command, rc.Args...)
+}
+
 // BuildStartupCommand builds a full startup command with environment exports.
 // envVars is a map of environment variable names to values.
 // rigPath is optional - if empty, uses envVars["GT_ROOT"] to find town root,
@@ -2312,8 +2322,8 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 	// Set GT_PROCESS_NAMES for accurate liveness detection. Custom agents may
 	// shadow built-in preset names (e.g., custom "codex" running "opencode"),
 	// or wrap the real binary with a launcher (e.g., `env -u VAR claude ...`).
-	// Pass rc.Args so wrapper-unwrap can find the real binary.
-	processNames := ResolveProcessNames(rc.ResolvedAgent, rc.Command, rc.Args...)
+	// Runtime tmux process names are authoritative when configured.
+	processNames := RuntimeProcessNames(rc, rc.ResolvedAgent)
 	resolvedEnv["GT_PROCESS_NAMES"] = strings.Join(processNames, ",")
 	// Merge agent-specific env vars (e.g., OPENCODE_PERMISSION for yolo mode)
 	for k, v := range rc.Env {
@@ -2572,9 +2582,8 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 		resolvedEnv["GT_AGENT"] = rc.ResolvedAgent
 	}
 	// Set GT_PROCESS_NAMES for accurate liveness detection of custom agents.
-	// Pass rc.Args so wrapper-unwrap (env/sudo/nohup wrapping a real binary)
-	// can find the real agent binary.
-	processNamesOverride := ResolveProcessNames(agentForProcess, rc.Command, rc.Args...)
+	// Runtime tmux process names are authoritative when configured.
+	processNamesOverride := RuntimeProcessNames(rc, agentForProcess)
 	resolvedEnv["GT_PROCESS_NAMES"] = strings.Join(processNamesOverride, ",")
 	// Merge agent-specific env vars (e.g., OPENCODE_PERMISSION for yolo mode)
 	for k, v := range rc.Env {
