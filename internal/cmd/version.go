@@ -93,6 +93,13 @@ func resolveBranch() string {
 		return Branch
 	}
 
+	// Pinned runtime binaries intentionally report only the pinned commit, so
+	// skip build-info/runtime branch discovery that would leak the build or
+	// current working-tree branch into the version line.
+	if Build == "pinned" {
+		return ""
+	}
+
 	// Try to get branch from build info (build-time VCS detection)
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, setting := range info.Settings {
