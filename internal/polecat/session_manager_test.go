@@ -1,6 +1,7 @@
 package polecat
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -361,7 +362,10 @@ func TestEnsureCanonicalSessionBranch_UsesOriginDefaultBranch(t *testing.T) {
 	}
 
 	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
-	branch := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
+	branch, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
+	if err != nil {
+		t.Fatalf("ensureCanonicalSessionBranch: %v", err)
+	}
 	if !strings.Contains(branch, "/gt-9qb@") {
 		t.Fatalf("fresh session branch = %q, want issue-scoped branch", branch)
 	}
@@ -392,7 +396,10 @@ func TestEnsureCanonicalSessionBranch_KeepsCurrentIssueBranch(t *testing.T) {
 	}
 
 	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
-	branch := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
+	branch, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
+	if err != nil {
+		t.Fatalf("ensureCanonicalSessionBranch: %v", err)
+	}
 	if branch != currentBranch {
 		t.Fatalf("ensureCanonicalSessionBranch changed active issue branch: got %q want %q", branch, currentBranch)
 	}
@@ -964,5 +971,135 @@ func TestShouldCreateFreshSessionBranch_Structural(t *testing.T) {
 					c.currentBranch, c.issue, c.canonicalBranch, got, c.want)
 			}
 		})
+	}
+}
+
+func TestEnsureCanonicalSessionBranch_QuarantinesAbandonedWIP(t *testing.T) {
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+
+	// Create an old WIP branch for a different issue with local commits.
+	oldBranch := "polecat/toast/gt-old@seed"
+	if err := repoGit.CheckoutNewBranch(oldBranch, "main"); err != nil {
+		t.Fatalf("checkout old WIP branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "abandoned.txt"), []byte("abandoned\n"), 0644); err != nil {
+		t.Fatalf("write abandoned.txt: %v", err)
+	}
+	if err := repoGit.Add("abandoned.txt"); err != nil {
+		t.Fatalf("git add abandoned.txt: %v", err)
+	}
+	if err := repoGit.Commit("abandoned WIP commit"); err != nil {
+		t.Fatalf("git commit abandoned.txt: %v", err)
+	}
+	tipSHA, err := repoGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("resolve abandoned tip: %v", err)
+	}
+
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	branch, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-new"})
+	if err != nil {
+		t.Fatalf("ensureCanonicalSessionBranch: %v", err)
+	}
+	if !strings.Contains(branch, "/gt-new@") {
+		t.Fatalf("fresh session branch = %q, want issue-scoped branch for gt-new", branch)
+	}
+
+	// The new branch must descend from origin/main, not the abandoned tip.
+	mainSHA, err := repoGit.Rev("origin/main")
+	if err != nil {
+		t.Fatalf("resolve origin/main: %v", err)
+	}
+	isAncestor, err := repoGit.IsAncestor(mainSHA, branch)
+	if err != nil {
+		t.Fatalf("check new branch ancestry: %v", err)
+	}
+	if !isAncestor {
+		t.Fatalf("fresh branch %q should descend from origin/main", branch)
+	}
+	abandonedAncestor, err := repoGit.IsAncestor(tipSHA, branch)
+	if err != nil {
+		t.Fatalf("check abandoned ancestry: %v", err)
+	}
+	if abandonedAncestor {
+		t.Fatalf("fresh branch %q unexpectedly includes abandoned commit %s", branch, tipSHA)
+	}
+
+	// A quarantine ref must exist and point at the abandoned tip.
+	refs, err := repoGit.ListRefs("refs/quarantine/polecat/gastown/toast/*")
+	if err != nil {
+		t.Fatalf("list quarantine refs: %v", err)
+	}
+	if len(refs) == 0 {
+		t.Fatalf("expected a quarantine ref for the abandoned branch, found none")
+	}
+	quarantineRef := refs[0]
+	quarantineSHA, err := repoGit.Rev(quarantineRef)
+	if err != nil {
+		t.Fatalf("resolve quarantine ref %q: %v", quarantineRef, err)
+	}
+	if quarantineSHA != tipSHA {
+		t.Fatalf("quarantine ref %q = %s, want %s", quarantineRef, quarantineSHA, tipSHA)
+	}
+}
+
+func TestEnsureCanonicalSessionBranch_RejectsContaminatedNoAssignment(t *testing.T) {
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+
+	// A polecat branch with local commits but no assignment should be rejected.
+	oldBranch := "polecat/toast/gt-old@seed"
+	if err := repoGit.CheckoutNewBranch(oldBranch, "main"); err != nil {
+		t.Fatalf("checkout old WIP branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "abandoned.txt"), []byte("abandoned\n"), 0644); err != nil {
+		t.Fatalf("write abandoned.txt: %v", err)
+	}
+	if err := repoGit.Add("abandoned.txt"); err != nil {
+		t.Fatalf("git add abandoned.txt: %v", err)
+	}
+	if err := repoGit.Commit("abandoned WIP commit"); err != nil {
+		t.Fatalf("git commit abandoned.txt: %v", err)
+	}
+
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	_, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{})
+	if !errors.Is(err, ErrBranchContaminatedNoAssignment) {
+		t.Fatalf("expected ErrBranchContaminatedNoAssignment, got: %v", err)
+	}
+}
+
+func TestEnsureCanonicalSessionBranch_PreservesSameIssueWithCommits(t *testing.T) {
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+
+	currentBranch := "polecat/toast/gt-9qb@seed"
+	if err := repoGit.CheckoutNewBranch(currentBranch, "main"); err != nil {
+		t.Fatalf("checkout current issue branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "progress.txt"), []byte("progress\n"), 0644); err != nil {
+		t.Fatalf("write progress.txt: %v", err)
+	}
+	if err := repoGit.Add("progress.txt"); err != nil {
+		t.Fatalf("git add progress.txt: %v", err)
+	}
+	if err := repoGit.Commit("progress commit"); err != nil {
+		t.Fatalf("git commit progress.txt: %v", err)
+	}
+
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	branch, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
+	if err != nil {
+		t.Fatalf("ensureCanonicalSessionBranch: %v", err)
+	}
+	if branch != currentBranch {
+		t.Fatalf("same-issue branch changed: got %q want %q", branch, currentBranch)
+	}
+
+	// No quarantine ref should have been created.
+	refs, err := repoGit.ListRefs("refs/quarantine/*")
+	if err != nil {
+		t.Fatalf("list quarantine refs: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("unexpected quarantine refs: %v", refs)
 	}
 }

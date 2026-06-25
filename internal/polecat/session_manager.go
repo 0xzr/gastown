@@ -35,9 +35,11 @@ func debugSession(context string, err error) {
 
 // Session errors
 var (
-	ErrSessionRunning  = errors.New("session already running")
-	ErrSessionNotFound = errors.New("session not found")
-	ErrIssueInvalid    = errors.New("issue not found or tombstoned")
+	ErrSessionRunning                 = errors.New("session already running")
+	ErrSessionNotFound                = errors.New("session not found")
+	ErrIssueInvalid                   = errors.New("issue not found or tombstoned")
+	ErrNoAssignedHook                 = errors.New("no assigned hook for worktree")
+	ErrBranchContaminatedNoAssignment = errors.New("branch has abandoned commits and no hook assignment")
 )
 
 // SessionManager handles polecat session lifecycle.
@@ -265,20 +267,106 @@ func shouldCreateFreshSessionBranch(currentBranch, issue, canonicalBranch string
 	return issue != "" && meta.ok
 }
 
-func (m *SessionManager) ensureCanonicalSessionBranch(g *git.Git, polecat string, opts SessionStartOptions) string {
+// sanitizeRefComponent replaces characters that are awkward in git ref names
+// with safe substitutes. Git ref names disallow sequences like "..", "@{",
+// control characters, and leading/trailing ".". We conservatively map the
+// common punctuation found in polecat branch names.
+func sanitizeRefComponent(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '/':
+			b.WriteByte('-')
+		case '@':
+			b.WriteString("_at_")
+		case '.':
+			b.WriteByte('_')
+		case '~', '^', ':', ' ', '\\', '*', '?', '[', ']':
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return strings.Trim(b.String(), "-_")
+}
+
+// ensureCanonicalSessionBranch makes sure a polecat session starts on a safe,
+// clean branch. It preserves same-issue branches, quarantines abandoned WIP
+// branches that have commits not reachable from the canonical base, and
+// rejects contaminated branches when there is no hook assignment (hq-bhoz).
+func (m *SessionManager) ensureCanonicalSessionBranch(g *git.Git, polecat string, opts SessionStartOptions) (string, error) {
 	currentBranch, err := g.CurrentBranch()
 	if err != nil {
-		return ""
+		return "", err
 	}
 
 	startPoint := m.canonicalSessionStartPoint(g)
 	if startPoint == "" {
 		debugSession("canonical session start point unresolved", fmt.Errorf("no default branch in rig config or remote"))
-		return currentBranch
+		return currentBranch, nil
 	}
 	canonicalBranch := strings.TrimPrefix(startPoint, "origin/")
-	if !shouldCreateFreshSessionBranch(currentBranch, opts.Issue, canonicalBranch) {
-		return currentBranch
+
+	// Determine the effective issue for this session. Explicit --issue wins,
+	// otherwise use the bead currently hooked to the polecat's agent bead.
+	// This ensures restart/session-start paths respect the durable assignment
+	// even when the caller does not pass an issue.
+	effectiveIssue := strings.TrimSpace(opts.Issue)
+	if effectiveIssue == "" {
+		effectiveIssue = strings.TrimSpace(m.readHookBead(polecat))
+	}
+
+	meta := parseFreshBranchName(currentBranch)
+
+	// Measure whether the current branch has commits not reachable from the
+	// canonical base. These are abandoned WIP commits if no owning bead
+	// claims the branch.
+	contamination, contamErr := g.CheckBranchContamination(startPoint)
+	if contamErr != nil {
+		debugSession("check branch contamination", contamErr)
+		contamination = git.BranchContamination{}
+	}
+	hasUnpreservedCommits := contamination.Ahead > 0
+
+	// A branch owns the current assignment when it is a polecat branch bound
+	// to the same issue. Same-issue branches preserve their work; other
+	// polecat branches with divergent commits are abandoned WIP.
+	branchOwnsIssue := meta.ok && effectiveIssue != "" && meta.issue == effectiveIssue
+
+	isContaminatedPolecatBranch := meta.ok && hasUnpreservedCommits && !branchOwnsIssue
+
+	if isContaminatedPolecatBranch {
+		// hq-bhoz-style incident: a polecat branch carries abandoned commits
+		// but the session has no assignment. Reject before work begins so the
+		// contamination is surfaced instead of silently inherited.
+		if effectiveIssue == "" {
+			debugSession("contaminated branch with no assignment", fmt.Errorf("%s on %s ahead of %s by %d commit(s)", currentBranch, polecat, startPoint, contamination.Ahead))
+			return "", fmt.Errorf("%w: branch %q has %d commit(s) not reachable from %s and no hook assignment; inspect and quarantine manually",
+				ErrBranchContaminatedNoAssignment, currentBranch, contamination.Ahead, startPoint)
+		}
+
+		// Preserve the abandoned branch tip to a quarantine ref before starting
+		// fresh. This keeps the commits reachable and auditable.
+		tipSHA, err := g.Rev("HEAD")
+		if err != nil {
+			return "", fmt.Errorf("resolving %s tip for quarantine: %w", currentBranch, err)
+		}
+		ts := strconv.FormatInt(time.Now().UnixMilli(), 36)
+		component := sanitizeRefComponent(currentBranch)
+		if component == "" {
+			component = "unknown"
+		}
+		quarantineRef := fmt.Sprintf("refs/quarantine/polecat/%s/%s/%s-%s", m.rig.Name, polecat, component, ts)
+		if err := g.CreateRef(quarantineRef, tipSHA); err != nil {
+			return "", fmt.Errorf("quarantining %s tip (%s) to %s: %w", currentBranch, tipSHA, quarantineRef, err)
+		}
+		fmt.Fprintf(os.Stderr, "[polecat] quarantined abandoned branch %s (%s) to %s\n", currentBranch, tipSHA, quarantineRef)
+		// After quarantine we must start from a clean base, so force a fresh
+		// branch regardless of the normal same-branch reuse rules.
+	}
+
+	if !isContaminatedPolecatBranch && !shouldCreateFreshSessionBranch(currentBranch, effectiveIssue, canonicalBranch) {
+		return currentBranch, nil
 	}
 
 	// Refresh origin refs before branching so recovered sessions start from the
@@ -290,20 +378,20 @@ func (m *SessionManager) ensureCanonicalSessionBranch(g *git.Git, polecat string
 	exists, err := g.RefExists(startPoint)
 	if err != nil {
 		debugSession("check canonical session start point", err)
-		return currentBranch
+		return currentBranch, nil
 	}
 	if !exists {
 		debugSession("missing canonical session start point", fmt.Errorf("%s", startPoint))
-		return currentBranch
+		return currentBranch, nil
 	}
 
-	newBranch := m.freshBranchName(polecat, opts.Issue)
+	newBranch := m.freshBranchName(polecat, effectiveIssue)
 	if err := g.CheckoutNewBranch(newBranch, startPoint); err != nil {
 		debugSession("auto-checkout fresh branch on canonical base", err)
-		return currentBranch
+		return currentBranch, err
 	}
 
-	return newBranch
+	return newBranch, nil
 }
 
 // hasPolecat checks if the polecat exists in this rig.
@@ -369,6 +457,20 @@ func (m *SessionManager) persistAssignedAgent(polecat, agent string) {
 	if err := bd.UpdateAgentAssignedAgent(agentID, agent); err != nil {
 		debugSession(fmt.Sprintf("persist assigned_agent=%s for %s", agent, polecat), err)
 	}
+}
+
+// readHookBead returns the bead ID currently hooked to this polecat, as stored
+// in the polecat's agent bead. It mirrors readPersistedAssignedAgent: best-
+// effort and non-fatal, because session start must degrade gracefully when
+// beads is temporarily unavailable.
+func (m *SessionManager) readHookBead(polecat string) string {
+	agentID := m.agentBeadIDForSession(polecat)
+	bd := beads.New(m.rig.Path).ForAgentBead()
+	_, fields, err := bd.GetAgentBead(agentID)
+	if err != nil || fields == nil {
+		return ""
+	}
+	return strings.TrimSpace(fields.HookBead)
 }
 
 // Start creates and starts a new session for a polecat.
@@ -525,7 +627,11 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// working directory.
 	polecatGitBranch := ""
 	if g := git.NewGit(workDir); g != nil {
-		polecatGitBranch = m.ensureCanonicalSessionBranch(g, polecat, opts)
+		branch, err := m.ensureCanonicalSessionBranch(g, polecat, opts)
+		if err != nil {
+			return fmt.Errorf("branch hygiene check failed: %w", err)
+		}
+		polecatGitBranch = branch
 	}
 	// Generate the GASTA run ID — the root identifier for all telemetry emitted
 	// by this polecat session and its subprocesses (bd, mail, …).

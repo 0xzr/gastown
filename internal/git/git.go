@@ -2109,6 +2109,24 @@ func (g *Git) ListBranches(pattern string) ([]string, error) {
 	return strings.Split(out, "\n"), nil
 }
 
+// ListRefs returns local refs matching the given refname pattern.
+// Pattern is passed to `git for-each-ref` (e.g., "refs/quarantine/polecat/*").
+// Returns fully qualified refnames.
+func (g *Git) ListRefs(pattern string) ([]string, error) {
+	args := []string{"for-each-ref", "--format=%(refname)"}
+	if pattern != "" {
+		args = append(args, pattern)
+	}
+	out, err := g.run(args...)
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(out, "\n"), nil
+}
+
 // ResetBranch force-updates a branch to point to a ref.
 // This is useful for resetting stale polecat branches to main.
 // NOTE: This uses `git branch -f` which fails on the currently checked-out branch.
@@ -2129,6 +2147,20 @@ func (g *Git) ResetHard(ref string) error {
 // Excludes .runtime/ to preserve agent lock files and session state.
 func (g *Git) CleanForce() error {
 	_, err := g.run("clean", "-fd", "--exclude=.runtime")
+	return err
+}
+
+// CreateRef creates or forcibly updates a ref to point at the given target.
+// The name may be fully qualified (refs/heads/...) or short (quarantine/...),
+// in which case it is prefixed with "refs/". This is used to preserve a branch
+// tip without checking it out, for example when quarantining an abandoned WIP
+// branch before starting fresh work.
+func (g *Git) CreateRef(name, target string) error {
+	fullRef := name
+	if !strings.HasPrefix(name, "refs/") {
+		fullRef = "refs/" + name
+	}
+	_, err := g.run("update-ref", fullRef, target)
 	return err
 }
 
