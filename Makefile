@@ -14,12 +14,24 @@ E2E_RUN_RETRIES ?= 1
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+BUILD ?= dev
+PINNED_RUNTIME_LINE ?=
+# Feature flags list hardening fixes present in this binary. Empty by default;
+# cutover builds set it explicitly (e.g. FEATURE_FLAGS=rework-deferred-throttle,...).
+FEATURE_FLAGS ?=
 
 LDFLAGS := -s -w \
            -X github.com/steveyegge/gastown/internal/cmd.Version=$(VERSION) \
            -X github.com/steveyegge/gastown/internal/cmd.Commit=$(COMMIT) \
            -X github.com/steveyegge/gastown/internal/cmd.BuildTime=$(BUILD_TIME) \
-           -X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1
+           -X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1 \
+           -X github.com/steveyegge/gastown/internal/cmd.Build=$(BUILD)
+ifneq ($(PINNED_RUNTIME_LINE),)
+LDFLAGS += -X github.com/steveyegge/gastown/internal/version.PinnedRuntimeLine=$(PINNED_RUNTIME_LINE)
+endif
+ifneq ($(FEATURE_FLAGS),)
+LDFLAGS += -X github.com/steveyegge/gastown/internal/version.FeatureFlags=$(FEATURE_FLAGS)
+endif
 
 # ICU4C detection for macOS (required by go-icu-regex transitive dependency).
 # Homebrew installs icu4c as a keg-only package, so headers/libs aren't on the
