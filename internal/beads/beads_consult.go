@@ -199,6 +199,16 @@ func nullify(s string) string {
 
 // CreateConsultBead creates a new consult bead. The bead is labeled
 // gt:consult and carries a "trigger:<class>" label for filtering.
+//
+// The bead is a DURABLE task, not an ephemeral wisp. A consult packet is the
+// audit record of a Mayor -> Codex/Opus decision: it must survive unanswered
+// until the consulted model responds and the Mayor closes it. Ephemeral wisps
+// are routed to the wisps table and swept by the reaper (default 24h max-age),
+// which would silently close an unanswered consult before a response arrives.
+// It is also NOT filed with --wisp-type: "consult" is not a valid wisp type
+// (only heartbeat/ping/patrol/gc_report/recovery/error/escalation are), so a
+// --wisp-type=consult flag is rejected by `bd create` and the packet is never
+// filed at all. Both flags are therefore omitted.
 func (b *Beads) CreateConsultBead(title string, fields *ConsultFields) (string, error) {
 	if IsFlagLikeTitle(title) {
 		return "", fmt.Errorf("%w (got %q)", ErrFlagTitle, title)
@@ -214,8 +224,6 @@ func (b *Beads) CreateConsultBead(title string, fields *ConsultFields) (string, 
 		"--title=" + title,
 		"--body-file=-",
 		"--type=task",
-		"--ephemeral",
-		"--wisp-type=consult",
 		"--labels=gt:consult",
 	}
 	if fields.Request.TriggerClass != "" {
@@ -280,6 +288,11 @@ func (b *Beads) GetConsultBead(id string) (*Issue, *consult.Request, *consult.Re
 // RecordConsultAnswer updates a consult bead with the response from the
 // consulted model. It does not close the bead; the Mayor closes it
 // separately with CloseConsultBead.
+//
+// State guard: a consult that is already closed cannot be re-answered. Closing
+// is terminal; allowing a closed bead to flip back to "answered" would
+// resurrect a finalized decision and corrupt the audit trail. Answering an
+// already-answered bead (idempotent re-record from the same model) is allowed.
 func (b *Beads) RecordConsultAnswer(id string, resp *consult.Response) error {
 	if resp == nil {
 		return errors.New("consult: nil response")
@@ -295,6 +308,9 @@ func (b *Beads) RecordConsultAnswer(id string, resp *consult.Response) error {
 		return ErrNotFound
 	}
 	_, fields := ParseConsultFields(issue.Description)
+	if fields.State == consult.StateClosed {
+		return fmt.Errorf("consult %s: cannot record answer on a closed consult", id)
+	}
 	fields.State = consult.StateAnswered
 	fields.DecidedBy = resp.DecidedBy
 	fields.DecidedAt = resp.DecidedAt
@@ -313,6 +329,11 @@ func (b *Beads) RecordConsultAnswer(id string, resp *consult.Response) error {
 // metadata into the description. The resp argument is optional — when the
 // bead has not been answered, the close metadata is recorded without
 // decision fields.
+//
+// State guard: closing is terminal. A consult that is already closed cannot be
+// re-closed (re-closing would overwrite the original closer/reason and, via
+// the mirrored note, append a second close record to the source bead). An
+// open or answered consult may be closed.
 func (b *Beads) CloseConsultBead(id, closedBy, closedReason string, resp *consult.Response) error {
 	issue, err := b.GetConsultBeadIssue(id)
 	if err != nil {
@@ -322,6 +343,9 @@ func (b *Beads) CloseConsultBead(id, closedBy, closedReason string, resp *consul
 		return ErrNotFound
 	}
 	_, fields := ParseConsultFields(issue.Description)
+	if fields.State == consult.StateClosed {
+		return fmt.Errorf("consult %s: already closed", id)
+	}
 	fields.State = consult.StateClosed
 	fields.ClosedBy = closedBy
 	fields.ClosedReason = closedReason
@@ -376,20 +400,25 @@ func (b *Beads) MirrorConsultResultOnSource(relatedBead string, resp *consult.Re
 	return b.appendNotesToBead(relatedBead, note)
 }
 
-// appendNotesToBead appends newLine to the source bead via `bd update --notes=`.
-// The bd CLI's --notes flag appends a note line (rather than replacing the
-// notes field), which preserves any prior audit trail on the source bead.
+// appendNotesToBead appends newLine to the source bead via
+// `bd update --append-notes=`. The bd CLI has two distinct flags:
+//   - --notes= REPLACES the notes field entirely (data loss)
+//   - --append-notes= concatenates with a newline separator (append-only)
 //
-// We use the CLI subprocess path (b.runWithStdin / b.run) rather than the
-// in-process store because UpdateOptions does not currently expose a Notes
-// field — and going through bd update --notes= keeps the mirror semantics
-// identical to other append-only audit notes (see ReleaseWithReason).
+// A consult decision mirrored onto its related source bead must NOT overwrite
+// that bead's existing notes, so --append-notes is required. (The prior
+// implementation used --notes=, which erased the source bead's audit trail.)
+//
+// The target is resolved via forIssueID so a cross-rig related_bead (e.g. an
+// hq-* bead mirrored from a rig consult) is written to the correct database
+// instead of the consult's own rig database.
 func (b *Beads) appendNotesToBead(beadID, newLine string) error {
 	if strings.TrimSpace(beadID) == "" || strings.TrimSpace(newLine) == "" {
 		return nil
 	}
-	args := []string{"update", beadID, "--notes=" + newLine}
-	if _, err := b.run(args...); err != nil {
+	args := []string{"update", beadID, "--append-notes=" + newLine}
+	target := b.forIssueID(beadID)
+	if _, err := target.run(args...); err != nil {
 		return fmt.Errorf("updating source bead %s: %w", beadID, err)
 	}
 	return nil

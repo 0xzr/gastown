@@ -1,6 +1,8 @@
 package beads
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -208,5 +210,269 @@ func TestNullify(t *testing.T) {
 	}
 	if nullify("x") != "x" {
 		t.Errorf(`nullify("x") = %q, want "x"`, nullify("x"))
+	}
+}
+
+// stubBdForConsult writes each bd arg on its own line to argsPath, captures
+// stdin to stdinPath, and emits a minimal valid issue JSON so unmarshal
+// succeeds. It also honors a "show" subcommand by echoing a canned consult
+// bead description so the state-guard tests can drive RecordConsultAnswer /
+// CloseConsultBead without a real Dolt.
+func stubBdForConsult(t *testing.T, argsPath, stdinPath string, showDescription string) {
+	t.Helper()
+	stubScript := `#!/bin/sh
+for a in "$@"; do
+  printf '%s\n' "$a" >> "` + argsPath + `"
+done
+cat > "` + stdinPath + `"
+is_show=0
+for a in "$@"; do
+  if [ "$a" = "show" ]; then is_show=1; fi
+done
+if [ "$is_show" = "1" ]; then
+  printf '%s\n' '[{"id":"gt-stub","title":"q","status":"open","priority":2,"type":"task","labels":["gt:consult"],"description":` + jsonQuote(showDescription) + `}]'
+else
+  echo '{"id":"gt-stub","title":"q","status":"open","priority":2,"type":"task","labels":["gt:consult"]}'
+fi
+exit 0
+`
+	stubDir := t.TempDir()
+	stubPath := filepath.Join(stubDir, "bd")
+	if err := os.WriteFile(stubPath, []byte(stubScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ResetBdAllowStaleCacheForTest()
+}
+
+// jsonQuote renders a Go string as a JSON string literal body (with surrounding
+// double quotes) so it can be embedded in the stub script's echo'd JSON.
+func jsonQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// TestCreateConsultBead_NotEphemeralNoWispType is the regression test for
+// gastown-cet.6.4 CRITICAL #1 and MAJOR #5: CreateConsultBead previously
+// passed `--wisp-type=consult` (rejected by `bd create` because "consult" is
+// not a valid wisp type, so the packet was never filed) and `--ephemeral`
+// (which routes the bead to the wisps table, where the reaper silently closes
+// open wisps past 24h — deleting an unanswered consult before the model
+// responds). Both flags must be absent so the consult lands as a durable task.
+func TestCreateConsultBead_NotEphemeralNoWispType(t *testing.T) {
+	argsPath := filepath.Join(t.TempDir(), "args.txt")
+	stdinPath := filepath.Join(t.TempDir(), "stdin.txt")
+	stubBdForConsult(t, argsPath, stdinPath, "")
+
+	b := New(t.TempDir())
+	fields := &ConsultFields{
+		Request: &consult.Request{
+			Question:       "Allow MR?",
+			TriggerClass:   consult.TriggerMergePolicy,
+			RequestedModel: consult.ModelOpus,
+			AskedBy:        "mayor",
+			AskedAt:        "2026-06-25T00:00:00Z",
+		},
+		State: consult.StateOpen,
+	}
+	if _, err := b.CreateConsultBead("Allow MR?", fields); err != nil {
+		t.Fatalf("CreateConsultBead: %v", err)
+	}
+
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read stub args: %v", err)
+	}
+	args := string(argsData)
+
+	if strings.Contains(args, "--ephemeral") {
+		t.Errorf("consult bead must NOT be ephemeral (reaper would close unanswered consults), got:\n%s", args)
+	}
+	if strings.Contains(args, "--wisp-type") {
+		t.Errorf("consult bead must NOT pass --wisp-type (consult is not a valid wisp type and bd create rejects it), got:\n%s", args)
+	}
+	if !strings.Contains(args, "--type=task") {
+		t.Errorf("consult bead must be a durable task, expected --type=task, got:\n%s", args)
+	}
+	if !strings.Contains(args, "--labels=gt:consult") {
+		t.Errorf("expected --labels=gt:consult, got:\n%s", args)
+	}
+}
+
+// TestAppendNotesToBead_UsesAppendNotesFlag is the regression test for
+// gastown-cet.6.4 CRITICAL #2: MirrorConsultResultOnSource previously mirrored
+// a consult decision onto the related source bead via `bd update --notes=`,
+// which REPLACES the notes field and erases the source bead's existing audit
+// trail (data loss). It must use `--append-notes=` (concatenate with newline).
+func TestAppendNotesToBead_UsesAppendNotesFlag(t *testing.T) {
+	argsPath := filepath.Join(t.TempDir(), "args.txt")
+	stdinPath := filepath.Join(t.TempDir(), "stdin.txt")
+	stubBdForConsult(t, argsPath, stdinPath, "")
+
+	b := New(t.TempDir())
+	if err := b.appendNotesToBead("gt-src1", "consult_decision: decided=allow"); err != nil {
+		t.Fatalf("appendNotesToBead: %v", err)
+	}
+
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read stub args: %v", err)
+	}
+	args := string(argsData)
+
+	if !strings.Contains(args, "--append-notes=") {
+		t.Errorf("must use --append-notes= (concatenates), got:\n%s", args)
+	}
+	for _, line := range strings.Split(args, "\n") {
+		if strings.HasPrefix(line, "--notes=") {
+			t.Errorf("must NOT use --notes= (replaces notes field, data loss), got %q", line)
+		}
+	}
+	if !strings.Contains(args, "consult_decision:") {
+		t.Errorf("note content missing from args, got:\n%s", args)
+	}
+}
+
+// TestAppendNotesToBead_EmptyInputsNoop verifies the guard clauses skip empty
+// bead IDs and empty note lines (no bd invocation at all).
+func TestAppendNotesToBead_EmptyInputsNoop(t *testing.T) {
+	argsPath := filepath.Join(t.TempDir(), "args.txt")
+	stdinPath := filepath.Join(t.TempDir(), "stdin.txt")
+	stubBdForConsult(t, argsPath, stdinPath, "")
+
+	b := New(t.TempDir())
+	for _, tc := range []struct{ bead, note string }{
+		{"", "note"},
+		{"   ", "note"},
+		{"gt-src1", ""},
+		{"gt-src1", "   "},
+	} {
+		if err := b.appendNotesToBead(tc.bead, tc.note); err != nil {
+			t.Errorf("appendNotesToBead(%q,%q): unexpected error %v", tc.bead, tc.note, err)
+		}
+	}
+	if _, err := os.Stat(argsPath); err == nil {
+		data, _ := os.ReadFile(argsPath)
+		t.Errorf("expected no bd invocation for empty inputs, got args:\n%s", string(data))
+	}
+}
+
+// renderConsultDesc builds a consult bead description in the parsed format
+// for state-guard tests, parameterized by state.
+func renderConsultDesc(state consult.DecisionState) string {
+	fields := &ConsultFields{
+		Request: &consult.Request{
+			Question:       "Allow MR?",
+			TriggerClass:   consult.TriggerMergePolicy,
+			RequestedModel: consult.ModelOpus,
+			AskedBy:        "mayor",
+			AskedAt:        "2026-06-25T00:00:00Z",
+		},
+		State: state,
+	}
+	return FormatConsultDescription("Allow MR?", fields)
+}
+
+// TestRecordConsultAnswer_RejectsClosed is the regression test for
+// gastown-cet.6.4 MAJOR #3: RecordConsultAnswer had no state guard, so a
+// closed consult could be re-answered (state flipped closed -> answered),
+// resurrecting a finalized decision. A closed consult must reject the answer.
+func TestRecordConsultAnswer_RejectsClosed(t *testing.T) {
+	argsPath := filepath.Join(t.TempDir(), "args.txt")
+	stdinPath := filepath.Join(t.TempDir(), "stdin.txt")
+	stubBdForConsult(t, argsPath, stdinPath, renderConsultDesc(consult.StateClosed))
+
+	b := New(t.TempDir())
+	resp := &consult.Response{
+		DecidedBy:  "opus",
+		DecidedAt:  "2026-06-25T01:00:00Z",
+		Decision:   "Reject",
+		Rationale:  "state guard test",
+		Confidence: "high",
+	}
+	err := b.RecordConsultAnswer("gt-stub", resp)
+	if err == nil {
+		t.Fatalf("expected error recording answer on a closed consult, got nil")
+	}
+	if !strings.Contains(err.Error(), "closed") {
+		t.Errorf("error should mention closed state, got %v", err)
+	}
+	// Must not have reached the update path.
+	argsData, _ := os.ReadFile(argsPath)
+	if strings.Contains(string(argsData), "update") {
+		t.Errorf("closed consult must not be updated, got bd args:\n%s", string(argsData))
+	}
+}
+
+// TestRecordConsultAnswer_AllowsOpen verifies a non-closed consult can be
+// answered (the guard permits open -> answered).
+func TestRecordConsultAnswer_AllowsOpen(t *testing.T) {
+	argsPath := filepath.Join(t.TempDir(), "args.txt")
+	stdinPath := filepath.Join(t.TempDir(), "stdin.txt")
+	stubBdForConsult(t, argsPath, stdinPath, renderConsultDesc(consult.StateOpen))
+
+	b := New(t.TempDir())
+	resp := &consult.Response{
+		DecidedBy:  "opus",
+		DecidedAt:  "2026-06-25T01:00:00Z",
+		Decision:   "Allow",
+		Rationale:  "ok",
+		Confidence: "high",
+	}
+	if err := b.RecordConsultAnswer("gt-stub", resp); err != nil {
+		t.Fatalf("RecordConsultAnswer on open consult: %v", err)
+	}
+}
+
+// TestCloseConsultBead_RejectsAlreadyClosed is the regression test for
+// gastown-cet.6.4 MAJOR #3: CloseConsultBead had no state guard, so a closed
+// consult could be re-closed (overwriting the original closer/reason and
+// appending a second close record to the source bead). Re-closing must error.
+func TestCloseConsultBead_RejectsAlreadyClosed(t *testing.T) {
+	argsPath := filepath.Join(t.TempDir(), "args.txt")
+	stdinPath := filepath.Join(t.TempDir(), "stdin.txt")
+	stubBdForConsult(t, argsPath, stdinPath, renderConsultDesc(consult.StateClosed))
+
+	b := New(t.TempDir())
+	err := b.CloseConsultBead("gt-stub", "mayor", "acted", nil)
+	if err == nil {
+		t.Fatalf("expected error closing an already-closed consult, got nil")
+	}
+	if !strings.Contains(err.Error(), "already closed") {
+		t.Errorf("error should mention already closed, got %v", err)
+	}
+	argsData, _ := os.ReadFile(argsPath)
+	if strings.Contains(string(argsData), "close") {
+		t.Errorf("already-closed consult must not be closed again, got bd args:\n%s", string(argsData))
+	}
+}
+
+// TestCloseConsultBead_AllowsOpen verifies a non-closed consult can be closed.
+func TestCloseConsultBead_AllowsOpen(t *testing.T) {
+	argsPath := filepath.Join(t.TempDir(), "args.txt")
+	stdinPath := filepath.Join(t.TempDir(), "stdin.txt")
+	stubBdForConsult(t, argsPath, stdinPath, renderConsultDesc(consult.StateOpen))
+
+	b := New(t.TempDir())
+	if err := b.CloseConsultBead("gt-stub", "mayor", "acted", nil); err != nil {
+		t.Fatalf("CloseConsultBead on open consult: %v", err)
 	}
 }
