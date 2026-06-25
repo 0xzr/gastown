@@ -243,6 +243,28 @@ type OperationalConfig struct {
 
 	// Witness configures witness patrol thresholds.
 	Witness *WitnessThresholds `json:"witness,omitempty"`
+
+	// Mayor configures Mayor supervision thresholds.
+	Mayor *MayorThresholds `json:"mayor,omitempty"`
+}
+
+// MayorThresholds configures Mayor heartbeat and supervision thresholds.
+type MayorThresholds struct {
+	// HeartbeatStaleThreshold is the age at which the Mayor heartbeat is considered stale.
+	// Default: "5m".
+	HeartbeatStaleThreshold string `json:"heartbeat_stale_threshold,omitempty"`
+
+	// HeartbeatVeryStaleThreshold is the age at which the Mayor heartbeat is considered
+	// very stale and the Mayor should be restarted. Default: "20m".
+	HeartbeatVeryStaleThreshold string `json:"heartbeat_very_stale_threshold,omitempty"`
+
+	// HungSessionThreshold is how long the Mayor tmux session can be inactive before
+	// considered hung. Default: "30m".
+	HungSessionThreshold string `json:"hung_session_threshold,omitempty"`
+
+	// CriticalMailBacklogThreshold is the number of unread high/urgent messages that
+	// triggers a supervision alert. Default: 5.
+	CriticalMailBacklogThreshold *int `json:"critical_mail_backlog_threshold,omitempty"`
 }
 
 // SessionThresholds configures session management timeouts.

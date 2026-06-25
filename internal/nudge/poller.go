@@ -162,6 +162,13 @@ func pollerAlive(townRoot, session string) (int, bool) {
 	return pid, true
 }
 
+// IsPollerAlive reports whether a nudge poller is running for the given session.
+// It is the public wrapper around pollerAlive, exposed for external supervision
+// (e.g. daemon-driven Mayor liveness). Returns the PID and true if alive.
+func IsPollerAlive(townRoot, session string) (int, bool) {
+	return pollerAlive(townRoot, session)
+}
+
 // Watcher provides a filesystem-event-driven interface to the nudge queue.
 // This is an ACP-safe alternative to polling and is preferred for long-running
 // watchers like ACP Propeller.
