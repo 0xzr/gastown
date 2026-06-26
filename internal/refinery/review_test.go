@@ -263,10 +263,9 @@ func TestMergeCandidateBasis_DiffBasis(t *testing.T) {
 // (gastown-spike/dropin/refinery-gate.sh). The rule: core reviewers are
 // m3, codex, umans-kimi, umans-glm. A known writer is excluded and all
 // remaining core reviewers must PASS; an unknown writer requires all four.
-// Any parsed FAIL rejects. Any core unavailable/no-verdict defers (non-zero,
-// no attestation) and records an audit obligation. Opus FAIL rejects; Opus
-// unavailable/no-verdict files an audit bead but does not block a fully PASSed
-// core panel.
+// Any parsed FAIL from a selected core reviewer rejects. Any selected core
+// unavailable/no-verdict defers (non-zero, no attestation) and records an audit
+// obligation. Non-core reviewers are not part of the gate while Opus is disabled.
 
 // coreResult builds a ReviewerResult for a core reviewer with the given verdict.
 func coreResult(name string, v ReviewerVerdict) ReviewerResult {
@@ -448,50 +447,6 @@ func TestCoreQuorum_MixedFailAndUnavailableRejects(t *testing.T) {
 	}
 }
 
-func TestCoreQuorum_OpusUnavailableAfterCorePassMergesWithAudit(t *testing.T) {
-	// Known-writer 3/3 core PASS + Opus NO_VERDICT -> merge with audit (M3/GLM
-	// non-blocking test).
-	q := CoreReviewerQuorum{Writer: "m3", Opus: OpusVerdictUnavailable}
-	results := allCorePass(q.SelectedCoreReviewers())
-	ev := EvaluateCoreReviewerQuorum(results, q)
-	if ev.State != ReviewStateDegradedQuorum {
-		t.Fatalf("opus unavailable after core PASS should merge under audit (DEGRADED_QUORUM), got %s: %s", ev.State, ev.Error)
-	}
-	if len(ev.AuditReviewers) != 1 || ev.AuditReviewers[0] != OpusReviewerName {
-		t.Errorf("expected opus audit obligation, got %v", ev.AuditReviewers)
-	}
-	if q.OpusStatus() != "UNAVAILABLE" {
-		t.Errorf("expected opus status UNAVAILABLE, got %s", q.OpusStatus())
-	}
-}
-
-func TestCoreQuorum_OpusFailRejects(t *testing.T) {
-	q := CoreReviewerQuorum{Writer: "unknown", Opus: OpusVerdictFail}
-	results := allCorePass(q.SelectedCoreReviewers())
-	ev := EvaluateCoreReviewerQuorum(results, q)
-	if ev.State != ReviewStateFail {
-		t.Fatalf("opus FAIL must REJECT even with all core PASS, got %s: %s", ev.State, ev.Error)
-	}
-	if ev.CauseKey != "opus_rejection" {
-		t.Errorf("expected cause opus_rejection, got %s", ev.CauseKey)
-	}
-}
-
-// TestCoreQuorum_OpusPassMerges confirms the explicit Opus PASS path remains
-// covered: a fully PASSed core panel plus an explicit Opus PASS merges cleanly
-// (M3/GLM non-blocking test).
-func TestCoreQuorum_OpusPassMerges(t *testing.T) {
-	q := CoreReviewerQuorum{Writer: "unknown", Opus: OpusVerdictPass}
-	results := append(allCorePass(q.SelectedCoreReviewers()), coreResult(OpusReviewerName, ReviewerVerdictPass))
-	ev := EvaluateCoreReviewerQuorum(results, q)
-	if ev.State != ReviewStatePass {
-		t.Fatalf("core 4/4 + opus PASS should MERGE, got %s: %s", ev.State, ev.Error)
-	}
-	if q.OpusStatus() != "PASS" {
-		t.Errorf("expected opus status PASS, got %s", q.OpusStatus())
-	}
-}
-
 // TestCoreQuorum_KnownWriterPeerFailRejects mirrors the live smoke test where
 // a known writer's peer FAIL was rejected as expected.
 func TestCoreQuorum_KnownWriterPeerFailRejects(t *testing.T) {
@@ -509,10 +464,10 @@ func TestCoreQuorum_KnownWriterPeerFailRejects(t *testing.T) {
 
 // TestCoreQuorum_TelemetryShape confirms the evaluation records the telemetry
 // fields the bead requires: expected peer count, peer_passes, unavailable count,
-// opus status, and the peer-review:N/N phase.
+// and the peer-review:N/N phase.
 func TestCoreQuorum_TelemetryShape(t *testing.T) {
-	q := CoreReviewerQuorum{Writer: "codex", Opus: OpusVerdictPass}
-	results := append(allCorePass(q.SelectedCoreReviewers()), coreResult(OpusReviewerName, ReviewerVerdictPass))
+	q := CoreReviewerQuorum{Writer: "codex"}
+	results := allCorePass(q.SelectedCoreReviewers())
 	ev := EvaluateCoreReviewerQuorum(results, q)
 
 	if ev.PassCount != 3 {
@@ -524,24 +479,18 @@ func TestCoreQuorum_TelemetryShape(t *testing.T) {
 	if ev.UnavailableCount != 0 {
 		t.Errorf("telemetry unavailable: expected 0, got %d", ev.UnavailableCount)
 	}
-	if q.OpusStatus() != "PASS" {
-		t.Errorf("telemetry opus status: expected PASS, got %s", q.OpusStatus())
-	}
 	if got := q.PeerReviewPhase(ev.PassCount); got != "peer-review:3/3" {
 		t.Errorf("telemetry phase: expected peer-review:3/3, got %s", got)
 	}
 }
 
-// TestCoreQuorum_OpusNotConsultedMerges confirms that when Opus is not part of
-// the gate pass (zero-valued Opus), a fully PASSed core panel still merges.
-func TestCoreQuorum_OpusNotConsultedMerges(t *testing.T) {
+// TestCoreQuorum_NonCoreReviewerIgnored confirms that a stale or accidental
+// non-core verifier result cannot affect the gate while Opus is disabled.
+func TestCoreQuorum_NonCoreReviewerIgnored(t *testing.T) {
 	q := CoreReviewerQuorum{Writer: "unknown"}
-	results := allCorePass(q.SelectedCoreReviewers())
+	results := append(allCorePass(q.SelectedCoreReviewers()), coreResult("opus", ReviewerVerdictFail))
 	ev := EvaluateCoreReviewerQuorum(results, q)
 	if ev.State != ReviewStatePass {
-		t.Fatalf("core 4/4 with opus not consulted should MERGE, got %s: %s", ev.State, ev.Error)
-	}
-	if q.OpusStatus() != "NOT_CONSULTED" {
-		t.Errorf("expected opus status NOT_CONSULTED, got %s", q.OpusStatus())
+		t.Fatalf("core 4/4 should MERGE while non-core opus result is ignored, got %s: %s", ev.State, ev.Error)
 	}
 }

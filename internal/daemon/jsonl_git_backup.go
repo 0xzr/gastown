@@ -505,14 +505,49 @@ func (d *Daemon) escalate(source, message string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "gt", "escalate", "-s", "HIGH",
-		fmt.Sprintf("%s: %s", source, message))
+	summary := firstLine(message)
+	if summary == "" {
+		summary = "daemon patrol failure"
+	}
+	description := fmt.Sprintf("%s: %s", source, summary)
+	const maxEscalationDescription = 240
+	description = truncateRunes(description, maxEscalationDescription)
+	const maxEscalationBody = 64 * 1024
+	body := truncateRunes(message, maxEscalationBody)
+
+	cmd := exec.CommandContext(ctx, "gt", "escalate", "-s", "HIGH", "--source", source, "--stdin", description)
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
+	cmd.Stdin = strings.NewReader(body)
 	util.SetDetachedProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		d.logger.Printf("jsonl_git_backup: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
 	}
+}
+
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	if max <= 3 {
+		return string(runes[:max])
+	}
+	return string(runes[:max-3]) + "..."
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
 }
 
 // spikeThreshold returns the configured spike threshold or the default (20%).

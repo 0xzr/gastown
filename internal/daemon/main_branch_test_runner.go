@@ -62,18 +62,18 @@ func mainBranchTestTimeout(config *DaemonPatrolConfig) time.Duration {
 	return defaultMainBranchTestTimeout
 }
 
-// mainBranchTestRigs returns the configured rig filter, or nil (all rigs).
-func mainBranchTestRigs(config *DaemonPatrolConfig) []string {
-	if config != nil && config.Patrols != nil && config.Patrols.MainBranchTest != nil {
-		return config.Patrols.MainBranchTest.Rigs
-	}
-	return nil
-}
-
 // rigGateConfig holds the gate/test configuration extracted from a rig's config.json.
 type rigGateConfig struct {
 	TestCommand string
 	Gates       map[string]string // gate name → command
+}
+
+func mainBranchTestRunnableGate(phase string) bool {
+	phase = strings.TrimSpace(strings.ToLower(phase))
+	// Post-squash gates validate a merge candidate after the refinery has
+	// applied a branch. Running them from the main-branch patrol re-enters the
+	// refinery review gate on already-merged code and can produce false alerts.
+	return phase != "post-squash"
 }
 
 // loadRigGateConfig reads the merge_queue section from a rig's config.json
@@ -114,9 +114,10 @@ func loadRigGateConfig(rigPath string) (*rigGateConfig, error) {
 		cfg.Gates = make(map[string]string, len(mq.Gates))
 		for name, rawGate := range mq.Gates {
 			var gate struct {
-				Cmd string `json:"cmd"`
+				Cmd   string `json:"cmd"`
+				Phase string `json:"phase"`
 			}
-			if err := json.Unmarshal(rawGate, &gate); err == nil && gate.Cmd != "" {
+			if err := json.Unmarshal(rawGate, &gate); err == nil && gate.Cmd != "" && mainBranchTestRunnableGate(gate.Phase) {
 				cfg.Gates[name] = gate.Cmd
 			}
 		}
@@ -143,23 +144,20 @@ func (d *Daemon) runMainBranchTests() {
 
 	d.logger.Printf("main_branch_test: starting patrol cycle")
 
-	rigNames := d.getKnownRigs()
+	// Use the Daemon method, not the package helper directly, so operational
+	// filters such as docked and parked rigs still apply.
+	rigNames := d.getPatrolRigs("main_branch_test")
 	if len(rigNames) == 0 {
-		d.logger.Printf("main_branch_test: no rigs found")
+		d.logger.Printf("main_branch_test: no operational rigs found")
 		return
 	}
 
-	allowedRigs := mainBranchTestRigs(d.patrolConfig)
 	timeout := mainBranchTestTimeout(d.patrolConfig)
 
 	var tested, failed int
 	var failures []string
 
 	for _, rigName := range rigNames {
-		if len(allowedRigs) > 0 && !sliceContains(allowedRigs, rigName) {
-			continue
-		}
-
 		rigPath := filepath.Join(d.config.TownRoot, rigName)
 		if err := d.testRigMainBranch(rigName, rigPath, timeout); err != nil {
 			d.logger.Printf("main_branch_test: %s: FAILED: %v", rigName, err)
@@ -295,14 +293,4 @@ func (d *Daemon) runCommandOnWorktree(ctx context.Context, rigName, workDir, lab
 		return fmt.Errorf("%s failed: %v\n%s", label, err, strings.Join(tail, "\n"))
 	}
 	return nil
-}
-
-// contains checks if a string slice contains a value.
-func sliceContains(slice []string, val string) bool {
-	for _, s := range slice {
-		if s == val {
-			return true
-		}
-	}
-	return false
 }

@@ -4,6 +4,9 @@ package refinery
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,6 +43,10 @@ func shortSHA(sha string) string {
 // to avoid re-claiming MRs that are legitimately processing long test suites.
 // Can be overridden per-rig via MergeQueueConfig.StaleClaimTimeout.
 const DefaultStaleClaimTimeout = 30 * time.Minute
+
+// DefaultDurableReviewGateTimeout bounds the external review-gate command when
+// config omits an explicit durable_review_gate timeout.
+const DefaultDurableReviewGateTimeout = 45 * time.Minute
 
 // isClaimStale checks if a claimed MR should be considered abandoned based on
 // its UpdatedAt timestamp and configured timeout. Returns true if the claim
@@ -113,7 +120,7 @@ type DurableReviewGateConfig struct {
 	Cmd string `json:"cmd,omitempty"`
 
 	// Timeout is the maximum time the review gate command may run.
-	// Zero means no timeout (inherits context deadline).
+	// Zero uses DefaultDurableReviewGateTimeout.
 	Timeout time.Duration `json:"timeout,omitempty"`
 
 	// AttestDir is the directory where HMAC attestation files are written.
@@ -121,6 +128,10 @@ type DurableReviewGateConfig struct {
 	// default is read from GT_GATE_ATTEST_DIR, falling back to
 	// /home/ubuntu/.gt-gate-attestations.
 	AttestDir string `json:"attest_dir,omitempty"`
+
+	// HMACKeyPath is the server-local key used to verify durable review
+	// attestations. If empty, the pinned production key path is used.
+	HMACKeyPath string `json:"hmac_key_path,omitempty"`
 }
 
 // GateResult holds the outcome of a single gate execution.
@@ -266,10 +277,11 @@ func DefaultMergeQueueConfig() *MergeQueueConfig {
 		MaxRetryCount:           5,
 		AutoPush:                true,
 		DurableReviewGate: &DurableReviewGateConfig{
-			Required:  true,
-			Cmd:       "",
-			Timeout:   0,
-			AttestDir: "",
+			Required:    true,
+			Cmd:         "",
+			Timeout:     DefaultDurableReviewGateTimeout,
+			AttestDir:   "",
+			HMACKeyPath: "",
 		},
 	}
 }
@@ -544,6 +556,9 @@ func (e *Engineer) LoadConfig() error {
 		if mqRaw.DurableReviewGate.AttestDir != "" {
 			e.config.DurableReviewGate.AttestDir = mqRaw.DurableReviewGate.AttestDir
 		}
+		if mqRaw.DurableReviewGate.HMACKeyPath != "" {
+			e.config.DurableReviewGate.HMACKeyPath = mqRaw.DurableReviewGate.HMACKeyPath
+		}
 		if mqRaw.DurableReviewGate.Timeout != "" {
 			dur, err := time.ParseDuration(mqRaw.DurableReviewGate.Timeout)
 			if err != nil {
@@ -596,10 +611,11 @@ type gateConfigRaw struct {
 // durableReviewGateConfigRaw is the JSON-friendly representation of a durable
 // review gate config with timeout as a string duration.
 type durableReviewGateConfigRaw struct {
-	Required  *bool  `json:"required,omitempty"`
-	Cmd       string `json:"cmd,omitempty"`
-	Timeout   string `json:"timeout,omitempty"`
-	AttestDir string `json:"attest_dir,omitempty"`
+	Required    *bool  `json:"required,omitempty"`
+	Cmd         string `json:"cmd,omitempty"`
+	Timeout     string `json:"timeout,omitempty"`
+	AttestDir   string `json:"attest_dir,omitempty"`
+	HMACKeyPath string `json:"hmac_key_path,omitempty"`
 }
 
 // Config returns the current merge queue configuration.
@@ -1597,6 +1613,193 @@ func (e *Engineer) durableReviewAttestDir() string {
 	return "/home/ubuntu/.gt-gate-attestations"
 }
 
+// durableReviewHMACKeyPath returns the key path used by refinery-gate.sh when
+// writing attestation tokens.
+func (e *Engineer) durableReviewHMACKeyPath() string {
+	if e.config.DurableReviewGate != nil && strings.TrimSpace(e.config.DurableReviewGate.HMACKeyPath) != "" {
+		return strings.TrimSpace(e.config.DurableReviewGate.HMACKeyPath)
+	}
+	return "/home/ubuntu/.gt-gate-hmac-key"
+}
+
+const (
+	minDurableReviewHMACKeyBytes = 32
+	maxDurableReviewHMACKeyBytes = 4096
+	maxDurableReviewTokenBytes   = 1024
+	maxDurableReviewAssignBytes  = 16 * 1024
+)
+
+func readBoundedFile(file *os.File, path, label string, maxBytes int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading %s %s: %w", label, path, err)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%s %s is too large", label, path)
+	}
+	return data, nil
+}
+
+func (e *Engineer) readDurableReviewHMACKey() ([]byte, error) {
+	keyPath := e.durableReviewHMACKeyPath()
+	file, info, err := openStableRegularFile(keyPath, "HMAC key")
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	if perm := info.Mode().Perm(); perm&0077 != 0 {
+		return nil, fmt.Errorf("HMAC key %s has insecure permissions %03o; group/other permissions must be 000", keyPath, perm)
+	}
+	if info.Size() > maxDurableReviewHMACKeyBytes {
+		return nil, fmt.Errorf("HMAC key %s is too large", keyPath)
+	}
+	key, err := readBoundedFile(file, keyPath, "HMAC key", maxDurableReviewHMACKeyBytes)
+	if err != nil {
+		return nil, err
+	}
+	key = bytes.TrimRight(key, "\r\n")
+	trimmedKey := bytes.TrimSpace(key)
+	if len(trimmedKey) == 0 {
+		return nil, fmt.Errorf("HMAC key %s must contain non-whitespace bytes", keyPath)
+	}
+	if len(trimmedKey) < minDurableReviewHMACKeyBytes {
+		return nil, fmt.Errorf("HMAC key %s must contain at least %d non-whitespace bytes", keyPath, minDurableReviewHMACKeyBytes)
+	}
+	return key, nil
+}
+
+func gateCommandEnvWith(extra ...string) []string {
+	env := util.GateCommandEnv()
+	if len(env) == 0 {
+		// exec.Cmd.Env=nil inherits the parent environment. When adding gate
+		// metadata we must materialize that same inherited environment first.
+		env = os.Environ()
+	}
+	env = append([]string(nil), env...)
+	for _, kv := range extra {
+		key, _, ok := strings.Cut(kv, "=")
+		if !ok || key == "" {
+			env = append(env, kv)
+			continue
+		}
+		prefix := key + "="
+		replaced := false
+		for i, existing := range env {
+			if strings.HasPrefix(existing, prefix) {
+				env[i] = kv
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			env = append(env, kv)
+		}
+	}
+	return env
+}
+
+var durableReviewAssignmentIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+func durableReviewAssignmentID(sourceIssue string) (string, bool) {
+	sourceIssue = strings.TrimSpace(sourceIssue)
+	if !durableReviewAssignmentIDRE.MatchString(sourceIssue) {
+		return "", false
+	}
+	if strings.ContainsAny(sourceIssue, `/\`) {
+		return "", false
+	}
+	if strings.Contains(sourceIssue, "..") {
+		return "", false
+	}
+	return sourceIssue, true
+}
+
+func (e *Engineer) durableReviewTownRoot() (string, bool) {
+	if e.rig == nil || strings.TrimSpace(e.rig.Path) == "" {
+		return "", false
+	}
+	start, err := filepath.EvalSymlinks(filepath.Clean(e.rig.Path))
+	if err != nil {
+		return "", false
+	}
+	for dir := start; ; dir = filepath.Dir(dir) {
+		if _, err := os.Stat(filepath.Join(dir, "mayor", "town.json")); err == nil {
+			return dir, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+	}
+	return "", false
+}
+
+type durableReviewModelAssignment struct {
+	Agent string `json:"agent"`
+}
+
+func (e *Engineer) durableReviewWriterFromAgentBead(agentBead string) string {
+	if strings.TrimSpace(agentBead) == "" || e.beads == nil {
+		return ""
+	}
+	agentBeads := e.beads.ForAgentBead()
+	if agentBeads == nil {
+		return ""
+	}
+	_, fields, err := agentBeads.GetAgentBead(agentBead)
+	if err != nil || fields == nil {
+		return ""
+	}
+	return strings.TrimSpace(fields.AssignedAgent)
+}
+
+func (e *Engineer) durableReviewWriterFromAssignment(sourceIssue string) string {
+	assignmentID, ok := durableReviewAssignmentID(sourceIssue)
+	if !ok || e.rig == nil || strings.TrimSpace(e.rig.Path) == "" {
+		return ""
+	}
+	townRoot, ok := e.durableReviewTownRoot()
+	if !ok {
+		return ""
+	}
+	path := filepath.Join(townRoot, ".runtime", "model-assignments", assignmentID+".json")
+	file, info, err := openStableRegularFile(path, "model assignment")
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	if perm := info.Mode().Perm(); perm&0022 != 0 {
+		return ""
+	}
+	if info.Size() > maxDurableReviewAssignBytes {
+		return ""
+	}
+	data, err := readBoundedFile(file, path, "model assignment", maxDurableReviewAssignBytes)
+	if err != nil {
+		return ""
+	}
+	var assignment durableReviewModelAssignment
+	if err := json.Unmarshal(data, &assignment); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(assignment.Agent)
+}
+
+func (e *Engineer) durableReviewWriter(mr *MRInfo) string {
+	if mr == nil {
+		return "unknown"
+	}
+	if writer := e.durableReviewWriterFromAgentBead(mr.AgentBead); writer != "" {
+		return writer
+	}
+	if writer := e.durableReviewWriterFromAssignment(mr.SourceIssue); writer != "" {
+		return writer
+	}
+	return "unknown"
+}
+
 // durableReviewGateCmd returns the configured review gate command, or an empty
 // string if none is configured.
 //
@@ -1625,6 +1828,13 @@ func (e *Engineer) durableReviewGateCmd() string {
 	return ""
 }
 
+func (e *Engineer) durableReviewGateTimeout() time.Duration {
+	if e.config.DurableReviewGate != nil && e.config.DurableReviewGate.Timeout > 0 {
+		return e.config.DurableReviewGate.Timeout
+	}
+	return DefaultDurableReviewGateTimeout
+}
+
 // durableReviewAttestationPath returns the path to the HMAC attestation file
 // for a given tree hash, if an attestation directory is configured.
 func (e *Engineer) durableReviewAttestationPath(tree string) string {
@@ -1634,9 +1844,31 @@ func (e *Engineer) durableReviewAttestationPath(tree string) string {
 	return filepath.Join(e.durableReviewAttestDir(), tree)
 }
 
+func durableReviewAttestationWriter(writer string) string {
+	writer = normalizeWriter(writer)
+	if writer == "" {
+		return "unknown"
+	}
+	return writer
+}
+
+func durableReviewAttestationPayload(tree, writer string) []byte {
+	return []byte(fmt.Sprintf("gastown-durable-review-v1\ntree=%s\nwriter=%s\n", tree, durableReviewAttestationWriter(writer)))
+}
+
+// expectedDurableReviewAttestation returns the HMAC token expected for a tree
+// reviewed under the given writer identity. Binding the writer prevents an
+// all-four unknown-writer attestation from being replayed as a known-writer
+// three-peer attestation, or vice versa.
+func expectedDurableReviewAttestationWithKey(key []byte, tree, writer string) []byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write(durableReviewAttestationPayload(tree, writer))
+	return mac.Sum(nil)
+}
+
 // hasDurableReviewAttestation reports whether an HMAC attestation exists for
 // the merge candidate at the current HEAD.
-func (e *Engineer) hasDurableReviewAttestation() (bool, string, error) {
+func (e *Engineer) hasDurableReviewAttestation(key []byte, writer string) (bool, string, error) {
 	tree, err := e.git.Rev("HEAD^{tree}")
 	if err != nil {
 		return false, "", fmt.Errorf("resolving merge-candidate tree: %w", err)
@@ -1645,21 +1877,36 @@ func (e *Engineer) hasDurableReviewAttestation() (bool, string, error) {
 	if path == "" {
 		return false, tree, nil
 	}
-	info, err := os.Stat(path)
+	file, info, err := openStableRegularFile(path, "attestation")
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return false, tree, nil
 		}
-		return false, tree, fmt.Errorf("checking attestation %s: %w", path, err)
+		return false, tree, err
 	}
-	return !info.IsDir(), tree, nil
+	defer file.Close()
+
+	if info.Size() > maxDurableReviewTokenBytes {
+		return false, tree, fmt.Errorf("checking attestation %s: token file too large", path)
+	}
+	rawToken, err := readBoundedFile(file, path, "attestation", maxDurableReviewTokenBytes)
+	if err != nil {
+		return false, tree, err
+	}
+	token := strings.TrimSpace(string(rawToken))
+	actual, err := hex.DecodeString(token)
+	if err != nil {
+		return false, tree, fmt.Errorf("invalid HMAC attestation token at %s: %w", path, err)
+	}
+	expected := expectedDurableReviewAttestationWithKey(key, tree, writer)
+	return hmac.Equal(actual, expected), tree, nil
 }
 
 // runDurableReviewGate enforces the fail-closed multi-model review gate.
 // It checks for an existing HMAC attestation for the merge-candidate tree and,
 // if missing, runs the configured review gate command. The merge is rejected
 // unless an attestation exists after enforcement.
-func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target string, _ *MRInfo) ProcessResult {
+func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target string, mr *MRInfo) ProcessResult {
 	if !e.durableReviewGateEnabled(target) {
 		return ProcessResult{Success: true}
 	}
@@ -1676,9 +1923,23 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 			Error:       "durable review gate required but no command configured",
 		}
 	}
+	key, err := e.readDurableReviewHMACKey()
+	if err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED - HMAC key check failed: %v\n", err)
+		return ProcessResult{
+			Success:     false,
+			TestsFailed: true,
+			Error:       fmt.Sprintf("durable review HMAC key check failed: %v", err),
+		}
+	}
 
-	// If an attestation already exists, we can skip running the expensive gate.
-	attested, tree, err := e.hasDurableReviewAttestation()
+	writer := e.durableReviewWriter(mr)
+	attestationWriter := durableReviewAttestationWriter(writer)
+
+	// If an attestation already exists for this tree and writer identity, we can
+	// skip running the expensive gate. An attestation for the same tree under a
+	// different writer does not satisfy this check.
+	attested, tree, err := e.hasDurableReviewAttestation(key, attestationWriter)
 	if err != nil {
 		return ProcessResult{
 			Success:     false,
@@ -1687,30 +1948,28 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 		}
 	}
 	if attested {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review attestation present for tree %s; skipping gate\n", shortSHA(tree))
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review attestation present for tree %s (writer=%s); skipping gate\n", shortSHA(tree), attestationWriter)
 		return ProcessResult{Success: true}
 	}
 
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Running durable review gate for tree %s...\n", shortSHA(tree))
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Running durable review gate for tree %s (writer=%s)...\n", shortSHA(tree), attestationWriter)
 
-	gateCtx := ctx
-	if e.config.DurableReviewGate.Timeout > 0 {
-		var cancel context.CancelFunc
-		gateCtx, cancel = context.WithTimeout(ctx, e.config.DurableReviewGate.Timeout)
-		defer cancel()
-	}
+	gateTimeout := e.durableReviewGateTimeout()
+	gateCtx, cancel := context.WithTimeout(ctx, gateTimeout)
+	defer cancel()
 
 	runCmd := exec.CommandContext(gateCtx, "sh", "-c", cmd) //nolint:gosec // G204: Review gate command is from trusted rig config
 	util.SetDetachedProcessGroup(runCmd)
 	runCmd.Dir = e.workDir
-	runCmd.Env = util.GateCommandEnv()
 	// Expose metadata to the review gate command so it can locate the
 	// worktree, the merge candidate, and the attestation directory.
-	runCmd.Env = append(runCmd.Env,
+	runCmd.Env = gateCommandEnvWith(
 		"GT_REVIEW_GATE_WORKTREE="+e.workDir,
 		"GT_REVIEW_GATE_BRANCH="+branch,
 		"GT_REVIEW_GATE_TARGET="+target,
+		"GT_REVIEW_GATE_WRITER="+attestationWriter,
 		"GT_GATE_ATTEST_DIR="+e.durableReviewAttestDir(),
+		"GT_GATE_HMAC_KEY="+e.durableReviewHMACKeyPath(),
 	)
 	var stdout, stderr bytes.Buffer
 	runCmd.Stdout = &stdout
@@ -1730,7 +1989,7 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 	if runErr != nil {
 		errMsg := fmt.Sprintf("durable review gate failed (%v)", runErr)
 		if gateCtx.Err() == context.DeadlineExceeded {
-			errMsg = fmt.Sprintf("durable review gate timed out after %v", e.config.DurableReviewGate.Timeout)
+			errMsg = fmt.Sprintf("durable review gate timed out after %v", gateTimeout)
 		}
 		if output != "" {
 			cap := output
@@ -1752,7 +2011,7 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 	// Fail closed if the gate command exited 0 but did not write the
 	// expected HMAC attestation. A missing attestation means there is no
 	// durable proof that reviewers actually ran.
-	attested, tree, err = e.hasDurableReviewAttestation()
+	attested, tree, err = e.hasDurableReviewAttestation(key, attestationWriter)
 	if err != nil {
 		return ProcessResult{
 			Success:     false,

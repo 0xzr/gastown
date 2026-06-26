@@ -58,24 +58,25 @@ func TestMainBranchTestTimeout(t *testing.T) {
 	}
 }
 
-func TestMainBranchTestRigs(t *testing.T) {
-	// Nil config returns nil
-	if got := mainBranchTestRigs(nil); got != nil {
-		t.Errorf("expected nil, got %v", got)
+func TestGetPatrolRigsIncludesMainBranchTestFilter(t *testing.T) {
+	if got := GetPatrolRigs(nil, "main_branch_test"); got != nil {
+		t.Fatalf("GetPatrolRigs(nil, main_branch_test) = %v, want nil", got)
+	}
+	if got := GetPatrolRigs(&DaemonPatrolConfig{Patrols: &PatrolsConfig{}}, "main_branch_test"); got != nil {
+		t.Fatalf("GetPatrolRigs(no main_branch_test config) = %v, want nil", got)
 	}
 
-	// Configured rigs
 	config := &DaemonPatrolConfig{
 		Patrols: &PatrolsConfig{
 			MainBranchTest: &MainBranchTestConfig{
 				Enabled: true,
-				Rigs:    []string{"gastown", "beads"},
+				Rigs:    []string{"gastown"},
 			},
 		},
 	}
-	got := mainBranchTestRigs(config)
-	if len(got) != 2 || got[0] != "gastown" || got[1] != "beads" {
-		t.Errorf("expected [gastown beads], got %v", got)
+	got := GetPatrolRigs(config, "main_branch_test")
+	if len(got) != 1 || got[0] != "gastown" {
+		t.Fatalf("GetPatrolRigs(main_branch_test) = %v, want [gastown]", got)
 	}
 }
 
@@ -183,6 +184,85 @@ func TestLoadRigGateConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("skips refinery review gates", func(t *testing.T) {
+		dir := t.TempDir()
+		data := map[string]interface{}{
+			"merge_queue": map[string]interface{}{
+				"gates": map[string]interface{}{
+					"build": map[string]interface{}{"cmd": "go build ./..."},
+					"four-model-refinery-review": map[string]interface{}{
+						"cmd":   "/home/ubuntu/gastown-spike/dropin/refinery-gate.sh --worktree \"$PWD\" --writer unknown",
+						"phase": "post-squash",
+					},
+				},
+			},
+		}
+		raw, _ := json.Marshal(data)
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadRigGateConfig(dir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("expected non-nil config")
+		}
+		if len(cfg.Gates) != 1 || cfg.Gates["build"] != "go build ./..." {
+			t.Fatalf("expected only deterministic build gate, got %+v", cfg.Gates)
+		}
+	})
+
+	t.Run("only refinery review gates means no main branch test", func(t *testing.T) {
+		dir := t.TempDir()
+		data := map[string]interface{}{
+			"merge_queue": map[string]interface{}{
+				"gates": map[string]interface{}{
+					"four-model-refinery-review": map[string]interface{}{
+						"cmd":   "/home/ubuntu/gastown-spike/dropin/refinery-gate.sh --worktree \"$PWD\" --writer unknown",
+						"phase": "post-squash",
+					},
+				},
+			},
+		}
+		raw, _ := json.Marshal(data)
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadRigGateConfig(dir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg != nil {
+			t.Fatalf("expected nil when only refinery review gates are configured, got %+v", cfg)
+		}
+	})
+
+	t.Run("pre-merge command name does not trigger refinery blacklist", func(t *testing.T) {
+		dir := t.TempDir()
+		data := map[string]interface{}{
+			"merge_queue": map[string]interface{}{
+				"gates": map[string]interface{}{
+					"refinery-review-smoke": map[string]interface{}{
+						"cmd":   "/tmp/refinery-gate.sh --dry-run",
+						"phase": "pre-merge",
+					},
+				},
+			},
+		}
+		raw, _ := json.Marshal(data)
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadRigGateConfig(dir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg == nil || cfg.Gates["refinery-review-smoke"] != "/tmp/refinery-gate.sh --dry-run" {
+			t.Fatalf("expected pre-merge command retained, got %+v", cfg)
+		}
+	})
+
 	t.Run("no test commands", func(t *testing.T) {
 		dir := t.TempDir()
 		data := map[string]interface{}{
@@ -204,15 +284,29 @@ func TestLoadRigGateConfig(t *testing.T) {
 	})
 }
 
-func TestContains(t *testing.T) {
-	if !sliceContains([]string{"a", "b", "c"}, "b") {
-		t.Error("expected true for 'b' in [a b c]")
+func TestFirstLine(t *testing.T) {
+	got := firstLine("main branch test failures:\ngastown: gate failed\nmore")
+	if got != "main branch test failures:" {
+		t.Fatalf("firstLine() = %q", got)
 	}
-	if sliceContains([]string{"a", "b", "c"}, "d") {
-		t.Error("expected false for 'd' in [a b c]")
+	if got := firstLine("  single line  "); got != "single line" {
+		t.Fatalf("firstLine(single) = %q", got)
 	}
-	if sliceContains(nil, "a") {
-		t.Error("expected false for nil slice")
+	if got := firstLine(" \n "); got != "" {
+		t.Fatalf("firstLine(empty) = %q", got)
+	}
+}
+
+func TestTruncateRunes(t *testing.T) {
+	got := truncateRunes("abc😀defg", 7)
+	if got != "abc😀..." {
+		t.Fatalf("truncateRunes preserved invalid boundary incorrectly: %q", got)
+	}
+	if got := truncateRunes("abcdef", 3); got != "abc" {
+		t.Fatalf("truncateRunes(max<=3) = %q", got)
+	}
+	if got := truncateRunes("short", 10); got != "short" {
+		t.Fatalf("truncateRunes(short) = %q", got)
 	}
 }
 
