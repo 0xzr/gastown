@@ -237,10 +237,7 @@ func TestForwardFromAgent_PropulsionTriggers(t *testing.T) {
 
 		agentStdoutWriter.Write([]byte(trigger))
 
-		// Give it a moment to process
-		time.Sleep(100 * time.Millisecond)
-
-		if !p.Propelled.Load() {
+		if !waitUntil(2*time.Second, func() bool { return p.Propelled.Load() }) {
 			t.Errorf("trigger %q did not set Propelled to true", trigger)
 		}
 	}
@@ -253,8 +250,7 @@ func TestForwardFromAgent_PropulsionTriggers(t *testing.T) {
 		t.Error("Propelled was set prematurely")
 	}
 	agentStdoutWriter.Write([]byte("WORK MODE\n"))
-	time.Sleep(100 * time.Millisecond)
-	if !p.Propelled.Load() {
+	if !waitUntil(2*time.Second, func() bool { return p.Propelled.Load() }) {
 		t.Error("Multi-line trigger split across writes failed to set Propelled to true")
 	}
 
@@ -268,8 +264,7 @@ func TestForwardFromAgent_PropulsionTriggers(t *testing.T) {
 	jsonTriggerBytes, _ := json.Marshal(jsonTrigger)
 	jsonTriggerBytes = append(jsonTriggerBytes, '\n')
 	agentStdoutWriter.Write(jsonTriggerBytes)
-	time.Sleep(100 * time.Millisecond)
-	if !p.Propelled.Load() {
+	if !waitUntil(2*time.Second, func() bool { return p.Propelled.Load() }) {
 		t.Error("JSON notification trigger did not set Propelled to true")
 	}
 
@@ -285,8 +280,7 @@ func TestForwardFromAgent_PropulsionTriggers(t *testing.T) {
 	responseBytes, _ := json.Marshal(responseMsg)
 	responseBytes = append(responseBytes, '\n')
 	agentStdoutWriter.Write(responseBytes)
-	time.Sleep(100 * time.Millisecond)
-	if p.Propelled.Load() {
+	if !waitUntil(2*time.Second, func() bool { return !p.Propelled.Load() }) {
 		t.Error("Propelled was not reset after prompt response")
 	}
 
@@ -323,17 +317,17 @@ func TestForwardFromAgent_PropulsionTriggers(t *testing.T) {
 			mu.Unlock()
 		}
 	}()
-	time.Sleep(100 * time.Millisecond)
 
-	foundAfterReset := false
-	mu.Lock()
-	for _, m := range receivedMsgs {
-		if m.Method == "test/after-reset" {
-			foundAfterReset = true
-			break
+	foundAfterReset := waitUntil(2*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, m := range receivedMsgs {
+			if m.Method == "test/after-reset" {
+				return true
+			}
 		}
-	}
-	mu.Unlock()
+		return false
+	})
 	if !foundAfterReset {
 		t.Error("Message after propulsion reset was not forwarded")
 	}
@@ -349,4 +343,15 @@ func TestForwardFromAgent_PropulsionTriggers(t *testing.T) {
 			break
 		}
 	}
+}
+
+func waitUntil(timeout time.Duration, condition func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return condition()
 }
