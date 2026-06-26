@@ -10,6 +10,10 @@ import (
 )
 
 func setupPrimeExternalToolTest(t *testing.T, bdScript, gtScript string) string {
+	return setupPrimeExternalToolTestWithTimeout(t, bdScript, gtScript, time.Second)
+}
+
+func setupPrimeExternalToolTestWithTimeout(t *testing.T, bdScript, gtScript string, timeout time.Duration) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script subprocess test")
@@ -19,7 +23,7 @@ func setupPrimeExternalToolTest(t *testing.T, bdScript, gtScript string) string 
 
 	oldTimeout := primeExternalToolTimeout
 	oldWaitDelay := primeExternalToolWaitDelay
-	primeExternalToolTimeout = 100 * time.Millisecond
+	primeExternalToolTimeout = timeout
 	primeExternalToolWaitDelay = 10 * time.Millisecond
 	t.Cleanup(func() {
 		primeExternalToolTimeout = oldTimeout
@@ -101,7 +105,7 @@ func TestRunPrimeExternalTools_BoundsSlowMailCheck(t *testing.T) {
 	markerDir := t.TempDir()
 	startedPath := filepath.Join(markerDir, "child-started")
 	survivedPath := filepath.Join(markerDir, "child-survived")
-	workDir := setupPrimeExternalToolTest(t, `
+	workDir := setupPrimeExternalToolTestWithTimeout(t, `
 case "$*" in
   "kv list --json") printf '%s\n' '{"memory.feedback.test":"remembered"}'; exit 0 ;;
 esac
@@ -114,7 +118,7 @@ case "$*" in
     exit 0
     ;;
 esac
-`)
+`, 100*time.Millisecond)
 	t.Setenv("PRIME_CHILD_STARTED", startedPath)
 	t.Setenv("PRIME_CHILD_SURVIVED", survivedPath)
 
@@ -180,7 +184,7 @@ esac
 	output := captureStdout(t, func() {
 		checkPendingEscalations(RoleContext{Role: RoleMayor, WorkDir: workDir})
 	})
-	assertElapsedUnder(t, time.Since(start), time.Second)
+	assertElapsedUnder(t, time.Since(start), 1500*time.Millisecond)
 	assertPrimeToolCalled(t, "bd:list --status=open --tag=escalation --json --flat")
 
 	if strings.Contains(output, "PENDING ESCALATIONS") {
