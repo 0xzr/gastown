@@ -116,7 +116,7 @@ exit 0
 	}
 
 	// Call updateAgentStateOnDone directly
-	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123")
+	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123", "", false, false)
 
 	// Verify close calls
 	closesBytes, err := os.ReadFile(closesLog)
@@ -289,7 +289,7 @@ exit 0
 	}
 
 	// Should not error even though molecule has no children
-	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123")
+	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123", "", false, false)
 
 	// Verify close calls
 	closesBytes, err := os.ReadFile(closesLog)
@@ -422,7 +422,7 @@ exit 0
 		t.Fatalf("chdir: %v", err)
 	}
 
-	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123")
+	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123", "", false, false)
 
 	// Verify close calls
 	closesBytes, err := os.ReadFile(closesLog)
@@ -574,7 +574,7 @@ exit 0
 		t.Fatalf("chdir: %v", err)
 	}
 
-	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123")
+	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123", "", false, false)
 
 	// Verify close calls
 	closesBytes, err := os.ReadFile(closesLog)
@@ -742,7 +742,7 @@ exit 0
 	}
 
 	// Should not error even though there's no attached molecule
-	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123")
+	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123", "", false, false)
 
 	// Verify close calls - should only close the hooked base bead (no molecule)
 	closesBytes, err := os.ReadFile(closesLog)
@@ -866,7 +866,7 @@ exit 0
 	}
 
 	// Should not error even though list fails - continues with closing molecule and base bead
-	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123")
+	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123", "", false, false)
 
 	// Verify close calls - should still close wisp and base even though list failed
 	closesBytes, err := os.ReadFile(closesLog)
@@ -982,7 +982,7 @@ exit 0
 	}
 
 	// Should not error - handles molecule close failure gracefully
-	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123")
+	updateAgentStateOnDone(filepath.Join(townRoot, "gastown"), townRoot, ExitCompleted, "gt-base-123", "", false, false)
 
 	// Implementation behavior: when molecule close fails with a generic error
 	// (not beads.ErrNotFound), the function returns early WITHOUT closing the
@@ -1006,5 +1006,277 @@ exit 0
 	if err == nil {
 		closesBytes, _ := os.ReadFile(closesLog)
 		t.Logf("Note: closes.log exists with content: %s", string(closesBytes))
+	}
+}
+
+// TestDoneDeferSourceBeadCloseToRefinery verifies the gastown-5oy fix:
+// when gt done runs with an mrID (MR successfully created), the source bead
+// is NOT closed here — instead it gets an "awaiting-merge-stamp:<mr-id>" label
+// and its assignee is cleared so the witness doesn't treat it as an orphan.
+// The refinery closes the bead with the proper "Merged in <MR-id>" provenance
+// when it merges the MR (see internal/refinery/manager.go:634 and
+// engineer.go:2254). Before this fix, gt done closed the source bead with the
+// default "Closed" reason (no provenance) and the refinery skipped stamping
+// because the bead was already terminal.
+func TestDoneDeferSourceBeadCloseToRefinery(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script bd stub not supported on Windows")
+	}
+
+	townRoot := t.TempDir()
+
+	// Workspace marker
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+
+	// .beads directory
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "locks"), 0755); err != nil {
+		t.Fatalf("mkdir .beads/locks: %v", err)
+	}
+
+	// Create routes for rig lookup
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown"), 0755); err != nil {
+		t.Fatalf("mkdir gastown: %v", err)
+	}
+	routes := strings.Join([]string{
+		`{"prefix":"gt-","path":"gastown"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routes), 0644); err != nil {
+		t.Fatalf("write routes.jsonl: %v", err)
+	}
+
+	// Stub bd binary
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	closesLog := filepath.Join(townRoot, "closes.log")
+	updatesLog := filepath.Join(townRoot, "updates.log")
+
+	// The stub simulates:
+	// - Agent bead with hook_bead pointing to source bead
+	// - Source bead (no attached molecule) in hooked status
+	// The stub records close attempts and update calls so we can verify the
+	// deferral: source bead should NOT be closed, and update should add the
+	// awaiting-merge-stamp label and clear the assignee.
+	bdScript := fmt.Sprintf(`#!/bin/sh
+while [ "$1" = "--allow-stale" ]; do shift; done
+cmd="$1"
+shift || true
+case "$cmd" in
+  show)
+    beadID="$1"
+    case "$beadID" in
+      gt-gastown-polecat-nux)
+        echo '[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","status":"open","hook_bead":"gt-source-1","agent_state":"working"}]'
+        ;;
+      gt-source-1)
+        echo '[{"id":"gt-source-1","title":"Source bead","status":"hooked","assignee":"gastown/polecats/nux"}]'
+        ;;
+    esac
+    ;;
+  update)
+    # Log update args so we can verify the deferral marker + assignee clear
+    echo "$@" >> "%s"
+    ;;
+  close)
+    # Log bead IDs only, skip flags (--reason, --force, --session)
+    for arg in "$@"; do
+      case "$arg" in --*) continue ;; esac
+      echo "$arg" >> "%s"
+    done
+    ;;
+  agent|list|slot)
+    exit 0
+    ;;
+esac
+exit 0
+`, updatesLog, closesLog)
+
+	bdPath := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_ROLE", "polecat")
+	t.Setenv("GT_RIG", "gastown")
+	t.Setenv("GT_POLECAT", "nux")
+	t.Setenv("GT_CREW", "")
+	t.Setenv("TMUX_PANE", "")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Join(townRoot, "gastown")); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	// Call updateAgentStateOnDone with mrID set — deferral path
+	updateAgentStateOnDone(
+		filepath.Join(townRoot, "gastown"),
+		townRoot,
+		ExitCompleted,
+		"gt-source-1",
+		"gastown-wisp-abc", // mrID — non-empty, so deferral triggers
+		false,              // mrFailed
+		false,              // pushFailed
+	)
+
+	// Verify source bead was NOT closed (refinery will close it with provenance)
+	if _, err := os.Stat(closesLog); err == nil {
+		closesBytes, _ := os.ReadFile(closesLog)
+		if strings.Contains(string(closesBytes), "gt-source-1") {
+			t.Errorf("source bead gt-source-1 WAS closed — deferral failed.\nCloses:\n%s", string(closesBytes))
+		} else {
+			t.Logf("closes.log exists but doesn't contain gt-source-1 (other closes only): %s", string(closesBytes))
+		}
+	}
+
+	// Verify source bead WAS updated: assignee cleared + awaiting-merge-stamp label added
+	updatesBytes, err := os.ReadFile(updatesLog)
+	if err != nil {
+		t.Fatalf("no updates were made on the source bead — deferral helper did not run (err: %v)", err)
+	}
+	updates := string(updatesBytes)
+
+	// The update call should reference gt-source-1
+	if !strings.Contains(updates, "gt-source-1") {
+		t.Errorf("expected update call referencing gt-source-1, got:\n%s", updates)
+	}
+	// Assignee should be cleared (--assignee= with empty value)
+	if !strings.Contains(updates, "--assignee=") {
+		t.Errorf("expected --assignee= flag in update (clear assignee), got:\n%s", updates)
+	}
+	// Label should be added: awaiting-merge-stamp:gastown-wisp-abc
+	if !strings.Contains(updates, "awaiting-merge-stamp:gastown-wisp-abc") {
+		t.Errorf("expected awaiting-merge-stamp:gastown-wisp-abc label in update, got:\n%s", updates)
+	}
+}
+
+// TestDoneDeferSourceBeadCloseSkippedOnFailure verifies the gastown-5oy fix
+// failure-mode behavior: when mrFailed=true (or pushFailed=true), the
+// deferral is NOT used and the source bead is closed normally. The refinery
+// won't process anything for failed submissions, so deferral would leave the
+// bead stuck open forever.
+func TestDoneDeferSourceBeadCloseSkippedOnFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script bd stub not supported on Windows")
+	}
+
+	townRoot := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "locks"), 0755); err != nil {
+		t.Fatalf("mkdir .beads/locks: %v", err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown"), 0755); err != nil {
+		t.Fatalf("mkdir gastown: %v", err)
+	}
+	routes := strings.Join([]string{
+		`{"prefix":"gt-","path":"gastown"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routes), 0644); err != nil {
+		t.Fatalf("write routes.jsonl: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	closesLog := filepath.Join(townRoot, "closes.log")
+	updatesLog := filepath.Join(townRoot, "updates.log")
+
+	bdScript := fmt.Sprintf(`#!/bin/sh
+while [ "$1" = "--allow-stale" ]; do shift; done
+cmd="$1"
+shift || true
+case "$cmd" in
+  show)
+    beadID="$1"
+    case "$beadID" in
+      gt-gastown-polecat-nux)
+        echo '[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","status":"open","hook_bead":"gt-source-2","agent_state":"working"}]'
+        ;;
+      gt-source-2)
+        echo '[{"id":"gt-source-2","title":"Source bead","status":"hooked","assignee":"gastown/polecats/nux"}]'
+        ;;
+    esac
+    ;;
+  update)
+    echo "$@" >> "%s"
+    ;;
+  close)
+    for arg in "$@"; do
+      case "$arg" in --*) continue ;; esac
+      echo "$arg" >> "%s"
+    done
+    ;;
+  agent|list|slot)
+    exit 0
+    ;;
+esac
+exit 0
+`, updatesLog, closesLog)
+
+	bdPath := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_ROLE", "polecat")
+	t.Setenv("GT_RIG", "gastown")
+	t.Setenv("GT_POLECAT", "nux")
+	t.Setenv("GT_CREW", "")
+	t.Setenv("TMUX_PANE", "")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Join(townRoot, "gastown")); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	// mrID is non-empty BUT mrFailed=true — deferral must be skipped,
+	// bead closed normally (refinery won't process this MR).
+	updateAgentStateOnDone(
+		filepath.Join(townRoot, "gastown"),
+		townRoot,
+		ExitCompleted,
+		"gt-source-2",
+		"gastown-wisp-failed", // mrID present
+		true,                  // mrFailed — deferral must skip
+		false,                 // pushFailed
+	)
+
+	// Source bead MUST be closed (deferral skipped due to mrFailed)
+	closesBytes, err := os.ReadFile(closesLog)
+	if err != nil {
+		t.Fatalf("expected source bead gt-source-2 to be closed, but no closes logged: %v", err)
+	}
+	if !strings.Contains(string(closesBytes), "gt-source-2") {
+		t.Errorf("expected source bead gt-source-2 in closes log, got:\n%s", string(closesBytes))
+	}
+
+	// The deferral helper (which writes to updates.log) must NOT have run
+	if _, err := os.Stat(updatesLog); err == nil {
+		updatesBytes, _ := os.ReadFile(updatesLog)
+		if strings.Contains(string(updatesBytes), "awaiting-merge-stamp:") {
+			t.Errorf("deferral helper ran despite mrFailed — update log contains awaiting-merge-stamp label:\n%s", string(updatesBytes))
+		}
 	}
 }
