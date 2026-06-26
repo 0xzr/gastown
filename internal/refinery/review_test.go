@@ -690,3 +690,129 @@ func TestIsEmptyReview_DetectsDegeneratePass(t *testing.T) {
 		}
 	})
 }
+
+// ============================================================================
+// gastown-6z5: EvaluateWithRule must preserve packet-level DiffBasis and
+// packet-level CauseKey so the provider's merge-candidate provenance and
+// primary failure cause survive the quorum-rule re-evaluation.
+// ============================================================================
+
+// TestEvaluateWithRule_PreservesPacketDiffBasis confirms that the packet-level
+// DiffBasis stamped by the provider (e.g. githubPRProvider) survives
+// EvaluateWithRule so downstream telemetry can still identify which diff was
+// reviewed after the quorum rule is applied.
+func TestEvaluateWithRule_PreservesPacketDiffBasis(t *testing.T) {
+	packetBasis := DiffBasis{Base: "origin/main", Head: "head-sha", Kind: "merge_candidate"}
+	ev := &ReviewEvaluation{
+		State:     ReviewStatePass,
+		Results:   []ReviewerResult{{Reviewer: "alice", Verdict: ReviewerVerdictPass}},
+		PassCount: 1,
+		DiffBasis: packetBasis,
+	}
+	got := EvaluateWithRule(ev, DegradedQuorumRule{})
+	if got == nil {
+		t.Fatal("EvaluateWithRule returned nil for non-nil input")
+	}
+	if got.DiffBasis != packetBasis {
+		t.Errorf("packet-level DiffBasis lost: got %+v, want %+v", got.DiffBasis, packetBasis)
+	}
+}
+
+// TestEvaluateWithRule_PreservesPacketCauseKey confirms that when the
+// provider stamped a CauseKey on the packet (e.g. gh_changes_requested_overall)
+// and EvaluateReviews does not synthesize a more specific per-result one,
+// the packet-level CauseKey survives the quorum rule pass.
+func TestEvaluateWithRule_PreservesPacketCauseKey(t *testing.T) {
+	ev := &ReviewEvaluation{
+		State:     ReviewStateNoVerdict,
+		Results:   []ReviewerResult{{Reviewer: "github", Verdict: ReviewerVerdictNoVerdict, Evidence: "no reviews"}},
+		DiffBasis: MergeCandidateBasis("origin/main", "head"),
+		CauseKey:  "gh_changes_requested_overall",
+	}
+	got := EvaluateWithRule(ev, DegradedQuorumRule{})
+	if got == nil {
+		t.Fatal("EvaluateWithRule returned nil")
+	}
+	if got.CauseKey != "gh_changes_requested_overall" {
+		t.Errorf("packet-level CauseKey lost: got %q", got.CauseKey)
+	}
+}
+
+// TestEvaluateWithRule_PerResultCauseKeyWinsOverPacket confirms that when
+// EvaluateReviews synthesizes a more specific per-result CauseKey (e.g. a
+// reviewer-blocker-derived key), that more specific key wins over the
+// packet-level key. The packet-level key is a fallback only.
+func TestEvaluateWithRule_PerResultCauseKeyWinsOverPacket(t *testing.T) {
+	ev := &ReviewEvaluation{
+		State:     ReviewStateFail,
+		Results:   []ReviewerResult{{Reviewer: "codex", Verdict: ReviewerVerdictFail, Blockers: []string{"race condition"}, CauseKey: "race_condition"}},
+		DiffBasis: MergeCandidateBasis("origin/main", "head"),
+		CauseKey:  "packet_level_key_should_be_overridden",
+		FailCount: 1,
+	}
+	got := EvaluateWithRule(ev, DegradedQuorumRule{})
+	if got == nil {
+		t.Fatal("EvaluateWithRule returned nil")
+	}
+	if got.CauseKey != "race_condition" {
+		t.Errorf("per-result CauseKey must win over packet-level: got %q", got.CauseKey)
+	}
+}
+
+// TestEvaluateWithRule_NilInput confirms EvaluateWithRule is nil-safe.
+func TestEvaluateWithRule_NilInput(t *testing.T) {
+	if got := EvaluateWithRule(nil, DegradedQuorumRule{}); got != nil {
+		t.Errorf("EvaluateWithRule(nil) must return nil, got %+v", got)
+	}
+}
+
+// TestEvaluateReviews_CommitHistoryFAILReclassified covers the full
+// commit_history reclassification path added for hq-luba, exercised directly
+// via EvaluateReviews so it is regression-protected even when no provider
+// emits a commit_history result. The bead calls out that this path was
+// previously dead code under four-model gate conditions.
+func TestEvaluateReviews_CommitHistoryFAILReclassified(t *testing.T) {
+	results := []ReviewerResult{
+		{Reviewer: "luba", Verdict: ReviewerVerdictFail, Blockers: []string{"race condition"}, CauseKey: "race_condition",
+			DiffBasis: DiffBasis{Base: "base-sha", Head: "head-sha", Kind: "commit_history"}},
+	}
+	ev := EvaluateReviews(results, DegradedQuorumRule{})
+
+	if ev.State != ReviewStateNoVerdict {
+		t.Fatalf("commit_history FAIL must reclassify to NO_VERDICT, got %s: %s", ev.State, ev.Error)
+	}
+	if ev.FailCount != 0 {
+		t.Errorf("commit_history FAIL must NOT count as FailCount, got %d", ev.FailCount)
+	}
+	if ev.NoVerdictCount != 1 {
+		t.Errorf("commit_history FAIL must increment NoVerdictCount, got %d", ev.NoVerdictCount)
+	}
+	// The reclassified verdict is recorded so audit trails still see the reviewer.
+	if ev.Results[0].Verdict != ReviewerVerdictNoVerdict {
+		t.Errorf("reclassified verdict must be NO_VERDICT, got %s", ev.Results[0].Verdict)
+	}
+	if len(ev.Results[0].Blockers) != 0 {
+		t.Errorf("reclassified result must drop blockers, got %v", ev.Results[0].Blockers)
+	}
+}
+
+// TestEvaluateReviews_MergeCandidateFAILStillRejects confirms the
+// counterpart: a FAIL whose DiffBasis IS merge_candidate still hard-rejects
+// the merge. The commit_history reclassification must not over-generalize.
+func TestEvaluateReviews_MergeCandidateFAILStillRejects(t *testing.T) {
+	results := []ReviewerResult{
+		{Reviewer: "codex", Verdict: ReviewerVerdictFail, Blockers: []string{"missing test"}, CauseKey: "missing_test",
+			DiffBasis: MergeCandidateBasis("base-sha", "head-sha")},
+	}
+	ev := EvaluateReviews(results, DegradedQuorumRule{})
+
+	if ev.State != ReviewStateFail {
+		t.Fatalf("merge_candidate FAIL must hard-reject, got %s: %s", ev.State, ev.Error)
+	}
+	if ev.FailCount != 1 {
+		t.Errorf("expected FailCount=1, got %d", ev.FailCount)
+	}
+	if ev.CauseKey != "missing_test" {
+		t.Errorf("expected CauseKey=missing_test, got %q", ev.CauseKey)
+	}
+}

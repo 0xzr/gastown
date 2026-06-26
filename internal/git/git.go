@@ -1495,6 +1495,15 @@ type PRReview struct {
 	// effective review (gastown-cet.12.6.1). Empty when the provider did not
 	// report one; ties break on slice order.
 	SubmittedAt string `json:"submitted_at,omitempty"`
+
+	// CommitID is the SHA of the PR head the review was submitted against.
+	// Used to distinguish a review of the current merge candidate from a
+	// stale review of an older intermediate commit (gastown-6z5):
+	// a stale CHANGES_REQUESTED must not block a later APPROVED made on the
+	// same head, nor override an APPROVED against an even newer head.
+	// Empty when the provider did not report one; callers must fall back to
+	// slice-position ordering in that case (legacy behavior).
+	CommitID string `json:"commit_id,omitempty"`
 }
 
 // IsPRApproved checks whether a GitHub PR has at least one approving review.
@@ -1519,36 +1528,88 @@ func (g *Git) IsPRApproved(prNumber int) (bool, error) {
 
 // GetPRReviews returns per-reviewer GitHub review states for a PR.
 // Requires the gh CLI. Returns an empty slice if there are no reviews.
+//
+// Uses the REST API (GET /repos/{owner}/{repo}/pulls/{n}/reviews) rather than
+// the gh pr view GraphQL query because GraphQL does not surface commit_id per
+// review. commit_id is what lets the refinery tell a review of the current
+// merge-candidate head from a stale review of an older intermediate commit
+// (gastown-6z5).
 func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviews")
+	// gh api paginates Link-rel results by default, so a single invocation
+	// collects every page. {owner}/{repo} are expanded by gh from the
+	// current git context.
+	cmd := exec.Command("gh", "api", "--paginate",
+		fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/reviews?per_page=100", prNumber))
 	cmd.Dir = g.workDir
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("gh pr view reviews failed: %w", err)
+		return nil, fmt.Errorf("gh api pr reviews failed: %w", err)
 	}
-	var result struct {
-		Reviews []struct {
-			Author struct {
-				Login string `json:"login"`
-			} `json:"author"`
-			State       string `json:"state"`
-			Body        string `json:"body"`
-			SubmittedAt string `json:"submittedAt"`
-		} `json:"reviews"`
+	var result []struct {
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		State       string `json:"state"`
+		Body        string `json:"body"`
+		SubmittedAt string `json:"submitted_at"`
+		CommitID    string `json:"commit_id"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
-		return nil, fmt.Errorf("failed to parse gh pr reviews output: %w", err)
+		return nil, fmt.Errorf("failed to parse gh api pr reviews output: %w", err)
 	}
-	reviews := make([]PRReview, 0, len(result.Reviews))
-	for _, r := range result.Reviews {
+	reviews := make([]PRReview, 0, len(result))
+	for _, r := range result {
 		reviews = append(reviews, PRReview{
-			Reviewer:    r.Author.Login,
+			Reviewer:    r.User.Login,
 			State:       r.State,
 			Body:        r.Body,
 			SubmittedAt: r.SubmittedAt,
+			CommitID:    r.CommitID,
 		})
 	}
 	return reviews, nil
+}
+
+// GetPRBaseRef returns the target branch name (e.g. "main") for a PR.
+// Uses the gh pr view GraphQL query, which exposes baseRefName without
+// requiring a separate REST call. An empty string is returned on error;
+// callers that cannot determine the base fall back to the merge-candidate
+// default (treat as merge_candidate basis) rather than committing to a
+// possibly-wrong target.
+func (g *Git) GetPRBaseRef(prNumber int) (string, error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "baseRefName")
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("gh pr view baseRefName failed: %w", err)
+	}
+	var result struct {
+		BaseRefName string `json:"baseRefName"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
+		return "", fmt.Errorf("failed to parse gh pr view baseRefName output: %w", err)
+	}
+	return result.BaseRefName, nil
+}
+
+// GetPRHeadSHA returns the current head commit SHA for a PR.
+// Used to align reviewer verdict basis with the diff that will actually
+// land: a review submitted against an older commit (commit_id != head SHA)
+// is intermediate commit history, not the merge candidate (gastown-6z5).
+func (g *Git) GetPRHeadSHA(prNumber int) (string, error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "headRefOid")
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("gh pr view headRefOid failed: %w", err)
+	}
+	var result struct {
+		HeadRefOid string `json:"headRefOid"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
+		return "", fmt.Errorf("failed to parse gh pr view headRefOid output: %w", err)
+	}
+	return result.HeadRefOid, nil
 }
 
 // GetPRReviewDecision returns the overall GitHub review decision for a PR.
@@ -1690,6 +1751,39 @@ func (g *Git) GetBitbucketPRParticipants(workspace, repoSlug string, prID int) (
 		})
 	}
 	return participants, nil
+}
+
+// GetBitbucketPRDestination returns the destination (target) branch name
+// for a Bitbucket PR. The destination is the ref the PR will merge into;
+// mergeCandidateBasis must use this rather than a hardcoded "main" so a PR
+// against any other target branch is routed through the correct diff
+// (gastown-6z5). An empty string is returned on error; callers fall back to
+// the merge-candidate default rather than committing to a possibly-wrong
+// target.
+func (g *Git) GetBitbucketPRDestination(workspace, repoSlug string, prID int) (string, error) {
+	token := os.Getenv("BITBUCKET_TOKEN")
+	if token == "" {
+		return "", fmt.Errorf("BITBUCKET_TOKEN is required for Bitbucket PR operations")
+	}
+	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d",
+		workspace, repoSlug, prID)
+	cmd := exec.Command("curl", "-s", "-H", "Authorization: Bearer "+token, url)
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("bitbucket API request failed: %w", err)
+	}
+	var pr struct {
+		Destination struct {
+			Branch struct {
+				Name string `json:"name"`
+			} `json:"branch"`
+		} `json:"destination"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &pr); err != nil {
+		return "", fmt.Errorf("failed to parse Bitbucket destination: %w", err)
+	}
+	return pr.Destination.Branch.Name, nil
 }
 
 // BitbucketPRMerge merges a Bitbucket PR via the REST API.
