@@ -188,6 +188,57 @@ func TestRenderRole_Refinery_DefaultBranch(t *testing.T) {
 	}
 }
 
+func TestRenderRole_Refinery_DurableGateBeforeDirectPush(t *testing.T) {
+	tmpl, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	data := RoleData{
+		Role:          "refinery",
+		RigName:       "gastown",
+		TownRoot:      "/home/ubuntu/gt-town",
+		TownName:      "town",
+		WorkDir:       "/home/ubuntu/gt-town/gastown/refinery/rig",
+		DefaultBranch: "main",
+		MayorSession:  "gt-town-mayor",
+		DeaconSession: "gt-town-deacon",
+	}
+
+	output, err := tmpl.RenderRole("refinery", data)
+	if err != nil {
+		t.Fatalf("RenderRole() error = %v", err)
+	}
+
+	required := []string{
+		"Durable Review Gate Rule (hard stop)",
+		"/home/ubuntu/gastown-spike/dropin/refinery-gate.sh",
+		"GT_REVIEW_GATE_WRITER",
+		"GT_GATE_ATTEST_DIR",
+		"GT_GATE_HMAC_KEY",
+		"MERGE_TREE=$(git rev-parse 'HEAD^{tree}')",
+		"hmac.compare_digest",
+		"Reviewer/tooling unavailability is deferred review",
+	}
+	for _, want := range required {
+		if !strings.Contains(output, want) {
+			t.Fatalf("refinery role output missing durable review gate requirement %q", want)
+		}
+	}
+
+	gateIdx := strings.Index(output, "/home/ubuntu/gastown-spike/dropin/refinery-gate.sh")
+	pushIdx := strings.Index(output, "git push origin <merge-target>")
+	if gateIdx == -1 || pushIdx == -1 {
+		t.Fatalf("could not locate gate or push command in rendered refinery role")
+	}
+	if gateIdx > pushIdx {
+		t.Fatalf("durable review gate must appear before direct push in rendered refinery role")
+	}
+	if strings.Contains(output, "git merge --ff-only temp\ngit push origin <merge-target>") {
+		t.Fatalf("rendered refinery role still allows raw merge-to-push bypass")
+	}
+}
+
 func TestRenderMessage_Spawn(t *testing.T) {
 	tmpl, err := New()
 	if err != nil {

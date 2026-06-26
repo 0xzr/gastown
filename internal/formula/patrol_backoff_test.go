@@ -171,6 +171,56 @@ func TestPatrolFormulasHaveWispGC(t *testing.T) {
 	}
 }
 
+func TestRefineryPatrolRequiresDurableReviewGateBeforeDirectPush(t *testing.T) {
+	content, err := formulasFS.ReadFile("formulas/mol-refinery-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading refinery patrol formula: %v", err)
+	}
+
+	f, err := Parse(content)
+	if err != nil {
+		t.Fatalf("parsing refinery patrol formula: %v", err)
+	}
+
+	var mergePush string
+	for _, step := range f.Steps {
+		if step.ID == "merge-push" {
+			mergePush = step.Description
+			break
+		}
+	}
+	if mergePush == "" {
+		t.Fatal("refinery patrol formula: merge-push step not found or empty")
+	}
+
+	required := []string{
+		"/home/ubuntu/gastown-spike/dropin/refinery-gate.sh",
+		"GT_REVIEW_GATE_WRITER",
+		"GT_GATE_ATTEST_DIR",
+		"GT_GATE_HMAC_KEY",
+		"MERGE_TREE=$(git rev-parse 'HEAD^{tree}')",
+		"hmac.compare_digest",
+		"review infrastructure unavailability",
+	}
+	for _, want := range required {
+		if !strings.Contains(mergePush, want) {
+			t.Fatalf("refinery merge-push step missing durable review gate requirement %q", want)
+		}
+	}
+
+	gateIdx := strings.Index(mergePush, "/home/ubuntu/gastown-spike/dropin/refinery-gate.sh")
+	pushIdx := strings.Index(mergePush, "git push origin <merge-target>")
+	if gateIdx == -1 || pushIdx == -1 {
+		t.Fatalf("could not locate gate or push command in merge-push step")
+	}
+	if gateIdx > pushIdx {
+		t.Fatalf("durable review gate must appear before direct push")
+	}
+	if strings.Contains(mergePush, "git merge --ff-only temp\ngit push origin <merge-target>") {
+		t.Fatalf("refinery merge-push step still allows raw merge-to-push bypass")
+	}
+}
+
 // TestDeaconPatrolDoesNotRunAgeBasedWispGC verifies that the Deacon patrol
 // does not reap open step wisps from its own active patrol molecule.
 //
