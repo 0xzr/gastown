@@ -892,7 +892,7 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	// or HMAC attestation blocks the merge. It is required for the default
 	// branch in direct-merge mode; the PR merge path relies on VCS-level
 	// review evaluation instead.
-	durableResult := e.runDurableReviewGate(ctx, branch, target, mr, reviewBase)
+	durableResult := e.runDurableReviewGate(ctx, branch, target, mr, shouldSkipGates, reviewBase)
 	if !durableResult.Success {
 		if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after durable review gate failure: %v\n", target, resetErr)
@@ -1617,6 +1617,40 @@ func (e *Engineer) durableReviewGateEnabled(target string) bool {
 	return strings.EqualFold(canonicalMergeTarget(target), e.effectiveDurableReviewTarget())
 }
 
+// durableReviewRequiredForMR reports whether the durable review gate must
+// enforce an HMAC attestation before a particular MR may merge.
+//
+// Durable attestation is required when EITHER:
+//   - the durable review gate is explicitly required for the target branch
+//     (durable_review_gate.required=true), OR
+//   - this MR is actually skipping deterministic gate execution via the
+//     pre-verified fast path. When the fast path skips gates, the HMAC
+//     attestation is the ONLY durable proof that the merge candidate was
+//     reviewed, so it must be produced or consumed even when the rig config
+//     leaves durable_review_gate.required=false (gastown-6n7).
+//
+// Crucially, the second condition keys off the *resolved* skipGates decision
+// (whether ProcessMRInfo/doMerge are actually skipping deterministic gates),
+// NOT the bare mr.PreVerified flag. ProcessMRInfo only skips gates when the
+// target HEAD still matches PreVerifiedBase; if the target moved, normal gates
+// run and the MR is no longer on the fast path — so it must NOT be denied for a
+// missing attestation solely because mr.PreVerified is stale-true. Treating the
+// flag itself as the trigger conflates "was pre-verified at dispatch" with "is
+// skipping gates now," incorrectly blocking stale pre-verified MRs that ran the
+// normal gate path.
+//
+// The default-branch guard from durableReviewGateEnabled still applies: the
+// enforcement is for the rig's audited merge history, not integration branches.
+func (e *Engineer) durableReviewRequiredForMR(target string, mr *MRInfo, skipGates bool) bool {
+	if !strings.EqualFold(canonicalMergeTarget(target), e.effectiveDurableReviewTarget()) {
+		return false
+	}
+	if e.durableReviewGateEnabled(target) {
+		return true
+	}
+	return skipGates
+}
+
 // durableReviewAttestDir returns the configured attestation directory with
 // environment fallbacks.
 func (e *Engineer) durableReviewAttestDir() string {
@@ -1952,23 +1986,13 @@ func (e *Engineer) isEmptyReviewDiff(branch, target string) (bool, error) {
 // the m3-degenerate-PASS incident where m3 returned PASS on the empty gtviz
 // initial commit and the gate treated that zero-content PASS as approval,
 // enabling a degraded-quorum bypass.
-func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target string, mr *MRInfo, reviewBase ...string) ProcessResult {
-	if !e.durableReviewGateEnabled(target) {
+func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target string, mr *MRInfo, skipGates bool, reviewBase ...string) ProcessResult {
+	if !e.durableReviewRequiredForMR(target, mr, skipGates) {
 		return ProcessResult{Success: true}
 	}
 
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate required for %s\n", target)
 
-	// Fail closed immediately if no review gate command is configured.
-	cmd := e.durableReviewGateCmd()
-	if cmd == "" {
-		_, _ = fmt.Fprintln(e.output, "[Engineer] Durable review gate FAILED - no command configured")
-		return ProcessResult{
-			Success:     false,
-			TestsFailed: true,
-			Error:       "durable review gate required but no command configured",
-		}
-	}
 	key, err := e.readDurableReviewHMACKey()
 	if err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED - HMAC key check failed: %v\n", err)
@@ -1979,11 +2003,21 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 		}
 	}
 
-	// Empty-diff guard: refuse to grant an attestation when there is nothing
-	// to review. In the doMerge flow, target is already locally advanced to
-	// the squashed candidate when this runs, so compare branch against the
-	// pre-merge target commit captured before the squash. Direct unit tests
-	// and callers that have not advanced target use the target branch itself.
+	writer := e.durableReviewWriter(mr)
+	attestationWriter := durableReviewAttestationWriter(writer)
+
+	// Empty-diff guard: refuse to grant or reuse an attestation when there is
+	// nothing to review. This MUST run before the existing-attestation
+	// short-circuit (gastown-6n7): otherwise a replayed attestation for an
+	// unchanged tree would satisfy a zero-content review candidate, regressing
+	// the zero-content fail-closed defense (gastown-cet.12.4). A reviewer that
+	// produces zero findings on a zero-content diff performed no actual review,
+	// so the gate must not treat a cached attestation as evidence of approval.
+	//
+	// In the doMerge flow, target is already locally advanced to the squashed
+	// candidate when this runs, so compare branch against the pre-merge target
+	// commit captured before the squash. Direct unit tests and callers that have
+	// not advanced target use the target branch itself.
 	diffBase := target
 	if len(reviewBase) > 0 {
 		if base := strings.TrimSpace(reviewBase[0]); base != "" {
@@ -2006,12 +2040,14 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 		}
 	}
 
-	writer := e.durableReviewWriter(mr)
-	attestationWriter := durableReviewAttestationWriter(writer)
-
-	// If an attestation already exists for this tree and writer identity, we can
-	// skip running the expensive gate. An attestation for the same tree under a
-	// different writer does not satisfy this check.
+	// If a verified attestation already exists for this tree and writer identity,
+	// the durable review is satisfied — the merge may proceed without re-running
+	// the reviewer. This is the only condition under which a pre-verified MR may
+	// skip durable gate execution (gastown-6n7): an attestation for the exact
+	// tree/writer is already present and verified. An attestation for the same
+	// tree under a different writer does not satisfy this check. This runs AFTER
+	// the empty-diff guard so a cached attestation cannot satisfy a zero-content
+	// review candidate.
 	attested, tree, err := e.hasDurableReviewAttestation(key, attestationWriter)
 	if err != nil {
 		return ProcessResult{
@@ -2025,6 +2061,18 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 		return ProcessResult{Success: true}
 	}
 
+	// No existing attestation: the review gate command must run and produce one.
+	// Fail closed immediately if no review gate command is configured — a
+	// pre-verified MR cannot manufacture the missing attestation by skipping it.
+	cmd := e.durableReviewGateCmd()
+	if cmd == "" {
+		_, _ = fmt.Fprintln(e.output, "[Engineer] Durable review gate FAILED - no command configured")
+		return ProcessResult{
+			Success:     false,
+			TestsFailed: true,
+			Error:       "durable review gate required but no command configured",
+		}
+	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Running durable review gate for tree %s (writer=%s)...\n", shortSHA(tree), attestationWriter)
 
 	gateTimeout := e.durableReviewGateTimeout()
