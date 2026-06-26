@@ -1903,6 +1903,26 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 // BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
 // If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
 // All errors are warnings, not failures - gt done must complete even if bead ops fail.
+//
+// gastown-5oy: When the agent bead's CompletionMetadata indicates a successful
+// MR submission (MRID set, MRFailed=false, PushFailed=false), defer the source
+// bead close so the refinery can stamp "Merged in <MR-id>" provenance. The
+// refinery closes the source bead with proper provenance when it merges the
+// MR (see internal/refinery/manager.go:634 and engineer.go:2254). Closing
+// here with bd.Close() (no reason → default "Closed") would beat the refinery
+// to the punch and produce generic "Closed" beads that never get provenance
+// stamped (13/13 polecat completions on 2026-06-26 patrol #73 hit this before
+// the fix).
+//
+// The deferral decision keys off CompletionMetadata.MRID + exitType +
+// MRFailed/PushFailed only. active_mr is best-effort traceability written
+// earlier by UpdateAgentActiveMR; missing or mismatched active_mr is logged
+// (not enforced) so that an idempotent/existing-MR submission path or a
+// transient UpdateAgentActiveMR failure does not force a generic close.
+//
+// We don't need an mrID parameter because the agent bead carries this info:
+// UpdateAgentCompletion (run earlier in runDone) writes MRID/MRFailed/
+// PushFailed into the agent bead's description, and we read them back here.
 func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
@@ -2033,9 +2053,26 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 			if unchecked := beads.HasUncheckedCriteria(hookedBead); unchecked > 0 {
 				style.PrintWarning("hooked bead %s has %d unchecked acceptance criteria — skipping close", hookedBeadID, unchecked)
 				fmt.Fprintf(os.Stderr, "  The bead will remain open for witness/mayor review.\n")
-			} else if err := bd.Close(hookedBeadID); err != nil {
-				// Non-fatal: warn but continue
-				fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, err)
+			} else {
+				// gastown-5oy: When an MR was successfully submitted (CompletionMetadata.MRID
+				// set with no failures), defer the source-bead close to the refinery. The
+				// refinery stamps "Merged in <MR-id>" provenance when it merges the MR.
+				// Closing here with the default "Closed" reason would beat the refinery
+				// and produce generic close reasons across all polecat completions.
+				//
+				// Failure paths (no MR, MR submission failed, push failed) close
+				// normally — the refinery won't process anything for those paths.
+				if mrID, deferrable := mrContextForDeferral(agentBd, agentBeadID, exitType); deferrable {
+					if deferErr := deferSourceBeadCloseToRefinery(bd, hookedBeadID, mrID); deferErr != nil {
+						style.PrintWarning("could not defer source bead close to refinery for %s: %v — falling back to immediate close", hookedBeadID, deferErr)
+						if err := bd.Close(hookedBeadID); err != nil {
+							fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, err)
+						}
+					}
+				} else if err := bd.Close(hookedBeadID); err != nil {
+					// Non-fatal: warn but continue
+					fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, err)
+				}
 			}
 		}
 	}
@@ -2089,6 +2126,103 @@ doneStateUpdate:
 	// lingering labels to detect the zombie and resume from checkpoints.
 	clearDoneIntentLabel(agentBd, agentBeadID)
 	clearDoneCheckpoints(agentBd, agentBeadID)
+}
+
+// awaitingMergeStampLabelPrefix is the prefix used on the source bead to mark
+// that gt done deferred its close to the refinery. The MR ID is appended so
+// investigators can trace the deferral back to the originating merge request.
+// gastown-5oy: replaces the prior generic "Closed" reason that beat the
+// refinery's "Merged in <MR-id>" provenance stamp.
+const awaitingMergeStampLabelPrefix = "awaiting-merge-stamp:"
+
+// mrContextForDeferral inspects the agent bead's CompletionMetadata to
+// determine whether the source-bead close should be deferred to the refinery
+// for provenance stamping (gastown-5oy).
+//
+// Returns (mrID, true) when ALL of the following hold:
+//   - exitType is COMPLETED
+//   - The agent bead's CompletionMetadata.MRID is non-empty (an MR was created)
+//   - CompletionMetadata.MRFailed is false (MR creation succeeded)
+//   - CompletionMetadata.PushFailed is false (the branch was pushed)
+//
+// In any other case returns ("", false) — the caller closes the source bead
+// normally with bd.Close().
+//
+// The agent bead carries these fields because runDone writes them via
+// UpdateAgentCompletion and UpdateAgentActiveMR before calling
+// updateAgentStateOnDone. Reading them here avoids threading parameters
+// through the function signature and keeps existing callers (and tests)
+// unchanged.
+//
+// ActiveMR (set earlier by UpdateAgentActiveMR) is best-effort traceability,
+// not a contract: if the warn-only UpdateAgentActiveMR update fails, is stale,
+// or the MR is discovered through an idempotent/existing-MR path, completion
+// metadata can still be valid while ActiveMR is empty or mismatched. In that
+// valid state the source bead MUST still be deferred, not closed with bare
+// bd.Close(). Traceability drift is logged but never blocks deferral when
+// CompletionMetadata says MR success. (See codex FAIL on prior rework.)
+//
+// Reads are best-effort: if the agent bead can't be fetched (Dolt unavailable,
+// missing bead, etc.), the function returns false and the caller falls back
+// to the original close-immediately behavior — never worse than the bug.
+func mrContextForDeferral(agentBd *beads.Beads, agentBeadID, exitType string) (string, bool) {
+	if exitType != ExitCompleted || agentBeadID == "" {
+		return "", false
+	}
+	agentIssue, err := agentBd.Show(agentBeadID)
+	if err != nil || agentIssue == nil {
+		return "", false
+	}
+	fields := beads.ParseAgentFields(agentIssue.Description)
+	if fields == nil {
+		return "", false
+	}
+	// Contract: CompletionMetadata is the authoritative signal for MR success.
+	if fields.MRID == "" {
+		return "", false
+	}
+	if fields.MRFailed || fields.PushFailed {
+		return "", false
+	}
+	// active_mr is best-effort traceability. Log drift but don't block.
+	if fields.ActiveMR != "" && fields.ActiveMR != fields.MRID {
+		fmt.Fprintf(os.Stderr, "Note: agent %s active_mr=%q does not match CompletionMetadata.MRID=%q — deferring using MRID per codex guidance (gastown-5oy)\n", agentBeadID, fields.ActiveMR, fields.MRID)
+	}
+	return fields.MRID, true
+}
+
+// deferSourceBeadCloseToRefinery transitions the source bead to a
+// "merge-pending" state instead of closing it. The refinery will close the
+// bead with the proper "Merged in <MR-id>" provenance when it merges the MR
+// (see internal/refinery/manager.go:634 and engineer.go:2254).
+//
+// Without this deferral, gt done closes the source bead with the default
+// "Closed" reason before the refinery processes the MR. The refinery then
+// sees the bead is already terminal and skips the provenance stamp
+// (manager.go:639-642, engineer.go:2266-2268), leaving the bead with a
+// generic "Closed" close_reason that breaks merge-provenance consistency
+// across swarms (gastown-5oy: 13/13 polecat completions on 2026-06-26
+// patrol #73 hit this before the fix).
+//
+// Side effects on the source bead:
+//   - Assignee cleared (prevents witness zombie patrol from re-dispatching
+//     the bead to a new polecat while the refinery is still processing)
+//   - awaiting-merge-stamp:<mr-id> label added (traceability + lets the
+//     refinery detect that this bead was deferred by gt done)
+//   - Status left alone (whatever it was: hooked, in_progress, open)
+//
+// Returns an error if the bd update failed so the caller can fall back to
+// the immediate-close path.
+func deferSourceBeadCloseToRefinery(bd *beads.Beads, sourceIssueID, mrID string) error {
+	if sourceIssueID == "" || mrID == "" {
+		return fmt.Errorf("deferSourceBeadCloseToRefinery: sourceIssueID and mrID required")
+	}
+	emptyAssignee := ""
+	label := awaitingMergeStampLabelPrefix + mrID
+	return bd.Update(sourceIssueID, beads.UpdateOptions{
+		Assignee:  &emptyAssignee,
+		AddLabels: []string{label},
+	})
 }
 
 // ensureAgentBeadExists recreates a missing agent bead so done-intent labels,
