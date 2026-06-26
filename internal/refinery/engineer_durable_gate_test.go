@@ -23,8 +23,12 @@ func TestDoMerge_DurableReviewGate_MissingCommand_BlocksMerge(t *testing.T) {
 	e.config.RunTests = false
 	e.config.AutoPush = false
 	e.config.Gates = nil
+	keyPath := writeTestHMACKey(t, workDir)
 	// Re-enable durable gate but leave command empty. Required + no command must fail closed.
-	e.config.DurableReviewGate = &DurableReviewGateConfig{Required: true}
+	// A key is configured so the gate reaches the command check rather than failing
+	// earlier on key setup; both states fail closed, but the command-missing message
+	// is the specific contract this test pins.
+	e.config.DurableReviewGate = &DurableReviewGateConfig{Required: true, HMACKeyPath: keyPath}
 
 	createFeatureBranch(t, workDir, "feat/no-cmd", "feature.txt", "feature content")
 
@@ -762,6 +766,135 @@ func TestDoMerge_DurableReviewGate_LegacyFallback_ReusesPostSquashGate(t *testin
 	attestationPath := filepath.Join(attestDir, tree)
 	if _, err := os.Stat(attestationPath); err != nil {
 		t.Errorf("expected fallback attestation file %s to exist: %v", attestationPath, err)
+	}
+}
+
+// TestProcessMRInfo_PreVerified_NoAttestation_BlocksMerge is the gastown-6n7
+// regression. A pre-verified MR (gt done --pre-verified) reaches the refinery
+// via ProcessMRInfo, which sets skipGates=true to skip deterministic gate
+// execution. The durable multi-model/HMAC attestation is the only remaining
+// durable proof that the merge candidate was reviewed.
+//
+// The bypass: when the live rig config leaves durable_review_gate.required
+// unset/false, durableReviewGateEnabled returned false and the durable gate
+// was skipped entirely — so a pre-verified MR merged with zero attestation.
+// This test reproduces that config (Required=false, no command, no
+// attestation) and asserts the merge now fails closed. It must NOT reach
+// "Closed MR bead" / "Closed source issue".
+func TestProcessMRInfo_PreVerified_NoAttestation_BlocksMerge(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	keyPath := writeTestHMACKey(t, workDir)
+	// Durable gate disabled — exactly the live config state that allowed the
+	// gastown-6n7 bypass. A pre-verified MR must still require an attestation.
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    false,
+		HMACKeyPath: keyPath,
+		AttestDir:   filepath.Join(workDir, "attestations"),
+	}
+
+	createFeatureBranch(t, workDir, "feat/pv-no-attest", "feature.txt", "pv content")
+
+	targetHead, err := g.Rev("origin/main")
+	if err != nil {
+		t.Fatalf("resolve origin/main: %v", err)
+	}
+	mr := &MRInfo{
+		Branch:          "feat/pv-no-attest",
+		Target:          "main",
+		SourceIssue:     "gt-test",
+		PreVerified:     true,
+		PreVerifiedBase: targetHead,
+	}
+
+	result := e.ProcessMRInfo(context.Background(), mr)
+	if result.Success {
+		t.Fatal("expected pre-verified merge WITHOUT attestation to be blocked, but it succeeded")
+	}
+	if !result.TestsFailed {
+		t.Errorf("expected TestsFailed=true for pre-verified MR without attestation, got %+v", result)
+	}
+	if !strings.Contains(result.Error, "no command configured") {
+		t.Errorf("expected fail-closed 'no command configured' error, got: %s", result.Error)
+	}
+
+	output := e.output.(*bytes.Buffer).String()
+	if !strings.Contains(output, "Pre-verification valid") {
+		t.Errorf("expected pre-verified fast-path to engage, got:\n%s", output)
+	}
+	if !strings.Contains(output, "Durable review gate required for main") {
+		t.Errorf("expected durable gate to be enforced for pre-verified MR even when Required=false, got:\n%s", output)
+	}
+	if strings.Contains(output, "Closed MR bead") || strings.Contains(output, "Closed source issue") {
+		t.Errorf("blocked pre-verified MR must not close MR/source as merged; output:\n%s", output)
+	}
+}
+
+// TestProcessMRInfo_PreVerified_WithAttestation_AllowsFastPath proves the
+// legitimate fast path still works: a pre-verified MR whose merge-candidate
+// tree already has a verified HMAC attestation for the writer merges without
+// re-running the reviewer. This is the ONLY condition under which a
+// pre-verified MR may skip durable gate execution (gastown-6n7).
+func TestProcessMRInfo_PreVerified_WithAttestation_AllowsFastPath(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	attestDir := filepath.Join(workDir, "attestations")
+	if err := os.MkdirAll(attestDir, 0755); err != nil {
+		t.Fatalf("create attest dir: %v", err)
+	}
+	keyPath := writeTestHMACKey(t, workDir)
+	// Disabled durable gate + a command that would fail if invoked. The
+	// existing attestation must short-circuit before the command runs.
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    false,
+		AttestDir:   attestDir,
+		HMACKeyPath: keyPath,
+		Cmd:         `echo "gate must not run" >&2; exit 1`,
+	}
+
+	createFeatureBranch(t, workDir, "feat/pv-attested", "feature.txt", "pv attested content")
+
+	// Pre-compute the squashed merge-candidate tree and pre-write its attestation.
+	mustRun(t, workDir, "git", "checkout", "main")
+	mustRun(t, workDir, "git", "merge", "--squash", "feat/pv-attested")
+	mustRun(t, workDir, "git", "add", ".")
+	mustRun(t, workDir, "git", "commit", "-m", "tmp: compute squashed tree")
+	tree, err := g.Rev("HEAD^{tree}")
+	if err != nil {
+		t.Fatalf("resolve merge-candidate tree: %v", err)
+	}
+	writeHMACToken(t, attestDir, keyPath, tree, "unknown")
+	mustRun(t, workDir, "git", "reset", "--hard", "HEAD~1")
+
+	targetHead, err := g.Rev("origin/main")
+	if err != nil {
+		t.Fatalf("resolve origin/main: %v", err)
+	}
+	mr := &MRInfo{
+		Branch:          "feat/pv-attested",
+		Target:          "main",
+		SourceIssue:     "gt-test",
+		PreVerified:     true,
+		PreVerifiedBase: targetHead,
+	}
+
+	result := e.ProcessMRInfo(context.Background(), mr)
+	if !result.Success {
+		t.Fatalf("expected pre-verified merge WITH attestation to succeed, got: %s", result.Error)
+	}
+
+	output := e.output.(*bytes.Buffer).String()
+	if !strings.Contains(output, "Durable review attestation present") {
+		t.Errorf("expected existing attestation to short-circuit the gate, got:\n%s", output)
+	}
+	if strings.Contains(output, "gate must not run") {
+		t.Errorf("durable gate command ran despite verified attestation; output:\n%s", output)
 	}
 }
 
