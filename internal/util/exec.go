@@ -5,9 +5,33 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 )
+
+// userHomeDirForTest is a test seam. When non-nil it is used in place of the
+// production home-directory lookup. Tests override this to exercise the
+// os/user fallback without depending on the host's actual account database.
+var userHomeDirForTest func() string
+
+// userHomeDir returns the current user's home directory. It prefers $HOME (or
+// its platform equivalents), falling back to the operating-system account
+// database when the environment variable is unset or empty. This matters for
+// background refinery/daemon sessions launched with a minimal environment that
+// omits HOME but still has a user record pointing at the toolchain install.
+func userHomeDir() string {
+	if userHomeDirForTest != nil {
+		return userHomeDirForTest()
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return home
+	}
+	if u, err := user.Current(); err == nil {
+		return u.HomeDir
+	}
+	return ""
+}
 
 // FirstLine returns the first non-empty line from s, trimmed of whitespace.
 // Used to extract the meaningful error message from subprocess stderr, which
@@ -77,7 +101,8 @@ func ExecRun(workDir, cmd string, args ...string) error {
 //
 // Locations checked (existing directories with a `go` binary only):
 //   - $GOROOT/bin (explicit override, if GOROOT is set)
-//   - $HOME/go-toolchain/go/bin (this host's toolchain install location)
+//   - $HOME/go-toolchain/go/bin (this host's toolchain install location, falling
+//     back to the user record from os/user when $HOME is unset)
 //   - /usr/local/go/bin (standard tarball install location)
 //
 // Order is deliberate: operator-set GOROOT wins, then the host toolchain, then
@@ -117,7 +142,7 @@ func goToolchainPathEntries() []string {
 	if root := os.Getenv("GOROOT"); root != "" {
 		add(filepath.Join(root, "bin"))
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
+	if home := userHomeDir(); home != "" {
 		add(filepath.Join(home, "go-toolchain", "go", "bin"))
 	}
 	add("/usr/local/go/bin")

@@ -354,6 +354,52 @@ func TestGateCommandEnv_UsrLocalGoBinFallback(t *testing.T) {
 	}
 }
 
+// TestGateCommandEnv_HomeUnset_FallsBackToUserHomeDir verifies that when $HOME
+// is not set, GateCommandEnv still discovers the toolchain by looking up the
+// current user's home directory via os/user. Background refinery and daemon
+// sessions are often launched with a minimal environment that omits HOME, which
+// previously caused every Go gate to fail with "go: not found" even though the
+// toolchain was installed at the user's home.
+func TestGateCommandEnv_HomeUnset_FallsBackToUserHomeDir(t *testing.T) {
+	if hasUsrLocalGoBin() {
+		t.Skip("/usr/local/go/bin/go exists; cannot isolate the HOME-unset fallback branch")
+	}
+
+	snap := snapshotEnv()
+	defer snap.restore()
+
+	// Create a fake toolchain in a temp directory and tell the production lookup
+	// to treat that temp directory as the user's home. HOME itself is left empty
+	// so os.UserHomeDir would otherwise fail and the os/user fallback would be
+	// exercised.
+	home := t.TempDir()
+	binDir := filepath.Dir(writeFakeGo(t, filepath.Join(home, "go-toolchain", "go", "bin"), 0o755))
+
+	os.Setenv("HOME", "")
+	os.Setenv("GOROOT", "")
+	os.Setenv("PATH", "/usr/bin:/bin")
+
+	if _, err := exec.LookPath("go"); err == nil {
+		t.Skip("go is resolvable on the restricted PATH; cannot test the missing case")
+	}
+
+	old := userHomeDirForTest
+	userHomeDirForTest = func() string { return home }
+	defer func() { userHomeDirForTest = old }()
+
+	env := GateCommandEnv()
+	if env == nil {
+		t.Fatal("expected non-nil env with fallback home toolchain PATH, got nil")
+	}
+	path := envPath(env)
+	if !strings.HasPrefix(path, binDir) {
+		t.Errorf("expected PATH to start with toolchain bin %q, got %q", binDir, path)
+	}
+	if !strings.Contains(path, "/usr/bin") {
+		t.Errorf("expected original PATH entries preserved, got %q", path)
+	}
+}
+
 // TestGateCommandEnv_NonExecutableGoIsDetected pins the presence-only check
 // contract: the helper treats any file named `go` (regardless of executable
 // bits) as a toolchain candidate. This is a deliberate trade-off — see the
