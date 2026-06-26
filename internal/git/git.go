@@ -1468,6 +1468,12 @@ type PRReview struct {
 	Reviewer string `json:"reviewer"`
 	State    string `json:"state"`
 	Body     string `json:"body,omitempty"`
+
+	// SubmittedAt is the RFC3339 timestamp the review was submitted, used to order
+	// a reviewer's review history chronologically when collapsing to the final
+	// effective review (gastown-cet.12.6.1). Empty when the provider did not
+	// report one; ties break on slice order.
+	SubmittedAt string `json:"submitted_at,omitempty"`
 }
 
 // IsPRApproved checks whether a GitHub PR has at least one approving review.
@@ -1504,8 +1510,9 @@ func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
 			Author struct {
 				Login string `json:"login"`
 			} `json:"author"`
-			State string `json:"state"`
-			Body  string `json:"body"`
+			State       string `json:"state"`
+			Body        string `json:"body"`
+			SubmittedAt string `json:"submittedAt"`
 		} `json:"reviews"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
@@ -1514,9 +1521,10 @@ func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
 	reviews := make([]PRReview, 0, len(result.Reviews))
 	for _, r := range result.Reviews {
 		reviews = append(reviews, PRReview{
-			Reviewer: r.Author.Login,
-			State:    r.State,
-			Body:     r.Body,
+			Reviewer:    r.Author.Login,
+			State:       r.State,
+			Body:        r.Body,
+			SubmittedAt: r.SubmittedAt,
 		})
 	}
 	return reviews, nil
