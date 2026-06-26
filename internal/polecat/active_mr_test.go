@@ -2,6 +2,7 @@ package polecat
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -133,5 +134,106 @@ func TestAssessActiveMRReconcilableReworkClose(t *testing.T) {
 	}
 	if !merged.Pending {
 		t.Fatalf("merged MR with open source Pending = false, want true (source not terminal)")
+	}
+}
+
+// TestAssessActiveMRReconcilableMissingMRWithOpenSource covers gastown-p3w /
+// the Jasper-like case: a stale active_mr that points at an MR bead no longer
+// present in beads (status=missing) and whose source issue is still verified
+// open. The slot must classify as Reconcilable so it can be safely
+// re-dispatched for rework without a Mayor nudge.
+//
+// Negative coverage: when the source is unknown, missing, or terminal, the
+// verdict stays Pending so the slot is escalated to Mayor with a precise
+// blocker reason instead of being silently recycled.
+func TestAssessActiveMRReconcilableMissingMRWithOpenSource(t *testing.T) {
+	reader := fakeActiveMRReader{issues: map[string]*beads.Issue{
+		// Jasper-like: the MR has been deleted from beads but the source
+		// issue is still open (mid-rework). The slot is recyclable.
+		"gt-rework-open": &beads.Issue{ID: "gt-rework-open", Status: "in_progress"},
+		// Same shape but the source was closed after a successful merge —
+		// the missing MR + closed source is a no-op, the slot is clear.
+		"gt-merged-source": &beads.Issue{ID: "gt-merged-source", Status: "closed"},
+	}}
+
+	// Happy path: missing MR + open source + safe git = Reconcilable, non-pending.
+	got := AssessActiveMR(reader, ActiveMRInput{
+		ActiveMR:        "mr-jasper-missing",
+		SourceIssueHint: "gt-rework-open",
+		RequireGitSafe:  true,
+		GitSafe:         true,
+	})
+	if got.Pending {
+		t.Fatalf("missing MR + open source Pending = true, want false (reason %q)", got.Reason)
+	}
+	if !got.Stale {
+		t.Fatalf("missing MR Stale = false, want true")
+	}
+	if !got.Reconcilable {
+		t.Fatalf("missing MR + open source Reconcilable = false, want true (gastown-p3w Jasper case)")
+	}
+	if got.SourceIssue != "gt-rework-open" {
+		t.Fatalf("SourceIssue = %q, want gt-rework-open", got.SourceIssue)
+	}
+	if !strings.Contains(got.Reason, "rework-reconcilable") {
+		t.Fatalf("Reason %q should mention rework-reconcilable", got.Reason)
+	}
+
+	// Unsafe git blocks the reconcilable path even when source is open.
+	unsafe := AssessActiveMR(reader, ActiveMRInput{
+		ActiveMR:        "mr-jasper-missing",
+		SourceIssueHint: "gt-rework-open",
+		RequireGitSafe:  true,
+		GitSafe:         false,
+	})
+	if !unsafe.Pending {
+		t.Fatalf("missing MR + open source + unsafe git Pending = false, want true (reason %q)", unsafe.Reason)
+	}
+	if !strings.Contains(unsafe.Reason, "git_state=unsafe") {
+		t.Fatalf("unsafe git reason = %q, want contains git_state=unsafe", unsafe.Reason)
+	}
+
+	// Closed source: missing MR + terminal source + safe git clears the slot.
+	closed := AssessActiveMR(reader, ActiveMRInput{
+		ActiveMR:        "mr-jasper-missing",
+		SourceIssueHint: "gt-merged-source",
+		RequireGitSafe:  true,
+		GitSafe:         true,
+	})
+	if closed.Pending {
+		t.Fatalf("missing MR + closed source Pending = true, want false (reason %q)", closed.Reason)
+	}
+	if !closed.SourceTerminal {
+		t.Fatalf("SourceTerminal = false, want true for closed source")
+	}
+}
+
+// TestAssessActiveMRMissingMRWithUnknownSourceFailsClosed covers the
+// fail-closed case: a missing MR with no resolvable source issue must NOT be
+// silently cleared. The slot escalates to Mayor with a precise blocker reason
+// instead of being treated as a generic NEEDS_RECOVERY capacity hold.
+func TestAssessActiveMRMissingMRWithUnknownSourceFailsClosed(t *testing.T) {
+	// Source hint names an issue that doesn't exist anywhere in beads.
+	reader := fakeActiveMRReader{issues: map[string]*beads.Issue{}}
+	got := AssessActiveMR(reader, ActiveMRInput{
+		ActiveMR:        "mr-jasper-missing",
+		SourceIssueHint: "gt-source-vanished",
+		RequireGitSafe:  true,
+		GitSafe:         true,
+	})
+	if !got.Pending {
+		t.Fatalf("missing MR + unknown source Pending = false, want true (reason %q)", got.Reason)
+	}
+	if got.Reconcilable {
+		t.Fatalf("missing MR + unknown source Reconcilable = true, want false (no positive evidence)")
+	}
+	if !strings.Contains(got.Reason, "source_status=missing") && !strings.Contains(got.Reason, "source_issue=") {
+		t.Fatalf("Reason %q should mention the source-status evidence", got.Reason)
+	}
+
+	// Empty source hint: same fail-closed behavior.
+	noHint := AssessActiveMR(reader, ActiveMRInput{ActiveMR: "mr-jasper-missing"})
+	if !noHint.Pending {
+		t.Fatalf("missing MR + empty source hint Pending = false, want true (reason %q)", noHint.Reason)
 	}
 }

@@ -100,6 +100,55 @@ func assessStaleActiveMR(reader IssueReader, in ActiveMRInput, result ActiveMRAs
 		return result
 	}
 
+	// gastown-p3w: a stale active_mr that points at an MR bead no longer present
+	// in beads (status=missing, mr=nil) is the Jasper-like case. The MR has been
+	// removed from the merge queue entirely (manual close, restart, or
+	// housekeeping), so there is no live merge-queue work to wait on. When the
+	// source issue is still open, the slot is recyclable for the next rework
+	// dispatch the same way an MR closed with close_reason=rejected/conflict/
+	// superseded is. The slot must not be left as a generic NEEDS_RECOVERY
+	// capacity hold with no deterministic next action.
+	if mrStatus == "missing" {
+		// gastown-p3w: a stale active_mr that points at an MR bead no longer
+		// present in beads (status=missing, mr=nil) is the Jasper-like case.
+		// The MR has been removed from the merge queue entirely (manual
+		// close, restart, or housekeeping), so there is no live merge-queue
+		// work to wait on. We only classify the slot as rework-reconcilable
+		// when we have positive evidence the source issue is verified
+		// open — an unknown or terminal source keeps the fail-closed
+		// verdict so we never silently recycle a slot whose work is in
+		// question.
+		if openStatus := sourceIssueOpenStatus(reader, sourceIssue); openStatus != "" {
+			result.Reconcilable = true
+			if in.RequireGitSafe && !in.GitSafe {
+				result.Reason = fmt.Sprintf("active_mr=%s status=missing source_issue=%s git_state=unsafe", result.ActiveMR, sourceIssue)
+				return result
+			}
+			result.Pending = false
+			result.Reason = fmt.Sprintf("active_mr=%s status=missing source_issue=%s source_status=%s (rework-reconcilable)", result.ActiveMR, sourceIssue, openStatus)
+			return result
+		}
+		// Source is unknown, missing, terminal, or unverified — fall
+		// through to the source-terminal gate. terminalSourceIssue will
+		// produce a Pending=true verdict with a precise blocker reason
+		// ("source_status=missing" / "source_issue=<missing>" / etc.) so
+		// the slot can be escalated to Mayor with actionable evidence
+		// instead of being silently recycled.
+		terminal, reason := terminalSourceIssue(reader, sourceIssue)
+		result.SourceTerminal = terminal
+		if !terminal {
+			result.Reason = fmt.Sprintf("active_mr=%s status=missing %s", result.ActiveMR, reason)
+			return result
+		}
+		if in.RequireGitSafe && !in.GitSafe {
+			result.Reason = fmt.Sprintf("active_mr=%s status=missing source_issue=%s git_state=unsafe", result.ActiveMR, sourceIssue)
+			return result
+		}
+		result.Pending = false
+		result.Reason = ""
+		return result
+	}
+
 	terminal, reason := terminalSourceIssue(reader, sourceIssue)
 	result.SourceTerminal = terminal
 	if !terminal {
@@ -180,4 +229,26 @@ func terminalSourceIssue(reader IssueReader, sourceIssue string) (bool, string) 
 		return true, ""
 	}
 	return false, fmt.Sprintf("source_issue=%s source_status=%s", sourceIssue, issue.Status)
+}
+
+// sourceIssueOpenStatus reports whether the source issue is verified open
+// (looked up, present, and in a non-terminal state). Returns "" when the
+// source is empty, missing, or unverified. Used by the missing-MR path to
+// gate the rework-reconcilable classification on positive evidence that the
+// polecat still owns an open rework assignment.
+func sourceIssueOpenStatus(reader IssueReader, sourceIssue string) string {
+	if sourceIssue == "" {
+		return ""
+	}
+	if reader == nil {
+		return ""
+	}
+	issue, err := reader.Show(sourceIssue)
+	if err != nil || issue == nil {
+		return ""
+	}
+	if beads.IssueStatus(issue.Status).IsTerminal() {
+		return ""
+	}
+	return issue.Status
 }
