@@ -1079,6 +1079,27 @@ func (g *Git) DiffNameOnly(base, head string) ([]string, error) {
 	return strings.Split(strings.TrimSpace(out), "\n"), nil
 }
 
+// IsEmptyDiff reports whether the merge-candidate range (base...head,
+// triple-dot) contains no changes. This is the source-controlled counterpart
+// of the m3 reviewer's "empty diff is blocking" rubric item: a reviewer that
+// returns PASS on an empty diff produced no actual review, so the gate must
+// fail closed rather than treat zero findings as evidence of approval
+// (gastown-cet.12.4: the degraded-quorum bypass was enabled by an m3 PASS
+// on the empty gtviz initial commit).
+//
+// A missing base or head is treated as "unknown" and returns (false, nil):
+// callers should not assume an empty diff when the basis cannot be resolved.
+func (g *Git) IsEmptyDiff(base, head string) (bool, error) {
+	if base == "" || head == "" {
+		return false, nil
+	}
+	files, err := g.DiffNameOnly(base, head)
+	if err != nil {
+		return false, err
+	}
+	return len(files) == 0, nil
+}
+
 // GitStatus represents the status of the working directory.
 type GitStatus struct {
 	Clean     bool

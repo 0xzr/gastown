@@ -50,11 +50,27 @@ type DiffBasis struct {
 	//   - "merge_candidate": the diff the merge will land (base...head triple-dot).
 	//   - "commit_history": per-commit differences (base..head double-dot).
 	Kind string `json:"kind,omitempty"`
+
+	// EmptyDiff reports whether the reviewed range had zero changes. A
+	// reviewer that returns PASS with zero findings on an empty diff produced
+	// no actual review (gastown-cet.12.4: m3 PASS on the empty gtviz initial
+	// commit enabled a degraded-quorum bypass). Callers should set this from
+	// `git diff --name-only base...head` so the evaluator can defend against
+	// degenerate PASS verdicts on empty diffs.
+	EmptyDiff bool `json:"empty_diff,omitempty"`
 }
 
 // IsMergeCandidate reports whether this basis is the final merge candidate.
 func (d DiffBasis) IsMergeCandidate() bool {
 	return d.Kind == "merge_candidate" || d.Kind == ""
+}
+
+// IsEmptyReview reports whether a PASS verdict on this basis is a degenerate
+// zero-content review (no changes between base and head). The PASS is treated
+// as evidence-free because there was nothing to actually review, so it must
+// not authoritatively approve the change (gastown-cet.12.4).
+func (r ReviewerResult) IsEmptyReview() bool {
+	return r.Verdict == ReviewerVerdictPass && r.DiffBasis.EmptyDiff
 }
 
 // ReviewerResult is the classified outcome for one reviewer.
@@ -198,12 +214,29 @@ func EvaluateReviews(results []ReviewerResult, rule DegradedQuorumRule) ReviewEv
 
 	// Classify each result, reclassifying commit-history FAILs as audit-gaps
 	// so they cannot authoritatively reject the final merge candidate (hq-luba).
+	// Also reclassify empty-review PASSes as FAILs so a zero-content review
+	// cannot authoritatively approve the merge (gastown-cet.12.4).
 	auditGaps := []string{}
 	for i := range results {
 		r := &results[i]
 		switch r.Verdict {
 		case ReviewerVerdictPass:
-			ev.PassCount++
+			if r.IsEmptyReview() {
+				// Empty-review guard: PASS on a known-empty diff is a
+				// degenerate zero-content verdict, not evidence of approval.
+				// Reclassify as a hard FAIL with a stable cause key so the
+				// merge is blocked and the audit trail is unambiguous.
+				// Do not increment PassCount — the reclassified FAIL is
+				// counted in FailCount below.
+				r.Verdict = ReviewerVerdictFail
+				r.CauseKey = "empty_diff_degenerate_pass"
+				if len(r.Blockers) == 0 {
+					r.Blockers = []string{"PASS on empty diff (no content reviewed)"}
+				}
+				ev.FailCount++
+			} else {
+				ev.PassCount++
+			}
 		case ReviewerVerdictFail:
 			if !r.DiffBasis.IsMergeCandidate() {
 				// Reviewed intermediate commit history, not the final candidate.
@@ -444,6 +477,27 @@ func EvaluateCoreReviewerQuorum(results []ReviewerResult, q CoreReviewerQuorum) 
 	// FAIL precedence: a parsed FAIL from ANY consulted reviewer (core or Opus)
 	// rejects immediately, even if other core reviewers were unavailable. This
 	// matches the dropin's "any parsed FAIL rejects" rule.
+	//
+	// Empty-review guard (gastown-cet.12.4): a PASS verdict on a known-empty
+	// diff (zero changes between base and head) is treated as a FAIL, not a
+	// PASS. A reviewer that produces zero findings on a zero-content diff
+	// performed no actual review, so it must not authoritatively approve the
+	// merge. This defends against the m3-degenerate-PASS incident where m3
+	// returned PASS on the empty gtviz initial commit and the gate treated
+	// that zero-content PASS as evidence of approval, enabling a
+	// degraded-quorum bypass. The reclassification is recorded as a FAIL with
+	// a stable cause key (`empty_diff_degenerate_pass`) so the merge is
+	// blocked and the audit trail is clear.
+	for _, r := range results {
+		if r.IsEmptyReview() {
+			ev.State = ReviewStateFail
+			ev.CauseKey = "empty_diff_degenerate_pass"
+			ev.FailCount = 1
+			ev.Error = fmt.Sprintf("core multi-model reviewer rejection: %s returned PASS on empty diff (zero findings, no content reviewed)", r.Reviewer)
+			return ev
+		}
+	}
+
 	var failReviewer string
 	var failCause string
 	for _, r := range results {

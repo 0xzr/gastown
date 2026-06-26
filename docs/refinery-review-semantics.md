@@ -25,6 +25,15 @@ The refinery classifies each review probe into exactly one of these verdicts:
 `NO_VERDICT` and `UNAVAILABLE` are **not** treated as content `FAIL`. They are
 non-terminal states that may be handled by degraded quorum.
 
+**Empty-review guard (gastown-cet.12.4):** a `PASS` verdict on a known-empty
+diff (zero changes between base and head) is reclassified as a `FAIL` with
+cause key `empty_diff_degenerate_pass`. A reviewer that produces zero
+findings on a zero-content diff performed no actual review, so the verdict
+must not authoritatively approve the merge. The durable review gate also
+refuses to run the reviewer command at all when the merge-candidate diff is
+empty, so a degenerate `PASS` cannot lead to an HMAC attestation that would
+later be treated as evidence of approval.
+
 ## Decision Rules
 
 The refinery applies these rules in order:

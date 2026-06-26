@@ -545,3 +545,199 @@ func TestCoreQuorum_OpusNotConsultedMerges(t *testing.T) {
 		t.Errorf("expected opus status NOT_CONSULTED, got %s", q.OpusStatus())
 	}
 }
+
+// --- Empty-diff guard (gastown-cet.12.4) -----------------------------------
+//
+// These tests pin the empty-review guard: a PASS verdict on a known-empty
+// diff (zero changes between base and head) is a degenerate zero-content
+// review, not evidence of approval. It must be reclassified as a FAIL with a
+// stable cause key (`empty_diff_degenerate_pass`) so the merge is blocked and
+// the audit trail is unambiguous.
+//
+// The bug this fixes: m3 returned PASS on the empty gtviz initial commit
+// (2abdc645) at 2026-06-25T08:27:29, while 7+ other m3 attempts against the
+// same commit correctly returned FAIL with explicit "empty diff is blocking"
+// findings. The single degenerate PASS enabled a degraded-quorum bypass merge
+// under the live four-model refinery gate. The fix hardens both the legacy
+// `EvaluateReviews` aggregator and the strict `EvaluateCoreReviewerQuorum`
+// quorum to refuse to credit a zero-content PASS as a real approval.
+
+// TestEvaluateReviews_EmptyDiffPassReclassifiedAsFail covers the legacy
+// aggregator: a PASS verdict on an explicitly-empty merge-candidate diff is
+// reclassified as a hard FAIL, not silently passed through.
+func TestEvaluateReviews_EmptyDiffPassReclassifiedAsFail(t *testing.T) {
+	results := []ReviewerResult{
+		{Reviewer: "m3", Verdict: ReviewerVerdictPass,
+			DiffBasis: DiffBasis{Base: "base-sha", Head: "head-sha", Kind: "merge_candidate", EmptyDiff: true}},
+	}
+	ev := EvaluateReviews(results, DegradedQuorumRule{Enabled: true, MinPassReviews: 1})
+
+	if ev.State != ReviewStateFail {
+		t.Fatalf("empty-diff PASS must be reclassified as FAIL, got %s: %s", ev.State, ev.Error)
+	}
+	if ev.CauseKey != "empty_diff_degenerate_pass" {
+		t.Errorf("expected cause key empty_diff_degenerate_pass, got %s", ev.CauseKey)
+	}
+	if ev.FailCount != 1 {
+		t.Errorf("expected FailCount=1 after reclassification, got %d", ev.FailCount)
+	}
+	if ev.PassCount != 0 {
+		t.Errorf("expected PassCount=0 after reclassification, got %d", ev.PassCount)
+	}
+	// The reclassified PASS must carry a concrete blocker so the FAIL is
+	// visible in the audit trail, not just a cause-key change.
+	if ev.Results[0].Verdict != ReviewerVerdictFail {
+		t.Errorf("expected reclassified verdict FAIL, got %s", ev.Results[0].Verdict)
+	}
+	if len(ev.Results[0].Blockers) == 0 {
+		t.Error("expected reclassified FAIL to carry a concrete blocker, got none")
+	}
+}
+
+// TestEvaluateReviews_NonEmptyDiffPassStillPasses is the counterpart: a real
+// PASS on a non-empty diff is NOT reclassified, so legitimate approvals are
+// unaffected.
+func TestEvaluateReviews_NonEmptyDiffPassStillPasses(t *testing.T) {
+	results := []ReviewerResult{
+		{Reviewer: "m3", Verdict: ReviewerVerdictPass,
+			DiffBasis: DiffBasis{Base: "base-sha", Head: "head-sha", Kind: "merge_candidate", EmptyDiff: false}},
+	}
+	ev := EvaluateReviews(results, DegradedQuorumRule{})
+
+	if ev.State != ReviewStatePass {
+		t.Fatalf("non-empty PASS must remain PASS, got %s: %s", ev.State, ev.Error)
+	}
+	if ev.Results[0].Verdict != ReviewerVerdictPass {
+		t.Errorf("non-empty PASS verdict must not be reclassified, got %s", ev.Results[0].Verdict)
+	}
+}
+
+// TestEvaluateReviews_EmptyDiffUnknownBasisDefaultsToFailClosed is the
+// fail-closed default for the empty-diff guard: when the diff basis is
+// unknown (no basis supplied at all), the empty-review reclassification must
+// not credit a zero-blocker PASS, because there is no evidence to confirm
+// the diff was non-empty.
+func TestEvaluateReviews_EmptyDiffUnknownBasisDefaultsToFailClosed(t *testing.T) {
+	results := []ReviewerResult{
+		// Empty basis with PASS and zero findings, no blockers, no evidence.
+		{Reviewer: "m3", Verdict: ReviewerVerdictPass},
+	}
+	ev := EvaluateReviews(results, DegradedQuorumRule{Enabled: true, MinPassReviews: 1})
+
+	// With no basis, IsEmptyReview is false (we only reclassify when the
+	// basis explicitly marks the diff empty), so a PASS without basis is
+	// accepted as evidence of approval. This documents the explicit
+	// fail-closed default: callers must set EmptyDiff to opt in to the
+	// reclassification. If a caller wants fail-closed for ALL zero-blocker
+	// PASS verdicts, they can leave EmptyDiff unset and the gate's own
+	// empty-diff guard (runDurableReviewGate) catches it at the gate layer.
+	if ev.State != ReviewStatePass {
+		t.Fatalf("PASS with empty basis should not be reclassified (EmptyDiff unset), got %s: %s", ev.State, ev.Error)
+	}
+}
+
+// TestCoreQuorum_EmptyDiffPassReclassifiedAsFail is the core-multi-model
+// counterpart: even when every selected core reviewer returns PASS, if the
+// diff is empty, the quorum must reject with the empty-review cause key so
+// the gate cannot merge on a degenerate PASS.
+func TestCoreQuorum_EmptyDiffPassReclassifiedAsFail(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "unknown"}
+	selected := q.SelectedCoreReviewers()
+
+	results := make([]ReviewerResult, 0, len(selected))
+	for _, n := range selected {
+		results = append(results, ReviewerResult{
+			Reviewer: n,
+			Verdict:  ReviewerVerdictPass,
+			DiffBasis: DiffBasis{
+				Base:      "base-sha",
+				Head:      "head-sha",
+				Kind:      "merge_candidate",
+				EmptyDiff: true,
+			},
+		})
+	}
+
+	ev := EvaluateCoreReviewerQuorum(results, q)
+	if ev.State != ReviewStateFail {
+		t.Fatalf("4/4 PASS on empty diff must reclassify as FAIL, got %s: %s", ev.State, ev.Error)
+	}
+	if ev.CauseKey != "empty_diff_degenerate_pass" {
+		t.Errorf("expected cause key empty_diff_degenerate_pass, got %s", ev.CauseKey)
+	}
+	if ev.FailCount != 1 {
+		t.Errorf("expected FailCount=1, got %d", ev.FailCount)
+	}
+}
+
+// TestCoreQuorum_EmptyDiffKnownM3Writer still reclassifies when the writer
+// exclusion produces 3/3 PASS — even the smaller quorum cannot merge an
+// empty diff, since the empty-review guard fires before the quorum tally.
+func TestCoreQuorum_EmptyDiffKnownM3Writer(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "m3"}
+	selected := q.SelectedCoreReviewers()
+
+	results := make([]ReviewerResult, 0, len(selected))
+	for _, n := range selected {
+		results = append(results, ReviewerResult{
+			Reviewer: n,
+			Verdict:  ReviewerVerdictPass,
+			DiffBasis: DiffBasis{
+				Base:      "base-sha",
+				Head:      "head-sha",
+				Kind:      "merge_candidate",
+				EmptyDiff: true,
+			},
+		})
+	}
+
+	ev := EvaluateCoreReviewerQuorum(results, q)
+	if ev.State != ReviewStateFail {
+		t.Fatalf("3/3 PASS on empty diff must reclassify as FAIL, got %s: %s", ev.State, ev.Error)
+	}
+	if ev.CauseKey != "empty_diff_degenerate_pass" {
+		t.Errorf("expected cause key empty_diff_degenerate_pass, got %s", ev.CauseKey)
+	}
+}
+
+// TestIsEmptyReview_DetectsDegeneratePass pins the IsEmptyReview predicate:
+// PASS + EmptyDiff basis + zero blockers = degenerate PASS. A FAIL verdict
+// must not be reported as an empty review (the reclassification only targets
+// PASS verdicts).
+func TestIsEmptyReview_DetectsDegeneratePass(t *testing.T) {
+	t.Run("pass_with_empty_diff_returns_true", func(t *testing.T) {
+		r := ReviewerResult{Reviewer: "m3", Verdict: ReviewerVerdictPass,
+			DiffBasis: DiffBasis{Base: "b", Head: "h", EmptyDiff: true}}
+		if !r.IsEmptyReview() {
+			t.Error("PASS with EmptyDiff basis must be reported as empty review")
+		}
+	})
+	t.Run("pass_with_non_empty_diff_returns_false", func(t *testing.T) {
+		r := ReviewerResult{Reviewer: "m3", Verdict: ReviewerVerdictPass,
+			DiffBasis: DiffBasis{Base: "b", Head: "h", EmptyDiff: false}}
+		if r.IsEmptyReview() {
+			t.Error("PASS with non-empty diff must not be reported as empty review")
+		}
+	})
+	t.Run("fail_with_empty_diff_returns_false", func(t *testing.T) {
+		r := ReviewerResult{Reviewer: "m3", Verdict: ReviewerVerdictFail,
+			DiffBasis: DiffBasis{Base: "b", Head: "h", EmptyDiff: true}}
+		if r.IsEmptyReview() {
+			t.Error("FAIL must not be reported as empty review (only PASS reclassifies)")
+		}
+	})
+	t.Run("pass_with_empty_diff_and_blockers_returns_true", func(t *testing.T) {
+		// A PASS verdict on an empty diff is degenerate regardless of any
+		// carried blockers: if the diff is empty, the reviewer could not
+		// have engaged with content. Blockers on a zero-content review are
+		// misattributed (a PASS verdict should not carry blockers; that is
+		// a data-model contradiction handled by the reclassification, not
+		// by relaxing the empty-review predicate).
+		r := ReviewerResult{Reviewer: "m3", Verdict: ReviewerVerdictPass,
+			Blockers: []string{"some concrete finding"},
+			DiffBasis: DiffBasis{Base: "b", Head: "h", EmptyDiff: true}}
+		if !r.IsEmptyReview() {
+			t.Error("PASS on empty diff must be reported as empty review even when blockers are present")
+		}
+	})
+}

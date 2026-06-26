@@ -274,6 +274,117 @@ func TestDoMerge_DurableReviewGate_LegacyFallback_ReusesPostSquashGate(t *testin
 	}
 }
 
+// TestRunDurableReviewGate_EmptyDiff_BlocksMerge proves the empty-diff guard
+// (gastown-cet.12.4): when the merge-candidate diff between the branch and
+// the target is empty, the durable review gate fails closed regardless of
+// what the configured reviewer command returns. A reviewer that produces
+// zero findings on a zero-content diff performed no actual review, so the
+// gate must not grant an HMAC attestation that would later be treated as
+// evidence of approval.
+//
+// The incident this test pins: m3 returned PASS on the empty gtviz initial
+// commit (2abdc645), and the gate treated that zero-content PASS as
+// approval, enabling a degraded-quorum bypass merge. The fix hardens the
+// gate to refuse to run on an empty diff — the reviewer command is never
+// invoked.
+//
+// We invoke runDurableReviewGate directly rather than through doMerge so the
+// guard is exercised at the unit level. In the full doMerge flow, an empty
+// diff also fails at the squash-merge step (nothing to commit), but the
+// guard is the durable reviewer-specific defense and must work in isolation
+// — for example, when the branch tree equals the target tree but the
+// squash-merge step somehow succeeds (whitespace-only changes, identical
+// tree after rebase, etc.).
+func TestRunDurableReviewGate_EmptyDiff_BlocksMerge(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	// This command would succeed and write an attestation if it ran. If
+	// the gate returns failure, we know the empty-diff guard short-circuited
+	// before the gate command was invoked.
+	attestDir := filepath.Join(workDir, "attestations")
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:  true,
+		AttestDir: attestDir,
+		Cmd: `mkdir -p "$GT_GATE_ATTEST_DIR" && git rev-parse HEAD^{tree} > "$GT_GATE_ATTEST_DIR/$(git rev-parse HEAD^{tree})"`,
+	}
+
+	// Branch and target point at the same commit — diff is empty.
+	mustRun(t, workDir, "git", "branch", "feat/empty", "main")
+
+	result := e.runDurableReviewGate(context.Background(), "feat/empty", "main", nil)
+	if result.Success {
+		t.Fatal("expected gate to fail when merge-candidate diff is empty")
+	}
+	if !result.TestsFailed {
+		t.Errorf("expected TestsFailed=true for empty-diff refusal, got %+v", result)
+	}
+	if !strings.Contains(result.Error, "empty diff") {
+		t.Errorf("expected empty-diff error in result, got: %s", result.Error)
+	}
+
+	output := e.output.(*bytes.Buffer).String()
+	if !strings.Contains(output, "empty diff") {
+		t.Errorf("expected empty-diff log message, got:\n%s", output)
+	}
+	// The reviewer command must not have been invoked at all — the
+	// empty-diff guard runs before the gate command. We assert this by
+	// checking that no attestation file was created.
+	entries, err := os.ReadDir(attestDir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Errorf("could not read attest dir: %v", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			t.Errorf("empty-diff guard must not allow attestation file %s to be written", entry.Name())
+		}
+	}
+	_ = g // keep linter happy about unused variable in some test setups
+}
+
+// TestIsEmptyReviewDiff_BranchAndTargetVariations pins the helper that drives
+// the empty-diff guard: a missing branch or target is treated as "unknown"
+// (returns false) so legitimate first-commit reviews are not blocked. An
+// identical branch and target is treated as "empty" (returns true) and the
+// gate refuses to grant an attestation.
+func TestIsEmptyReviewDiff_BranchAndTargetVariations(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+
+	t.Run("missing_branch_returns_false", func(t *testing.T) {
+		empty, err := e.isEmptyReviewDiff("", "main")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if empty {
+			t.Error("missing branch must not be reported as empty diff")
+		}
+	})
+	t.Run("missing_target_returns_false", func(t *testing.T) {
+		empty, err := e.isEmptyReviewDiff("main", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if empty {
+			t.Error("missing target must not be reported as empty diff")
+		}
+	})
+	t.Run("identical_refs_returns_true", func(t *testing.T) {
+		// main...main triple-dot is empty by definition.
+		empty, err := e.isEmptyReviewDiff("main", "main")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !empty {
+			t.Error("identical branch and target must be reported as empty diff")
+		}
+	})
+}
+
 func mustRun(t *testing.T, dir string, name string, args ...string) string {
 	t.Helper()
 	cmdOut, err := runWithError(dir, name, args...)

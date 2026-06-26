@@ -1655,10 +1655,40 @@ func (e *Engineer) hasDurableReviewAttestation() (bool, string, error) {
 	return !info.IsDir(), tree, nil
 }
 
+// isEmptyReviewDiff reports whether the merge-candidate range (target...branch,
+// triple-dot) contains no changes. This is the source-controlled counterpart
+// of the m3 reviewer's "empty diff is blocking" rubric item: when the diff
+// between branch and target is empty, the durable review gate refuses to grant
+// an attestation regardless of what any reviewer (m3, codex, umans-kimi,
+// umans-glm, opus) returned (gastown-cet.12.4). The gate must fail closed
+// because a PASS on a zero-content diff is a degenerate verdict, not
+// evidence of approval.
+//
+// A missing branch or target is treated as "unknown" and returns (false, nil):
+// the gate does not refuse to run on a missing ref, only on a verified-empty
+// diff. This avoids blocking legitimate first-commit reviews where the base
+// branch is being created fresh.
+func (e *Engineer) isEmptyReviewDiff(branch, target string) (bool, error) {
+	if branch == "" || target == "" {
+		return false, nil
+	}
+	return e.git.IsEmptyDiff(target, branch)
+}
+
 // runDurableReviewGate enforces the fail-closed multi-model review gate.
 // It checks for an existing HMAC attestation for the merge-candidate tree and,
 // if missing, runs the configured review gate command. The merge is rejected
 // unless an attestation exists after enforcement.
+//
+// Empty-diff guard (gastown-cet.12.4): before invoking the reviewer, the gate
+// checks whether the merge-candidate diff (branch...target) contains any
+// changes. If the diff is empty, the gate fails closed regardless of what the
+// reviewer returns. A reviewer that produces zero findings on a zero-content
+// diff performed no actual review, so the gate must not write an attestation
+// that would later be treated as evidence of approval. This defends against
+// the m3-degenerate-PASS incident where m3 returned PASS on the empty gtviz
+// initial commit and the gate treated that zero-content PASS as approval,
+// enabling a degraded-quorum bypass.
 func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target string, _ *MRInfo) ProcessResult {
 	if !e.durableReviewGateEnabled(target) {
 		return ProcessResult{Success: true}
@@ -1674,6 +1704,26 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 			Success:     false,
 			TestsFailed: true,
 			Error:       "durable review gate required but no command configured",
+		}
+	}
+
+	// Empty-diff guard: refuse to grant an attestation when there is nothing
+	// to review. A PASS from any reviewer on a zero-content diff is a
+	// degenerate verdict (gastown-cet.12.4), and the gate must fail closed
+	// rather than treat zero findings as evidence of approval.
+	if empty, err := e.isEmptyReviewDiff(branch, target); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED - could not determine diff state: %v\n", err)
+		return ProcessResult{
+			Success:     false,
+			TestsFailed: true,
+			Error:       fmt.Sprintf("durable review gate could not determine diff state: %v", err),
+		}
+	} else if empty {
+		_, _ = fmt.Fprintln(e.output, "[Engineer] Durable review gate FAILED - empty diff (no changes between branch and target); refusing to grant attestation on zero-content review")
+		return ProcessResult{
+			Success:     false,
+			TestsFailed: true,
+			Error:       "durable review gate: empty diff (no changes between branch and target); degenerate PASS on empty diff is not a valid attestation (gastown-cet.12.4)",
 		}
 	}
 
