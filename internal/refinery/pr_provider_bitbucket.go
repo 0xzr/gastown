@@ -42,7 +42,12 @@ func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluati
 	// Record the merge-candidate diff basis so the review packet identifies the
 	// exact diff reviewed (gastown-cet.8). A verdict against intermediate
 	// commit history is distinguished from one against the final candidate.
-	basis := p.mergeCandidateBasis()
+	//
+	// The base ref is the PR's actual destination branch (queried via the
+	// Bitbucket REST API), not a hardcoded "main": a PR against a non-main
+	// target must report its own basis so mergeCandidateBasis doesn't silently
+	// misroute the verdict (gastown-6z5).
+	basis := p.mergeCandidateBasis(prNumber)
 
 	participants, err := p.git.GetBitbucketPRParticipants(p.workspace, p.repoSlug, prNumber)
 	if err != nil {
@@ -100,8 +105,18 @@ func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluati
 // mergeCandidateBasis returns the merge-candidate diff basis for the PR under
 // review. Best-effort resolution; an empty component means "unknown" (treated
 // as a merge-candidate basis, the safe default).
-func (p *bitbucketPRProvider) mergeCandidateBasis() DiffBasis {
-	base, _ := p.git.RemoteBranchTip("origin", "main")
+//
+// The base ref is the PR's actual destination branch (queried via the
+// Bitbucket REST API), not a hardcoded "main", so a PR against any other
+// target branch is routed through the correct diff (gastown-6z5). On error
+// the base falls back to origin/main so a transient API failure cannot
+// silently misroute the verdict.
+func (p *bitbucketPRProvider) mergeCandidateBasis(prNumber int) DiffBasis {
+	baseRef := "main"
+	if name, err := p.git.GetBitbucketPRDestination(p.workspace, p.repoSlug, prNumber); err == nil && name != "" {
+		baseRef = name
+	}
+	base, _ := p.git.RemoteBranchTip("origin", baseRef)
 	head, _ := p.git.Rev("HEAD")
 	return MergeCandidateBasis(base, head)
 }
