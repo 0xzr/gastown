@@ -154,12 +154,12 @@ func TestDecideWorkstateLiveSignals(t *testing.T) {
 			wantConfidence:    WorkstateConfidenceHigh,
 		},
 		{
-			name:              "live session without hook is not recovery",
+			name:              "live session without hook stays in recovery (scope-creep removed)",
 			in:                WorkstateInput{State: StateReviewNeeded, SessionRunning: true, HeartbeatExists: true, HeartbeatFresh: true, ProcessAlive: true},
-			wantVerdict:       WorkstateVerdictWorking,
-			wantReason:        "live-review",
-			wantNeedsRecovery: false,
-			wantConfidence:    WorkstateConfidenceMedium,
+			wantVerdict:       WorkstateVerdictNeedsRecovery,
+			wantReason:        "stale-session",
+			wantNeedsRecovery: true,
+			wantConfidence:    WorkstateConfidenceHigh,
 		},
 		{
 			name:                 "dead session with hook needs recovery",

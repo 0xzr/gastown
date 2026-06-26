@@ -217,14 +217,11 @@ func decideNonIdleWorkstate(in WorkstateInput) WorkstateDisposition {
 			d.Confidence = WorkstateConfidenceHigh
 			d.Signals = append([]string{stateSignal}, liveSignals(in)...)
 			d.Signals = append(d.Signals, "hook_active")
-		} else if live {
-			// Session is live but there is no active hook. The agent is up and
-			// may be between assignments; do not treat it as a recovery case.
-			d.Verdict = WorkstateVerdictWorking
-			d.Reason = "live-review"
-			d.Confidence = WorkstateConfidenceMedium
-			d.Signals = append([]string{stateSignal}, liveSignals(in)...)
 		} else {
+			// Live session without a hook, or dead/stale session: fall back to
+			// NEEDS_RECOVERY. The gastown-cet.9 regression only extended
+			// WORKING to live+hooked; live-but-UNHOOKED remains recovery
+			// (gastown-9rl: scope creep removed).
 			d.Verdict = WorkstateVerdictNeedsRecovery
 			d.Reason = "stale-session"
 			d.NeedsRecovery = true
@@ -232,9 +229,8 @@ func decideNonIdleWorkstate(in WorkstateInput) WorkstateDisposition {
 			d.Confidence = WorkstateConfidenceHigh
 			d.Signals = append([]string{stateSignal}, allSignals(in)...)
 			if !hasAnyLiveSignal(in) {
-				// No liveness data at all: low-confidence fallback. This used to
-				// share the coarse "not-idle" reason, but a distinct reason makes
-				// the no-data path observable to operators and dashboards.
+				// No liveness data at all: low-confidence fallback. A distinct
+				// reason makes the no-data path observable to operators.
 				d.Reason = "no-liveness-data"
 				d.Confidence = WorkstateConfidenceLow
 			}

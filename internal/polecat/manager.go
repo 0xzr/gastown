@@ -2028,6 +2028,48 @@ func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) boo
 	return false
 }
 
+// isSessionProcessAlive is the fail-closed counterpart of isSessionProcessDead.
+// It returns true only when we can positively confirm the agent process is
+// alive. If liveness cannot be determined (no heartbeat, tmux errors, missing
+// PID, etc.) it returns (false, nil) rather than assuming alive. This prevents
+// dead polecats from being misclassified as live (gastown-cet.9, gastown-9rl).
+func isSessionProcessAlive(t *tmux.Tmux, sessionName string, townRoot string) (bool, error) {
+	// Primary: a fresh heartbeat is strong evidence the process is alive.
+	if townRoot != "" {
+		stale, exists := IsSessionHeartbeatStale(townRoot, sessionName)
+		if exists {
+			return !stale, nil
+		}
+		// No heartbeat file — fall through to PID-based check.
+	}
+
+	// Fallback: PID signal probing (legacy, for sessions without heartbeat support).
+	if t == nil {
+		return false, nil
+	}
+	pidStr, err := t.GetPanePID(sessionName)
+	if err != nil {
+		return false, fmt.Errorf("getting pane PID for %s: %w", sessionName, err)
+	}
+	if pidStr == "" {
+		// No PID means no process — session is dead.
+		return false, nil
+	}
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		return false, fmt.Errorf("parsing pane PID %q: %w", pidStr, err)
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false, nil
+	}
+	// On Unix, Signal(0) checks if process exists without sending a signal.
+	if err := p.Signal(syscall.Signal(0)); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
 // pendingMaxAge is how long a .pending reservation marker may exist before
 // it is considered stale. gt sling completes in seconds, so 5 minutes is
 // a conservative bound that avoids false positives on slow machines.
@@ -2182,6 +2224,18 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
 
 func (m *Manager) workstateInputForPolecat(name string, state State, issue string) WorkstateInput {
 	input := WorkstateInput{State: state, CleanupStatus: CleanupUnknown}
+
+	// Populate direct session/heartbeat/process signals so the canonical
+	// workstate classifier can distinguish a live agent from a stale persisted
+	// State. LivenessSignals is fail-closed: errors keep the classifier in its
+	// conservative state-based fallback (gastown-cet.9, gastown-9rl).
+	if running, heartbeatFresh, heartbeatExists, processAlive, livenessErr := m.LivenessSignals(name); livenessErr == nil {
+		input.SessionRunning = running
+		input.HeartbeatFresh = heartbeatFresh
+		input.HeartbeatExists = heartbeatExists
+		input.ProcessAlive = processAlive
+	}
+
 	agentID := m.agentBeadID(name)
 	activeMR := ""
 	sourceHint := ""
@@ -2748,6 +2802,10 @@ func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {
 // LivenessSignals returns direct session/heartbeat/process evidence for a polecat.
 // These signals are intentionally independent of the polecat's persisted State so
 // callers can distinguish a live agent from a stale State value (gastown-cet.9).
+//
+// processAlive is fail-closed: it is true only when liveness can be confirmed,
+// not when the check is inconclusive. Errors from tmux queries are returned so
+// callers can distinguish missing data from errored checks (gastown-9rl).
 func (m *Manager) LivenessSignals(name string) (sessionRunning, heartbeatFresh, heartbeatExists, processAlive bool, err error) {
 	if m.tmux == nil {
 		return false, false, false, false, nil
@@ -2756,7 +2814,9 @@ func (m *Manager) LivenessSignals(name string) (sessionRunning, heartbeatFresh, 
 	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
 	sessionRunning, herr := m.tmux.HasSession(sessionName)
 	if herr != nil {
-		sessionRunning = false
+		// Tmux query failures are not the same as "session not found"; surface
+		// the error so callers do not treat uncertain state as "dead".
+		return false, false, false, false, fmt.Errorf("checking tmux session %s: %w", sessionName, herr)
 	}
 
 	townRoot := filepath.Dir(m.rig.Path)
@@ -2764,9 +2824,10 @@ func (m *Manager) LivenessSignals(name string) (sessionRunning, heartbeatFresh, 
 	heartbeatExists = exists
 	heartbeatFresh = exists && !stale
 
-	// isSessionProcessDead returns true when it can confirm the process is dead.
-	// A false result means either alive or unable to determine; treat as alive.
-	processAlive = !isSessionProcessDead(m.tmux, sessionName, townRoot)
+	processAlive, perr := isSessionProcessAlive(m.tmux, sessionName, townRoot)
+	if perr != nil {
+		return sessionRunning, heartbeatFresh, heartbeatExists, false, fmt.Errorf("checking process liveness for %s: %w", sessionName, perr)
+	}
 
 	return sessionRunning, heartbeatFresh, heartbeatExists, processAlive, nil
 }
