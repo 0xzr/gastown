@@ -223,6 +223,64 @@ func TestIsSessionProcessDead_EmptyTownRoot(t *testing.T) {
 	}
 }
 
+// TestIsSessionProcessAlive_FreshHeartbeat verifies the fail-closed path:
+// a fresh heartbeat returns alive=true with no error (gastown-9rl).
+func TestIsSessionProcessAlive_FreshHeartbeat(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-test-alive-fresh"
+
+	TouchSessionHeartbeat(townRoot, sessionName)
+
+	alive, err := isSessionProcessAlive(nil, sessionName, townRoot)
+	if err != nil {
+		t.Fatalf("isSessionProcessAlive error: %v", err)
+	}
+	if !alive {
+		t.Error("expected alive=true for fresh heartbeat")
+	}
+}
+
+// TestIsSessionProcessAlive_StaleHeartbeat verifies a stale heartbeat is
+// classified as not alive (gastown-9rl).
+func TestIsSessionProcessAlive_StaleHeartbeat(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-test-alive-stale"
+
+	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-10 * time.Minute).UTC()
+	data := []byte(`{"timestamp":"` + oldTime.Format(time.RFC3339Nano) + `"}`)
+	if err := os.WriteFile(filepath.Join(dir, sessionName+".json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	alive, err := isSessionProcessAlive(nil, sessionName, townRoot)
+	if err != nil {
+		t.Fatalf("isSessionProcessAlive error: %v", err)
+	}
+	if alive {
+		t.Error("expected alive=false for stale heartbeat")
+	}
+}
+
+// TestIsSessionProcessAlive_NoHeartbeatNoTmux is the fail-closed regression:
+// with no heartbeat and no tmux, liveness cannot be confirmed, so alive=false
+// (gastown-9rl: opposite of the old fail-open !isSessionProcessDead path).
+func TestIsSessionProcessAlive_NoHeartbeatNoTmux(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-test-alive-no-data"
+
+	alive, err := isSessionProcessAlive(nil, sessionName, townRoot)
+	if err != nil {
+		t.Fatalf("isSessionProcessAlive error: %v", err)
+	}
+	if alive {
+		t.Error("expected alive=false when no heartbeat and no tmux (fail-closed)")
+	}
+}
+
 func TestReadSessionHeartbeat_V1BackwardsCompat(t *testing.T) {
 	townRoot := t.TempDir()
 

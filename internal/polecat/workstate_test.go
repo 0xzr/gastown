@@ -43,6 +43,16 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			in:   WorkstateInput{State: StateWorking, CleanupStatus: CleanupClean},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "working", NeedsRecovery: false, CountsTowardCapacity: true},
 		},
+		{
+			// gastown-9rl codex blocking: idle polecat with otherwise-clean
+			// state must NOT become SAFE_TO_NUKE/reusable when liveness
+			// could not be confirmed. Silently dropping LivenessSignals
+			// errors would let reuse/nuke decisions fire while a live
+			// session might still exist.
+			name: "idle with liveness failure fails closed (gastown-9rl)",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/test", LivenessCheckFailed: true, LivenessCheckFailedReason: "tmux error"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "liveness-check-failed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -154,12 +164,12 @@ func TestDecideWorkstateLiveSignals(t *testing.T) {
 			wantConfidence:    WorkstateConfidenceHigh,
 		},
 		{
-			name:              "live session without hook is not recovery",
+			name:              "live session without hook stays in recovery (scope-creep removed)",
 			in:                WorkstateInput{State: StateReviewNeeded, SessionRunning: true, HeartbeatExists: true, HeartbeatFresh: true, ProcessAlive: true},
-			wantVerdict:       WorkstateVerdictWorking,
-			wantReason:        "live-review",
-			wantNeedsRecovery: false,
-			wantConfidence:    WorkstateConfidenceMedium,
+			wantVerdict:       WorkstateVerdictNeedsRecovery,
+			wantReason:        "stale-session",
+			wantNeedsRecovery: true,
+			wantConfidence:    WorkstateConfidenceHigh,
 		},
 		{
 			name:                 "dead session with hook needs recovery",
@@ -186,6 +196,28 @@ func TestDecideWorkstateLiveSignals(t *testing.T) {
 			wantNeedsRecovery:    false,
 			wantConfidence:       WorkstateConfidenceHigh,
 			wantSignalSubstrings: []string{"state=working", "session_running=true"},
+		},
+		{
+			// gastown-9rl codex blocking: even an idle polecat with otherwise
+			// clean state must NOT become SAFE_TO_NUKE/reusable when liveness
+			// could not be confirmed. Silently dropping LivenessSignals errors
+			// would let reuse/nuke decisions fire while a live session might
+			// still exist.
+			name:              "idle with liveness check failed fails closed (gastown-9rl)",
+			in:                WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/test", LivenessCheckFailed: true, LivenessCheckFailedReason: "tmux query error"},
+			wantVerdict:       WorkstateVerdictNeedsRecovery,
+			wantReason:        "liveness-check-failed",
+			wantNeedsRecovery: true,
+		},
+		{
+			// gastown-9rl codex blocking: idle with a single blocker (just the
+			// liveness failure) must still escalate to NEEDS_RECOVERY rather
+			// than fall through to SAFE_TO_NUKE.
+			name:              "idle with liveness failure blocks even when everything else clean",
+			in:                WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, LivenessCheckFailed: true},
+			wantVerdict:       WorkstateVerdictNeedsRecovery,
+			wantReason:        "liveness-check-failed",
+			wantNeedsRecovery: true,
 		},
 	}
 

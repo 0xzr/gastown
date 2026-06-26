@@ -54,6 +54,15 @@ type WorkstateInput struct {
 	HeartbeatExists bool `json:"heartbeat_exists,omitempty"`
 	// ProcessAlive is true when the session's agent process is confirmed alive.
 	ProcessAlive bool `json:"process_alive,omitempty"`
+	// LivenessCheckFailed is true when the gatherer could not obtain liveness
+	// data (tmux error, missing rig, etc.). It must fail-closed: idle
+	// polecats must not become SAFE_TO_NUKE/reusable while the liveness of a
+	// possible live session is unknown. Set by workstateInputForPolecat when
+	// LivenessSignals returns an error (gastown-9rl).
+	LivenessCheckFailed bool `json:"liveness_check_failed,omitempty"`
+	// LivenessCheckFailedReason carries the human-readable cause for
+	// LivenessCheckFailed, surfaced via the disposition's Reason field.
+	LivenessCheckFailedReason string `json:"liveness_check_failed_reason,omitempty"`
 }
 
 // WorkstateDisposition is the canonical polecat lifecycle decision. It is pure
@@ -91,6 +100,19 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		}
 		if blocker != "" {
 			d.Blockers = append(d.Blockers, blocker)
+		}
+	}
+
+	// Fail closed when the gatherer could not confirm the polecat is not
+	// running. Reuse/nuke decisions must not be made while a live session
+	// may still exist (gastown-9rl). The persistent State alone is not
+	// enough: a session can outlive its State, and silently dropping the
+	// error would let SAFE_TO_NUKE/reusable fire even though tmux
+	// liveness could not be determined.
+	if in.LivenessCheckFailed {
+		block("liveness-check-failed", "liveness_check_failed="+boolString(in.LivenessCheckFailed))
+		if in.LivenessCheckFailedReason != "" {
+			d.Blockers = append(d.Blockers, "liveness_reason="+in.LivenessCheckFailedReason)
 		}
 	}
 
@@ -217,14 +239,11 @@ func decideNonIdleWorkstate(in WorkstateInput) WorkstateDisposition {
 			d.Confidence = WorkstateConfidenceHigh
 			d.Signals = append([]string{stateSignal}, liveSignals(in)...)
 			d.Signals = append(d.Signals, "hook_active")
-		} else if live {
-			// Session is live but there is no active hook. The agent is up and
-			// may be between assignments; do not treat it as a recovery case.
-			d.Verdict = WorkstateVerdictWorking
-			d.Reason = "live-review"
-			d.Confidence = WorkstateConfidenceMedium
-			d.Signals = append([]string{stateSignal}, liveSignals(in)...)
 		} else {
+			// Live session without a hook, or dead/stale session: fall back to
+			// NEEDS_RECOVERY. The gastown-cet.9 regression only extended
+			// WORKING to live+hooked; live-but-UNHOOKED remains recovery
+			// (gastown-9rl: scope creep removed).
 			d.Verdict = WorkstateVerdictNeedsRecovery
 			d.Reason = "stale-session"
 			d.NeedsRecovery = true
@@ -232,9 +251,8 @@ func decideNonIdleWorkstate(in WorkstateInput) WorkstateDisposition {
 			d.Confidence = WorkstateConfidenceHigh
 			d.Signals = append([]string{stateSignal}, allSignals(in)...)
 			if !hasAnyLiveSignal(in) {
-				// No liveness data at all: low-confidence fallback. This used to
-				// share the coarse "not-idle" reason, but a distinct reason makes
-				// the no-data path observable to operators and dashboards.
+				// No liveness data at all: low-confidence fallback. A distinct
+				// reason makes the no-data path observable to operators.
 				d.Reason = "no-liveness-data"
 				d.Confidence = WorkstateConfidenceLow
 			}
