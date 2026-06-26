@@ -17,6 +17,21 @@ func newGitHubPRProvider(g *git.Git) PRProvider {
 	return &githubPRProvider{git: g}
 }
 
+// mergeCandidateBasisForBaseRef is the test-only seam for exercising the
+// provider's basis computation without mocking gh: it constructs a basis for
+// the supplied target ref, exactly as the production mergeCandidateBasis
+// would once GetPRBaseRef returned a non-empty ref. The fail-closed behavior
+// (returning UnknownBasis on missing/empty target) lives in
+// mergeCandidateBasis itself and is exercised through the EvaluateReviews
+// coverage in TestEvaluateReviews_StalePASSOnUnknownBasisReclassified
+// (gastown-6z5 rework).
+func (p *githubPRProvider) mergeCandidateBasisForBaseRef(name string) DiffBasis {
+	if strings.TrimSpace(name) == "" {
+		return UnknownBasis()
+	}
+	return mergeCandidateBasisFromBaseRef(p.git, name)
+}
+
 func (p *githubPRProvider) FindPRNumber(branch string) (int, error) {
 	return p.git.FindPRNumber(branch)
 }
@@ -31,7 +46,34 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 	// makes the review packet identify the exact diff reviewed (gastown-cet.8),
 	// so a verdict against intermediate commit history can be distinguished
 	// from a verdict against the final merge candidate.
-	basis := p.mergeCandidateBasis()
+	//
+	// The base ref is the PR's actual target branch (queried from gh), not a
+	// hardcoded "main": a PR against a non-main target must report its own
+	// basis so mergeCandidateBasis doesn't silently misroute the verdict
+	// (gastown-6z5).
+	basis := p.mergeCandidateBasis(prNumber)
+
+	// Fetch the PR's current head SHA so per-reviewer basis can be stamped
+	// "commit_history" when a review was submitted against an older commit.
+	//
+	// Fail-closed on unverified head (gastown-6z5 rework): if GetPRHeadSHA
+	// errors or returns empty, we cannot verify that a reviewer's CommitID
+	// matches the current head, so a stale APPROVED could otherwise count as
+	// a merge-candidate PASS against the wrong diff. Flipping the packet-level
+	// basis to commit_history before classifying means every per-reviewer
+	// result inherits that basis (classifyCollapsedReviews uses the packet
+	// basis verbatim when headSHA is empty), and EvaluateReviews reclassifies
+	// every verdict — PASS or FAIL — to NO_VERDICT so the merge defers until
+	// a reviewer has explicitly approved the current head.
+	headSHA, headErr := p.git.GetPRHeadSHA(prNumber)
+	if headErr != nil || strings.TrimSpace(headSHA) == "" {
+		basis = DiffBasis{
+			Base: basis.Base,
+			Head: basis.Head,
+			Kind: "commit_history",
+		}
+		headSHA = ""
+	}
 
 	reviews, err := p.git.GetPRReviews(prNumber)
 	if err != nil {
@@ -54,9 +96,10 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 			// no individual reviews reachable (e.g. branch protection rule).
 			return &ReviewEvaluation{
 				State:     ReviewStateFail,
-				Results:   []ReviewerResult{{Reviewer: "github", Verdict: ReviewerVerdictFail, Evidence: "overall review decision: CHANGES_REQUESTED", DiffBasis: basis}},
+				Results:   []ReviewerResult{{Reviewer: "github", Verdict: ReviewerVerdictFail, Evidence: "overall review decision: CHANGES_REQUESTED", DiffBasis: basis, CauseKey: "gh_changes_requested_overall"}},
 				FailCount: 1,
 				DiffBasis: basis,
+				CauseKey:  "gh_changes_requested_overall",
 				Error:     "overall review decision: CHANGES_REQUESTED",
 			}, nil
 		}
@@ -69,7 +112,7 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 		}, nil
 	}
 
-	results := classifyCollapsedReviews(collapseReviews(reviews), basis)
+	results := classifyCollapsedReviews(collapseReviews(reviews), basis, headSHA)
 
 	ev := EvaluateReviews(results, DegradedQuorumRule{})
 	ev.DiffBasis = basis
@@ -80,10 +123,32 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 // collapsed to its final state by collapseReviews) onto a ReviewerResult,
 // applying GitHub review-state semantics. Extracted so the collapse + classify
 // path is unit-testable without shelling to gh (gastown-cet.12.6.1).
-func classifyCollapsedReviews(reviews []git.PRReview, basis DiffBasis) []ReviewerResult {
+//
+// headSHA is the PR's current head commit. When a reviewer's collapsed review
+// carries a CommitID that is not an ancestor of (or equal to) headSHA, that
+// review was made against intermediate commit history, not the merge candidate:
+// the result is stamped with a commit_history basis so EvaluateReviews can
+// reclassify a stale FAIL as a no-verdict audit gap (gastown-6z5).
+//
+// headSHA == "" disables commit_history stamping: callers in tests or in
+// offline/error paths that cannot determine the head fall back to the
+// packet-level basis, preserving the legacy merge-candidate semantics.
+func classifyCollapsedReviews(reviews []git.PRReview, basis DiffBasis, headSHA string) []ReviewerResult {
 	results := make([]ReviewerResult, 0, len(reviews))
 	for _, r := range reviews {
-		result := ReviewerResult{Reviewer: r.Reviewer, DiffBasis: basis}
+		resultBasis := basis
+		if headSHA != "" && r.CommitID != "" && r.CommitID != headSHA {
+			// Stale review: stamped against an older commit, so the verdict
+			// applies to intermediate commit history rather than the merge
+			// candidate. Keep the base/head range informative while flipping
+			// Kind so EvaluateReviews reclassifies a FAIL to NO_VERDICT.
+			resultBasis = DiffBasis{
+				Base: basis.Base,
+				Head: r.CommitID,
+				Kind: "commit_history",
+			}
+		}
+		result := ReviewerResult{Reviewer: r.Reviewer, DiffBasis: resultBasis}
 		switch strings.ToUpper(r.State) {
 		case "APPROVED":
 			result.Verdict = ReviewerVerdictPass
@@ -91,6 +156,7 @@ func classifyCollapsedReviews(reviews []git.PRReview, basis DiffBasis) []Reviewe
 			result.Verdict = ReviewerVerdictFail
 			result.Evidence = r.Body
 			result.Blockers = extractBlockers(r.Body)
+			result.CauseKey = deriveChangesRequestedCauseKey(r.Body, result.Blockers)
 		case "COMMENTED", "PENDING", "DISMISSED", "":
 			result.Verdict = ReviewerVerdictNoVerdict
 			result.Evidence = r.Body
@@ -103,9 +169,90 @@ func classifyCollapsedReviews(reviews []git.PRReview, basis DiffBasis) []Reviewe
 	return results
 }
 
+// deriveChangesRequestedCauseKey produces a stable machine-readable key for
+// a CHANGES_REQUESTED review so the merge queue can record why a gate failed
+// without forcing every reader to parse free-form review bodies (gastown-6z5).
+//
+// Preference order:
+//  1. Snake-case the first concrete blocker line when it is short and
+//     shaped like an identifier (e.g. "race condition" -> "race_condition").
+//  2. Fall back to a generic stable key so downstream tooling still has
+//     something deterministic to branch on.
+func deriveChangesRequestedCauseKey(body string, blockers []string) string {
+	for _, b := range blockers {
+		key := normalizeBlockerCauseKey(b)
+		if key != "" {
+			return key
+		}
+	}
+	if key := normalizeBlockerCauseKey(body); key != "" {
+		return key
+	}
+	return "gh_changes_requested"
+}
+
+// normalizeBlockerCauseKey turns a short human-readable phrase into a
+// snake_case machine key. Returns "" when the input is too long or shaped
+// like free-form prose (more than 6 words) — the caller then falls back to
+// a generic stable key rather than fabricating a misleading identifier.
+func normalizeBlockerCauseKey(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	// Strip leading list markers ("- ", "* ", "• ").
+	for _, prefix := range []string{"- ", "* ", "• "} {
+		if strings.HasPrefix(s, prefix) {
+			s = strings.TrimPrefix(s, prefix)
+			break
+		}
+	}
+	// Collapse whitespace and lowercase.
+	s = strings.ToLower(strings.TrimSpace(s))
+	// Strip a leading "blocker:" / "blocking:" prefix — the convention
+	// used by Gas Town review bodies — so the resulting key describes
+	// the failure, not the convention.
+	for _, prefix := range []string{"blocker:", "blocking:"} {
+		if strings.HasPrefix(s, prefix) {
+			s = strings.TrimPrefix(s, prefix)
+			break
+		}
+	}
+	s = strings.TrimSpace(s)
+	words := strings.Fields(s)
+	if len(words) == 0 || len(words) > 6 {
+		return ""
+	}
+	var b strings.Builder
+	for _, w := range words {
+		// Drop purely non-alphanumeric tokens (punctuation) and tokens
+		// that contain characters that cannot survive a stable key.
+		cleaned := strings.Map(func(r rune) rune {
+			switch {
+			case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+				return r
+			default:
+				return -1
+			}
+		}, w)
+		if cleaned == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('_')
+		}
+		b.WriteString(cleaned)
+	}
+	out := b.String()
+	if out == "" || len(out) > 64 {
+		return ""
+	}
+	return out
+}
+
 // collapseReviews reduces a reviewer's full review history to the single
 // effective final-state review, so a stale earlier verdict cannot block a merge
-// the reviewer has since superseded (gastown-cet.12.6.1).
+// the reviewer has since superseded (gastown-cet.12.6.1, gastown-6z5).
 //
 // GitHub review semantics (mirroring the reviewDecision the API exposes):
 //   - APPROVED and CHANGES_REQUESTED are terminal states that set the
@@ -115,11 +262,21 @@ func classifyCollapsedReviews(reviews []git.PRReview, basis DiffBasis) []Reviewe
 //   - DISMISSED explicitly dismisses the reviewer's prior decision, clearing
 //     it back to "no decision".
 //
+// Commit-aware selection (gastown-6z5): when a reviewer has reviewed multiple
+// commits on the PR, only the reviews attached to their latest reviewed
+// commit_id are considered. Reviews on older commits are discarded, so a
+// stale CHANGES_REQUESTED cannot override a later COMMENTED or APPROVED on
+// the newer head. The collapse result for each reviewer carries the
+// commit_id that produced it, so the caller can stamp a commit_history basis
+// for stale-rejection reclassification downstream.
+//
 // Reviews are ordered by SubmittedAt (ties broken by input order) before the
 // latest terminal decision is selected, so the result is independent of the
 // slice order the provider happens to return. Each reviewer appears at most
 // once in the output; reviewers with no effective terminal decision emit their
 // latest non-terminal review (e.g. a COMMENTED body) so its evidence survives.
+// Reviews without a CommitID are grouped under a sentinel empty key so the
+// commit-aware path degrades gracefully to position-only ordering.
 func collapseReviews(reviews []git.PRReview) []git.PRReview {
 	if len(reviews) == 0 {
 		return nil
@@ -127,10 +284,6 @@ func collapseReviews(reviews []git.PRReview) []git.PRReview {
 
 	// Group each reviewer's reviews, preserving their original positions for
 	// stable tie-breaking when timestamps are absent or equal.
-	type indexedReview struct {
-		idx int
-		rev git.PRReview
-	}
 	byReviewer := make(map[string][]indexedReview)
 	order := make([]string, 0, len(reviews))
 	for i, r := range reviews {
@@ -143,12 +296,22 @@ func collapseReviews(reviews []git.PRReview) []git.PRReview {
 		if _, seen := byReviewer[name]; !seen {
 			order = append(order, name)
 		}
-		byReviewer[name] = append(byReviewer[name], indexedReview{idx: i, rev: r})
+		byReviewer[name] = append(byReviewer[name], indexedReview{idx: i, rev: r, commitID: r.CommitID})
 	}
 
 	out := make([]git.PRReview, 0, len(order))
 	for _, name := range order {
 		hist := byReviewer[name]
+
+		// Commit-aware narrowing: if the reviewer reviewed multiple distinct
+		// commits and at least one carries a CommitID, keep only the reviews
+		// attached to their latest reviewed commit. When CommitID is absent on
+		// every review we fall through to the legacy position-only collapse so
+		// older gh output keeps working unchanged.
+		if anyCommitID(hist) {
+			hist = narrowToLatestCommit(hist)
+		}
+
 		// Chronological order by SubmittedAt; equal/empty timestamps keep
 		// original order (sort.SliceStable).
 		sort.SliceStable(hist, func(a, b int) bool {
@@ -187,14 +350,109 @@ func collapseReviews(reviews []git.PRReview) []git.PRReview {
 	return out
 }
 
+// indexedReview is a reviewer's review paired with its slice position and
+// commit_id. Used by collapseReviews for stable tie-breaking when timestamps
+// are absent or equal.
+type indexedReview struct {
+	idx      int
+	rev      git.PRReview
+	commitID string
+}
+
+// anyCommitID reports whether any review in the group carries a non-empty
+// CommitID. Used to decide whether the commit-aware collapse path is
+// applicable; a group with no CommitID information anywhere degrades to the
+// legacy position-only behavior so older gh output is unaffected.
+func anyCommitID(hist []indexedReview) bool {
+	for _, r := range hist {
+		if r.commitID != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// narrowToLatestCommit drops reviews attached to commits older than the
+// reviewer's latest reviewed commit. "Latest" is the commit_id attached to
+// the reviewer's chronologically latest review (by SubmittedAt), with the
+// original slice position breaking timestamp ties.
+//
+// Why not lexicographic SHA comparison (gastown-6z5 rework)? Git SHAs are
+// random-looking 40-hex strings, not chronological: an older commit with a
+// numerically higher hash will sort after the true head, and the previous
+// lexicographic comparison would discard the actual latest review (and the
+// verdict it carries) in favor of a stale one. Forcing the selection to be
+// driven by the reviewer's review timeline — the thing that actually tells
+// us what they last looked at — closes that gap. Reviews with empty
+// SubmittedAt fall back to slice position so the test-helper and pre-timestamp
+// gh outputs continue to work unchanged.
+func narrowToLatestCommit(hist []indexedReview) []indexedReview {
+	if len(hist) == 0 {
+		return hist
+	}
+	// Pick the chronologically latest review. Real timestamps beat empty ones;
+	// ties (and all-empty) fall through to the later slice position, matching
+	// the rest of the collapse's stable-tie-breaking conventions.
+	latestIdx := 0
+	for i := 1; i < len(hist); i++ {
+		ta := hist[i].rev.SubmittedAt
+		tb := hist[latestIdx].rev.SubmittedAt
+		switch {
+		case ta == "" && tb == "":
+			if hist[i].idx > hist[latestIdx].idx {
+				latestIdx = i
+			}
+		case ta == "":
+			// tb has a real timestamp; keep latestIdx.
+		case tb == "":
+			latestIdx = i
+		case ta > tb:
+			latestIdx = i
+		}
+	}
+	target := hist[latestIdx].commitID
+	if target == "" {
+		return hist
+	}
+	out := make([]indexedReview, 0, len(hist))
+	for _, r := range hist {
+		if r.commitID == target {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // mergeCandidateBasis returns the merge-candidate diff basis for the PR under
 // review. Base is the merge target tip (origin/<target>); head is the branch
-// tip. Both are resolved on a best-effort basis — an empty component means
-// "unknown", which EvaluateReviews treats as a merge-candidate basis (the safe
-// default) rather than a commit-history basis.
-func (p *githubPRProvider) mergeCandidateBasis() DiffBasis {
-	base, _ := p.git.RemoteBranchTip("origin", "main")
-	head, _ := p.git.Rev("HEAD")
+// tip.
+//
+// The base ref is queried from the PR's actual target (gh pr view
+// --json baseRefName) rather than hardcoded to "main", so a PR against any
+// other target branch is routed through the correct diff (gastown-6z5).
+//
+// Fail-closed on unknown target (gastown-6z5 rework): if GetPRBaseRef fails or
+// returns empty (transient gh failure, retired repo, private token scope), the
+// caller has no defensible basis to stamp. A silent fallback to origin/main
+// would preserve the wrong basis for non-main PRs and could let a PASS
+// verdict on a different branch authoritatively approve the merge. Returning
+// UnknownBasis() here forces every verdict against this packet to be
+// reclassified as a no-verdict audit gap, so the merge defers until a real
+// basis can be resolved — never merging under a fabricated basis.
+func (p *githubPRProvider) mergeCandidateBasis(prNumber int) DiffBasis {
+	name, err := p.git.GetPRBaseRef(prNumber)
+	if err != nil || strings.TrimSpace(name) == "" {
+		return UnknownBasis()
+	}
+	return mergeCandidateBasisFromBaseRef(p.git, name)
+}
+
+// mergeCandidateBasisFromBaseRef builds the merge-candidate basis for a known
+// target ref. Extracted so the fail-closed path can be exercised in isolation
+// without mocking the gh CLI surface (gastown-6z5 rework).
+func mergeCandidateBasisFromBaseRef(g *git.Git, name string) DiffBasis {
+	base, _ := g.RemoteBranchTip("origin", name)
+	head, _ := g.Rev("HEAD")
 	return MergeCandidateBasis(base, head)
 }
 

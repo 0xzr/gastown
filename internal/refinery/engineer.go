@@ -1158,11 +1158,27 @@ func (e *Engineer) degradedQuorumRule() DegradedQuorumRule {
 // EvaluateWithRule re-evaluates a provider-level review evaluation using the
 // configured degraded-quorum rule. Providers return a raw classification;
 // this applies the rig's explicit quorum settings.
+//
+// The packet-level DiffBasis and CauseKey from the provider are preserved on
+// the returned ReviewEvaluation so downstream telemetry and gate logic can
+// continue to reason about the diff basis and primary failure cause after the
+// quorum rule is applied (gastown-6z5). Without this preservation, the
+// provider's merge-candidate basis would be silently replaced with whatever
+// EvaluateReviews infers from results, and a packet-level CauseKey set by the
+// provider (e.g. gh_changes_requested_overall) would be lost.
 func EvaluateWithRule(ev *ReviewEvaluation, rule DegradedQuorumRule) *ReviewEvaluation {
 	if ev == nil {
 		return nil
 	}
 	result := EvaluateReviews(ev.Results, rule)
+	// Preserve packet-level provenance fields the provider stamped before the
+	// quorum rule was applied.
+	result.DiffBasis = ev.DiffBasis
+	if ev.CauseKey != "" && result.CauseKey == "" {
+		// Only adopt the provider's CauseKey when EvaluateReviews did not
+		// synthesize a more specific one from the per-result CauseKey set.
+		result.CauseKey = ev.CauseKey
+	}
 	return &result
 }
 
