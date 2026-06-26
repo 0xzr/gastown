@@ -1004,3 +1004,58 @@ func TestExtractEpicNumericSuffix(t *testing.T) {
 		})
 	}
 }
+
+// TestRunTestCommand_BootstrapsGoToolchain is the regression test for
+// gastown-ezr: runTestCommand must put the Go toolchain on PATH for its
+// subprocess so a Go test_command does not fail with "go: command not found"
+// when invoked from an automated session (refinery patrol formula, cron) whose
+// PATH lacks `go`. It mirrors the util.GateCommandEnv coverage of the refinery
+// gate and daemon main-branch patrol exec sites.
+func TestRunTestCommand_BootstrapsGoToolchain(t *testing.T) {
+	// Build a toolchain tree at $HOME/go-toolchain/go/bin containing a fake `go`
+	// so util.GateCommandEnv's discovery finds it.
+	home := t.TempDir()
+	binDir := filepath.Join(home, "go-toolchain", "go", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeGo := filepath.Join(binDir, "go")
+	if err := os.WriteFile(fakeGo, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHome, oldPath, oldRoot := os.Getenv("HOME"), os.Getenv("PATH"), os.Getenv("GOROOT")
+	defer func() {
+		os.Setenv("HOME", oldHome)
+		os.Setenv("PATH", oldPath)
+		os.Setenv("GOROOT", oldRoot)
+	}()
+	os.Setenv("HOME", home)
+	os.Setenv("GOROOT", "")
+	// A PATH that provably has no `go` anywhere; the subprocess inherits a
+	// GateCommandEnv PATH with the discovered toolchain prepended.
+	os.Setenv("PATH", "/usr/bin:/bin")
+
+	if _, err := exec.LookPath("go"); err == nil {
+		t.Skip("go is resolvable on the restricted PATH; cannot test the bootstrap case")
+	}
+
+	// `command -v go` prints go's resolved path and exits 0 only if it is on
+	// PATH. Capture stdout via a temp file because runTestCommand writes to
+	// os.Stdout directly.
+	outFile := filepath.Join(t.TempDir(), "which.txt")
+	// The test command resolves `go` in the subprocess shell; it must succeed
+	// (exit 0) precisely because GateCommandEnv prepended the toolchain bin.
+	testCmd := "command -v go > '" + outFile + "'"
+	if err := runTestCommand(".", testCmd); err != nil {
+		t.Fatalf("runTestCommand failed (go should be on PATH via GateCommandEnv): %v", err)
+	}
+
+	resolved, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("could not read command -v output: %v", err)
+	}
+	if strings.TrimSpace(string(resolved)) != fakeGo {
+		t.Errorf("expected subprocess to resolve go to %q, got %q", fakeGo, strings.TrimSpace(string(resolved)))
+	}
+}

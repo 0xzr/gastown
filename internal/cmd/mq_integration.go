@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -846,6 +847,14 @@ func runTestCommand(workDir, testCmd string) error {
 
 	cmd := exec.Command("sh", "-c", testCmd) //nolint:gosec // G204: TestCommand is from trusted rig config
 	cmd.Dir = workDir
+	// Ensure the Go toolchain is on PATH for the test subprocess. This command
+	// runs from automated contexts (refinery patrol formula, cron) whose PATH
+	// lacks `go`; without this a Go test_command fails with "go: command not
+	// found" before any branch code runs — a toolchain failure misread as a
+	// branch failure (gastown-ezr / gastown-0op). Mirrors util.GateCommandEnv
+	// usage at the refinery gate and daemon main-branch patrol exec sites.
+	util.SetDetachedProcessGroup(cmd)
+	cmd.Env = util.GateCommandEnv()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
