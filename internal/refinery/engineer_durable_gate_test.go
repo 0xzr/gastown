@@ -805,7 +805,7 @@ func TestRunDurableReviewGate_EmptyDiff_BlocksMerge(t *testing.T) {
 	// Branch and target point at the same commit — diff is empty.
 	mustRun(t, workDir, "git", "branch", "feat/empty", "main")
 
-	result := e.runDurableReviewGate(context.Background(), "feat/empty", "main", nil)
+	result := e.runDurableReviewGate(context.Background(), "feat/empty", "main", nil, false, "main")
 	if result.Success {
 		t.Fatal("expected gate to fail when merge-candidate diff is empty")
 	}
@@ -963,4 +963,173 @@ func TestHMACAttestationHelper(t *testing.T) {
 	writer := os.Getenv("GT_REVIEW_GATE_WRITER")
 	fmt.Println(hex.EncodeToString(expectedDurableReviewAttestationWithKey(key, tree, writer)))
 	os.Exit(0)
+}
+
+// TestDoMerge_PreVerified_StaleBase_RunsGatesAndBlocksMerge proves that a
+// pre-verified MR whose PreVerifiedBase no longer matches the refreshed target
+// HEAD cannot skip deterministic gates. doMerge must revalidate after pulling
+// origin/<target>; otherwise a TOCTOU window lets the fast path bypass durable
+// review. (gastown-6n7)
+func TestDoMerge_PreVerified_StaleBase_RunsGatesAndBlocksMerge(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	// A deterministic gate that reports it ran and then fails. If the fast path
+	// is incorrectly used, this gate is skipped and the merge would succeed.
+	e.config.Gates = map[string]*GateConfig{
+		"probe": {Cmd: "echo deterministic-gate-ran; exit 1"},
+	}
+	e.config.DurableReviewGate = nil
+
+	createFeatureBranch(t, workDir, "feat/pv-stale", "feature.txt", "feature content")
+
+	// Simulate the target advancing after the polecat recorded PreVerifiedBase.
+	oldBase := run(t, workDir, "git", "rev-parse", "main")
+	writeFile(t, workDir, "advance.txt", "advance content")
+	run(t, workDir, "git", "add", ".")
+	run(t, workDir, "git", "commit", "-m", "advance main")
+	run(t, workDir, "git", "push", "origin", "main")
+
+	result := e.doMerge(context.Background(), "feat/pv-stale", "main", "gt-test", &MRInfo{
+		SourceIssue:     "gt-test",
+		PreVerified:     true,
+		PreVerifiedBase: oldBase,
+	}, true)
+
+	if result.Success {
+		t.Fatal("expected merge to fail with stale pre-verified base")
+	}
+
+	output := e.output.(*bytes.Buffer).String()
+	if !strings.Contains(output, "Pre-verification stale") {
+		t.Errorf("expected stale pre-verification log, got:\n%s", output)
+	}
+	if !strings.Contains(output, "deterministic-gate-ran") {
+		t.Errorf("expected deterministic gate to run, got:\n%s", output)
+	}
+	if strings.Contains(output, "Skipping gates (pre-verified by polecat)") {
+		t.Errorf("fast path should not be used with stale base, got:\n%s", output)
+	}
+
+	_ = g
+}
+
+// TestDoMerge_PreVerifiedFastPath_WithoutAttestation_BlocksMerge proves that a
+// pre-verified MR that skips deterministic gates cannot bypass durable review
+// when no HMAC attestation exists. Even when durable_review_gate.required is
+// false, the fast path still requires attestation and fails closed without one.
+// The source issue/MR must not be reported as merged. (gastown-6n7)
+func TestDoMerge_PreVerifiedFastPath_WithoutAttestation_BlocksMerge(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+
+	attestDir := filepath.Join(workDir, "attestations")
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		// Required=false is the regression condition: the fast path must still
+		// enforce durable review/attestation on the default branch.
+		Required:    false,
+		AttestDir:   attestDir,
+		HMACKeyPath: keyPath,
+		// Exit 0 without writing an attestation: the only way the merge can fail
+		// is if the gate refuses to proceed without an attestation.
+		Cmd: `echo durable-gate-command-ran`,
+	}
+
+	createFeatureBranch(t, workDir, "feat/pv-no-attest", "feature.txt", "feature content")
+	base := run(t, workDir, "git", "rev-parse", "main")
+
+	result := e.doMerge(context.Background(), "feat/pv-no-attest", "main", "gt-test", &MRInfo{
+		SourceIssue:     "gt-test",
+		PreVerified:     true,
+		PreVerifiedBase: base,
+	}, true)
+
+	if result.Success {
+		t.Fatal("expected merge to fail without durable attestation")
+	}
+	if result.MergeCommit != "" {
+		t.Errorf("merge must not produce a commit without attestation, got %s", result.MergeCommit)
+	}
+
+	output := e.output.(*bytes.Buffer).String()
+	if !strings.Contains(output, "Durable review gate required") {
+		t.Errorf("expected durable gate required log, got:\n%s", output)
+	}
+	if !strings.Contains(result.Error, "attestation missing") {
+		t.Errorf("expected missing HMAC attestation error, got: %s", result.Error)
+	}
+	// Deterministic gates are intentionally skipped on the fast path; the
+	// durable review gate must still run and fail closed without an attestation.
+	if !strings.Contains(output, "Running durable review gate") {
+		t.Errorf("expected durable gate to run, got:\n%s", output)
+	}
+
+	_ = g
+}
+
+// TestDoMerge_PreVerifiedFastPath_WithAttestation_AllowsMerge proves the happy
+// path for the fast path: deterministic gates may be skipped when an HMAC
+// attestation for the merge-candidate tree is already present and verified.
+func TestDoMerge_PreVerifiedFastPath_WithAttestation_AllowsMerge(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+
+	attestDir := filepath.Join(workDir, "attestations")
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    false,
+		AttestDir:   attestDir,
+		HMACKeyPath: keyPath,
+		// This command must not run because the attestation already exists.
+		Cmd: `echo durable-gate-command-ran; exit 1`,
+	}
+
+	createFeatureBranch(t, workDir, "feat/pv-attested", "feature.txt", "feature content")
+	base := run(t, workDir, "git", "rev-parse", "main")
+
+	// Pre-compute the merge-candidate tree by squash-merging the branch and
+	// recording the tree. doMerge produces the same tree when it lands the MR.
+	mustRun(t, workDir, "git", "checkout", "main")
+	mustRun(t, workDir, "git", "merge", "--squash", "feat/pv-attested")
+	mustRun(t, workDir, "git", "add", ".")
+	mustRun(t, workDir, "git", "commit", "-m", "tmp: compute tree")
+	tree := mustRun(t, workDir, "git", "rev-parse", "HEAD^{tree}")
+	mustRun(t, workDir, "git", "reset", "--hard", "HEAD~1")
+
+	// Write an attestation for the exact merge-candidate tree.
+	if err := os.MkdirAll(attestDir, 0755); err != nil {
+		t.Fatalf("create attest dir: %v", err)
+	}
+	writeHMACToken(t, attestDir, keyPath, tree, "unknown")
+
+	result := e.doMerge(context.Background(), "feat/pv-attested", "main", "gt-test", &MRInfo{
+		SourceIssue:     "gt-test",
+		PreVerified:     true,
+		PreVerifiedBase: base,
+	}, true)
+
+	if !result.Success {
+		t.Fatalf("expected merge to succeed with existing attestation, got: %s", result.Error)
+	}
+
+	output := e.output.(*bytes.Buffer).String()
+	if !strings.Contains(output, "Skipping gates (pre-verified by polecat)") {
+		t.Errorf("expected deterministic gates to be skipped, got:\n%s", output)
+	}
+	if !strings.Contains(output, "Durable review attestation present") {
+		t.Errorf("expected durable gate to use existing attestation, got:\n%s", output)
+	}
+	if strings.Contains(output, "durable-gate-command-ran") {
+		t.Error("durable gate command ran despite existing attestation")
+	}
+
+	_ = g
 }

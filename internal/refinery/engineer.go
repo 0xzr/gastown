@@ -743,6 +743,30 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	}
 	e.surface = &gateSurface{base: reviewBase, head: branch}
 
+	// Step 2.5: Revalidate the pre-verified skip-gates decision against the
+	// *actual* refreshed target HEAD. ProcessMRInfo computed the initial
+	// skipGates value by comparing mr.PreVerifiedBase to origin/<target> before
+	// the pull above, so the remote-tracking ref or target may have advanced
+	// between that probe and the real merge base. doMerge has the authoritative
+	// refreshed reviewBase and must revalidate before using the fast path.
+	// (gastown-6n7: TOCTOU between ProcessMRInfo skipGates and doMerge pull.)
+	shouldSkipGates := len(skipGates) > 0 && skipGates[0]
+	if shouldSkipGates {
+		if mr == nil {
+			// Caller explicitly requested the fast path without an MR struct;
+			// production callers always provide a real MR. Trust the request and
+			// let durableReviewRequiredForMR bind any attestation requirement
+			// to skipGates below.
+		} else if !mr.PreVerified || mr.PreVerifiedBase == "" {
+			_, _ = fmt.Fprintln(e.output, "[Engineer] Pre-verification invalid — running gates normally")
+			shouldSkipGates = false
+		} else if mr.PreVerifiedBase != reviewBase {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Pre-verification stale — target refreshed from %s to %s, running gates normally\n",
+				shortSHA(mr.PreVerifiedBase), shortSHA(reviewBase))
+			shouldSkipGates = false
+		}
+	}
+
 	// Step 3: Check for merge conflicts (using local branch)
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Checking for conflicts...\n")
 	conflicts, err := e.git.CheckConflicts(branch, target)
@@ -794,9 +818,10 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	}
 
 	// Step 4: Run quality gates (or legacy tests) if configured.
-	// Phase 3 fast-path: if skipGates is true (pre-verified MR with matching base),
-	// skip all gate execution — the polecat already ran gates after rebasing.
-	shouldSkipGates := len(skipGates) > 0 && skipGates[0]
+	// Phase 3 fast-path: if shouldSkipGates is true (pre-verified MR with a
+	// verified, refreshed base), skip deterministic gate execution — the polecat
+	// already ran gates after rebasing. The durable multi-model review/HMAC gate
+	// is still enforced separately and cannot be bypassed by the fast path.
 	if shouldSkipGates {
 		_, _ = fmt.Fprintln(e.output, "[Engineer] Skipping gates (pre-verified by polecat)")
 	} else if len(e.config.Gates) > 0 {
@@ -891,8 +916,10 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	// candidate before pushing. This gate runs fail-closed: a missing reviewer
 	// or HMAC attestation blocks the merge. It is required for the default
 	// branch in direct-merge mode; the PR merge path relies on VCS-level
-	// review evaluation instead.
-	durableResult := e.runDurableReviewGate(ctx, branch, target, mr, reviewBase)
+	// review evaluation instead. A pre-verified MR that skips deterministic
+	// gates must still pass durable review, so the gate decision includes the
+	// actual skipGates outcome. (gastown-6n7)
+	durableResult := e.runDurableReviewGate(ctx, branch, target, mr, shouldSkipGates, reviewBase)
 	if !durableResult.Success {
 		if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after durable review gate failure: %v\n", target, resetErr)
@@ -1605,13 +1632,36 @@ func canonicalMergeTarget(target string) string {
 	return strings.TrimPrefix(target, "origin/")
 }
 
-// durableReviewGateEnabled reports whether the durable review gate must be
-// enforced for the given target branch.
+// durableReviewGateEnabled reports whether the durable review gate is
+// configured as required for the given target branch.
 func (e *Engineer) durableReviewGateEnabled(target string) bool {
 	if e.config.DurableReviewGate == nil {
 		return false
 	}
 	if !e.config.DurableReviewGate.Required {
+		return false
+	}
+	return strings.EqualFold(canonicalMergeTarget(target), e.effectiveDurableReviewTarget())
+}
+
+// durableReviewRequiredForMR reports whether the durable review/HMAC gate must
+// be enforced for this merge. The gate is required when configured for the
+// target (Required=true). It is also required when the pre-verified skip-gates
+// fast path is actually being used on the durable-review target, even when
+// durable_review_gate.required is false. This prevents a stale or misconfigured
+// Required toggle from letting gt done --pre-verified bypass durable
+// multi-model review/HMAC attestation. The requirement is bound to the actual
+// skipGates decision (not merely mr.PreVerified) so a stale PV MR that falls
+// back to normal gates is not held to the extra requirement. (gastown-6n7)
+func (e *Engineer) durableReviewRequiredForMR(mr *MRInfo, skipGates bool, target string) bool {
+	_ = mr
+	if e.durableReviewGateEnabled(target) {
+		return true
+	}
+	if !skipGates {
+		return false
+	}
+	if e.config.DurableReviewGate == nil {
 		return false
 	}
 	return strings.EqualFold(canonicalMergeTarget(target), e.effectiveDurableReviewTarget())
@@ -1952,8 +2002,8 @@ func (e *Engineer) isEmptyReviewDiff(branch, target string) (bool, error) {
 // the m3-degenerate-PASS incident where m3 returned PASS on the empty gtviz
 // initial commit and the gate treated that zero-content PASS as approval,
 // enabling a degraded-quorum bypass.
-func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target string, mr *MRInfo, reviewBase ...string) ProcessResult {
-	if !e.durableReviewGateEnabled(target) {
+func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target string, mr *MRInfo, skipGates bool, reviewBase string) ProcessResult {
+	if !e.durableReviewRequiredForMR(mr, skipGates, target) {
 		return ProcessResult{Success: true}
 	}
 
@@ -1985,10 +2035,8 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 	// pre-merge target commit captured before the squash. Direct unit tests
 	// and callers that have not advanced target use the target branch itself.
 	diffBase := target
-	if len(reviewBase) > 0 {
-		if base := strings.TrimSpace(reviewBase[0]); base != "" {
-			diffBase = base
-		}
+	if base := strings.TrimSpace(reviewBase); base != "" {
+		diffBase = base
 	}
 	if empty, err := e.isEmptyReviewDiff(branch, diffBase); err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED - could not determine diff state: %v\n", err)
