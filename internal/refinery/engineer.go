@@ -97,6 +97,32 @@ type GateConfig struct {
 	SurfaceScope string `json:"surface_scope,omitempty"`
 }
 
+// DurableReviewGateConfig configures the mandatory multi-model review gate.
+// This gate runs after the normal quality gates and verifies that the merge
+// candidate has passed the durable refinery review (e.g. refinery-gate.sh)
+// and produced a verifiable HMAC attestation. It fails closed: a missing
+// reviewer/HMAC attestation blocks the merge.
+type DurableReviewGateConfig struct {
+	// Required enables fail-closed enforcement. When true, the merge cannot
+	// proceed unless the review gate passes and an attestation exists for the
+	// merge-candidate tree. Defaults to true.
+	Required bool `json:"required,omitempty"`
+
+	// Cmd is the shell command that runs the durable review gate.
+	// If empty while Required is true, the merge fails closed.
+	Cmd string `json:"cmd,omitempty"`
+
+	// Timeout is the maximum time the review gate command may run.
+	// Zero means no timeout (inherits context deadline).
+	Timeout time.Duration `json:"timeout,omitempty"`
+
+	// AttestDir is the directory where HMAC attestation files are written.
+	// Each file is named after the merge-candidate tree hash. If empty, the
+	// default is read from GT_GATE_ATTEST_DIR, falling back to
+	// /home/ubuntu/.gt-gate-attestations.
+	AttestDir string `json:"attest_dir,omitempty"`
+}
+
 // GateResult holds the outcome of a single gate execution.
 type GateResult struct {
 	Name    string
@@ -215,6 +241,11 @@ type MergeQueueConfig struct {
 	// Batch holds configuration for the batch-then-bisect merge queue.
 	// When nil or MaxBatchSize <= 1, batching is disabled and MRs process sequentially.
 	Batch *BatchConfig `json:"batch,omitempty"`
+
+	// DurableReviewGate configures the fail-closed multi-model review gate that
+	// must pass before a merge is pushed. This is the source-controlled
+	// enforcement counterpart to the live refinery-gate.sh runtime gate.
+	DurableReviewGate *DurableReviewGateConfig `json:"durable_review_gate,omitempty"`
 }
 
 // DefaultMergeQueueConfig returns sensible defaults for merge queue configuration.
@@ -234,6 +265,12 @@ func DefaultMergeQueueConfig() *MergeQueueConfig {
 		StaleClaimCriticalAfter: 6 * time.Hour,
 		MaxRetryCount:           5,
 		AutoPush:                true,
+		DurableReviewGate: &DurableReviewGateConfig{
+			Required:  true,
+			Cmd:       "",
+			Timeout:   0,
+			AttestDir: "",
+		},
 	}
 }
 
@@ -382,23 +419,24 @@ func (e *Engineer) LoadConfig() error {
 	// Parse merge_queue section into our config struct
 	// We need special handling for poll_interval (string -> Duration)
 	var mqRaw struct {
-		Enabled               *bool                     `json:"enabled"`
-		OnConflict            *string                   `json:"on_conflict"`
-		RunTests              *bool                     `json:"run_tests"`
-		TestCommand           *string                   `json:"test_command"`
-		DeleteMergedBranches  *bool                     `json:"delete_merged_branches"`
-		RetryFlakyTests       *int                      `json:"retry_flaky_tests"`
-		PollInterval          *string                   `json:"poll_interval"`
-		MaxConcurrent         *int                      `json:"max_concurrent"`
-		StaleClaimTimeout     *string                   `json:"stale_claim_timeout"`
-		Gates                 map[string]*gateConfigRaw `json:"gates"`
-		GatesParallel         *bool                     `json:"gates_parallel"`
-		AutoPush              *bool                     `json:"auto_push"`
-		MergeStrategy         *string                   `json:"merge_strategy"`
-		VCSProvider           *string                   `json:"vcs_provider"`
-		RequireReview         *bool                     `json:"require_review"`
-		DegradedQuorumEnabled *bool                     `json:"degraded_quorum_enabled"`
-		ReviewQuorumMin       *int                      `json:"review_quorum_min"`
+		Enabled               *bool                       `json:"enabled"`
+		OnConflict            *string                     `json:"on_conflict"`
+		RunTests              *bool                       `json:"run_tests"`
+		TestCommand           *string                     `json:"test_command"`
+		DeleteMergedBranches  *bool                       `json:"delete_merged_branches"`
+		RetryFlakyTests       *int                        `json:"retry_flaky_tests"`
+		PollInterval          *string                     `json:"poll_interval"`
+		MaxConcurrent         *int                        `json:"max_concurrent"`
+		StaleClaimTimeout     *string                     `json:"stale_claim_timeout"`
+		Gates                 map[string]*gateConfigRaw   `json:"gates"`
+		GatesParallel         *bool                       `json:"gates_parallel"`
+		AutoPush              *bool                       `json:"auto_push"`
+		MergeStrategy         *string                     `json:"merge_strategy"`
+		VCSProvider           *string                     `json:"vcs_provider"`
+		RequireReview         *bool                       `json:"require_review"`
+		DegradedQuorumEnabled *bool                       `json:"degraded_quorum_enabled"`
+		ReviewQuorumMin       *int                        `json:"review_quorum_min"`
+		DurableReviewGate     *durableReviewGateConfigRaw `json:"durable_review_gate,omitempty"`
 	}
 
 	if err := json.Unmarshal(rawConfig.MergeQueue, &mqRaw); err != nil {
@@ -493,6 +531,30 @@ func (e *Engineer) LoadConfig() error {
 	if mqRaw.ReviewQuorumMin != nil {
 		e.config.ReviewQuorumMin = *mqRaw.ReviewQuorumMin
 	}
+	if mqRaw.DurableReviewGate != nil {
+		if e.config.DurableReviewGate == nil {
+			e.config.DurableReviewGate = &DurableReviewGateConfig{}
+		}
+		if mqRaw.DurableReviewGate.Required != nil {
+			e.config.DurableReviewGate.Required = *mqRaw.DurableReviewGate.Required
+		}
+		if mqRaw.DurableReviewGate.Cmd != "" {
+			e.config.DurableReviewGate.Cmd = mqRaw.DurableReviewGate.Cmd
+		}
+		if mqRaw.DurableReviewGate.AttestDir != "" {
+			e.config.DurableReviewGate.AttestDir = mqRaw.DurableReviewGate.AttestDir
+		}
+		if mqRaw.DurableReviewGate.Timeout != "" {
+			dur, err := time.ParseDuration(mqRaw.DurableReviewGate.Timeout)
+			if err != nil {
+				return fmt.Errorf("invalid durable_review_gate timeout %q: %w", mqRaw.DurableReviewGate.Timeout, err)
+			}
+			if dur <= 0 {
+				return fmt.Errorf("durable_review_gate timeout must be positive, got %v", dur)
+			}
+			e.config.DurableReviewGate.Timeout = dur
+		}
+	}
 
 	// Initialize the PR provider when merge_strategy=pr.
 	if e.config.MergeStrategy == "pr" {
@@ -529,6 +591,15 @@ type gateConfigRaw struct {
 	Timeout      string `json:"timeout"`
 	Phase        string `json:"phase"`
 	SurfaceScope string `json:"surface_scope,omitempty"`
+}
+
+// durableReviewGateConfigRaw is the JSON-friendly representation of a durable
+// review gate config with timeout as a string duration.
+type durableReviewGateConfigRaw struct {
+	Required  *bool  `json:"required,omitempty"`
+	Cmd       string `json:"cmd,omitempty"`
+	Timeout   string `json:"timeout,omitempty"`
+	AttestDir string `json:"attest_dir,omitempty"`
 }
 
 // Config returns the current merge queue configuration.
@@ -789,6 +860,19 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 			}
 			return postResult
 		}
+	}
+
+	// Step 5.6: Enforce the durable multi-model review gate on the merge
+	// candidate before pushing. This gate runs fail-closed: a missing reviewer
+	// or HMAC attestation blocks the merge. It is required for the default
+	// branch in direct-merge mode; the PR merge path relies on VCS-level
+	// review evaluation instead.
+	durableResult := e.runDurableReviewGate(ctx, branch, target, mr)
+	if !durableResult.Success {
+		if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after durable review gate failure: %v\n", target, resetErr)
+		}
+		return durableResult
 	}
 
 	// Step 6: Get the merge commit SHA
@@ -1479,6 +1563,212 @@ func (e *Engineer) runGatesForPhase(ctx context.Context, phase GatePhase) Proces
 	}
 
 	_, _ = fmt.Fprintln(e.output, "[Engineer] All quality gates passed")
+	return ProcessResult{Success: true}
+}
+
+// effectiveDurableReviewTarget returns the branch the durable review gate
+// protects. It only enforces on the rig's default branch (usually main),
+// because that is where the audited merge history lives.
+func (e *Engineer) effectiveDurableReviewTarget() string {
+	return e.rig.DefaultBranch()
+}
+
+// durableReviewGateEnabled reports whether the durable review gate must be
+// enforced for the given target branch.
+func (e *Engineer) durableReviewGateEnabled(target string) bool {
+	if e.config.DurableReviewGate == nil {
+		return false
+	}
+	if !e.config.DurableReviewGate.Required {
+		return false
+	}
+	return strings.EqualFold(target, e.effectiveDurableReviewTarget())
+}
+
+// durableReviewAttestDir returns the configured attestation directory with
+// environment fallbacks.
+func (e *Engineer) durableReviewAttestDir() string {
+	if e.config.DurableReviewGate != nil && e.config.DurableReviewGate.AttestDir != "" {
+		return e.config.DurableReviewGate.AttestDir
+	}
+	if dir := os.Getenv("GT_GATE_ATTEST_DIR"); dir != "" {
+		return dir
+	}
+	return "/home/ubuntu/.gt-gate-attestations"
+}
+
+// durableReviewGateCmd returns the configured review gate command, or an empty
+// string if none is configured.
+//
+// Legacy-config fallback: if durable_review_gate is required but the command is
+// empty, reuse an existing post-squash gate whose command invokes
+// refinery-gate.sh. Gastown's production config defines the durable review as
+// a post-squash gate named "four-model-refinery-review"; this fallback lets
+// that config enforce durable attestation without duplicating the command.
+func (e *Engineer) durableReviewGateCmd() string {
+	if e.config.DurableReviewGate == nil {
+		return ""
+	}
+	cmd := strings.TrimSpace(e.config.DurableReviewGate.Cmd)
+	if cmd != "" {
+		return cmd
+	}
+	for _, gate := range e.config.Gates {
+		if gate == nil || gate.Phase != GatePhasePostSquash {
+			continue
+		}
+		candidate := strings.TrimSpace(gate.Cmd)
+		if strings.Contains(candidate, "refinery-gate.sh") {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// durableReviewAttestationPath returns the path to the HMAC attestation file
+// for a given tree hash, if an attestation directory is configured.
+func (e *Engineer) durableReviewAttestationPath(tree string) string {
+	if tree == "" {
+		return ""
+	}
+	return filepath.Join(e.durableReviewAttestDir(), tree)
+}
+
+// hasDurableReviewAttestation reports whether an HMAC attestation exists for
+// the merge candidate at the current HEAD.
+func (e *Engineer) hasDurableReviewAttestation() (bool, string, error) {
+	tree, err := e.git.Rev("HEAD^{tree}")
+	if err != nil {
+		return false, "", fmt.Errorf("resolving merge-candidate tree: %w", err)
+	}
+	path := e.durableReviewAttestationPath(tree)
+	if path == "" {
+		return false, tree, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, tree, nil
+		}
+		return false, tree, fmt.Errorf("checking attestation %s: %w", path, err)
+	}
+	return !info.IsDir(), tree, nil
+}
+
+// runDurableReviewGate enforces the fail-closed multi-model review gate.
+// It checks for an existing HMAC attestation for the merge-candidate tree and,
+// if missing, runs the configured review gate command. The merge is rejected
+// unless an attestation exists after enforcement.
+func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target string, _ *MRInfo) ProcessResult {
+	if !e.durableReviewGateEnabled(target) {
+		return ProcessResult{Success: true}
+	}
+
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate required for %s\n", target)
+
+	// Fail closed immediately if no review gate command is configured.
+	cmd := e.durableReviewGateCmd()
+	if cmd == "" {
+		_, _ = fmt.Fprintln(e.output, "[Engineer] Durable review gate FAILED - no command configured")
+		return ProcessResult{
+			Success:     false,
+			TestsFailed: true,
+			Error:       "durable review gate required but no command configured",
+		}
+	}
+
+	// If an attestation already exists, we can skip running the expensive gate.
+	attested, tree, err := e.hasDurableReviewAttestation()
+	if err != nil {
+		return ProcessResult{
+			Success:     false,
+			TestsFailed: true,
+			Error:       fmt.Sprintf("durable review attestation check failed: %v", err),
+		}
+	}
+	if attested {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review attestation present for tree %s; skipping gate\n", shortSHA(tree))
+		return ProcessResult{Success: true}
+	}
+
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Running durable review gate for tree %s...\n", shortSHA(tree))
+
+	gateCtx := ctx
+	if e.config.DurableReviewGate.Timeout > 0 {
+		var cancel context.CancelFunc
+		gateCtx, cancel = context.WithTimeout(ctx, e.config.DurableReviewGate.Timeout)
+		defer cancel()
+	}
+
+	runCmd := exec.CommandContext(gateCtx, "sh", "-c", cmd) //nolint:gosec // G204: Review gate command is from trusted rig config
+	util.SetDetachedProcessGroup(runCmd)
+	runCmd.Dir = e.workDir
+	runCmd.Env = util.GateCommandEnv()
+	// Expose metadata to the review gate command so it can locate the
+	// worktree, the merge candidate, and the attestation directory.
+	runCmd.Env = append(runCmd.Env,
+		"GT_REVIEW_GATE_WORKTREE="+e.workDir,
+		"GT_REVIEW_GATE_BRANCH="+branch,
+		"GT_REVIEW_GATE_TARGET="+target,
+		"GT_GATE_ATTEST_DIR="+e.durableReviewAttestDir(),
+	)
+	var stdout, stderr bytes.Buffer
+	runCmd.Stdout = &stdout
+	runCmd.Stderr = &stderr
+
+	start := time.Now()
+	runErr := runCmd.Run()
+	elapsed := time.Since(start)
+	output := strings.TrimSpace(stdout.String())
+	if stderrStr := strings.TrimSpace(stderr.String()); stderrStr != "" {
+		if output != "" {
+			output += "\n"
+		}
+		output += stderrStr
+	}
+
+	if runErr != nil {
+		errMsg := fmt.Sprintf("durable review gate failed (%v)", runErr)
+		if gateCtx.Err() == context.DeadlineExceeded {
+			errMsg = fmt.Sprintf("durable review gate timed out after %v", e.config.DurableReviewGate.Timeout)
+		}
+		if output != "" {
+			cap := output
+			if len(cap) > 500 {
+				cap = cap[:500] + "..."
+			}
+			errMsg = fmt.Sprintf("%s: %s", errMsg, cap)
+		}
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED (%v) - %s\n", elapsed.Truncate(time.Millisecond), errMsg)
+		return ProcessResult{
+			Success:     false,
+			TestsFailed: true,
+			Error:       errMsg,
+		}
+	}
+
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate passed (%v)\n", elapsed.Truncate(time.Millisecond))
+
+	// Fail closed if the gate command exited 0 but did not write the
+	// expected HMAC attestation. A missing attestation means there is no
+	// durable proof that reviewers actually ran.
+	attested, tree, err = e.hasDurableReviewAttestation()
+	if err != nil {
+		return ProcessResult{
+			Success:     false,
+			TestsFailed: true,
+			Error:       fmt.Sprintf("durable review gate passed but attestation check failed: %v", err),
+		}
+	}
+	if !attested {
+		return ProcessResult{
+			Success:     false,
+			TestsFailed: true,
+			Error:       fmt.Sprintf("durable review gate passed but HMAC attestation missing for tree %s at %s", tree, e.durableReviewAttestationPath(tree)),
+		}
+	}
+
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review attestation recorded for tree %s\n", shortSHA(tree))
 	return ProcessResult{Success: true}
 }
 

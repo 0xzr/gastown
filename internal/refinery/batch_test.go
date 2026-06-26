@@ -104,6 +104,10 @@ func newTestEngineer(t *testing.T, workDir string, g *gitpkg.Git) *Engineer {
 	e.git = g
 	e.workDir = workDir
 	e.output = &bytes.Buffer{}
+	// Disable the durable review gate by default so characterization tests
+	// for other merge behaviors do not need to produce HMAC attestations.
+	// Tests that exercise the durable gate re-enable it explicitly.
+	e.config.DurableReviewGate = nil
 	// No-op merge slot functions for tests
 	e.mergeSlotEnsureExists = func() (string, error) { return "test-slot", nil }
 	e.mergeSlotAcquire = func(holder string, addWaiter bool) (*beads.MergeSlotStatus, error) {
