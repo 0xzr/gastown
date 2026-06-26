@@ -385,3 +385,184 @@ func TestListPolecats_FiltersWorktrees(t *testing.T) {
 		t.Errorf("listPolecats should return only [scout], got: %v", polecats)
 	}
 }
+
+// TestAgentBeadsExistCheck_FixTargetsRigBeadsDir is a regression guard for
+// gastown-cet.1.1 (doctor --fix seam). It verifies that Fix() seeds rig-level
+// agent beads (witness, refinery, crew, polecat) with BEADS_DIR pointing to
+// the rig's own .beads database, not the town/HQ database. Before the fix,
+// the rig-level `bd` wrapper in Fix() had prefix routing enabled, so a real
+// `bd` client would have redirected the create to the HQ database — silently
+// re-introducing the HQ contamination the original gastown-cet.1.1 commit
+// removed.
+//
+// We mock bd to log the BEADS_DIR of every invocation so we can verify which
+// database each create targeted. We also assert that the rig-level creates
+// do NOT target the town .beads directory.
+func TestAgentBeadsExistCheck_FixTargetsRigBeadsDir(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Set up routes pointing to a rig with a known prefix.
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	const rigName = "gastown"
+	const rigPrefix = "gs"
+	const rigRoutePath = "gastown/mayor/rig"
+	routesContent := fmt.Sprintf(`{"prefix":"%s-","path":"%s"}`+"\n", rigPrefix, rigRoutePath)
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create the rig beads directory tree matching the route path so that
+	// bd subprocess invocations (which set cmd.Dir to this path) succeed.
+	rigBeadsDir := filepath.Join(tmpDir, rigRoutePath, ".beads")
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create the town root marker so ForAgentBead() can detect the town root
+	// and would otherwise redirect rig-level creates to the town .beads
+	// directory. This is what makes the bug observable: without WithNoRoute(),
+	// CreateAgentBead would re-route to townBeadsDir; with WithNoRoute() it
+	// stays on rigBeadsDir.
+	if err := os.MkdirAll(filepath.Join(tmpDir, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "mayor", "town.json"), []byte(`{"name":"test-town"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mock bd that logs every create invocation with its BEADS_DIR.
+	binDir := filepath.Join(tmpDir, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(tmpDir, "bd-cmd.log")
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+
+logfile="` + logPath + `"
+
+args=()
+for arg in "$@"; do
+  if [[ "$arg" == --allow-stale ]]; then
+    continue
+  fi
+  args+=("$arg")
+done
+
+cmd=""
+idx=0
+for i in "${!args[@]}"; do
+  if [[ "${args[$i]}" != -* ]]; then
+    cmd="${args[$i]}"
+    idx=$i
+    break
+  fi
+done
+
+case "$cmd" in
+  list)
+    printf '[]\n'
+    ;;
+  mol)
+    if [[ "${args[$((idx + 1))]:-}" == "wisp" && "${args[$((idx + 2))]:-}" == "list" ]]; then
+      printf '{"wisps":[]}\n'
+      exit 0
+    fi
+    exit 1
+    ;;
+  show)
+    exit 1
+    ;;
+  create)
+    id=""
+    for arg in "${args[@]:$((idx + 1))}"; do
+      case "$arg" in
+        --id=*) id="${arg#--id=}" ;;
+      esac
+    done
+    # Single-line log entry: BEADS_DIR + command. Keep arg newlines collapsed
+    # so each bd invocation produces exactly one log line.
+    log_line=""
+    for arg in "${args[@]}"; do
+      arg_nl=$(printf '%s' "$arg" | tr '\n' ' ')
+      if [[ -z "$log_line" ]]; then
+        log_line="$arg_nl"
+      else
+        log_line="$log_line $arg_nl"
+      fi
+    done
+    printf 'BEADS_DIR=%s %s\n' "${BEADS_DIR:-<unset>}" "$log_line" >> "$logfile"
+    printf '{"id":"%s","status":"open","created_at":"2025-01-01T00:00:00Z"}\n' "$id"
+    ;;
+  update)
+    printf '{}'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+	bdScript := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(bdScript, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fmt.Sprintf("%s%c%s", binDir, os.PathListSeparator, os.Getenv("PATH")))
+
+	check := NewAgentBeadsCheck()
+	ctx := &CheckContext{TownRoot: tmpDir}
+	if err := check.Fix(ctx); err != nil {
+		t.Fatalf("Fix() returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("reading mock bd log: %v", err)
+	}
+	log := string(data)
+
+	townBeadsDir := beadsDir
+	witnessID := fmt.Sprintf("%s-%s-witness", rigPrefix, rigName)
+	refineryID := fmt.Sprintf("%s-%s-refinery", rigPrefix, rigName)
+
+	// Find the create for witness/refinery and verify their BEADS_DIR pointed
+	// to the rig's own .beads directory, not the town/HQ .beads directory.
+	for _, id := range []string{witnessID, refineryID} {
+		var foundLine string
+		var foundDir string
+		for _, line := range strings.Split(strings.TrimSpace(log), "\n") {
+			// Lines have the form: BEADS_DIR=<dir> create ... --id=<id> ...
+			const prefix = "BEADS_DIR="
+			if !strings.HasPrefix(line, prefix) {
+				continue
+			}
+			rest := strings.TrimPrefix(line, prefix)
+			beadsDir, cmdLine, ok := strings.Cut(rest, " ")
+			if !ok {
+				continue
+			}
+			if strings.Contains(cmdLine, "--id="+id) {
+				foundLine = line
+				foundDir = beadsDir
+				break
+			}
+		}
+		if foundLine == "" {
+			t.Errorf("expected create for %s in bd log, got:\n%s", id, log)
+			continue
+		}
+		if foundDir == "<unset>" {
+			t.Errorf("create for %s ran with unset BEADS_DIR (would route via prefix): %s", id, foundLine)
+			continue
+		}
+		if foundDir == townBeadsDir {
+			t.Errorf("create for %s targeted town/HQ beads dir %q, want rig dir %q", id, townBeadsDir, rigBeadsDir)
+			continue
+		}
+		if !strings.HasPrefix(foundDir, rigBeadsDir) {
+			t.Errorf("create for %s targeted %q, want prefix %q", id, foundDir, rigBeadsDir)
+		}
+	}
+}

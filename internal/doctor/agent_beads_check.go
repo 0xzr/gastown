@@ -357,10 +357,12 @@ func (c *AgentBeadsCheck) Fix(ctx *CheckContext) error {
 		return errors.Join(errs...)
 	}
 
-	// Load existing rig-level agent beads and wisp IDs before fixing
+	// Load existing rig-level agent beads and wisp IDs before fixing.
+	// WithNoRoute() disables prefix-based routing so the listing targets the
+	// rig's own beads database, not the town/HQ database (gastown-cet.1.1).
 	for _, info := range prefixToRig {
 		rigBeadsPath := filepath.Join(ctx.TownRoot, info.beadsPath)
-		bd := beads.New(rigBeadsPath)
+		bd := beads.New(rigBeadsPath).WithNoRoute()
 		if rigAgents, err := bd.ListAgentBeads(); err == nil {
 			for id, issue := range rigAgents {
 				allAgentBeads[id] = issue
@@ -373,10 +375,15 @@ func (c *AgentBeadsCheck) Fix(ctx *CheckContext) error {
 		}
 	}
 
-	// Fix agents for each rig
+	// Fix agents for each rig.
+	// WithNoRoute() disables prefix-based routing so the rig-scoped creates
+	// (witness, refinery, crew, polecat) target the rig's own beads database
+	// instead of being redirected to the town/HQ database via routes.jsonl
+	// (gastown-cet.1.1). Without this, gt doctor --fix could re-introduce the
+	// HQ contamination the original fix removed.
 	for prefix, info := range prefixToRig {
 		rigBeadsPath := filepath.Join(ctx.TownRoot, info.beadsPath)
-		bd := beads.New(rigBeadsPath)
+		bd := beads.New(rigBeadsPath).WithNoRoute()
 		rigName := info.name
 
 		witnessID := beads.WitnessBeadIDWithPrefix(prefix, rigName)
