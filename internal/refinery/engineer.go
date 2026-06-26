@@ -734,6 +734,15 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: pull from origin/%s: %v (continuing)\n", target, err)
 	}
 
+	reviewBase, err := e.git.Rev("HEAD")
+	if err != nil {
+		return ProcessResult{
+			Success: false,
+			Error:   fmt.Sprintf("failed to resolve pre-merge target %s: %v", target, err),
+		}
+	}
+	e.surface = &gateSurface{base: reviewBase, head: branch}
+
 	// Step 3: Check for merge conflicts (using local branch)
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Checking for conflicts...\n")
 	conflicts, err := e.git.CheckConflicts(branch, target)
@@ -883,7 +892,7 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	// or HMAC attestation blocks the merge. It is required for the default
 	// branch in direct-merge mode; the PR merge path relies on VCS-level
 	// review evaluation instead.
-	durableResult := e.runDurableReviewGate(ctx, branch, target, mr)
+	durableResult := e.runDurableReviewGate(ctx, branch, target, mr, reviewBase)
 	if !durableResult.Success {
 		if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after durable review gate failure: %v\n", target, resetErr)
@@ -1943,7 +1952,7 @@ func (e *Engineer) isEmptyReviewDiff(branch, target string) (bool, error) {
 // the m3-degenerate-PASS incident where m3 returned PASS on the empty gtviz
 // initial commit and the gate treated that zero-content PASS as approval,
 // enabling a degraded-quorum bypass.
-func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target string, mr *MRInfo) ProcessResult {
+func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target string, mr *MRInfo, reviewBase ...string) ProcessResult {
 	if !e.durableReviewGateEnabled(target) {
 		return ProcessResult{Success: true}
 	}
@@ -1971,10 +1980,17 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 	}
 
 	// Empty-diff guard: refuse to grant an attestation when there is nothing
-	// to review. A PASS from any reviewer on a zero-content diff is a
-	// degenerate verdict (gastown-cet.12.4), and the gate must fail closed
-	// rather than treat zero findings as evidence of approval.
-	if empty, err := e.isEmptyReviewDiff(branch, target); err != nil {
+	// to review. In the doMerge flow, target is already locally advanced to
+	// the squashed candidate when this runs, so compare branch against the
+	// pre-merge target commit captured before the squash. Direct unit tests
+	// and callers that have not advanced target use the target branch itself.
+	diffBase := target
+	if len(reviewBase) > 0 {
+		if base := strings.TrimSpace(reviewBase[0]); base != "" {
+			diffBase = base
+		}
+	}
+	if empty, err := e.isEmptyReviewDiff(branch, diffBase); err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED - could not determine diff state: %v\n", err)
 		return ProcessResult{
 			Success:     false,
@@ -1982,11 +1998,11 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 			Error:       fmt.Sprintf("durable review gate could not determine diff state: %v", err),
 		}
 	} else if empty {
-		_, _ = fmt.Fprintln(e.output, "[Engineer] Durable review gate FAILED - empty diff (no changes between branch and target); refusing to grant attestation on zero-content review")
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED - empty diff (no changes between branch and review base %s); refusing to grant attestation on zero-content review\n", diffBase)
 		return ProcessResult{
 			Success:     false,
 			TestsFailed: true,
-			Error:       "durable review gate: empty diff (no changes between branch and target); degenerate PASS on empty diff is not a valid attestation (gastown-cet.12.4)",
+			Error:       "durable review gate: empty diff (no changes between branch and review base); degenerate PASS on empty diff is not a valid attestation (gastown-cet.12.4)",
 		}
 	}
 

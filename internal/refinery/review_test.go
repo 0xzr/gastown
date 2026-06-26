@@ -683,7 +683,7 @@ func TestIsEmptyReview_DetectsDegeneratePass(t *testing.T) {
 		// a data-model contradiction handled by the reclassification, not
 		// by relaxing the empty-review predicate).
 		r := ReviewerResult{Reviewer: "m3", Verdict: ReviewerVerdictPass,
-			Blockers: []string{"some concrete finding"},
+			Blockers:  []string{"some concrete finding"},
 			DiffBasis: DiffBasis{Base: "b", Head: "h", EmptyDiff: true}}
 		if !r.IsEmptyReview() {
 			t.Error("PASS on empty diff must be reported as empty review even when blockers are present")

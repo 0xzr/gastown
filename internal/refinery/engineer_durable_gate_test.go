@@ -799,7 +799,7 @@ func TestRunDurableReviewGate_EmptyDiff_BlocksMerge(t *testing.T) {
 	e.config.DurableReviewGate = &DurableReviewGateConfig{
 		Required:  true,
 		AttestDir: attestDir,
-		Cmd: `mkdir -p "$GT_GATE_ATTEST_DIR" && git rev-parse HEAD^{tree} > "$GT_GATE_ATTEST_DIR/$(git rev-parse HEAD^{tree})"`,
+		Cmd:       `mkdir -p "$GT_GATE_ATTEST_DIR" && git rev-parse HEAD^{tree} > "$GT_GATE_ATTEST_DIR/$(git rev-parse HEAD^{tree})"`,
 	}
 
 	// Branch and target point at the same commit — diff is empty.
