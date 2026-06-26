@@ -61,8 +61,23 @@ type DiffBasis struct {
 }
 
 // IsMergeCandidate reports whether this basis is the final merge candidate.
+//
+// An "unknown" basis (produced when the provider could not resolve the PR's
+// target branch — e.g. transient gh/api failure on a non-main PR) is
+// deliberately NOT a merge candidate: it is fail-closed so the merge defers
+// rather than silently routing through the wrong diff (gastown-6z5 rework).
 func (d DiffBasis) IsMergeCandidate() bool {
 	return d.Kind == "merge_candidate" || d.Kind == ""
+}
+
+// UnknownBasis returns a DiffBasis representing a target-branch the provider
+// could not resolve. The basis is intentionally not a merge candidate so that
+// no verdict against it can authoritatively approve or reject the merge; the
+// merge queue treats the evaluation as a no-verdict audit gap and defers
+// (gastown-6z5 rework). Use this when the PR's actual target branch is
+// unknown and a guess at origin/main would silently misroute the verdict.
+func UnknownBasis() DiffBasis {
+	return DiffBasis{Kind: "unknown"}
 }
 
 // IsEmptyReview reports whether a PASS verdict on this basis is a degenerate
@@ -194,11 +209,16 @@ func MergeCandidateBasis(base, head string) DiffBasis {
 //
 // Rules, in order:
 //  1. Any authoritative FAIL (merge-candidate basis + concrete blockers) -> FAIL.
-//     A FAIL whose DiffBasis is "commit_history" is NOT authoritative against
-//     the final merge candidate: it reviewed intermediate commits that the
-//     squashed merge candidate may have superseded. Such verdicts are
-//     reclassified as audit-gaps (NO_VERDICT) rather than hard rejections,
-//     so a reworked final candidate is not blocked by a stale review.
+//     A FAIL whose DiffBasis is "commit_history" or "unknown" is NOT
+//     authoritative against the final merge candidate: it reviewed intermediate
+//     commits (or an unresolvable target) that the squashed merge candidate
+//     may have superseded. Such verdicts are reclassified as audit-gaps
+//     (NO_VERDICT) rather than hard rejections, so a reworked final candidate
+//     is not blocked by a stale review.
+//     Symmetrically (gastown-6z5 rework), a PASS whose DiffBasis is not
+//     "merge_candidate" is also reclassified to NO_VERDICT — a stale APPROVED
+//     review on an older commit cannot authoritatively approve the current
+//     candidate either.
 //  2. With degraded quorum enabled and enough independent PASS reviews:
 //     missing/unavailable reviewers become an audit obligation, not a blocker.
 //  3. Without degraded quorum, NO_VERDICT/UNAVAILABLE block the merge.
@@ -214,8 +234,11 @@ func EvaluateReviews(results []ReviewerResult, rule DegradedQuorumRule) ReviewEv
 
 	// Classify each result, reclassifying commit-history FAILs as audit-gaps
 	// so they cannot authoritatively reject the final merge candidate (hq-luba).
-	// Also reclassify empty-review PASSes as FAILs so a zero-content review
-	// cannot authoritatively approve the merge (gastown-cet.12.4).
+	// Also reclassify commit-history PASSes as audit-gaps so a stale APPROVED
+	// review on an older commit cannot authoritatively approve the current merge
+	// candidate either (gastown-6z5 rework). Empty-review PASSes are
+	// reclassified as FAILs so a zero-content review cannot authoritatively
+	// approve the merge (gastown-cet.12.4).
 	auditGaps := []string{}
 	for i := range results {
 		r := &results[i]
@@ -234,6 +257,17 @@ func EvaluateReviews(results []ReviewerResult, rule DegradedQuorumRule) ReviewEv
 					r.Blockers = []string{"PASS on empty diff (no content reviewed)"}
 				}
 				ev.FailCount++
+			} else if !r.DiffBasis.IsMergeCandidate() {
+				// Stale PASS on a non-merge-candidate basis: an APPROVED review
+				// against an older commit (commit_history) or against an
+				// unknown basis (gastown-6z5 rework) does not authoritatively
+				// approve the current merge candidate. Reclassify as a
+				// no-verdict audit gap so the merge defers until a reviewer
+				// has explicitly approved the actual candidate.
+				auditGaps = append(auditGaps, r.Reviewer)
+				r.Verdict = ReviewerVerdictNoVerdict
+				r.Evidence = "stale PASS against non-merge-candidate basis; not authoritative for current candidate"
+				ev.NoVerdictCount++
 			} else {
 				ev.PassCount++
 			}
