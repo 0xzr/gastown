@@ -223,6 +223,57 @@ func TestIsSessionProcessDead_EmptyTownRoot(t *testing.T) {
 	}
 }
 
+func TestIsSessionProcessAlive_FreshHeartbeat(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-test-alive-fresh"
+
+	TouchSessionHeartbeat(townRoot, sessionName)
+
+	alive, err := isSessionProcessAlive(nil, sessionName, townRoot)
+	if err != nil {
+		t.Fatalf("isSessionProcessAlive error: %v", err)
+	}
+	if !alive {
+		t.Error("expected alive=true for fresh heartbeat")
+	}
+}
+
+func TestIsSessionProcessAlive_StaleHeartbeat(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-test-alive-stale"
+
+	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-10 * time.Minute).UTC()
+	data := []byte(`{"timestamp":"` + oldTime.Format(time.RFC3339Nano) + `"}`)
+	if err := os.WriteFile(filepath.Join(dir, sessionName+".json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	alive, err := isSessionProcessAlive(nil, sessionName, townRoot)
+	if err != nil {
+		t.Fatalf("isSessionProcessAlive error: %v", err)
+	}
+	if alive {
+		t.Error("expected alive=false for stale heartbeat")
+	}
+}
+
+func TestIsSessionProcessAlive_NoHeartbeatNoTmux(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-test-alive-no-data"
+
+	alive, err := isSessionProcessAlive(nil, sessionName, townRoot)
+	if err != nil {
+		t.Fatalf("isSessionProcessAlive error: %v", err)
+	}
+	if alive {
+		t.Error("expected alive=false when no heartbeat and no tmux")
+	}
+}
+
 func TestReadSessionHeartbeat_V1BackwardsCompat(t *testing.T) {
 	townRoot := t.TempDir()
 

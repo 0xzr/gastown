@@ -230,3 +230,113 @@ func TestManagerTreatsLiveSessionWithoutWorkAsReviewNeeded(t *testing.T) {
 		t.Fatalf("FindIdlePolecat() = %q, want nil while session %s needs review", idle.Name, sessionName)
 	}
 }
+
+// TestWorkstateDispositionForPolecat_LiveHookedSessionIsWorking is a
+// regression test for gastown-9rl: a freshly started active session with a
+// hooked issue, live tmux session, fresh heartbeat, and live process must be
+// classified as WORKING by the canonical workstate path, never as
+// NEEDS_RECOVERY / no-liveness-data.
+func TestWorkstateDispositionForPolecat_LiveHookedSessionIsWorking(t *testing.T) {
+	if _, err := exec.LookPath("bd"); err != nil {
+		t.Skip("bd not installed, skipping integration test")
+	}
+	requireTmuxIntegration(t)
+	testutil.RequireDoltContainer(t)
+
+	n := polecatManagerIntegrationCounter.Add(1)
+	prefix := fmt.Sprintf("pm%d", n)
+
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	rigPath := filepath.Join(townRoot, rigName)
+	mayorRigPath := filepath.Join(rigPath, "mayor", "rig")
+
+	if err := os.MkdirAll(mayorRigPath, 0755); err != nil {
+		t.Fatalf("mkdir mayor rig path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigPath, "polecats", "toast"), 0755); err != nil {
+		t.Fatalf("mkdir polecat dir: %v", err)
+	}
+
+	rigBeadsDir := filepath.Join(rigPath, ".beads")
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
+	}
+
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir town .beads: %v", err)
+	}
+	routes := []beads.Route{
+		{Prefix: "hq-", Path: "."},
+		{Prefix: prefix + "-", Path: filepath.Join(rigName, "mayor", "rig")},
+	}
+	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	initBeadsDBWithPrefix(t, mayorRigPath, prefix)
+
+	r := &rig.Rig{Name: rigName, Path: rigPath}
+	tm := tmux.NewTmux()
+	mgr := NewManager(r, git.NewGit(rigPath), tm)
+
+	current, err := mgr.beads.Create(beads.CreateOptions{
+		Title:    "current hooked issue",
+		Type:     "task",
+		Priority: 2,
+	})
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	assignee := mgr.assigneeID("toast")
+	hooked := beads.StatusHooked
+	if err := mgr.beads.Update(current.ID, beads.UpdateOptions{
+		Status:   &hooked,
+		Assignee: &assignee,
+	}); err != nil {
+		t.Fatalf("hook issue: %v", err)
+	}
+
+	if _, err := mgr.beads.CreateOrReopenAgentBead(mgr.agentBeadID("toast"), assignee, &beads.AgentFields{
+		HookBead:   current.ID,
+		AgentState: string(beads.AgentStateWorking),
+	}); err != nil {
+		t.Fatalf("create agent bead: %v", err)
+	}
+
+	sessionName := NewSessionManager(tm, r).SessionName("toast")
+	startLiveSession(t, sessionName)
+	TouchSessionHeartbeat(townRoot, sessionName)
+
+	// Use StateStalled for the persisted state to simulate the false-stalled
+	// regression: direct liveness evidence must override stale persisted state.
+	disposition := mgr.WorkstateDispositionForPolecat("toast", StateStalled, current.ID)
+	if disposition.Verdict != WorkstateVerdictWorking {
+		t.Fatalf("Verdict = %q, want %q", disposition.Verdict, WorkstateVerdictWorking)
+	}
+	if disposition.Reason != "live-hooked" {
+		t.Fatalf("Reason = %q, want live-hooked", disposition.Reason)
+	}
+	if disposition.Confidence != WorkstateConfidenceHigh {
+		t.Fatalf("Confidence = %q, want %q", disposition.Confidence, WorkstateConfidenceHigh)
+	}
+	if disposition.NeedsRecovery {
+		t.Fatalf("NeedsRecovery = true, want false")
+	}
+
+	seenLiveSignal := false
+	for _, s := range disposition.Signals {
+		if s == "process_alive=true" || s == "session_running=true" || s == "heartbeat_fresh=true" {
+			seenLiveSignal = true
+			break
+		}
+	}
+	if !seenLiveSignal {
+		t.Fatalf("Signals = %v, want a live signal", disposition.Signals)
+	}
+}
