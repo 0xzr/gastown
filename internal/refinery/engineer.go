@@ -1589,6 +1589,13 @@ func (e *Engineer) effectiveDurableReviewTarget() string {
 	return e.rig.DefaultBranch()
 }
 
+func canonicalMergeTarget(target string) string {
+	target = strings.TrimSpace(target)
+	target = strings.TrimPrefix(target, "refs/heads/")
+	target = strings.TrimPrefix(target, "refs/remotes/")
+	return strings.TrimPrefix(target, "origin/")
+}
+
 // durableReviewGateEnabled reports whether the durable review gate must be
 // enforced for the given target branch.
 func (e *Engineer) durableReviewGateEnabled(target string) bool {
@@ -1598,7 +1605,7 @@ func (e *Engineer) durableReviewGateEnabled(target string) bool {
 	if !e.config.DurableReviewGate.Required {
 		return false
 	}
-	return strings.EqualFold(target, e.effectiveDurableReviewTarget())
+	return strings.EqualFold(canonicalMergeTarget(target), e.effectiveDurableReviewTarget())
 }
 
 // durableReviewAttestDir returns the configured attestation directory with
@@ -2115,10 +2122,18 @@ func (e *Engineer) syncCrewWorkspaces() {
 
 // ProcessMRInfo processes a merge request from MRInfo.
 func (e *Engineer) ProcessMRInfo(ctx context.Context, mr *MRInfo) ProcessResult {
+	target := canonicalMergeTarget(mr.Target)
+	if target == "" {
+		target = e.rig.DefaultBranch()
+	}
 	// MR fields are directly on the struct
 	_, _ = fmt.Fprintln(e.output, "[Engineer] Processing MR:")
 	_, _ = fmt.Fprintf(e.output, "  Branch: %s\n", mr.Branch)
-	_, _ = fmt.Fprintf(e.output, "  Target: %s\n", mr.Target)
+	if target != mr.Target {
+		_, _ = fmt.Fprintf(e.output, "  Target: %s (canonicalized from %s)\n", target, mr.Target)
+	} else {
+		_, _ = fmt.Fprintf(e.output, "  Target: %s\n", target)
+	}
 	_, _ = fmt.Fprintf(e.output, "  Worker: %s\n", mr.Worker)
 	_, _ = fmt.Fprintf(e.output, "  Source: %s\n", mr.SourceIssue)
 
@@ -2129,9 +2144,9 @@ func (e *Engineer) ProcessMRInfo(ctx context.Context, mr *MRInfo) ProcessResult 
 	if mr.PreVerified && mr.PreVerifiedBase != "" {
 		_, _ = fmt.Fprintf(e.output, "  Pre-verified: yes (base=%s)\n", mr.PreVerifiedBase[:min(8, len(mr.PreVerifiedBase))])
 		// Check if target HEAD still matches the verified base
-		targetHead, err := e.git.Rev("origin/" + mr.Target)
+		targetHead, err := e.git.Rev("origin/" + target)
 		if err != nil {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not resolve origin/%s HEAD: %v (falling through to normal gates)\n", mr.Target, err)
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not resolve origin/%s HEAD: %v (falling through to normal gates)\n", target, err)
 		} else if targetHead == mr.PreVerifiedBase {
 			_, _ = fmt.Fprintln(e.output, "[Engineer] Pre-verification valid — target unchanged, skipping gates (fast-path)")
 			skipGates = true
@@ -2142,7 +2157,7 @@ func (e *Engineer) ProcessMRInfo(ctx context.Context, mr *MRInfo) ProcessResult 
 	}
 
 	// Use the shared merge logic
-	return e.doMerge(ctx, mr.Branch, mr.Target, mr.SourceIssue, mr, skipGates)
+	return e.doMerge(ctx, mr.Branch, target, mr.SourceIssue, mr, skipGates)
 }
 
 // HandleMRInfoSuccess handles a successful merge from MRInfo.

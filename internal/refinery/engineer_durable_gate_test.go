@@ -691,6 +691,23 @@ func TestDoMerge_DurableReviewGate_Disabled_AllowsMerge(t *testing.T) {
 	}
 }
 
+func TestDurableReviewGateEnabledCanonicalizesOriginMain(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{Required: true}
+
+	for _, target := range []string{"main", "origin/main", "refs/heads/main", "refs/remotes/origin/main"} {
+		t.Run(target, func(t *testing.T) {
+			if !e.durableReviewGateEnabled(target) {
+				t.Fatalf("durableReviewGateEnabled(%q) = false, want true", target)
+			}
+		})
+	}
+	if e.durableReviewGateEnabled("integration/test") {
+		t.Fatal("durableReviewGateEnabled(integration/test) = true, want false")
+	}
+}
+
 // TestDoMerge_DurableReviewGate_LegacyFallback_ReusesPostSquashGate proves that
 // when durable_review_gate is required but has no explicit command, the refinery
 // reuses an existing post-squash gate that invokes refinery-gate.sh. This keeps

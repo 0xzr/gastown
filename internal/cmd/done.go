@@ -81,10 +81,17 @@ const (
 func doneContaminationBaseRef(defaultBranch, explicitTarget string) string {
 	targetBranch := defaultBranch
 	if explicitTarget != "" {
-		targetBranch = strings.TrimPrefix(explicitTarget, "origin/")
+		targetBranch = canonicalMergeTarget(explicitTarget)
 	}
 
 	return "origin/" + targetBranch
+}
+
+func canonicalMergeTarget(target string) string {
+	target = strings.TrimSpace(target)
+	target = strings.TrimPrefix(target, "refs/heads/")
+	target = strings.TrimPrefix(target, "refs/remotes/")
+	return strings.TrimPrefix(target, "origin/")
 }
 
 // isValidMergeTarget reports whether a resolved MR target branch is safe to
@@ -98,7 +105,7 @@ func isValidMergeTarget(target, rigName string) bool {
 		return false
 	}
 	// Strip a leading origin/ so "origin/<rig>" is caught too.
-	trimmed := strings.TrimPrefix(target, "origin/")
+	trimmed := canonicalMergeTarget(target)
 	if trimmed == "" {
 		return false
 	}
@@ -1211,6 +1218,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// branch with a warning rather than submitting a malformed MR. The
 		// explicit --issue / restored hook is still honored for issue
 		// attribution; only an invalid *target* is rejected here.
+		target = canonicalMergeTarget(target)
 		if !isValidMergeTarget(target, rigName) {
 			style.PrintWarning("resolved MR target %q is not a valid merge target (matches rig name %q) — falling back to %s", target, rigName, defaultBranch)
 			if explicitTarget {

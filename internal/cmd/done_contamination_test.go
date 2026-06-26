@@ -27,6 +27,12 @@ func TestDoneContaminationBaseRef(t *testing.T) {
 			explicitTarget: "origin/upstream-rebuild-main",
 			want:           "origin/upstream-rebuild-main",
 		},
+		{
+			name:           "canonicalizes full remote ref",
+			defaultBranch:  "main",
+			explicitTarget: "refs/remotes/origin/main",
+			want:           "origin/main",
+		},
 	}
 
 	for _, tt := range tests {
@@ -34,6 +40,30 @@ func TestDoneContaminationBaseRef(t *testing.T) {
 			got := doneContaminationBaseRef(tt.defaultBranch, tt.explicitTarget)
 			if got != tt.want {
 				t.Fatalf("doneContaminationBaseRef(%q, %q) = %q, want %q", tt.defaultBranch, tt.explicitTarget, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalMergeTarget(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+		want   string
+	}{
+		{name: "plain branch", target: "main", want: "main"},
+		{name: "origin branch", target: "origin/main", want: "main"},
+		{name: "heads ref", target: "refs/heads/main", want: "main"},
+		{name: "remote ref", target: "refs/remotes/origin/main", want: "main"},
+		{name: "integration branch", target: "origin/integration/gt-epic", want: "integration/gt-epic"},
+		{name: "trims whitespace", target: " origin/main ", want: "main"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := canonicalMergeTarget(tt.target)
+			if got != tt.want {
+				t.Fatalf("canonicalMergeTarget(%q) = %q, want %q", tt.target, got, tt.want)
 			}
 		})
 	}
