@@ -128,6 +128,19 @@ func (g *Git) run(args ...string) (string, error) {
 // (e.g. GitLab) is unreachable or slow.
 const pushTimeout = 60 * time.Second
 
+// reviewProviderTimeout is the maximum time an external review-provider
+// command (gh / curl) is allowed to run during reviewer evaluation. A stalled
+// provider — gh waiting on an auth relogin, curl hung on an unreachable API,
+// or a paginating request that never completes — would otherwise hang the
+// refinery merge gate indefinitely. The command is killed at the deadline and
+// the caller maps the resulting error to a fail-closed verdict (UNAVAILABLE /
+// deferred), never an authoritative PASS, so a hung provider fails closed
+// rather than letting the merge proceed (gastown-6z5 rework).
+//
+// It is a var, not a const, only so the timeout/fail-closed regression tests
+// can shrink it to a deterministic window; production code must not mutate it.
+var reviewProviderTimeout = 45 * time.Second
+
 // runWithTimeout executes a git command with a deadline. If the command does
 // not finish within the timeout, the process is killed and an error is returned.
 func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _ error) { //nolint:unparam // string return kept for consistency with Run()
@@ -161,6 +174,37 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 	}
 
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// runProviderCommand executes an external review-provider command (gh, curl)
+// with a bounded deadline so a stalled provider cannot hang the refinery merge
+// gate (gastown-6z5 rework). It captures combined stdout/stderr-style output
+// via Output() semantics: on a deadline or cancellation, the process is killed
+// and a timeout error is returned; the caller classifies that as a fail-closed
+// (UNAVAILABLE / deferred) verdict rather than an authoritative PASS.
+//
+// exec.CommandContext kills the process when the context expires. We use a
+// process-group detach (matching runWithTimeout) so a hung paginating gh or
+// curl child does not survive its parent.
+func (g *Git) runProviderCommand(name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), reviewProviderTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	util.SetDetachedProcessGroup(cmd)
+	if g.workDir != "" {
+		cmd.Dir = g.workDir
+	}
+
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("%s %s timed out after %v (review provider unreachable)",
+				name, strings.Join(args, " "), reviewProviderTimeout)
+		}
+		return nil, fmt.Errorf("%s %s failed: %w", name, strings.Join(args, " "), err)
+	}
+	return out, nil
 }
 
 // runWithEnv executes a git command with additional environment variables.
@@ -1448,11 +1492,9 @@ func (g *Git) DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error 
 // Uses the gh CLI to query for open PRs with the branch as head ref.
 // Returns false on any error (fail-open: branch deletion proceeds if gh is unavailable).
 func (g *Git) HasOpenPR(branch string) bool {
-	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	out, err := g.runProviderCommand("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
 	if err != nil {
-		return false // fail-open: can't determine PR state, allow deletion
+		return false // fail-open: can't determine PR state (incl. timeout), allow deletion
 	}
 	out = bytes.TrimSpace(out)
 	// Empty array "[]" means no open PRs
@@ -1462,11 +1504,9 @@ func (g *Git) HasOpenPR(branch string) bool {
 // FindPRNumber returns the GitHub PR number for the given branch, or 0 if none exists.
 // Uses the gh CLI to query for open PRs with the branch as head ref.
 func (g *Git) FindPRNumber(branch string) (int, error) {
-	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	out, err := g.runProviderCommand("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
 	if err != nil {
-		return 0, fmt.Errorf("gh pr list failed: %w", err)
+		return 0, err
 	}
 	out = bytes.TrimSpace(out)
 	if len(out) <= 2 {
@@ -1509,12 +1549,12 @@ type PRReview struct {
 // IsPRApproved checks whether a GitHub PR has at least one approving review.
 // Returns true if approved, false if not (or on error).
 func (g *Git) IsPRApproved(prNumber int) (bool, error) {
-	// Use gh pr view which includes review decision
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	// Use gh pr view which includes review decision. Bounded by
+	// reviewProviderTimeout so a stalled gh cannot hang the merge gate
+	// (gastown-6z5 rework); the caller fails the approval closed.
+	out, err := g.runProviderCommand("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision")
 	if err != nil {
-		return false, fmt.Errorf("gh pr view failed: %w", err)
+		return false, err
 	}
 	var result struct {
 		ReviewDecision string `json:"reviewDecision"`
@@ -1537,13 +1577,13 @@ func (g *Git) IsPRApproved(prNumber int) (bool, error) {
 func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
 	// gh api paginates Link-rel results by default, so a single invocation
 	// collects every page. {owner}/{repo} are expanded by gh from the
-	// current git context.
-	cmd := exec.Command("gh", "api", "--paginate",
+	// current git context. Bounded by reviewProviderTimeout because a
+	// paginating request against an unreachable API can otherwise stall the
+	// refinery merge gate indefinitely (gastown-6z5 rework).
+	out, err := g.runProviderCommand("gh", "api", "--paginate",
 		fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/reviews?per_page=100", prNumber))
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("gh api pr reviews failed: %w", err)
+		return nil, err
 	}
 	var result []struct {
 		User struct {
@@ -1577,11 +1617,9 @@ func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
 // default (treat as merge_candidate basis) rather than committing to a
 // possibly-wrong target.
 func (g *Git) GetPRBaseRef(prNumber int) (string, error) {
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "baseRefName")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	out, err := g.runProviderCommand("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "baseRefName")
 	if err != nil {
-		return "", fmt.Errorf("gh pr view baseRefName failed: %w", err)
+		return "", err
 	}
 	var result struct {
 		BaseRefName string `json:"baseRefName"`
@@ -1597,11 +1635,9 @@ func (g *Git) GetPRBaseRef(prNumber int) (string, error) {
 // land: a review submitted against an older commit (commit_id != head SHA)
 // is intermediate commit history, not the merge candidate (gastown-6z5).
 func (g *Git) GetPRHeadSHA(prNumber int) (string, error) {
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "headRefOid")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	out, err := g.runProviderCommand("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "headRefOid")
 	if err != nil {
-		return "", fmt.Errorf("gh pr view headRefOid failed: %w", err)
+		return "", err
 	}
 	var result struct {
 		HeadRefOid string `json:"headRefOid"`
@@ -1615,11 +1651,9 @@ func (g *Git) GetPRHeadSHA(prNumber int) (string, error) {
 // GetPRReviewDecision returns the overall GitHub review decision for a PR.
 // Known values: APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, "".
 func (g *Git) GetPRReviewDecision(prNumber int) (string, error) {
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	out, err := g.runProviderCommand("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision")
 	if err != nil {
-		return "", fmt.Errorf("gh pr view reviewDecision failed: %w", err)
+		return "", err
 	}
 	var result struct {
 		ReviewDecision string `json:"reviewDecision"`
@@ -1666,11 +1700,9 @@ func (g *Git) FindBitbucketPRNumber(workspace, repoSlug, branch string) (int, er
 	}
 	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests?q=source.branch.name%%3D%%22%s%%22+AND+state%%3D%%22OPEN%%22&pagelen=1",
 		workspace, repoSlug, branch)
-	cmd := exec.Command("curl", "-s", "-H", "Authorization: Bearer "+token, url)
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	out, err := g.runProviderCommand("curl", "-s", "-H", "Authorization: Bearer "+token, url)
 	if err != nil {
-		return 0, fmt.Errorf("bitbucket API request failed: %w", err)
+		return 0, err
 	}
 	var resp struct {
 		Values []struct {
@@ -1715,11 +1747,9 @@ func (g *Git) GetBitbucketPRParticipants(workspace, repoSlug string, prID int) (
 	}
 	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d",
 		workspace, repoSlug, prID)
-	cmd := exec.Command("curl", "-s", "-H", "Authorization: Bearer "+token, url)
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	out, err := g.runProviderCommand("curl", "-s", "-H", "Authorization: Bearer "+token, url)
 	if err != nil {
-		return nil, fmt.Errorf("bitbucket API request failed: %w", err)
+		return nil, err
 	}
 	var pr struct {
 		Participants []struct {
@@ -1767,11 +1797,9 @@ func (g *Git) GetBitbucketPRDestination(workspace, repoSlug string, prID int) (s
 	}
 	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d",
 		workspace, repoSlug, prID)
-	cmd := exec.Command("curl", "-s", "-H", "Authorization: Bearer "+token, url)
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	out, err := g.runProviderCommand("curl", "-s", "-H", "Authorization: Bearer "+token, url)
 	if err != nil {
-		return "", fmt.Errorf("bitbucket API request failed: %w", err)
+		return "", err
 	}
 	var pr struct {
 		Destination struct {

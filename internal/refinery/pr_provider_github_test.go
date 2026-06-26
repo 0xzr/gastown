@@ -747,3 +747,58 @@ func TestGitHubMergeCandidateBasis_FailClosedOnEmptyBaseRef(t *testing.T) {
 		}
 	}
 }
+
+// TestEvaluateReviews_ProviderUnavailableNeverPasses pins the gastown-6z5
+// rework's fail-closed guarantee at the merge-gate evaluation layer: when a
+// review-provider command (gh/curl) times out or otherwise cannot return a
+// parseable actionable result, the production GetReviewEvaluation path emits a
+// single ReviewerVerdictUnavailable result. EvaluateReviews must classify that
+// as a non-passing, deferring state — never PASS — so a hung provider fails
+// closed instead of authoritatively approving the merge. This mirrors exactly
+// the result GetReviewEvaluation builds when GetPRReviews/GetBitbucketPRParticipants
+// return an error (gastown-6z5 rework: unbounded provider command hang).
+func TestEvaluateReviews_ProviderUnavailableNeverPasses(t *testing.T) {
+	results := []ReviewerResult{
+		{Reviewer: "github", Verdict: ReviewerVerdictUnavailable, Evidence: "provider command timed out", DiffBasis: UnknownBasis()},
+	}
+	ev := EvaluateReviews(results, DegradedQuorumRule{})
+
+	if ev.State == ReviewStatePass {
+		t.Fatalf("an unavailable provider must never yield PASS, got %s", ev.State)
+	}
+	if ev.PassCount != 0 {
+		t.Errorf("expected PassCount=0 when the provider is unavailable, got %d", ev.PassCount)
+	}
+	if ev.UnavailableCount != 1 {
+		t.Errorf("expected UnavailableCount=1, got %d", ev.UnavailableCount)
+	}
+	// UNAVAILABLE (every probe down) is the strongest fail-closed signal;
+	// NO_VERDICT also defers and is acceptable. The contract is: not PASS.
+	if ev.State != ReviewStateUnavailable && ev.State != ReviewStateNoVerdict {
+		t.Errorf("expected UNAVAILABLE or NO_VERDICT for a timed-out provider, got %s: %s", ev.State, ev.Error)
+	}
+}
+
+// TestEvaluateReviews_ProviderUnavailableDoesNotMaskPass ensures the
+// fail-closed behavior is symmetric with the rest of the gate: when some
+// reviewers PASS but a provider probe is UNAVAILABLE, the merge must still
+// defer (degraded quorum off) rather than silently proceeding on the partial
+// result. A hung provider cannot be hidden behind the reviewers that did
+// return (gastown-6z5 rework).
+func TestEvaluateReviews_ProviderUnavailableDoesNotMaskPass(t *testing.T) {
+	results := []ReviewerResult{
+		{Reviewer: "alice", Verdict: ReviewerVerdictPass, DiffBasis: MergeCandidateBasis("base", "head")},
+		{Reviewer: "github", Verdict: ReviewerVerdictUnavailable, Evidence: "provider command timed out", DiffBasis: UnknownBasis()},
+	}
+	ev := EvaluateReviews(results, DegradedQuorumRule{})
+
+	if ev.State == ReviewStatePass {
+		t.Fatalf("a partial PASS must not become a merge PASS while a provider is unavailable, got %s", ev.State)
+	}
+	if ev.PassCount != 1 {
+		t.Errorf("expected PassCount=1 (alice), got %d", ev.PassCount)
+	}
+	if ev.UnavailableCount != 1 {
+		t.Errorf("expected UnavailableCount=1 (timed-out provider), got %d", ev.UnavailableCount)
+	}
+}
