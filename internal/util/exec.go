@@ -97,10 +97,17 @@ func goToolchainPathEntries() []string {
 		if seen[abs] {
 			return
 		}
-		// Only prepend directories that actually contain a `go` binary, so an
-		// absent install location cannot shadow the inherited PATH.
+		// Only prepend directories that actually contain a `go` file, so an
+		// absent install location cannot shadow the inherited PATH. We check
+		// presence only (os.Stat), not executability: real Go toolchain
+		// installs always mark `go` executable, and the gate subprocess will
+		// surface a non-executable `go` as a permission-denied failure at run
+		// time — still actionable, and we avoid an extra mode-bit check on
+		// every gate. TestGateCommandEnv_NonExecutableGoIsDetected pins this
+		// contract.
 		goBin := filepath.Join(abs, "go")
-		if info, err := os.Stat(goBin); err != nil || info.IsDir() {
+		info, err := os.Stat(goBin)
+		if err != nil || info.IsDir() {
 			return
 		}
 		seen[abs] = true

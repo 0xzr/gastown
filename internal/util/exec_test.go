@@ -3,6 +3,7 @@ package util
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -195,5 +196,196 @@ func TestGateCommandEnv_GoMissing(t *testing.T) {
 	// Original PATH must still be present (prepended, not replaced).
 	if !strings.Contains(path, "/usr/bin") {
 		t.Errorf("expected original PATH entries preserved, got %q", path)
+	}
+}
+
+// withEnv restores env vars to their prior values when the test ends.
+// Use as: defer withEnv(t).Restore()
+type envSnapshot struct {
+	home, goroot, path string
+}
+
+func snapshotEnv() envSnapshot {
+	return envSnapshot{
+		home:   os.Getenv("HOME"),
+		goroot: os.Getenv("GOROOT"),
+		path:   os.Getenv("PATH"),
+	}
+}
+
+func (s envSnapshot) restore() {
+	os.Setenv("HOME", s.home)
+	os.Setenv("GOROOT", s.goroot)
+	os.Setenv("PATH", s.path)
+}
+
+// hasUsrLocalGoBin reports whether /usr/local/go/bin/go exists on this host.
+// The implementation hardcodes that path, so we can only assert fallback
+// behavior on hosts where the file is present.
+func hasUsrLocalGoBin() bool {
+	if runtime.GOOS == "windows" {
+		return false
+	}
+	_, err := os.Stat("/usr/local/go/bin/go")
+	return err == nil
+}
+
+// writeFakeGo creates a non-functional `go` binary at dir/go with the given mode.
+// The fake script always exits 0 — enough to satisfy os.Stat presence checks
+// during discovery. Test only — never run.
+func writeFakeGo(t *testing.T, dir string, mode os.FileMode) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", dir, err)
+	}
+	goBin := filepath.Join(dir, "go")
+	if runtime.GOOS == "windows" {
+		goBin += ".exe"
+	}
+	if err := os.WriteFile(goBin, []byte("#!/bin/sh\nexit 0\n"), mode); err != nil {
+		t.Fatalf("WriteFile(%q): %v", goBin, err)
+	}
+	return goBin
+}
+
+// TestGateCommandEnv_NoToolchainFound verifies that GateCommandEnv returns
+// nil when none of the documented candidate locations contain a `go` binary.
+// This is the "let the gate fail with its own diagnostic" branch — better
+// than faking a toolchain via a bogus PATH entry.
+func TestGateCommandEnv_NoToolchainFound(t *testing.T) {
+	if hasUsrLocalGoBin() {
+		t.Skip("/usr/local/go/bin/go exists on this host; cannot exercise the no-toolchain branch")
+	}
+
+	snap := snapshotEnv()
+	defer snap.restore()
+
+	// HOME points to a directory that has no go-toolchain subtree, GOROOT is
+	// unset, and PATH is restricted so `go` is not resolvable on the parent
+	// PATH either.
+	os.Setenv("HOME", t.TempDir())
+	os.Setenv("GOROOT", "")
+	os.Setenv("PATH", "/usr/bin:/bin")
+
+	if _, err := exec.LookPath("go"); err == nil {
+		t.Skip("go is resolvable on the restricted PATH; cannot test the missing case")
+	}
+
+	if env := GateCommandEnv(); env != nil {
+		t.Errorf("expected nil env when no toolchain found, got %v", env)
+	}
+}
+
+// TestGateCommandEnv_GoToolchainPrecedence verifies that when both GOROOT/bin
+// and $HOME/go-toolchain/go/bin contain a `go` binary, GOROOT/bin is prepended
+// first. The order is load-bearing: GOROOT is the operator-set override, so a
+// pinned GOROOT toolchain must win over the host default.
+func TestGateCommandEnv_GoToolchainPrecedence(t *testing.T) {
+	if hasUsrLocalGoBin() {
+		t.Skip("/usr/local/go/bin/go exists; the third slot would also be present")
+	}
+
+	snap := snapshotEnv()
+	defer snap.restore()
+
+	root := t.TempDir()
+	gorootBin := filepath.Join(root, "goroot", "bin")
+	writeFakeGo(t, gorootBin, 0o755)
+
+	home := t.TempDir()
+	homeBin := filepath.Join(home, "go-toolchain", "go", "bin")
+	writeFakeGo(t, homeBin, 0o755)
+
+	os.Setenv("HOME", home)
+	os.Setenv("GOROOT", filepath.Join(root, "goroot"))
+	os.Setenv("PATH", "/usr/bin:/bin")
+
+	if _, err := exec.LookPath("go"); err == nil {
+		t.Skip("go is resolvable on the restricted PATH; cannot test the missing case")
+	}
+
+	env := GateCommandEnv()
+	if env == nil {
+		t.Fatal("expected non-nil env with prepended toolchain entries, got nil")
+	}
+	path := envPath(env)
+	gorootIdx := strings.Index(path, gorootBin)
+	homeIdx := strings.Index(path, homeBin)
+	if gorootIdx < 0 {
+		t.Fatalf("GOROOT/bin %q not in PATH: %q", gorootBin, path)
+	}
+	if homeIdx < 0 {
+		t.Fatalf("HOME/go-toolchain/bin %q not in PATH: %q", homeBin, path)
+	}
+	if gorootIdx >= homeIdx {
+		t.Errorf("expected GOROOT/bin before HOME/go-toolchain in PATH, got %q", path)
+	}
+}
+
+// TestGateCommandEnv_UsrLocalGoBinFallback verifies that when neither GOROOT
+// nor $HOME/go-toolchain contains a `go` binary, the function falls back to
+// /usr/local/go/bin (the standard tarball install location). The fallback path
+// is hardcoded in the implementation, so this test runs only on hosts where
+// /usr/local/go/bin/go is actually present.
+func TestGateCommandEnv_UsrLocalGoBinFallback(t *testing.T) {
+	if !hasUsrLocalGoBin() {
+		t.Skip("/usr/local/go/bin/go not present on this host; cannot exercise fallback")
+	}
+
+	snap := snapshotEnv()
+	defer snap.restore()
+
+	// HOME has no go-toolchain subtree; GOROOT unset.
+	os.Setenv("HOME", t.TempDir())
+	os.Setenv("GOROOT", "")
+	os.Setenv("PATH", "/usr/bin:/bin")
+
+	if _, err := exec.LookPath("go"); err == nil {
+		t.Skip("go is resolvable on the restricted PATH; cannot test the missing case")
+	}
+
+	env := GateCommandEnv()
+	if env == nil {
+		t.Fatal("expected non-nil env with /usr/local/go/bin prepended, got nil")
+	}
+	path := envPath(env)
+	if !strings.Contains(path, "/usr/local/go/bin") {
+		t.Errorf("expected PATH to contain /usr/local/go/bin fallback, got %q", path)
+	}
+}
+
+// TestGateCommandEnv_NonExecutableGoIsDetected pins the presence-only check
+// contract: the helper treats any file named `go` (regardless of executable
+// bits) as a toolchain candidate. This is a deliberate trade-off — see the
+// comment on goToolchainPathEntries — and a future change should fail this
+// test so the discoverer of the change has to reason about whether the new
+// behavior is intentional.
+func TestGateCommandEnv_NonExecutableGoIsDetected(t *testing.T) {
+	if hasUsrLocalGoBin() {
+		t.Skip("/usr/local/go/bin/go exists; HOME-only candidate is not the only entry")
+	}
+
+	snap := snapshotEnv()
+	defer snap.restore()
+
+	home := t.TempDir()
+	nonExecBin := writeFakeGo(t, filepath.Join(home, "go-toolchain", "go", "bin"), 0o644)
+
+	os.Setenv("HOME", home)
+	os.Setenv("GOROOT", "")
+	os.Setenv("PATH", "/usr/bin:/bin")
+
+	if _, err := exec.LookPath("go"); err == nil {
+		t.Skip("go is resolvable on the restricted PATH; cannot test the missing case")
+	}
+
+	env := GateCommandEnv()
+	if env == nil {
+		t.Fatalf("expected non-nil env (presence-only check should still find %q), got nil", nonExecBin)
+	}
+	path := envPath(env)
+	if !strings.Contains(path, filepath.Dir(nonExecBin)) {
+		t.Errorf("expected PATH to contain %q despite non-executable mode, got %q",
+			filepath.Dir(nonExecBin), path)
 	}
 }
