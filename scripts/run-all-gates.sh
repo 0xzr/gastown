@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+# run-all-gates.sh — Gastown deterministic validation gate.
+#
+# Used by the Refinery merge queue as the phase-1 validation gate.  When this
+# script exists in the repo worktree, the refinery runs it directly instead of
+# falling back to the shared rig script.
+#
+# Checks:
+#   1. No whitespace errors in the working diff.
+#   2. No Git conflict markers (with Go raw-string-literal awareness).
+#   3. Changed Go files are gofmt-clean.
+#   4. The full Go test suite passes.
+#
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
@@ -11,9 +23,7 @@ echo "[gastown gates] git diff whitespace check"
 git diff --check
 
 echo "[gastown gates] conflict marker check"
-# Use exact git conflict-marker tokens so decorative runs of '=' inside string
-# literals (e.g. mail-body section dividers) do not trip this check.
-if git grep -n -E '^(<{7} |={7}$|>{7} )' -- .; then
+if ! python3 scripts/check_conflict_markers.py; then
   echo "[gastown gates] conflict markers found" >&2
   exit 1
 fi
