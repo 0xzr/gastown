@@ -360,7 +360,49 @@ type Engineer struct {
 	// surface" for scoped gate acceptance. It is set before gates run and
 	// cleared afterward.
 	surface *gateSurface
+
+	// routeRejectionExec is a test seam for the rework-bounce routing path.
+	// When non-nil, routeRejectionToReworkBounce invokes this function
+	// instead of shelling out to `gt mq reject`. Production code leaves this
+	// nil and uses the real shell call.
+	routeRejectionExec func(ctx context.Context, args ...string) error
+
+	// reworkRouterTimeout overrides DefaultReworkRouterTimeout for tests.
+	// Zero means use the default.
+	reworkRouterTimeout time.Duration
+
+	// reviewerRejectionWorkerNudge and reviewerRejectionMayorNudge are test
+	// seams for the worker/mayor nudges in handleReviewerRejection. When
+	// non-nil they replace the `gt nudge` exec calls so tests can assert
+	// routing behavior without sending real nudges.
+	reviewerRejectionWorkerNudge func(target, msg string) error
+	reviewerRejectionMayorNudge  func(msg string) error
 }
+
+// DefaultReworkRouterTimeout bounds the external `gt mq reject` call that
+// triggers the rework-bounce router. It must be long enough for a Dolt
+// commit + router classification, but bounded so a hung gt/router cannot
+// stall the refinery rejection path.
+const DefaultReworkRouterTimeout = 2 * time.Minute
+
+// reworkRouteClassifications lists the rework-bounce classifications the
+// refinery can emit from the rejection reason. The dropin router
+// (gt-mq-reject-rework-router.py) accepts these as routing outcomes:
+//
+//   - NEEDS_REWORK_PEER_REVIEW: a peer reviewer (codex/m3/umans-kimi/umans-glm)
+//     returned FAIL with concrete blockers. Routine case; router writes a
+//     bounded rework packet and invokes gt-scoped-rework-bounce-runner.sh.
+//   - REVIEW_UNAVAILABLE_HOLD: a tooling/cap-deferral failure (no-verdict,
+//     reviewers-unavailable, cap-deferral, insufficient-quorum). Worker must
+//     NOT be told to resubmit until reviewer availability changes.
+//   - REWORK_ROUTE_AMBIGUOUS: both peer-review failure markers and cap markers
+//     were observed, or neither matched. The router cannot classify safely;
+//     escalate to Mayor for human judgment.
+const (
+	reworkRouteNeedsRework  = "NEEDS_REWORK_PEER_REVIEW"
+	reworkRouteReviewerHold = "REVIEW_UNAVAILABLE_HOLD"
+	reworkRouteAmbiguous    = "REWORK_ROUTE_AMBIGUOUS"
+)
 
 // NewEngineer creates a new Engineer for the given rig.
 func NewEngineer(r *rig.Rig) *Engineer {
@@ -2390,15 +2432,39 @@ func (e *Engineer) clearAgentActiveMR(agentBeadID string) error {
 // handleReviewerRejection closes the MR as rejected-needs-rework and notifies
 // the worker that the change requires revision. This is a terminal state, unlike
 // NeedsApproval which keeps the MR in queue.
+//
+// gastown-p3w: routes the rejection through `gt mq reject` so the refinery's
+// dropin rework router (GT_MQ_REWORK_ROUTER=shadow|enforce) can produce a
+// bounded rework packet and invoke the scoped rework-bounce runner without
+// Mayor intervention. The route call is shelled out BEFORE the MR is closed --
+// `gt mq reject` refuses an already-closed MR with ErrClosedImmutable
+// (manager.go:564), so closing first would silently drop the rework packet.
+// The classification returned by the router also drives the worker nudge
+// wording: routine NEEDS_REWORK keeps the revise-and-resubmit guidance,
+// REVIEW_UNAVAILABLE_HOLD (tooling/cap-deferral) tells the worker NOT to
+// resubmit until reviewer availability changes, and ambiguous cases (both
+// peer-review and cap markers, or neither) escalate to Mayor for human
+// judgment.
+//
+// gastown-p3w (xw8 rejection): the rework-bounce shell-out invokes `gt mq
+// reject` WITHOUT --notify. Manager.notifyWorkerRejected (manager.go:660)
+// sends a hardcoded "revise and resubmit with 'gt done'" nudge, which
+// would contradict the classification-aware nudge this function emits
+// moments later (especially for REVIEW_UNAVAILABLE_HOLD, where the worker
+// must NOT be told to resubmit). The classification-aware nudge below is
+// the single source of truth for what the worker should do next.
 func (e *Engineer) handleReviewerRejection(mr *MRInfo, result ProcessResult) {
 	cause := result.ReviewerRejectionCause
 	if cause == "" {
 		cause = "reviewer_rejection"
 	}
-	_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: reviewer rejection (cause=%s) — closing as rejected-needs-rework\n", mr.ID, cause)
+	_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: reviewer rejection (cause=%s) -- routing through rework-bounce then closing\n", mr.ID, cause)
 
-	// Persist the rejection cause on the MR bead before closing.
-	if mr.ID != "" {
+	// Step 1: Persist the rejection cause on the MR bead. We do not close
+	// yet -- the rework-bounce shell-out (step 2) needs the MR still open,
+	// and the router inspects both pre-close and post-close state when
+	// classifying.
+	if mr.ID != "" && e.beads != nil {
 		mrBead, err := e.beads.Show(mr.ID)
 		if err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to fetch MR bead %s: %v\n", mr.ID, err)
@@ -2415,6 +2481,29 @@ func (e *Engineer) handleReviewerRejection(mr *MRInfo, result ProcessResult) {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to record reviewer rejection on MR %s: %v\n", mr.ID, err)
 			}
 		}
+	}
+
+	// Step 2: gastown-p3w -- route the rejection through `gt mq reject`
+	// (without --notify) so the dropin rework router can produce a bounded
+	// rework packet and invoke the scoped rework-bounce runner without
+	// Mayor intervention. This MUST happen before the MR is closed: `gt mq
+	// reject` returns ErrClosedImmutable when the MR is already closed, so
+	// a close-first ordering would silently drop the rework packet. The
+	// notify flag is intentionally omitted because
+	// Manager.notifyWorkerRejected (manager.go:660) sends a hardcoded
+	// "revise and resubmit" nudge that would contradict the
+	// classification-aware nudge emitted in step 4 (REVIEW_UNAVAILABLE_HOLD
+	// cases must not be told to resubmit until reviewer availability
+	// changes).
+	var routeClass string
+	routed := false
+	if mr.ID != "" && e.rig != nil && e.rig.Name != "" {
+		routeClass, routed = e.routeRejectionToReworkBounce(mr, cause, result.Error, result.NeedsRework)
+	}
+
+	// Step 3: Now that the router has had its chance to schedule the scoped
+	// runner (or escalate itself), close the MR.
+	if mr.ID != "" && e.beads != nil {
 		if err := e.beads.CloseWithReason("rejected", mr.ID); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close MR %s as rejected: %v\n", mr.ID, err)
 		} else {
@@ -2422,28 +2511,306 @@ func (e *Engineer) handleReviewerRejection(mr *MRInfo, result ProcessResult) {
 		}
 	}
 
-	// Nudge the worker directly so they can revise and resubmit.
+	// Step 4: Nudge the worker with the classification-aware message. This
+	// is the single source of truth for what the worker should do next --
+	// the `gt mq reject` shell-out in step 2 deliberately omits --notify so
+	// Manager.notifyWorkerRejected does not fire a contradictory generic
+	// "resubmit" nudge ahead of this one.
 	polecatName := strings.TrimPrefix(mr.Worker, "polecats/")
 	nudgeTarget := fmt.Sprintf("%s/%s", e.rig.Name, polecatName)
-	nudgeMsg := fmt.Sprintf("REVIEWER_REJECTED: branch=%s issue=%s cause=%s error=%s — revise and resubmit with 'gt done'",
-		mr.Branch, mr.SourceIssue, cause, result.Error)
-	nudgeCmd := exec.Command("gt", "nudge", nudgeTarget, nudgeMsg)
-	util.SetDetachedProcessGroup(nudgeCmd)
-	nudgeCmd.Dir = e.workDir
-	if err := nudgeCmd.Run(); err != nil {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge %s about reviewer rejection: %v\n", polecatName, err)
+	var nudgeMsg string
+	switch routeClass {
+	case reworkRouteReviewerHold:
+		nudgeMsg = fmt.Sprintf("REVIEW_UNAVAILABLE_HOLD: branch=%s issue=%s cause=%s error=%s -- reviewer tooling/cap deferral; do NOT resubmit until reviewer availability changes",
+			mr.Branch, mr.SourceIssue, cause, result.Error)
+	case reworkRouteAmbiguous:
+		nudgeMsg = fmt.Sprintf("REWORK_ROUTE_AMBIGUOUS: branch=%s issue=%s cause=%s error=%s -- both peer-review and cap markers observed (or neither); routing deferred to Mayor for human classification. Hold resubmit.",
+			mr.Branch, mr.SourceIssue, cause, result.Error)
+	default:
+		// Routine NEEDS_REWORK (or unset): revise and resubmit guidance.
+		nudgeMsg = fmt.Sprintf("REVIEWER_REJECTED: branch=%s issue=%s cause=%s error=%s -- revise and resubmit with 'gt done'",
+			mr.Branch, mr.SourceIssue, cause, result.Error)
+	}
+	if e.reviewerRejectionWorkerNudge != nil {
+		if err := e.reviewerRejectionWorkerNudge(nudgeTarget, nudgeMsg); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge %s about reviewer rejection: %v\n", polecatName, err)
+		} else {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Nudged %s about reviewer rejection (routeClass=%s)\n", polecatName, routeClass)
+		}
 	} else {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Nudged %s about reviewer rejection\n", polecatName)
+		nudgeCmd := exec.Command("gt", "nudge", nudgeTarget, nudgeMsg)
+		util.SetDetachedProcessGroup(nudgeCmd)
+		nudgeCmd.Dir = e.workDir
+		if err := nudgeCmd.Run(); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge %s about reviewer rejection: %v\n", polecatName, err)
+		} else {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Nudged %s about reviewer rejection (routeClass=%s)\n", polecatName, routeClass)
+		}
 	}
 
-	// Nudge mayor so dependent work stays blocked until the revision lands.
-	mayorMsg := fmt.Sprintf("REVIEWER_REJECTED: %s issue=%s branch=%s cause=%s", mr.ID, mr.SourceIssue, mr.Branch, cause)
-	mayorCmd := exec.Command("gt", "nudge", "mayor/", mayorMsg)
-	util.SetDetachedProcessGroup(mayorCmd)
-	mayorCmd.Dir = e.workDir
-	if err := mayorCmd.Run(); err != nil {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about reviewer rejection: %v\n", err)
+	// Step 5: Only escalate to Mayor when the rework-bounce router could
+	// not route the rejection (routed=false). Routed cases are owned by
+	// the scoped rework-bounce runner and Witness from this point on;
+	// routine NEEDS_REWORK does not need Mayor intervention.
+	if !routed {
+		mayorMsg := fmt.Sprintf("REVIEWER_REJECTED: %s issue=%s branch=%s cause=%s routeClass=%s routed=%t",
+			mr.ID, mr.SourceIssue, mr.Branch, cause, routeClass, routed)
+		if e.reviewerRejectionMayorNudge != nil {
+			if err := e.reviewerRejectionMayorNudge(mayorMsg); err != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about reviewer rejection: %v\n", err)
+			}
+		} else {
+			mayorCmd := exec.Command("gt", "nudge", "mayor/", mayorMsg)
+			util.SetDetachedProcessGroup(mayorCmd)
+			mayorCmd.Dir = e.workDir
+			if err := mayorCmd.Run(); err != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about reviewer rejection: %v\n", err)
+			}
+		}
 	}
+}
+
+// routeRejectionToReworkBounce invokes `gt mq reject` on the still-open MR
+// so the dropin rework-bounce router (gt-mq-reject-rework-router.py) can
+// classify the rejection, write a bounded rework packet, and schedule the
+// scoped rework-bounce runner. The reason text is shaped so the router's
+// peer-review content classifier matches (the historical "Codex-failed
+// commit" rejections from gastown-wisp-ehs / gastown-wisp-wvl returned
+// route_reason=not_apply_conflict because the rejection text had no
+// classifier-matching keywords), and it preserves actionable reviewer
+// details (concrete blockers and the affected branch) where practical.
+//
+// Review-tooling/cap-deferral cases are flagged with the
+// REVIEW_UNAVAILABLE_HOLD prefix so the router classifies them separately
+// as reviewer unavailable, not as source-code rework. Ambiguous cases
+// (both peer-review failure markers AND cap markers observed, or neither
+// matched) return REWORK_ROUTE_AMBIGUOUS so the caller can escalate to
+// Mayor for human judgment.
+//
+// The shell call is bounded by DefaultReworkRouterTimeout and uses the
+// cancellation process-group helper (util.SetProcessGroup) so a timed-out
+// gt/router and any forked children are killed at the process-group level
+// on deadline. SetDetachedProcessGroup only sets the Setpgid bit but does
+// not install a Cancel function, so context timeout would leave orphaned
+// gt/router subprocess trees.
+//
+// gastown-p3w (xw8 rejection): `gt mq reject` is invoked WITHOUT --notify.
+// Manager.notifyWorkerRejected (manager.go:660) sends a hardcoded
+// "revise and resubmit with 'gt done'" nudge that contradicts the
+// classification-aware nudge emitted by handleReviewerRejection (especially
+// for REVIEW_UNAVAILABLE_HOLD, where the worker must NOT be told to
+// resubmit). handleReviewerRejection is the single source of truth for
+// what the worker should do next.
+//
+// gastown-p3w (xw8 rejection): reworkBounceReason now receives the
+// isPeerReviewRejection flag (true when result.NeedsRework is set). When
+// set and the cause/errMsg text does NOT contain cap markers, the case
+// defaults to NEEDS_REWORK_PEER_REVIEW. Previously, a CauseKey like
+// "race_condition" or "missing_test" (concrete reviewer blockers, no
+// "codex failed" / "blockers:" text in the errMsg) fell through to
+// REWORK_ROUTE_AMBIGUOUS, which would route to Mayor instead of the
+// scoped rework-bounce runner -- a misuse of Mayor's attention for a
+// routine substantive peer-review rejection.
+func (e *Engineer) routeRejectionToReworkBounce(mr *MRInfo, cause, errMsg string, isPeerReviewRejection bool) (classification string, routed bool) {
+	if mr == nil || mr.ID == "" {
+		return "", false
+	}
+	routerMode := os.Getenv("GT_MQ_REWORK_ROUTER")
+	if routerMode == "" {
+		// No router mode configured -- skip silently so the path is a
+		// no-op for rigs that have not opted in. This preserves the prior
+		// behavior for environments that have not enabled the
+		// rework-bounce pipeline.
+		return "", false
+	}
+
+	classification, reasonText := reworkBounceReason(mr, cause, errMsg, isPeerReviewRejection)
+	_, _ = fmt.Fprintf(e.output, "[Engineer] routing %s to rework-bounce: class=%s\n", mr.ID, classification)
+
+	timeout := e.reworkRouterTimeout
+	if timeout == 0 {
+		timeout = DefaultReworkRouterTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if e.routeRejectionExec == nil {
+		// Production: shell out to `gt mq reject` WITHOUT --notify. The
+		// --notify flag would cause Manager.notifyWorkerRejected
+		// (manager.go:660) to fire a hardcoded "resubmit" nudge ahead of
+		// the classification-aware nudge emitted by
+		// handleReviewerRejection step 4. See the function doc for the
+		// ordering contract.
+		args := []string{"mq", "reject", e.rig.Name, mr.ID, "--reason", reasonText}
+		cmd := exec.CommandContext(ctx, "gt", args...)
+		util.SetProcessGroup(cmd)
+		cmd.Dir = e.workDir
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: rework-bounce router call for %s timed out after %s (process group killed)\n", mr.ID, timeout)
+			} else {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: rework-bounce router call failed for %s: %v\n", mr.ID, err)
+			}
+			return classification, false
+		}
+		return classification, classification != reworkRouteAmbiguous
+	}
+	// Test seam: invoke the fake exec to assert argument shape without
+	// shelling out. The function returns nil on success, or an error.
+	args := []string{"mq", "reject", e.rig.Name, mr.ID, "--reason", reasonText}
+	if err := e.routeRejectionExec(ctx, args...); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: rework-bounce router call for %s timed out after %s (process group killed)\n", mr.ID, timeout)
+		} else {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: rework-bounce router call failed for %s: %v\n", mr.ID, err)
+		}
+		return classification, false
+	}
+	return classification, classification != reworkRouteAmbiguous
+}
+
+// reworkBounceReason shapes a router-friendly rejection reason from the
+// engineer's cause/error pair and the caller's NeedsRework signal. The
+// router's peer-review content classifier looks for tokens like
+// "peer-fail", "codex/m3/umans-kimi failed", "blockers:", or
+// "verdict:fail". Review-tooling/cap-deferral cases are flagged with
+// "REVIEW_UNAVAILABLE_HOLD" so the router's reviewer-cap classifier
+// (no-verdict, reviewers unavailable) can route them separately and avoid
+// triggering a source-code rework packet for a tooling failure.
+//
+// Classification order is deliberate:
+//  1. If cap markers are observed in the haystack, classify as
+//     REVIEW_UNAVAILABLE_HOLD -- tooling failure, not source code.
+//  2. Else if peer-review failure markers are observed OR the caller
+//     asserts isPeerReviewRejection (i.e. NeedsRework was set in the
+//     ProcessResult, which by field contract means a reviewer explicitly
+//     rejected with concrete blockers), classify as NEEDS_REWORK_PEER_REVIEW.
+//  3. Else classify as REWORK_ROUTE_AMBIGUOUS so the caller can escalate
+//     to Mayor for human judgment.
+//
+// gastown-p3w (Codex finding #1): the haystack normalizes underscores AND
+// hyphens to spaces so documented hyphenated tooling-failure markers such
+// as 'no-verdict', 'reviewer-unavailable', and 'cap-deferral' are
+// recognized in addition to the underscore forms. capMarkers is kept in
+// space-separated form because the haystack is now normalized to spaces.
+//
+// gastown-p3w (xw8 rejection): isPeerReviewRejection is honored so concrete
+// reviewer blockers with non-conforming CauseKey values (e.g.
+// "race_condition", "missing_test", "api_break" from the historical
+// review.go CauseKey assignments) default to NEEDS_REWORK_PEER_REVIEW
+// instead of being misrouted to REWORK_ROUTE_AMBIGUOUS. Per the NeedsRework
+// field contract on ProcessResult, NeedsRework=true means a reviewer
+// explicitly rejected with concrete blockers, so it is by definition a
+// substantive peer-review rejection -- unless the cause/errMsg contains
+// cap markers indicating the rejection was actually a tooling failure.
+//
+// The returned classification is for human/log visibility and to drive
+// the worker nudge wording in handleReviewerRejection. The returned
+// reasonText is the actual --reason argument the router will see; where
+// practical it preserves the reviewer's concrete blocker text and the
+// affected branch so the generated rework packet is actionable for the
+// worker.
+func reworkBounceReason(mr *MRInfo, cause, errMsg string, isPeerReviewRejection bool) (classification, reasonText string) {
+	// Normalize both cause and errMsg into a single haystack. Underscores
+	// AND hyphens are converted to spaces so hyphenated markers
+	// (no-verdict, reviewer-unavailable, cap-deferral) match alongside the
+	// underscore forms. Without hyphen normalization, these markers fall
+	// through into NEEDS_REWORK_PEER_REVIEW and produce bogus source-code
+	// rework packets for reviewer/cap issues.
+	haystack := strings.ToLower(cause + " " + errMsg)
+	haystack = strings.NewReplacer("_", " ", "-", " ").Replace(haystack)
+
+	branch := ""
+	if mr != nil {
+		branch = mr.Branch
+	}
+
+	// Reviewer unavailable / cap deferral / no-verdict / quorum -- NOT
+	// source code rework. The markers are stored in their normalized
+	// (space-separated) form so the haystack's normalized form matches
+	// both underscore and hyphen inputs from the upstream cause/errMsg.
+	// Checked FIRST so a coincidental peer-review marker in the same
+	// message does not shadow the real tooling-failure signal.
+	capMarkers := []string{
+		"reviewer unavailable",
+		"reviewers unavailable",
+		"no verdict",
+		"insufficient quorum",
+		"capped",
+		"cap deferral",
+		"hook decision: defer",
+		"deferred",
+	}
+	capMatch := matchAnyMarker(haystack, capMarkers)
+
+	if capMatch {
+		return reworkRouteReviewerHold, fmt.Sprintf(
+			"REVIEW_UNAVAILABLE_HOLD: reviewers unavailable/no-verdict (cause=%s error=%q branch=%s). "+
+				"This is a tooling/cap deferral, not a source-code rework. "+
+				"Do not resubmit the same commit until reviewer availability changes.",
+			cause, errMsg, branch)
+	}
+
+	// Peer-review failure markers -- substantive reviewer verdicts with
+	// actionable blockers.
+	peerMarkers := []string{
+		"peer fail",
+		"peer review fail",
+		"verdict fail",
+		"verdict: fail",
+		"concrete blockers",
+		"blockers:",
+		"codex failed",
+		"m3 failed",
+		"umans kimi failed",
+		"umans glm failed",
+		"codex return fail",
+		"return fail",
+	}
+	peerMatch := matchAnyMarker(haystack, peerMarkers)
+
+	// gastown-p3w (xw8 rejection): a NeedsRework=true ProcessResult is by
+	// field contract a substantive peer-review rejection with concrete
+	// blockers. The peerMarkers list above matches "codex failed", "m3
+	// failed", etc. but NOT the historical reviewer CauseKey values
+	// ("race_condition", "missing_test", "api_break", ...). Without this
+	// fallback, those cases misroute to REWORK_ROUTE_AMBIGUOUS and the
+	// caller escalates to Mayor -- a misuse of Mayor's attention for a
+	// routine substantive peer-review rejection.
+	if peerMatch || isPeerReviewRejection {
+		reviewer := strings.NewReplacer("_", " ").Replace(cause)
+		return reworkRouteNeedsRework, fmt.Sprintf(
+			"NEEDS_REWORK_PEER_REVIEW: peer-fail concrete blockers: cause=%s. %s failed; "+
+				"reviewer verdict=fail with actionable content blockers. error=%q branch=%s. "+
+				"This is a routine NEEDS_REWORK, not a review-tooling failure. "+
+				"Route to bounded rework packet and invoke gt-scoped-rework-bounce-runner.",
+			cause, reviewer, errMsg, branch)
+	}
+
+	// Neither matched and the caller did not assert isPeerReviewRejection.
+	// We cannot tell whether this is a substantive peer-review failure
+	// (in which case the cause/errMsg text is missing the documented
+	// markers AND NeedsRework was not set, which is unexpected) or a
+	// tooling failure. Escalate to Mayor for human classification.
+	return reworkRouteAmbiguous, fmt.Sprintf(
+		"REWORK_ROUTE_AMBIGUOUS: no recognized peer-review failure markers or cap markers in rejection "+
+			"(cause=%s error=%q branch=%s isPeerReviewRejection=%t). "+
+			"Cannot classify safely; escalating to Mayor for human judgment.",
+		cause, errMsg, branch, isPeerReviewRejection)
+}
+
+// matchAnyMarker returns true if haystack contains any of the markers as a
+// substring. The markers are already in their normalized (space-separated)
+// form; haystack is the lowercased, underscore+hyphen-normalized rejection
+// text from reworkBounceReason. Substring matching is sufficient because
+// the markers are word-or-phrase forms that do not overlap each other.
+func matchAnyMarker(haystack string, markers []string) bool {
+	for _, marker := range markers {
+		if strings.Contains(haystack, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.
