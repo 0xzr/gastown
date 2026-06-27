@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -168,7 +169,17 @@ func LiveDryRunReworkDeferred(townRootOverride string) (*LiveDryRunResult, error
 	reworkDeferredNow = func() time.Time { return now }
 	defer func() { reworkDeferredNow = origNow }()
 
-	window := config.DefaultReworkDeferredThrottleWindow
+	// Derive the throttle window the same way the live path does
+	// (notifyMayorOfReworkBlocked): config.LoadOperationalConfig(townRoot).
+	// GetWitnessConfig().ReworkDeferredThrottleWindowD(). The live dry-run
+	// advances its frozen clock by multiples of this window to drive the
+	// emit→suppress→rollup phases; hardcoding DefaultReworkDeferredThrottleWindow
+	// here while the live path uses the configured window produced false dry-run
+	// failures whenever an operator overrode the default (gastown-9rc
+	// side-warning).
+	window := config.LoadOperationalConfig(townRoot).
+		GetWitnessConfig().
+		ReworkDeferredThrottleWindowD()
 
 	router := &captureRouter{}
 
@@ -396,9 +407,24 @@ func capturedSuppressedCount(router *captureRouter, before int) int {
 // starts with liveDryRunPrefix, regardless of who created it. The prefix is
 // the contract: production records never use it, so this is safe to call
 // even on a populated production state file.
+//
+// This is a read-modify-write on the durable throttle state file, so it MUST
+// acquire the same cross-process flock (ReworkDeferredStateFile(townRoot)+".flock")
+// that EvaluateReworkDeferred, ListReworkDeferredRecords, and
+// ClearReworkDeferredRecord use. Without the flock, a live dry-run cleanup
+// running alongside an active witness interleaves with a concurrent
+// EvaluateReworkDeferred save and clobbers its records — turning a read-only
+// diagnostic into a corruptor of durable throttle state (gastown-9rc). The
+// in-process reworkDeferredMu alone only serializes callers within this
+// process; it cannot stop a separate witness process from racing the save.
 func removeLiveDryRunRecords(townRoot string) (int, error) {
 	reworkDeferredMu.Lock()
 	defer reworkDeferredMu.Unlock()
+
+	unlock, flockErr := lock.FlockAcquire(ReworkDeferredStateFile(townRoot) + ".flock")
+	if flockErr == nil {
+		defer unlock()
+	}
 
 	state := loadReworkDeferredState(townRoot)
 	kept := state.Records[:0]
