@@ -48,6 +48,12 @@ const DefaultStaleClaimTimeout = 30 * time.Minute
 // config omits an explicit durable_review_gate timeout.
 const DefaultDurableReviewGateTimeout = 45 * time.Minute
 
+// DefaultReworkRouterTimeout bounds the external `gt mq reject --notify` call
+// that triggers the rework-bounce router. It must be long enough for a Dolt
+// commit + router classification, but bounded so a hung gt/router cannot stall
+// the refinery rejection path.
+const DefaultReworkRouterTimeout = 2 * time.Minute
+
 // isClaimStale checks if a claimed MR should be considered abandoned based on
 // its UpdatedAt timestamp and configured timeout. Returns true if the claim
 // is stale (eligible for re-claim), false if the claim is recent or the
@@ -365,7 +371,18 @@ type Engineer struct {
 	// When non-nil, routeRejectionToReworkBounce invokes this function
 	// instead of shelling out to `gt mq reject --notify`. Production code
 	// leaves this nil and uses the real shell call.
-	routeRejectionExec func(rigName, mrID, reason string) error
+	routeRejectionExec func(ctx context.Context, rigName, mrID, reason string) error
+
+	// reworkRouterTimeout overrides DefaultReworkRouterTimeout for tests.
+	// Zero means use the default.
+	reworkRouterTimeout time.Duration
+
+	// reviewerRejectionWorkerNudge and reviewerRejectionMayorNudge are test seams
+	// for the worker/mayor nudges in handleReviewerRejection. When non-nil they
+	// replace the `gt nudge` exec calls so tests can assert routing behavior
+	// without sending real nudges.
+	reviewerRejectionWorkerNudge func(target, msg string) error
+	reviewerRejectionMayorNudge  func(msg string) error
 }
 
 // NewEngineer creates a new Engineer for the given rig.
@@ -2437,8 +2454,10 @@ func (e *Engineer) handleReviewerRejection(mr *MRInfo, result ProcessResult) {
 	// rejections are no longer left as `route_reason=not_apply_conflict`.
 	// Review-tooling/cap-deferral cases get the REVIEWER_UNAVAILABLE_HOLD
 	// classification instead (so they are not treated as source-code rework).
+	var routeClass string
+	routed := false
 	if mr.ID != "" && e.rig != nil && e.rig.Name != "" {
-		e.routeRejectionToReworkBounce(mr, cause, result.Error)
+		routeClass, routed = e.routeRejectionToReworkBounce(mr, cause, result.Error)
 	}
 
 	// Nudge the worker directly so they can revise and resubmit.
@@ -2446,22 +2465,41 @@ func (e *Engineer) handleReviewerRejection(mr *MRInfo, result ProcessResult) {
 	nudgeTarget := fmt.Sprintf("%s/%s", e.rig.Name, polecatName)
 	nudgeMsg := fmt.Sprintf("REVIEWER_REJECTED: branch=%s issue=%s cause=%s error=%s — revise and resubmit with 'gt done'",
 		mr.Branch, mr.SourceIssue, cause, result.Error)
-	nudgeCmd := exec.Command("gt", "nudge", nudgeTarget, nudgeMsg)
-	util.SetDetachedProcessGroup(nudgeCmd)
-	nudgeCmd.Dir = e.workDir
-	if err := nudgeCmd.Run(); err != nil {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge %s about reviewer rejection: %v\n", polecatName, err)
+	if e.reviewerRejectionWorkerNudge != nil {
+		if err := e.reviewerRejectionWorkerNudge(nudgeTarget, nudgeMsg); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge %s about reviewer rejection: %v\n", polecatName, err)
+		}
 	} else {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Nudged %s about reviewer rejection\n", polecatName)
+		nudgeCmd := exec.Command("gt", "nudge", nudgeTarget, nudgeMsg)
+		util.SetDetachedProcessGroup(nudgeCmd)
+		nudgeCmd.Dir = e.workDir
+		if err := nudgeCmd.Run(); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge %s about reviewer rejection: %v\n", polecatName, err)
+		} else {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Nudged %s about reviewer rejection\n", polecatName)
+		}
 	}
 
-	// Nudge mayor so dependent work stays blocked until the revision lands.
-	mayorMsg := fmt.Sprintf("REVIEWER_REJECTED: %s issue=%s branch=%s cause=%s", mr.ID, mr.SourceIssue, mr.Branch, cause)
-	mayorCmd := exec.Command("gt", "nudge", "mayor/", mayorMsg)
-	util.SetDetachedProcessGroup(mayorCmd)
-	mayorCmd.Dir = e.workDir
-	if err := mayorCmd.Run(); err != nil {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about reviewer rejection: %v\n", err)
+	// Mayor involvement is required only when the rework-bounce router did not
+	// successfully handle the rejection (routing failure, ambiguous
+	// classification, or an explicit non-routine condition). Ordinary NEEDS_REWORK
+	// and reviewer-unavailable/cap-deferral cases are routed to the worker or
+	// the scoped rework-bounce runner without Mayor escalation.
+	if !routed {
+		mayorMsg := fmt.Sprintf("REVIEWER_REJECTED: %s issue=%s branch=%s cause=%s routeClass=%s routed=%t",
+			mr.ID, mr.SourceIssue, mr.Branch, cause, routeClass, routed)
+		if e.reviewerRejectionMayorNudge != nil {
+			if err := e.reviewerRejectionMayorNudge(mayorMsg); err != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about reviewer rejection: %v\n", err)
+			}
+		} else {
+			mayorCmd := exec.Command("gt", "nudge", "mayor/", mayorMsg)
+			util.SetDetachedProcessGroup(mayorCmd)
+			mayorCmd.Dir = e.workDir
+			if err := mayorCmd.Run(); err != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about reviewer rejection: %v\n", err)
+			}
+		}
 	}
 }
 
@@ -2472,49 +2510,71 @@ func (e *Engineer) handleReviewerRejection(mr *MRInfo, result ProcessResult) {
 // peer-review content classifier matches (the historical "Codex-failed commit"
 // rejections from gastown-wisp-ehs / gastown-wisp-wvl returned
 // route_reason=not_apply_conflict because the rejection text had no
-// classifier-matching keywords).
+// classifier-matching keywords), and it preserves actionable reviewer
+// details (concrete blockers and the affected branch) where practical.
 //
 // Review-tooling/cap-deferral cases are flagged with the REVIEW_UNAVAILABLE_HOLD
 // prefix so the router classifies them separately as reviewer unavailable, not
 // as source-code rework.
 //
-// The shell call is best-effort: any failure is logged but does not block the
-// nudge / mail path. Mayor-involvement is not required for the routine case
-// because the dropin router deterministically produces the rework packet and
-// schedules the bounded runner.
-func (e *Engineer) routeRejectionToReworkBounce(mr *MRInfo, cause, errMsg string) {
+// The shell call is bounded by DefaultReworkRouterTimeout and fails closed: any
+// failure or timeout is logged and reported back to the caller so that
+// handleReviewerRejection can escalate to Mayor only when the rework-bounce
+// pipeline cannot handle the rejection itself. Mayor-involvement is not
+// required for the routine case because the dropin router deterministically
+// produces the rework packet and schedules the bounded runner.
+func (e *Engineer) routeRejectionToReworkBounce(mr *MRInfo, cause, errMsg string) (classification string, routed bool) {
 	if mr == nil || mr.ID == "" {
-		return
+		return "", false
 	}
 	routerMode := os.Getenv("GT_MQ_REWORK_ROUTER")
 	if routerMode == "" {
 		// No router mode configured — skip silently so the path is a no-op
 		// for rigs that have not opted in. This preserves the prior behavior
 		// for environments that have not enabled the rework-bounce pipeline.
-		return
+		return "", false
 	}
 
-	classification, reasonText := reworkBounceReason(cause, errMsg)
+	classification, reasonText := reworkBounceReason(mr, cause, errMsg)
 	subject := fmt.Sprintf("REWORK_ROUTE: %s %s issue=%s", classification, mr.ID, mr.SourceIssue)
 	_, _ = fmt.Fprintf(e.output, "[Engineer] routing %s to rework-bounce: %s\n", mr.ID, subject)
 
+	timeout := e.reworkRouterTimeout
+	if timeout == 0 {
+		timeout = DefaultReworkRouterTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	if e.routeRejectionExec == nil {
-		// In production, run the real `gt mq reject --notify` shell call.
-		cmd := exec.Command("gt", "mq", "reject", e.rig.Name, mr.ID,
+		// In production, run the real `gt mq reject --notify` shell call with
+		// a bounded context so a hung gt wrapper/router cannot stall refinery.
+		cmd := exec.CommandContext(ctx, "gt", "mq", "reject", e.rig.Name, mr.ID,
 			"--reason", reasonText,
 			"--notify")
 		util.SetDetachedProcessGroup(cmd)
 		cmd.Dir = e.workDir
 		if err := cmd.Run(); err != nil {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: rework-bounce router call failed for %s: %v\n", mr.ID, err)
+			if ctx.Err() == context.DeadlineExceeded {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: rework-bounce router call for %s timed out after %s\n", mr.ID, timeout)
+			} else {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: rework-bounce router call failed for %s: %v\n", mr.ID, err)
+			}
+			return classification, false
 		}
-		return
+		return classification, true
 	}
 	// Test seam: inject a fake exec to assert argument shape without
 	// shelling out. The function returns nil on success, or an error.
-	if err := e.routeRejectionExec(e.rig.Name, mr.ID, reasonText); err != nil {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: rework-bounce router call failed for %s: %v\n", mr.ID, err)
+	if err := e.routeRejectionExec(ctx, e.rig.Name, mr.ID, reasonText); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: rework-bounce router call for %s timed out after %s\n", mr.ID, timeout)
+		} else {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: rework-bounce router call failed for %s: %v\n", mr.ID, err)
+		}
+		return classification, false
 	}
+	return classification, true
 }
 
 // reworkBounceReason shapes a router-friendly rejection reason from the
@@ -2526,12 +2586,20 @@ func (e *Engineer) routeRejectionToReworkBounce(mr *MRInfo, cause, errMsg string
 // triggering a source-code rework packet for a tooling failure.
 //
 // The returned classification is for human/log visibility; the returned
-// reasonText is the actual --reason argument the router will see.
-func reworkBounceReason(cause, errMsg string) (classification, reasonText string) {
+// reasonText is the actual --reason argument the router will see. Where
+// practical it preserves the reviewer's concrete blocker text and the
+// affected branch so the generated rework packet is actionable for the
+// worker.
+func reworkBounceReason(mr *MRInfo, cause, errMsg string) (classification, reasonText string) {
 	// Build a haystack that matches both snake_case (cause) and prose
 	// (errMsg) by normalizing underscores to spaces and lowercasing.
 	haystack := strings.ToLower(cause + " " + errMsg)
 	haystack = strings.NewReplacer("_", " ").Replace(haystack)
+
+	branch := ""
+	if mr != nil {
+		branch = mr.Branch
+	}
 
 	// Reviewer unavailable / cap deferral / no-verdict / quorum — NOT source
 	// code rework. The router will classify this as REVIEW_UNAVAILABLE_HOLD.
@@ -2548,10 +2616,10 @@ func reworkBounceReason(cause, errMsg string) (classification, reasonText string
 	for _, marker := range capMarkers {
 		if strings.Contains(haystack, marker) {
 			return "REVIEW_UNAVAILABLE_HOLD", fmt.Sprintf(
-				"REVIEW_UNAVAILABLE_HOLD: reviewers unavailable/no-verdict (cause=%s error=%s). "+
+				"REVIEW_UNAVAILABLE_HOLD: reviewers unavailable/no-verdict (cause=%s error=%q branch=%s). "+
 					"This is a tooling/cap deferral, not a source-code rework. "+
 					"Do not resubmit the same commit until reviewer availability changes.",
-				cause, errMsg)
+				cause, errMsg, branch)
 		}
 	}
 
@@ -2560,12 +2628,16 @@ func reworkBounceReason(cause, errMsg string) (classification, reasonText string
 	// "concrete blockers:" / "peer-fail" / "<reviewer> failed" terms makes
 	// is_peer_review_content_failure return True so the router produces a
 	// bounded rework packet and invokes gt-scoped-rework-bounce-runner.sh.
+	// The actual reviewer message and branch are included so the packet is
+	// actionable and the worker can see the concrete blockers without parsing
+	// synthetic classifier markers alone.
+	reviewer := strings.NewReplacer("_", " ").Replace(cause)
 	return "NEEDS_REWORK_PEER_REVIEW", fmt.Sprintf(
 		"NEEDS_REWORK_PEER_REVIEW: peer-fail concrete blockers: cause=%s. %s failed; "+
-			"reviewer verdict=fail with actionable content blockers on branch=%s. "+
+			"reviewer verdict=fail with actionable content blockers. error=%q branch=%s. "+
 			"This is a routine NEEDS_REWORK, not a review-tooling failure. "+
 			"Route to bounded rework packet and invoke gt-scoped-rework-bounce-runner.",
-		cause, cause, "")
+		cause, reviewer, errMsg, branch)
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.

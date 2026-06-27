@@ -14,20 +14,80 @@ package refinery
 //     REVIEW_UNAVAILABLE_HOLD so the router does NOT treat them as
 //     source-code rework.
 //  3. routeRejectionToReworkBounce invokes `gt mq reject --notify` with the
-//     right rig/mr/reason when GT_MQ_REWORK_ROUTER is set, and is a no-op
-//     when the env var is unset (preserving the prior behavior for rigs
-//     that have not opted in).
-//  4. handleReviewerRejection closes the MR + nudges AND routes through the
-//     rework-bounce pipeline in a single pass — no Mayor intervention
-//     required for the routine NEEDS_REWORK case.
+//     right rig/mr/reason when GT_MQ_REWORK_ROUTER is set, is bounded by a
+//     context/timeout, and fails closed with logging.
+//  4. handleReviewerRejection closes the MR + nudges the worker AND routes
+//     through the rework-bounce pipeline without Mayor involvement for the
+//     routine NEEDS_REWORK case. Mayor is only escalated when routing fails.
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/rig"
 )
+
+// dummyMR returns an MRInfo with enough fields populated for reason shaping.
+func dummyMR() *MRInfo {
+	return &MRInfo{
+		ID:          "gastown-wisp-ehs",
+		SourceIssue: "gastown-6z5",
+		Branch:      "polecat/jasper/gastown-6z5@verify",
+		Worker:      "polecats/jasper",
+	}
+}
+
+// newMockBeads creates a beads client backed by a no-op mock `bd` script so
+// handleReviewerRejection can exercise Show/Update/CloseWithoutWithout
+// touching a real Dolt server.
+func newMockBeads(t *testing.T) (*beads.Beads, string) {
+	t.Helper()
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, "beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("mkdir beads dir: %v", err)
+	}
+
+	script := `#!/bin/sh
+# Mock bd for rework-bounce tests. Ignores --allow-stale/--flat flags and
+# returns minimal valid output for the commands handleReviewerRejection uses.
+cmd=""
+for arg; do
+  case "$arg" in
+    --*) continue ;;
+  esac
+  cmd="$arg"
+  break
+done
+case "$cmd" in
+  show)
+    printf '[{"id":"%s","title":"mock","description":"","status":"open"}]\n' "${2:-test}"
+    ;;
+  update|close)
+    ;;
+  version)
+    ;;
+  *)
+    ;;
+esac
+exit 0
+`
+	bdPath := filepath.Join(dir, "bd")
+	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath)
+
+	return beads.NewWithBeadsDir(dir, beadsDir), dir
+}
 
 // TestReworkBounceReason_PeerReviewShapesClassifierMatchingText verifies the
 // routine NEEDS_REWORK path produces a reason with the keywords the dropin
@@ -37,7 +97,8 @@ func TestReworkBounceReason_PeerReviewShapesClassifierMatchingText(t *testing.T)
 	// Codex-failed commit / "resubmitted the same Codex-failed commit" —
 	// the exact pattern that returned route_reason=not_apply_conflict for
 	// gastown-wisp-ehs and gastown-wisp-wvl in the 2026-06-26 router log.
-	classification, reason := reworkBounceReason("codex_failed", "PR #42 reviewer rejection: codex returned FAIL on commit 49dc7c91")
+	mr := dummyMR()
+	classification, reason := reworkBounceReason(mr, "codex_failed", "PR #42 reviewer rejection: codex returned FAIL on commit 49dc7c91")
 
 	if classification != "NEEDS_REWORK_PEER_REVIEW" {
 		t.Errorf("classification = %q, want NEEDS_REWORK_PEER_REVIEW", classification)
@@ -53,6 +114,14 @@ func TestReworkBounceReason_PeerReviewShapesClassifierMatchingText(t *testing.T)
 	}
 	if !strings.Contains(reason, "codex_failed") {
 		t.Errorf("reason missing cause for traceability: %q", reason)
+	}
+	// The worker-facing reason should preserve actionable reviewer detail,
+	// not just synthetic classifier markers.
+	if !strings.Contains(reason, "PR #42 reviewer rejection") {
+		t.Errorf("reason dropped reviewer error message: %q", reason)
+	}
+	if !strings.Contains(reason, mr.Branch) {
+		t.Errorf("reason dropped affected branch: %q", reason)
 	}
 }
 
@@ -75,7 +144,8 @@ func TestReworkBounceReason_ReviewerUnavailableIsSeparateClassification(t *testi
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			classification, reason := reworkBounceReason(tc.cause, tc.errMsg)
+			mr := dummyMR()
+			classification, reason := reworkBounceReason(mr, tc.cause, tc.errMsg)
 			if classification != "REVIEW_UNAVAILABLE_HOLD" {
 				t.Errorf("classification = %q, want REVIEW_UNAVAILABLE_HOLD (cause=%s err=%s)", classification, tc.cause, tc.errMsg)
 			}
@@ -84,6 +154,12 @@ func TestReworkBounceReason_ReviewerUnavailableIsSeparateClassification(t *testi
 			}
 			if !strings.Contains(reason, "not a source-code rework") {
 				t.Errorf("reason should explicitly disclaim source-code rework: %q", reason)
+			}
+			if !strings.Contains(reason, tc.errMsg) {
+				t.Errorf("reason dropped reviewer error message: %q", reason)
+			}
+			if !strings.Contains(reason, mr.Branch) {
+				t.Errorf("reason dropped affected branch: %q", reason)
 			}
 		})
 	}
@@ -102,7 +178,7 @@ func TestRouteRejectionToReworkBounce_InvokesMQRejectWithClassifierReason(t *tes
 	e := &Engineer{
 		rig:    &rig.Rig{Name: "gastown"},
 		output: &bytes.Buffer{},
-		routeRejectionExec: func(rigName, mrID, reason string) error {
+		routeRejectionExec: func(_ context.Context, rigName, mrID, reason string) error {
 			capturedRig = rigName
 			capturedMR = mrID
 			capturedReason = reason
@@ -113,9 +189,15 @@ func TestRouteRejectionToReworkBounce_InvokesMQRejectWithClassifierReason(t *tes
 		},
 	}
 
-	mr := &MRInfo{ID: "gastown-wisp-ehs", SourceIssue: "gastown-6z5", Branch: "polecat/jasper/gastown-6z5@verify"}
-	e.routeRejectionToReworkBounce(mr, "codex_failed", "codex returned FAIL on commit 49dc7c91")
+	mr := dummyMR()
+	class, routed := e.routeRejectionToReworkBounce(mr, "codex_failed", "codex returned FAIL on commit 49dc7c91")
 
+	if !routed {
+		t.Errorf("routed = false, want true")
+	}
+	if class != "NEEDS_REWORK_PEER_REVIEW" {
+		t.Errorf("classification = %q, want NEEDS_REWORK_PEER_REVIEW", class)
+	}
 	if capturedRig != "gastown" {
 		t.Errorf("rig = %q, want gastown", capturedRig)
 	}
@@ -144,17 +226,20 @@ func TestRouteRejectionToReworkBounce_NoOpWhenEnvUnset(t *testing.T) {
 	e := &Engineer{
 		rig:    &rig.Rig{Name: "gastown"},
 		output: &bytes.Buffer{},
-		routeRejectionExec: func(rigName, mrID, reason string) error {
+		routeRejectionExec: func(context.Context, string, string, string) error {
 			called = true
 			return nil
 		},
 	}
 
 	mr := &MRInfo{ID: "gastown-wisp-ehs", SourceIssue: "gastown-6z5"}
-	e.routeRejectionToReworkBounce(mr, "codex_failed", "codex returned FAIL")
+	class, routed := e.routeRejectionToReworkBounce(mr, "codex_failed", "codex returned FAIL")
 
 	if called {
 		t.Errorf("routeRejectionExec called with empty GT_MQ_REWORK_ROUTER (want no-op)")
+	}
+	if class != "" || routed {
+		t.Errorf("expected no routing attempt when env unset, got class=%q routed=%v", class, routed)
 	}
 }
 
@@ -168,7 +253,7 @@ func TestRouteRejectionToReworkBounce_SkipsEmptyMR(t *testing.T) {
 	e := &Engineer{
 		rig:    &rig.Rig{Name: "gastown"},
 		output: &bytes.Buffer{},
-		routeRejectionExec: func(rigName, mrID, reason string) error {
+		routeRejectionExec: func(context.Context, string, string, string) error {
 			called = true
 			return nil
 		},
@@ -183,23 +268,29 @@ func TestRouteRejectionToReworkBounce_SkipsEmptyMR(t *testing.T) {
 }
 
 // TestRouteRejectionToReworkBounce_LogsRouterFailure verifies the engineer
-// does not crash when the rework-bounce routing fails. The best-effort
-// shell call is logged and the nudge / mail path still proceeds.
+// does not crash when the rework-bounce routing fails. The bounded shell
+// call is logged and the caller receives routed=false so the nudge path can
+// escalate appropriately.
 func TestRouteRejectionToReworkBounce_LogsRouterFailure(t *testing.T) {
 	t.Setenv("GT_MQ_REWORK_ROUTER", "enforce")
 
 	e := &Engineer{
 		rig:    &rig.Rig{Name: "gastown"},
 		output: &bytes.Buffer{},
-		routeRejectionExec: func(rigName, mrID, reason string) error {
+		routeRejectionExec: func(context.Context, string, string, string) error {
 			return &execFailure{msg: "simulated gt binary missing"}
 		},
 	}
 
 	mr := &MRInfo{ID: "gastown-wisp-ehs", SourceIssue: "gastown-6z5"}
-	// Should not panic; should log the failure.
-	e.routeRejectionToReworkBounce(mr, "codex_failed", "codex returned FAIL")
+	class, routed := e.routeRejectionToReworkBounce(mr, "codex_failed", "codex returned FAIL")
 
+	if routed {
+		t.Errorf("routed = true, want false on router failure")
+	}
+	if class != "NEEDS_REWORK_PEER_REVIEW" {
+		t.Errorf("classification = %q, want NEEDS_REWORK_PEER_REVIEW", class)
+	}
 	out := e.output.(*bytes.Buffer).String()
 	if !strings.Contains(out, "Warning") || !strings.Contains(out, "rework-bounce") {
 		t.Errorf("expected warning log for failed router call, got: %q", out)
@@ -224,19 +315,158 @@ func TestRouteRejectionToReworkBounce_ReviewerUnavailableRoutesSeparately(t *tes
 	e := &Engineer{
 		rig:    &rig.Rig{Name: "gastown"},
 		output: &bytes.Buffer{},
-		routeRejectionExec: func(rigName, mrID, reason string) error {
+		routeRejectionExec: func(_ context.Context, rigName, mrID, reason string) error {
 			capturedReason = reason
 			return nil
 		},
 	}
 
 	mr := &MRInfo{ID: "gastown-wisp-x", SourceIssue: "gastown-y"}
-	e.routeRejectionToReworkBounce(mr, "reviewer_unavailable", "no reviewers available for PR #42")
+	class, routed := e.routeRejectionToReworkBounce(mr, "reviewer_unavailable", "no reviewers available for PR #42")
 
+	if !routed {
+		t.Errorf("routed = false, want true")
+	}
+	if class != "REVIEW_UNAVAILABLE_HOLD" {
+		t.Errorf("classification = %q, want REVIEW_UNAVAILABLE_HOLD", class)
+	}
 	if !strings.HasPrefix(capturedReason, "REVIEW_UNAVAILABLE_HOLD:") {
 		t.Errorf("reviewer-unavailable case produced non-hold reason: %q", capturedReason)
 	}
 	if strings.Contains(capturedReason, "concrete blockers") {
 		t.Errorf("reviewer-unavailable case should NOT contain source-rework markers: %q", capturedReason)
+	}
+}
+
+// TestRouteRejectionToReworkBounce_ContextTimeoutLogsWarning verifies a
+// hung router command is bounded and logged as a timeout so the refinery
+// rejection path does not stall indefinitely.
+func TestRouteRejectionToReworkBounce_ContextTimeoutLogsWarning(t *testing.T) {
+	t.Setenv("GT_MQ_REWORK_ROUTER", "enforce")
+
+	e := &Engineer{
+		rig:                  &rig.Rig{Name: "gastown"},
+		output:               &bytes.Buffer{},
+		reworkRouterTimeout:  1 * time.Nanosecond,
+		routeRejectionExec: func(ctx context.Context, _ string, _ string, _ string) error {
+			// Simulate an external command that outlives its deadline.
+			time.Sleep(5 * time.Millisecond)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+
+	mr := &MRInfo{ID: "gastown-wisp-ehs", SourceIssue: "gastown-6z5"}
+	class, routed := e.routeRejectionToReworkBounce(mr, "codex_failed", "codex returned FAIL")
+
+	if routed {
+		t.Errorf("routed = true, want false on timeout")
+	}
+	if class != "NEEDS_REWORK_PEER_REVIEW" {
+		t.Errorf("classification = %q, want NEEDS_REWORK_PEER_REVIEW", class)
+	}
+	out := e.output.(*bytes.Buffer).String()
+	if !strings.Contains(out, "timed out") || !strings.Contains(out, "rework-bounce") {
+		t.Errorf("expected timeout log for slow router call, got: %q", out)
+	}
+}
+
+// TestHandleReviewerRejection_RoutineReworkRoutesWithoutMayorNudge verifies
+// the end-to-end rejection flow for a routine NEEDS_REWORK case: the MR is
+// closed, the worker is nudged, the rework-bounce router is invoked, and
+// Mayor is NOT notified.
+func TestHandleReviewerRejection_RoutineReworkRoutesWithoutMayorNudge(t *testing.T) {
+	t.Setenv("GT_MQ_REWORK_ROUTER", "enforce")
+
+	b, workDir := newMockBeads(t)
+	var workerCalled, mayorCalled bool
+	var capturedReason string
+	e := &Engineer{
+		rig:     &rig.Rig{Name: "gastown", Path: workDir},
+		beads:   b,
+		workDir: workDir,
+		output:  &bytes.Buffer{},
+		routeRejectionExec: func(_ context.Context, _ string, _ string, reason string) error {
+			capturedReason = reason
+			return nil
+		},
+		reviewerRejectionWorkerNudge: func(target, msg string) error {
+			workerCalled = true
+			return nil
+		},
+		reviewerRejectionMayorNudge: func(msg string) error {
+			mayorCalled = true
+			return nil
+		},
+	}
+
+	mr := dummyMR()
+	result := ProcessResult{
+		ReviewerRejectionCause: "codex_failed",
+		Error:                  "codex returned FAIL on commit 49dc7c91",
+	}
+	e.handleReviewerRejection(mr, result)
+
+	if !workerCalled {
+		t.Errorf("worker nudge was not sent")
+	}
+	if mayorCalled {
+		t.Errorf("mayor nudge was sent for a routine routed NEEDS_REWORK rejection")
+	}
+	if capturedReason == "" {
+		t.Errorf("rework-bounce router was not invoked")
+	}
+	if !strings.Contains(capturedReason, mr.Branch) {
+		t.Errorf("router reason dropped affected branch: %q", capturedReason)
+	}
+	if !strings.Contains(capturedReason, result.Error) {
+		t.Errorf("router reason dropped reviewer error: %q", capturedReason)
+	}
+}
+
+// TestHandleReviewerRejection_RouterFailureEscalatesMayor verifies that when
+// the rework-bounce router fails (or classification is otherwise ambiguous),
+// handleReviewerRejection escalates to Mayor after notifying the worker.
+func TestHandleReviewerRejection_RouterFailureEscalatesMayor(t *testing.T) {
+	t.Setenv("GT_MQ_REWORK_ROUTER", "enforce")
+
+	b, workDir := newMockBeads(t)
+	var workerCalled, mayorCalled bool
+	e := &Engineer{
+		rig:     &rig.Rig{Name: "gastown", Path: workDir},
+		beads:   b,
+		workDir: workDir,
+		output:  &bytes.Buffer{},
+		routeRejectionExec: func(context.Context, string, string, string) error {
+			return errors.New("simulated router failure")
+		},
+		reviewerRejectionWorkerNudge: func(target, msg string) error {
+			workerCalled = true
+			return nil
+		},
+		reviewerRejectionMayorNudge: func(msg string) error {
+			mayorCalled = true
+			return nil
+		},
+	}
+
+	mr := dummyMR()
+	result := ProcessResult{
+		ReviewerRejectionCause: "codex_failed",
+		Error:                  "codex returned FAIL on commit 49dc7c91",
+	}
+	e.handleReviewerRejection(mr, result)
+
+	if !workerCalled {
+		t.Errorf("worker nudge was not sent")
+	}
+	if !mayorCalled {
+		t.Errorf("mayor nudge was not sent when rework-bounce routing failed")
+	}
+	out := e.output.(*bytes.Buffer).String()
+	if !strings.Contains(out, "Warning") || !strings.Contains(out, "rework-bounce") {
+		t.Errorf("expected router-failure warning log, got: %q", out)
 	}
 }
