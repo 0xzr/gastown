@@ -15,14 +15,45 @@ package witness
 // behavior so future refactors cannot reintroduce the bypass.
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/mayor"
 )
+
+// writeWitnessConfigOverride writes a settings/config.json under townRoot that
+// overrides the witness rework-deferred throttle window. LiveDryRunReworkDeferred
+// and the live notifyMayorOfReworkBlocked path both derive the window from this
+// file via config.LoadOperationalConfig, so a temp dir with no file uses the
+// 1h default; this helper makes an override observable end-to-end.
+func writeWitnessConfigOverride(t *testing.T, townRoot, window string) {
+	t.Helper()
+	settingsDir := filepath.Join(townRoot, "settings")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatalf("mkdir settings: %v", err)
+	}
+	settings := config.TownSettings{
+		Type:    "town-settings",
+		Version: 1,
+		Operational: &config.OperationalConfig{
+			Witness: &config.WitnessThresholds{
+				ReworkDeferredThrottleWindow: window,
+			},
+		},
+	}
+	data, err := json.Marshal(settings)
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0o600); err != nil {
+		t.Fatalf("write config.json: %v", err)
+	}
+}
 
 // TestLiveDryRunReworkDeferred_PopulatesProductionStateFile is the gastown-fvy
 // regression: prove that calling notifyMayorOfReworkBlocked against the live
@@ -188,5 +219,98 @@ func TestLiveDryRunReworkDeferred_PrefixIsolatesFixtureFromProduction(t *testing
 	}
 	if !prodFound {
 		t.Error("live dry-run removed the production record; prefix isolation is broken")
+	}
+}
+
+// TestLiveDryRunReworkDeferred_ConfiguredShortWindowPasses is the
+// gastown-wisp-72s rejection regression. The prior Phase 2 advanced the frozen
+// clock by a FIXED 2 minutes per repeat regardless of the configured window.
+// EvaluateReworkDeferred suppresses only while elapsed-since-last-emit is
+// STRICTLY less than the window, so for a 5m (or 10m) override one repeat
+// landed at elapsed == window — not < — and correctly rolled up instead of
+// suppressing, producing a false dry-run failure despite correct live behavior.
+//
+// This test writes a real config.json override (so the window is observed
+// end-to-end via config.LoadOperationalConfig, exactly as the live path does)
+// and asserts LiveDryRunReworkDeferred still passes. It must FAIL on the
+// unpatched fixed-2m Phase 2 cadence and PASS once the step is derived from
+// the configured window.
+func TestLiveDryRunReworkDeferred_ConfiguredShortWindowPasses(t *testing.T) {
+	cases := []struct {
+		name   string
+		window string
+		want   time.Duration
+	}{
+		{"5m_override", "5m", 5 * time.Minute},
+		{"10m_override", "10m", 10 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(dir, "witness"), 0o755); err != nil {
+				t.Fatalf("mkdir witness dir: %v", err)
+			}
+			writeWitnessConfigOverride(t, dir, tc.window)
+
+			result, err := LiveDryRunReworkDeferred(dir)
+			if err != nil {
+				t.Fatalf("LiveDryRunReworkDeferred: %v", err)
+			}
+			if result.Window != tc.want {
+				t.Errorf("Window = %v, want %v (configured override must be honored)", result.Window, tc.want)
+			}
+			if !result.Pass {
+				for _, e := range result.Errors {
+					t.Errorf("live dry-run error: %s", e)
+				}
+				t.Fatalf("live dry-run failed for configured window %s — Phase 2 cadence must be derived from the window, not a fixed 2m step", tc.window)
+			}
+			// Every fixture must have emitted once, suppressed all repeats, and
+			// rolled up with the real suppressed count (5).
+			for _, tup := range result.Tuples {
+				if tup.FirstAction != ActionEmit {
+					t.Errorf("%s: FirstAction = %q, want emit", tup.Bead, tup.FirstAction)
+				}
+				if tup.RepeatAction != ActionSuppress {
+					t.Errorf("%s: RepeatAction = %q, want suppress", tup.Bead, tup.RepeatAction)
+				}
+				if tup.RollupAction != ActionRollup {
+					t.Errorf("%s: RollupAction = %q, want rollup", tup.Bead, tup.RollupAction)
+				}
+				if tup.RollupSuppressedCount != 5 {
+					t.Errorf("%s: RollupSuppressedCount = %d, want 5", tup.Bead, tup.RollupSuppressedCount)
+				}
+				if tup.MailSent != 3 {
+					t.Errorf("%s: MailSent = %d, want 3 (emit + rollup + change-emit; suppress must NOT send)",
+						tup.Bead, tup.MailSent)
+				}
+			}
+		})
+	}
+}
+
+// TestLiveDryRunReworkDeferred_DefaultWindowStillPasses pins the default-window
+// (1h) path so the derived-step change does not regress the previously-green
+// behavior: with the package default the entire Phase 2 run is well inside the
+// window and every repeat must still suppress.
+func TestLiveDryRunReworkDeferred_DefaultWindowStillPasses(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "witness"), 0o755); err != nil {
+		t.Fatalf("mkdir witness dir: %v", err)
+	}
+	// No config.json → LoadOperationalConfig returns the 1h default, the path
+	// the prior fixed-2m cadence was tuned for and must keep passing.
+	result, err := LiveDryRunReworkDeferred(dir)
+	if err != nil {
+		t.Fatalf("LiveDryRunReworkDeferred: %v", err)
+	}
+	if result.Window != config.DefaultReworkDeferredThrottleWindow {
+		t.Errorf("Window = %v, want default %v", result.Window, config.DefaultReworkDeferredThrottleWindow)
+	}
+	if !result.Pass {
+		for _, e := range result.Errors {
+			t.Errorf("live dry-run error: %s", e)
+		}
+		t.Fatalf("default-window live dry-run failed")
 	}
 }

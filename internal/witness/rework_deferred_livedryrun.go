@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -168,7 +169,17 @@ func LiveDryRunReworkDeferred(townRootOverride string) (*LiveDryRunResult, error
 	reworkDeferredNow = func() time.Time { return now }
 	defer func() { reworkDeferredNow = origNow }()
 
-	window := config.DefaultReworkDeferredThrottleWindow
+	// Derive the throttle window the same way the live path does
+	// (notifyMayorOfReworkBlocked): config.LoadOperationalConfig(townRoot).
+	// GetWitnessConfig().ReworkDeferredThrottleWindowD(). The live dry-run
+	// advances its frozen clock by multiples of this window to drive the
+	// emit→suppress→rollup phases; hardcoding DefaultReworkDeferredThrottleWindow
+	// here while the live path uses the configured window produced false dry-run
+	// failures whenever an operator overrode the default (gastown-9rc
+	// side-warning).
+	window := config.LoadOperationalConfig(townRoot).
+		GetWitnessConfig().
+		ReworkDeferredThrottleWindowD()
 
 	router := &captureRouter{}
 
@@ -227,8 +238,34 @@ func LiveDryRunReworkDeferred(townRootOverride string) (*LiveDryRunResult, error
 
 	// Phase 2 — repeated occurrences inside the window must suppress and
 	// must NOT call router.Send.
+	//
+	// The per-repeat clock step is DERIVED from the configured window, not a
+	// fixed 2 minutes. EvaluateReworkDeferred suppresses only while the elapsed
+	// time since the last un-throttled emit is STRICTLY less than the window
+	// (elapsed < window). The k-th repeat lands at elapsed = k*step (the
+	// record's LastEmittedAt is unchanged by suppresses), so the final repeat
+	// must satisfy repeatCount*step < window. Using step = window/(repeatCount+1)
+	// lands the last repeat at repeatCount*window/(repeatCount+1) < window for
+	// any positive window — e.g. a 5m override steps at 50s (last repeat 4m10s),
+	// a 10m override at 100s (last repeat 8m20s), both safely inside.
+	//
+	// The prior fixed 2m step only stayed inside the window for the 1h default;
+	// for valid overrides at or below 10m a repeat landed at elapsed == window
+	// (not <) and correctly rolled up instead of suppressing, producing a false
+	// dry-run failure despite correct live behavior (gastown-wisp-72s rejection).
+	// A non-positive window disables throttling entirely (EvaluateReworkDeferred
+	// emits every time), so suppression cannot be exercised; we fall back to a
+	// small positive step rather than dividing by zero and never hang.
+	repeatStep := window
+	if repeatStep <= 0 {
+		repeatStep = config.DefaultReworkDeferredThrottleWindow
+	}
+	repeatStep /= time.Duration(repeatCount + 1)
+	if repeatStep <= 0 {
+		repeatStep = 1 * time.Second
+	}
 	for i := 0; i < repeatCount; i++ {
-		now = now.Add(2 * time.Minute)
+		now = now.Add(repeatStep)
 		for j, fix := range fixtures {
 			decision.Type = fix.decision
 			mailBefore := router.count()
@@ -392,13 +429,52 @@ func capturedSuppressedCount(router *captureRouter, before int) int {
 	return n
 }
 
+// reworkDeferredFlockAcquire is the cross-process flock acquirer used by
+// removeLiveDryRunRecords. It is a package-level indirection (mirroring
+// reworkDeferredNow and ReworkDeferredStateFile) so the fail-closed regression
+// can inject an acquisition failure deterministically without depending on
+// the OS being unable to open a lock file. It defaults to the real
+// lock.FlockAcquire used everywhere else in this package.
+var reworkDeferredFlockAcquire = func(path string) (func(), error) {
+	return lock.FlockAcquire(path)
+}
+
 // removeLiveDryRunRecords drops every record whose BeadID or PolecatName
 // starts with liveDryRunPrefix, regardless of who created it. The prefix is
 // the contract: production records never use it, so this is safe to call
 // even on a populated production state file.
+//
+// This is a read-modify-write on the durable throttle state file, so it MUST
+// acquire the same cross-process flock (ReworkDeferredStateFile(townRoot)+".flock")
+// that EvaluateReworkDeferred, ListReworkDeferredRecords, and
+// ClearReworkDeferredRecord use. Without the flock, a live dry-run cleanup
+// running alongside an active witness interleaves with a concurrent
+// EvaluateReworkDeferred save and clobbers its records — turning a read-only
+// diagnostic into a corruptor of durable throttle state (gastown-9rc). The
+// in-process reworkDeferredMu alone only serializes callers within this
+// process; it cannot stop a separate witness process from racing the save.
+//
+// Unlike the throttle decision functions (EvaluateReworkDeferred et al.), which
+// treat a flock acquisition error as best-effort and proceed without the lock,
+// this cleanup is a DIAGNOSTIC path that mutates durable production state. It
+// must FAIL CLOSED: if the cross-process flock cannot be acquired it returns
+// the error WITHOUT loading or saving throttle state, rather than racing the
+// read-modify-write unlocked and clobbering concurrent witnesses (gastown-9rc
+// rework). This is deliberately stricter than the live emit/suppress paths,
+// whose save errors are documented non-fatal.
 func removeLiveDryRunRecords(townRoot string) (int, error) {
 	reworkDeferredMu.Lock()
 	defer reworkDeferredMu.Unlock()
+
+	// Fail closed: do NOT touch durable throttle state without the
+	// cross-process flock. Returning here, before loadReworkDeferredState,
+	// guarantees an acquisition error cannot load, modify, or save records
+	// through the unlocked path.
+	unlock, flockErr := reworkDeferredFlockAcquire(ReworkDeferredStateFile(townRoot) + ".flock")
+	if flockErr != nil {
+		return 0, fmt.Errorf("acquiring cross-process flock for live dry-run cleanup: %w", flockErr)
+	}
+	defer unlock()
 
 	state := loadReworkDeferredState(townRoot)
 	kept := state.Records[:0]
