@@ -1448,13 +1448,14 @@ func (g *Git) DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error 
 // Uses the gh CLI to query for open PRs with the branch as head ref.
 // Returns false on any error (fail-open: branch deletion proceeds if gh is unavailable).
 func (g *Git) HasOpenPR(branch string) bool {
-	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	// Bounded via runProviderCommand so a hung gh (auth relogin, paginate
+	// loop) cannot keep the gate waiting. Process-group kill on timeout
+	// prevents orphan children.
+	result, err := runProviderCommand("gh", []string{"pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1"}, g.workDir, "github has-pr")
 	if err != nil {
 		return false // fail-open: can't determine PR state, allow deletion
 	}
-	out = bytes.TrimSpace(out)
+	out := bytes.TrimSpace(result.Stdout)
 	// Empty array "[]" means no open PRs
 	return len(out) > 2
 }
@@ -1462,13 +1463,11 @@ func (g *Git) HasOpenPR(branch string) bool {
 // FindPRNumber returns the GitHub PR number for the given branch, or 0 if none exists.
 // Uses the gh CLI to query for open PRs with the branch as head ref.
 func (g *Git) FindPRNumber(branch string) (int, error) {
-	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	result, err := runProviderCommand("gh", []string{"pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1"}, g.workDir, "github find-pr")
 	if err != nil {
-		return 0, fmt.Errorf("gh pr list failed: %w", err)
+		return 0, err
 	}
-	out = bytes.TrimSpace(out)
+	out := bytes.TrimSpace(result.Stdout)
 	if len(out) <= 2 {
 		return 0, nil // No open PR
 	}
@@ -1500,33 +1499,35 @@ type PRReview struct {
 // IsPRApproved checks whether a GitHub PR has at least one approving review.
 // Returns true if approved, false if not (or on error).
 func (g *Git) IsPRApproved(prNumber int) (bool, error) {
-	// Use gh pr view which includes review decision
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	// Use gh pr view which includes review decision. Bounded via
+	// runProviderCommand so a hung gh cannot keep the gate waiting; on
+	// timeout the caller maps to a fail-closed verdict (UNAVAILABLE) rather
+	// than passing on an unconfirmed state.
+	result, err := runProviderCommand("gh", []string{"pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision"}, g.workDir, "github pr-decision")
 	if err != nil {
-		return false, fmt.Errorf("gh pr view failed: %w", err)
+		return false, err
 	}
-	var result struct {
+	var parsed struct {
 		ReviewDecision string `json:"reviewDecision"`
 	}
-	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &parsed); err != nil {
 		return false, fmt.Errorf("failed to parse gh pr view output: %w", err)
 	}
 	// APPROVED is the GitHub review decision when at least one approving review exists
-	return result.ReviewDecision == "APPROVED", nil
+	return parsed.ReviewDecision == "APPROVED", nil
 }
 
 // GetPRReviews returns per-reviewer GitHub review states for a PR.
 // Requires the gh CLI. Returns an empty slice if there are no reviews.
 func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviews")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	// Bounded via runProviderCommand: a hung gh (auth relogin, paginate loop)
+	// returns ErrProviderTimeout which the caller maps to a fail-closed
+	// ReviewStateUnavailable verdict, never PASS.
+	result, err := runProviderCommand("gh", []string{"pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviews"}, g.workDir, "github pr-reviews")
 	if err != nil {
-		return nil, fmt.Errorf("gh pr view reviews failed: %w", err)
+		return nil, err
 	}
-	var result struct {
+	var parsed struct {
 		Reviews []struct {
 			Author struct {
 				Login string `json:"login"`
@@ -1536,11 +1537,11 @@ func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
 			SubmittedAt string `json:"submittedAt"`
 		} `json:"reviews"`
 	}
-	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &parsed); err != nil {
 		return nil, fmt.Errorf("failed to parse gh pr reviews output: %w", err)
 	}
-	reviews := make([]PRReview, 0, len(result.Reviews))
-	for _, r := range result.Reviews {
+	reviews := make([]PRReview, 0, len(parsed.Reviews))
+	for _, r := range parsed.Reviews {
 		reviews = append(reviews, PRReview{
 			Reviewer:    r.Author.Login,
 			State:       r.State,
@@ -1554,19 +1555,20 @@ func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
 // GetPRReviewDecision returns the overall GitHub review decision for a PR.
 // Known values: APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, "".
 func (g *Git) GetPRReviewDecision(prNumber int) (string, error) {
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	// Bounded via runProviderCommand; on timeout the caller (PR provider)
+	// records the failure as ErrProviderTimeout evidence and maps to a
+	// fail-closed verdict.
+	result, err := runProviderCommand("gh", []string{"pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision"}, g.workDir, "github pr-overall")
 	if err != nil {
-		return "", fmt.Errorf("gh pr view reviewDecision failed: %w", err)
+		return "", err
 	}
-	var result struct {
+	var parsed struct {
 		ReviewDecision string `json:"reviewDecision"`
 	}
-	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &parsed); err != nil {
 		return "", fmt.Errorf("failed to parse gh pr reviewDecision output: %w", err)
 	}
-	return result.ReviewDecision, nil
+	return parsed.ReviewDecision, nil
 }
 
 // GhPrMerge merges a GitHub PR using the gh CLI, respecting branch protection rules.
@@ -1605,18 +1607,21 @@ func (g *Git) FindBitbucketPRNumber(workspace, repoSlug, branch string) (int, er
 	}
 	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests?q=source.branch.name%%3D%%22%s%%22+AND+state%%3D%%22OPEN%%22&pagelen=1",
 		workspace, repoSlug, branch)
-	cmd := exec.Command("curl", "-s", "-H", "Authorization: Bearer "+token, url)
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	// runProviderCommand enforces the bounded timeout, kills the entire
+	// process group on context cancellation, and scrubs BITBUCKET_TOKEN from
+	// any returned error / output. The "bitbucket find-pr" label is the
+	// sanitized operation name we are willing to expose; the raw args
+	// (including the Authorization header) never appear in err.
+	result, err := runProviderCommand("curl", []string{"-s", "-H", "Authorization: Bearer " + token, url}, g.workDir, "bitbucket find-pr", token)
 	if err != nil {
-		return 0, fmt.Errorf("bitbucket API request failed: %w", err)
+		return 0, err
 	}
 	var resp struct {
 		Values []struct {
 			ID int `json:"id"`
 		} `json:"values"`
 	}
-	if err := json.Unmarshal(bytes.TrimSpace(out), &resp); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &resp); err != nil {
 		return 0, fmt.Errorf("failed to parse Bitbucket response: %w", err)
 	}
 	if len(resp.Values) == 0 {
@@ -1654,11 +1659,13 @@ func (g *Git) GetBitbucketPRParticipants(workspace, repoSlug string, prID int) (
 	}
 	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d",
 		workspace, repoSlug, prID)
-	cmd := exec.Command("curl", "-s", "-H", "Authorization: Bearer "+token, url)
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	// runProviderCommand enforces the bounded timeout, kills the entire
+	// process group on context cancellation, and scrubs BITBUCKET_TOKEN from
+	// any returned error / output. The raw "Authorization: Bearer <token>"
+	// arg never appears in err.Error().
+	result, err := runProviderCommand("curl", []string{"-s", "-H", "Authorization: Bearer " + token, url}, g.workDir, "bitbucket get-participants", token)
 	if err != nil {
-		return nil, fmt.Errorf("bitbucket API request failed: %w", err)
+		return nil, err
 	}
 	var pr struct {
 		Participants []struct {
@@ -1671,7 +1678,7 @@ func (g *Git) GetBitbucketPRParticipants(workspace, repoSlug string, prID int) (
 			Approved bool   `json:"approved"`
 		} `json:"participants"`
 	}
-	if err := json.Unmarshal(bytes.TrimSpace(out), &pr); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &pr); err != nil {
 		return nil, fmt.Errorf("failed to parse Bitbucket response: %w", err)
 	}
 	participants := make([]BitbucketParticipant, 0, len(pr.Participants))
