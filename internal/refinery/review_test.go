@@ -690,3 +690,75 @@ func TestIsEmptyReview_DetectsDegeneratePass(t *testing.T) {
 		}
 	})
 }
+
+// --- Provider unavailability -> fail-closed invariants (gastown-6z5) ----------
+//
+// The reviewer/merge-gate path maps a provider subprocess failure
+// (gh / curl timeout, non-zero exit, parse error) to a ReviewerVerdictUnavailable
+// result so the merge cannot silently pass on unconfirmed evidence. These tests
+// pin the invariants: a UNAVAILABLE result alone is never PASS, and an
+// UNAVAILABLE alongside a PASS does not get silently dropped from the audit
+// surface (the provider that did not respond remains an audit obligation).
+
+// TestEvaluateReviews_ProviderUnavailableNeverPasses is the core fail-closed
+// invariant: a single reviewer returning UNAVAILABLE must never produce a
+// ReviewStatePass. If the gate could not reach the provider, no reviewer has
+// confirmed the merge candidate, so the verdict is unavailable, not pass.
+func TestEvaluateReviews_ProviderUnavailableNeverPasses(t *testing.T) {
+	results := []ReviewerResult{
+		{Reviewer: "github", Verdict: ReviewerVerdictUnavailable,
+			Evidence:  "provider command timed out: github pr-reviews",
+			DiffBasis: MergeCandidateBasis("base-sha", "head-sha")},
+	}
+	ev := EvaluateReviews(results, DegradedQuorumRule{Enabled: false})
+	if ev.State == ReviewStatePass {
+		t.Fatalf("UNAVAILABLE must never collapse to PASS, got state %s", ev.State)
+	}
+	if ev.State != ReviewStateUnavailable {
+		t.Errorf("expected UNAVAILABLE, got %s", ev.State)
+	}
+	if ev.PassCount != 0 {
+		t.Errorf("expected PassCount=0, got %d", ev.PassCount)
+	}
+	if ev.FailCount != 0 {
+		t.Errorf("UNAVAILABLE must not contribute to FailCount, got %d", ev.FailCount)
+	}
+	if ev.UnavailableCount != 1 {
+		t.Errorf("expected UnavailableCount=1, got %d", ev.UnavailableCount)
+	}
+}
+
+// TestEvaluateReviews_ProviderUnavailableDoesNotMaskPass confirms the
+// complementary invariant: an UNAVAILABLE reviewer alongside a PASS does not
+// silently mask the failure. The unavailable provider remains an audit
+// obligation (AuditReviewers), so a downstream process cannot pretend the gate
+// reached every required provider.
+func TestEvaluateReviews_ProviderUnavailableDoesNotMaskPass(t *testing.T) {
+	basis := MergeCandidateBasis("base-sha", "head-sha")
+	results := []ReviewerResult{
+		{Reviewer: "github", Verdict: ReviewerVerdictPass, DiffBasis: basis},
+		{Reviewer: "codex", Verdict: ReviewerVerdictUnavailable,
+			Evidence: "provider command timed out: codex evaluate", DiffBasis: basis},
+	}
+	// With degraded quorum enabled and one PASS, the merge proceeds under
+	// audit; the UNAVAILABLE reviewer must be recorded in AuditReviewers.
+	ev := EvaluateReviews(results, DegradedQuorumRule{Enabled: true, MinPassReviews: 1})
+	if ev.State != ReviewStateDegradedQuorum {
+		t.Fatalf("expected DEGRADED_QUORUM (PASS + UNAVAILABLE), got %s: %s", ev.State, ev.Error)
+	}
+	if ev.PassCount != 1 {
+		t.Errorf("expected PassCount=1, got %d", ev.PassCount)
+	}
+	if ev.UnavailableCount != 1 {
+		t.Errorf("expected UnavailableCount=1, got %d", ev.UnavailableCount)
+	}
+	found := false
+	for _, r := range ev.AuditReviewers {
+		if r == "codex" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected codex in AuditReviewers (must not be silently masked), got %v", ev.AuditReviewers)
+	}
+}
