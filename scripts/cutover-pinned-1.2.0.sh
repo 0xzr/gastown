@@ -141,7 +141,8 @@ else
   # Build the pinned 1.2.0 runtime binary from current source. The Makefile
   # safe-install target honors scripts/lib/wrapper-preserve.sh: if the public
   # path is the operational wrapper, the ELF is installed behind it as
-  # gt-real-bin instead of clobbering the wrapper.
+  # gt-real-bin instead of clobbering the wrapper. The install is now atomic,
+  # canary-gated, and flock-serialized (gastown-cet.12.9).
   echo "Building pinned 1.2.0 runtime binary..."
   (
     cd "${REPO_ROOT}"
@@ -153,18 +154,46 @@ else
   )
   echo ""
 
+  # Auto-rollback on failed verification (gastown-cet.12.9). If ANY post-
+  # cutover check below fails, restore the pre-cutover binary before exiting
+  # so a bad pinned build never stays live — the failure mode that killed all
+  # polecats at once. safe-install already snapshotted the previous real-bin
+  # to gt-real-bin.bak.<ts>; BACKUP_BINARY is the same ELF captured here.
+  cutover_rollback() {
+    local reason="$1"
+    echo "ERROR: ${reason}" >&2
+    if [ -f "${BACKUP_BINARY}" ]; then
+      echo "Auto-rolling back to pre-cutover binary: ${BACKUP_BINARY}" >&2
+      # Restore via the library so the rollback is flock-serialized, canary-
+      # checked, and itself snapshotable, matching the install path.
+      if INSTALL_DIR="${INSTALL_DIR}" BINARY="${BINARY}" \
+         GT_REAL_BIN="${REAL_BIN_PATH}" \
+         bash -c 'source "$0"; gt_install_rollback "$1"' \
+         "${SCRIPT_DIR}/lib/wrapper-preserve.sh" "${BACKUP_BINARY}" >&2; then
+        echo "Rollback complete: ${REAL_BIN_PATH} restored from ${BACKUP_BINARY}" >&2
+      else
+        # Fallback: direct copy if the library rollback cannot find a snapshot
+        # or its canary rejects the pre-cutover binary.
+        cp "${BACKUP_BINARY}" "${REAL_BIN_PATH}"
+        chmod 0755 "${REAL_BIN_PATH}"
+        echo "Rollback complete (direct restore): ${REAL_BIN_PATH}" >&2
+      fi
+    else
+      echo "WARNING: no pre-cutover backup at ${BACKUP_BINARY}; cannot auto-rollback" >&2
+    fi
+    exit 1
+  }
+
   # Post-cutover invariant: the public path is still a wrapper (text), and the
   # real binary slot has the freshly built ELF. This is what the doctor
   # wrapper-topology check would catch; we fail fast here too because the
   # wrapper-aware safe-install is what made it survive.
   echo "Verifying wrapper topology..."
   if ! gt_install_assert_wrapper_topology; then
-    echo "ERROR: post-cutover wrapper topology is broken" >&2
-    exit 1
+    cutover_rollback "post-cutover wrapper topology is broken"
   fi
   if [ ! -x "${REAL_BIN_PATH}" ]; then
-    echo "ERROR: ${REAL_BIN_PATH} missing or not executable after cutover" >&2
-    exit 1
+    cutover_rollback "${REAL_BIN_PATH} missing or not executable after cutover"
   fi
   echo "  Wrapper at ${WRAPPER_PATH}: preserved (text script)"
   echo "  ELF at ${REAL_BIN_PATH}: present and executable"
@@ -174,9 +203,8 @@ else
   # ELF so we get accurate version metadata rather than the wrapper's pass-through.
   echo "Verifying installed binary version..."
   if ! ${REAL_BIN_PATH} version | grep -q "gt version 1.2.0"; then
-    echo "ERROR: installed binary does not report version 1.2.0" >&2
     ${REAL_BIN_PATH} version >&2
-    exit 1
+    cutover_rollback "installed binary does not report version 1.2.0"
   fi
   ${REAL_BIN_PATH} version --verbose | sed 's/^/  /'
   echo ""
@@ -184,8 +212,7 @@ else
   # Verify pinned runtime line is visible.
   echo "Verifying pinned runtime line..."
   if ! ${REAL_BIN_PATH} version --verbose | grep -q "Pinned runtime line: 1.2.0"; then
-    echo "ERROR: installed binary does not report pinned runtime line 1.2.0" >&2
-    exit 1
+    cutover_rollback "installed binary does not report pinned runtime line 1.2.0"
   fi
   echo "  Pinned runtime line: 1.2.0 verified"
   echo ""
@@ -193,8 +220,7 @@ else
   # Verify the hardening fixes are advertised.
   echo "Verifying hardening fixes..."
   if ! ${REAL_BIN_PATH} version --verbose | grep -q "Hardening fixes:"; then
-    echo "ERROR: installed binary does not advertise hardening fixes" >&2
-    exit 1
+    cutover_rollback "installed binary does not advertise hardening fixes"
   fi
   ${REAL_BIN_PATH} version --verbose | grep "Hardening fixes:" | sed 's/^/  /'
   echo ""
@@ -202,13 +228,17 @@ else
   # Run the witness rework-deferred dry-run to prove the throttle is live.
   # Probe the public wrapper so we exercise the full PATH-mediated dispatch,
   # which catches cases where the wrapper has been broken even though the ELF
-  # looks healthy.
+  # looks healthy. This is the FINAL post-install verification: if it fails
+  # after `make safe-install` already installed the new binary, we MUST roll
+  # back to the pre-cutover binary rather than `exit 1`, otherwise a bad
+  # pinned build is left live — exactly the failure mode this script guards
+  # against (gastown-cet.12.9 rework: codex finding #1).
   echo "Running REWORK_DEFERRED throttle dry-run..."
   if ! ${WRAPPER_PATH} witness rework-deferred dry-run; then
     echo "ERROR: REWORK_DEFERRED throttle dry-run failed (wrapper path)" >&2
     echo "  Real binary probe follows for diagnostics:" >&2
     ${REAL_BIN_PATH} witness rework-deferred dry-run >&2 || true
-    exit 1
+    cutover_rollback "REWORK_DEFERRED throttle dry-run failed after install; rolling back to pre-cutover binary"
   fi
   echo ""
 fi
@@ -272,3 +302,5 @@ if [ -z "${DRY_RUN:-}" ]; then
 fi
 echo "To roll back to the pre-cutover binary:"
 echo "  cp '${BACKUP_BINARY}' '${REAL_BIN_PATH}'"
+echo "  # or, the one-command rollback (restores the newest gt-real-bin.bak.*):"
+echo "  source '${SCRIPT_DIR}/lib/wrapper-preserve.sh' && gt_install_rollback"

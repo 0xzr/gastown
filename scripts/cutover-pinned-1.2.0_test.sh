@@ -125,6 +125,56 @@ else
   cat "${EXPECTED_RECORD}" || true
 fi
 
+# --- Regression (gastown-cet.12.9 rework, codex finding #1) ---------------
+# The final post-cutover verification — `gt witness rework-deferred dry-run`
+# via the wrapper — runs AFTER `make safe-install` has already installed the
+# new binary. If it fails, the script MUST invoke cutover_rollback (which
+# restores the pre-cutover binary) rather than a bare `exit 1`, otherwise a
+# bad pinned build is left live — the exact failure mode this cutover guards.
+# The prior MR exited 1 directly here. Assert every verification failure
+# path in the non-dry-run block routes through cutover_rollback instead.
+
+# Extract the non-dry-run verify region: from the cutover_rollback() definition
+# through the end of the throttle dry-run block (the "# Record durable cutover
+# evidence" comment marks where verification ends and evidence recording begins).
+# This is the region where a failed verify must not strand a bad binary.
+# cutover_rollback itself ends with `exit 1`, so the only legitimate `exit 1`
+# in this region is the one INSIDE cutover_rollback.
+VERIFY_BLOCK="$(sed -n '/^  cutover_rollback() {$/,/^# Record durable cutover evidence/p' "${CUTOVER_SCRIPT}" | sed '${/^# Record durable cutover evidence/d;}')"
+
+# There must be exactly ONE `exit 1` STATEMENT in the verify region — the one
+# inside cutover_rollback's body. Any other bare `exit 1` is a verify path that
+# strands a bad binary (the codex finding: the throttle dry-run used to exit 1).
+# Exclude comment lines (which may mention "exit 1" in prose) from the count.
+VERIFY_EXITS="$(printf '%s\n' "${VERIFY_BLOCK}" | grep -v '^[[:space:]]*#' | grep -c 'exit 1' || true)"
+if [ "${VERIFY_EXITS}" -eq 1 ]; then
+  pass "cutover verify region has a single exit 1 (inside cutover_rollback only)"
+else
+  fail "cutover verify region has ${VERIFY_EXITS} 'exit 1' (expected 1, inside cutover_rollback); a verify path strands a bad binary"
+fi
+
+# The throttle dry-run is the FINAL post-install verify, the one codex flagged:
+# it runs after safe-install installed the new binary, so its failure MUST roll
+# back rather than exit. Assert it routes failures to cutover_rollback.
+THROTTLE_BLOCK="$(sed -n '/Running REWORK_DEFERRED throttle dry-run/,/^  echo ""$/p' "${CUTOVER_SCRIPT}" | head -20)"
+if printf '%s\n' "${THROTTLE_BLOCK}" | grep -q 'cutover_rollback'; then
+  pass "final throttle dry-run failure invokes cutover_rollback"
+else
+  fail "final throttle dry-run failure does NOT invoke cutover_rollback (bad build left live)"
+  printf '%s\n' "${THROTTLE_BLOCK}" >&2
+fi
+
+# Every post-install verify step must route through cutover_rollback. Count the
+# cutover_rollback invocations in the verify region (excluding the function
+# definition line itself): topology, real-bin executable, version, pinned-line,
+# hardening-fixes, and the throttle dry-run = 6 call sites.
+ROLLBACK_CALLS="$(printf '%s\n' "${VERIFY_BLOCK}" | grep -c 'cutover_rollback "' || true)"
+if [ "${ROLLBACK_CALLS}" -ge 6 ]; then
+  pass "all post-cutover verify failures route through cutover_rollback (${ROLLBACK_CALLS} sites)"
+else
+  fail "only ${ROLLBACK_CALLS} cutover_rollback verify sites (expected >=6); a verify path strands a bad binary"
+fi
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 [ "${FAIL}" -eq 0 ]
