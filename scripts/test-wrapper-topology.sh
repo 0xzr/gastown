@@ -38,13 +38,49 @@ fi
 pass() { echo "${GREEN}PASS${NC}: $1"; PASS=$((PASS + 1)); }
 fail() { echo "${RED}FAIL${NC}: $1"; FAIL=$((FAIL + 1)); }
 
-# Make a temp HOME with a fake ELF "source" binary that we can install.
-# The ELF just needs to look like an ELF to the wrapper-preserve library.
+# Resolve a real ELF binary to use as an install fixture. The pre-install
+# canary actually RUNS the new binary's `version`, so fixtures must be
+# genuine executables: `true` exits 0 (canary passes), `false` exits 1
+# (canary rejects). Prefer /bin then /usr/bin, then PATH.
+real_elf() {
+    local name="${1:?real_elf needs a binary name}"
+    for p in /bin/"$name" /usr/bin/"$name"; do
+        if [ -x "$p" ]; then printf '%s\n' "$p"; return 0; fi
+    done
+    command -v "$name"
+}
+TRUE_ELF="$(real_elf true)"
+FALSE_ELF="$(real_elf false)"
+ECHO_ELF="$(real_elf echo)"
+
+# A healthy ELF fixture: a copy of a real ELF that exits 0, so the pre-install
+# canary's `version` probe passes. (Was a synthetic \x7FELF blob; that can no
+# longer run under the canary gate added in gastown-cet.12.9.)
 make_elf_fixture() {
     local elf="$1"
-    # First 4 bytes 0x7F 'E' 'L' 'F', followed by enough junk to be a real file.
-    printf '\x7FELF%1024s' " " > "$elf"
+    if [ -z "$TRUE_ELF" ]; then
+        echo "SKIP: no real 'true' ELF found on this host" >&2
+        return 1
+    fi
+    cp "$TRUE_ELF" "$elf"
     chmod 0755 "$elf"
+}
+
+# A BAD ELF fixture: a real ELF that exits non-zero. The canary MUST reject it.
+make_bad_elf_fixture() {
+    local elf="$1"
+    if [ -z "$FALSE_ELF" ]; then
+        echo "SKIP: no real 'false' ELF found on this host" >&2
+        return 1
+    fi
+    cp "$FALSE_ELF" "$elf"
+    chmod 0755 "$elf"
+}
+
+# first_byte <path> echoes the od token of the file's first byte (for the
+# ELF/shebang switch used throughout these scenarios).
+first_byte() {
+    dd if="$1" bs=1 count=1 status=none | od -An -c | tr -d ' \n'
 }
 
 # Scenario 1: fresh host, no wrapper at $HOME/.local/bin/gt.
@@ -56,7 +92,7 @@ scenario_plain_install() {
     local install_dir="$tmp/home/.local/bin"
     mkdir -p "$install_dir"
     local elf="$tmp/source-gt"
-    make_elf_fixture "$elf"
+    make_elf_fixture "$elf" || return 0
 
     INSTALL_DIR="$install_dir" BINARY="gt" HOME="$tmp/home" \
         bash -c "source '$LIB'; gt_install_preserve_wrapper '$elf'"
@@ -66,7 +102,7 @@ scenario_plain_install() {
         return
     fi
     local first_byte
-    first_byte="$(dd if="$install_dir/gt" bs=1 count=1 status=none | od -An -c | tr -d ' \n')"
+    first_byte="$(first_byte "$install_dir/gt")"
     case "$first_byte" in
         177|E) pass "scenario_plain_install: ELF installed to public path" ;;
         *)     fail "scenario_plain_install: expected ELF at public path, got byte: $first_byte" ;;
@@ -88,7 +124,7 @@ scenario_wrapper_preserved() {
     local install_dir="$tmp/home/.local/bin"
     mkdir -p "$install_dir"
     local elf="$tmp/source-gt"
-    make_elf_fixture "$elf"
+    make_elf_fixture "$elf" || return 0
 
     # Plant a wrapper that looks like the operational one.
     cat > "$install_dir/gt" <<'WRAPPER'
@@ -117,7 +153,7 @@ WRAPPER
 
     # Sanity: gt-real-bin must be the ELF (not a stale wrapper snapshot).
     local real_first
-    real_first="$(dd if="$install_dir/gt-real-bin" bs=1 count=1 status=none | od -An -c | tr -d ' \n')"
+    real_first="$(first_byte "$install_dir/gt-real-bin")"
     case "$real_first" in
         177|E) pass "scenario_wrapper_preserved: gt-real-bin is an ELF" ;;
         *)     fail "scenario_wrapper_preserved: gt-real-bin is not an ELF -- got: $real_first" ;;
@@ -125,7 +161,7 @@ WRAPPER
 
     # Sanity: public gt must still be a script.
     local public_first
-    public_first="$(dd if="$install_dir/gt" bs=1 count=1 status=none | od -An -c | tr -d ' \n')"
+    public_first="$(first_byte "$install_dir/gt")"
     case "$public_first" in
         \#) pass "scenario_wrapper_preserved: public gt remains a shebang script" ;;
         *)  fail "scenario_wrapper_preserved: public gt was clobbered -- got: $public_first" ;;
@@ -141,14 +177,15 @@ scenario_realbin_rotated() {
 
     local install_dir="$tmp/home/.local/bin"
     mkdir -p "$install_dir"
+    # New ELF: true (exits 0 → canary passes). Incumbent: a DISTINCT healthy
+    # ELF (echo) so the rotation is provable by content.
     local elf="$tmp/source-gt"
-    local old_elf="$tmp/old-gt"
-    make_elf_fixture "$elf"
-    # Plant a different ELF at gt-real-bin that we can recognize post-install.
-    # Use a recognizable magic prefix that differs from the new ELF's padding.
-    printf '\x7FELFsource-rotated-1234567890' > "$old_elf"
-    chmod 0755 "$old_elf"
-    cp "$old_elf" "$install_dir/gt-real-bin"
+    make_elf_fixture "$elf" || return 0
+    [ -n "$ECHO_ELF" ] || { echo "SKIP scenario_realbin_rotated: no 'echo' ELF" >&2; return 0; }
+    cp "$ECHO_ELF" "$install_dir/gt-real-bin"
+    chmod 0755 "$install_dir/gt-real-bin"
+    local old_ino
+    old_ino="$(stat -c '%i' "$install_dir/gt-real-bin" 2>/dev/null || stat -f '%i' "$install_dir/gt-real-bin")"
 
     cat > "$install_dir/gt" <<'WRAPPER'
 #!/usr/bin/env bash
@@ -160,15 +197,14 @@ WRAPPER
     INSTALL_DIR="$install_dir" BINARY="gt" HOME="$tmp/home" \
         bash -c "source '$LIB'; gt_install_preserve_wrapper '$elf'"
 
-    # New ELF at gt-real-bin (not the old one).
-    local real_first
-    real_first="$(dd if="$install_dir/gt-real-bin" bs=1 count=1 status=none | od -An -c | tr -d ' \n')"
-    case "$real_first" in
+    # New ELF at gt-real-bin — a different inode than the old one proves it was
+    # replaced (rename installs a fresh file rather than rewriting in place).
+    local new_ino
+    new_ino="$(stat -c '%i' "$install_dir/gt-real-bin" 2>/dev/null || stat -f '%i' "$install_dir/gt-real-bin")"
+    case "$(first_byte "$install_dir/gt-real-bin")" in
         177|E)
-            # Look for the new ELF's signature — the old had 'source-rotated' literal,
-            # the new has just 'ELF' followed by spaces.
-            if grep -q "source-rotated" "$install_dir/gt-real-bin"; then
-                fail "scenario_realbin_rotated: gt-real-bin still holds the previous ELF"
+            if [ "$new_ino" = "$old_ino" ]; then
+                fail "scenario_realbin_rotated: gt-real-bin inode unchanged (not replaced)"
             else
                 pass "scenario_realbin_rotated: gt-real-bin replaced with new ELF"
             fi
@@ -183,15 +219,16 @@ WRAPPER
         fail "scenario_realbin_rotated: wrapper sentinel lost"
     fi
 
-    # Backup of previous ELF exists with timestamp suffix.
+    # Backup of previous ELF exists with timestamp suffix and holds the OLD
+    # binary (compare bytes; .bak is a copy so its inode differs).
     local bak
-    bak="$(ls "$install_dir"/gt-real-bin.bak.* 2>/dev/null | head -1 || true)"
+    bak="$(ls "$install_dir"/gt-real-bin.bak.* 2>/dev/null | grep -v 'pre-rollback' | head -1 || true)"
     if [ -z "$bak" ]; then
         fail "scenario_realbin_rotated: expected a gt-real-bin.bak.<ts> snapshot"
-    elif grep -q "source-rotated" "$bak"; then
+    elif cmp -s "$bak" "$ECHO_ELF"; then
         pass "scenario_realbin_rotated: previous ELF preserved at $bak"
     else
-        fail "scenario_realbin_rotated: backup file $bak does not contain old ELF payload"
+        fail "scenario_realbin_rotated: backup $bak does not match previous ELF"
     fi
 }
 
@@ -245,7 +282,7 @@ scenario_non_wrapper_script_treated_as_plain() {
     local install_dir="$tmp/home/.local/bin"
     mkdir -p "$install_dir"
     local elf="$tmp/source-gt"
-    make_elf_fixture "$elf"
+    make_elf_fixture "$elf" || return 0
 
     # Plain text file at the public path that is NOT the wrapper.
     printf '#!/usr/bin/env bash\necho hi\n' > "$install_dir/gt"
@@ -261,11 +298,631 @@ scenario_non_wrapper_script_treated_as_plain() {
     fi
 
     local first
-    first="$(dd if="$install_dir/gt" bs=1 count=1 status=none | od -An -c | tr -d ' \n')"
+    first="$(first_byte "$install_dir/gt")"
     case "$first" in
         177|E) pass "scenario_non_wrapper_script_treated_as_plain: public path now ELF" ;;
         *)     fail "scenario_non_wrapper_script_treated_as_plain: public path is not ELF" ;;
     esac
+}
+
+# Scenario 6 (gastown-cet.12.9): a BAD ELF — one whose `version` exits
+# non-zero — must be rejected by the pre-install canary BEFORE the live
+# binary is touched. The live slot must be left untouched.
+scenario_canary_rejects_bad_elf() {
+    local tmp
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    local install_dir="$tmp/home/.local/bin"
+    mkdir -p "$install_dir"
+    local bad_elf="$tmp/bad-gt"
+    make_bad_elf_fixture "$bad_elf" || return 0
+
+    # Plant a live ELF at gt-real-bin behind a wrapper so we can prove the
+    # canary left it alone. Use a healthy ELF (sleep) as the incumbent.
+    local sleep_elf
+    sleep_elf="$(real_elf sleep)"
+    [ -n "$sleep_elf" ] || { echo "SKIP scenario_canary_rejects_bad_elf: no 'sleep' ELF" >&2; return 0; }
+    cp "$sleep_elf" "$install_dir/gt-real-bin"
+    chmod 0755 "$install_dir/gt-real-bin"
+    local live_ino
+    live_ino="$(stat -c '%i' "$install_dir/gt-real-bin" 2>/dev/null || stat -f '%i' "$install_dir/gt-real-bin")"
+
+    cat > "$install_dir/gt" <<'WRAPPER'
+#!/usr/bin/env bash
+# gt wrapper — guarantees the current validation model-mix on `gt sling`.
+WRAPPER
+    chmod 0755 "$install_dir/gt"
+
+    local out rc
+    set +e
+    INSTALL_DIR="$install_dir" BINARY="gt" HOME="$tmp/home" \
+        bash -c "source '$LIB'; gt_install_preserve_wrapper '$bad_elf'" \
+        >"$tmp/canary.out" 2>&1
+    rc=$?
+    set -e
+    out="$(cat "$tmp/canary.out")"
+
+    if [ "$rc" -eq 0 ]; then
+        fail "scenario_canary_rejects_bad_elf: install succeeded for a bad ELF (rc=$rc)"
+    else
+        pass "scenario_canary_rejects_bad_elf: bad ELF rejected with rc=$rc"
+    fi
+    case "$out" in
+        *"canary"*) pass "scenario_canary_rejects_bad_elf: output mentions canary gate" ;;
+        *)          fail "scenario_canary_rejects_bad_elf: output missing canary mention -- got: $out" ;;
+    esac
+
+    # The live ELF must be unchanged (same inode — nothing was renamed over it).
+    local now_ino
+    now_ino="$(stat -c '%i' "$install_dir/gt-real-bin" 2>/dev/null || stat -f '%i' "$install_dir/gt-real-bin")"
+    if [ "$now_ino" = "$live_ino" ]; then
+        pass "scenario_canary_rejects_bad_elf: live binary left untouched"
+    else
+        fail "scenario_canary_rejects_bad_elf: live binary was modified despite canary"
+    fi
+}
+
+# Scenario 7 (gastown-cet.12.9): GT_INSTALL_CANARY_TIMEOUT=0 skips the version
+# probe, so a synthetic (non-runnable) ELF can again be installed. This is the
+# escape hatch for cross-compiled builds that can't run on the build host.
+scenario_canary_skip_installs_synthetic_elf() {
+    local tmp
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    local install_dir="$tmp/home/.local/bin"
+    mkdir -p "$install_dir"
+    # A synthetic ELF that is NOT runnable (the old fixture shape).
+    local synth="$tmp/synth-gt"
+    printf '\x7FELF%1024s' " " > "$synth"
+    chmod 0755 "$synth"
+
+    cat > "$install_dir/gt" <<'WRAPPER'
+#!/usr/bin/env bash
+# gt wrapper — guarantees the current validation model-mix on `gt sling`.
+WRAPPER
+    chmod 0755 "$install_dir/gt"
+
+    local rc
+    set +e
+    INSTALL_DIR="$install_dir" BINARY="gt" HOME="$tmp/home" GT_INSTALL_CANARY_TIMEOUT=0 \
+        bash -c "source '$LIB'; gt_install_preserve_wrapper '$synth'" \
+        >"$tmp/skip.out" 2>&1
+    rc=$?
+    set -e
+
+    if [ "$rc" -ne 0 ]; then
+        fail "scenario_canary_skip_installs_synthetic_elf: install failed under canary-skip (rc=$rc)"
+        cat "$tmp/skip.out" >&2
+        return
+    fi
+    pass "scenario_canary_skip_installs_synthetic_elf: synthetic ELF installed under canary-skip"
+    if [ ! -f "$install_dir/gt-real-bin" ]; then
+        fail "scenario_canary_skip_installs_synthetic_elf: gt-real-bin missing"
+    else
+        pass "scenario_canary_skip_installs_synthetic_elf: ELF at gt-real-bin"
+    fi
+}
+
+# Scenario 8 (gastown-cet.12.9): concurrent installs are serialized by the
+# flock. A second installer started while the first holds the lock must block
+# (not interleave) when given a wait budget, and fail fast when GT_INSTALL_LOCK_TIMEOUT=0.
+scenario_concurrent_installs_serialized() {
+    local tmp
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    local install_dir="$tmp/home/.local/bin"
+    mkdir -p "$install_dir"
+    local elf="$tmp/source-gt"
+    make_elf_fixture "$elf" || return 0
+
+    # Hold the lock in a background subshell that sleeps, then try to install
+    # with a non-blocking attempt. The non-blocking install must report contention.
+    INSTALL_DIR="$install_dir" BINARY="gt" HOME="$tmp/home" \
+        bash -c "source '$LIB'; gt_install_with_lock sleep 2" &
+    local holder=$!
+    # Give the holder a moment to acquire.
+    sleep 0.4
+
+    local rc
+    set +e
+    INSTALL_DIR="$install_dir" BINARY="gt" HOME="$tmp/home" GT_INSTALL_LOCK_TIMEOUT=0 \
+        bash -c "source '$LIB'; gt_install_preserve_wrapper '$elf'" >"$tmp/contend.out" 2>&1
+    rc=$?
+    set -e
+    wait "$holder" 2>/dev/null || true
+
+    if [ "$rc" -eq 0 ]; then
+        fail "scenario_concurrent_installs_serialized: install ran despite held lock"
+    else
+        pass "scenario_concurrent_installs_serialized: install blocked by lock (rc=$rc)"
+    fi
+    case "$(cat "$tmp/contend.out")" in
+        *"in progress"*) pass "scenario_concurrent_installs_serialized: output reports contention" ;;
+        *"timed out"*)  pass "scenario_concurrent_installs_serialized: output reports timeout" ;;
+        *)              fail "scenario_concurrent_installs_serialized: output missing contention msg -- got: $(cat "$tmp/contend.out")" ;;
+    esac
+}
+
+# Scenario 9 (gastown-cet.12.9): one-command rollback. After a wrapper-preserving
+# install that snapshots the previous ELF, gt_install_rollback restores the
+# previous ELF from the newest .bak.<ts> snapshot.
+scenario_rollback_restores_previous_binary() {
+    local tmp
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    local install_dir="$tmp/home/.local/bin"
+    mkdir -p "$install_dir"
+
+    # Incumbent: a distinct real ELF (echo, exits 0 → canary passes) behind a
+    # wrapper. New build: true (also exits 0). Distinct content proves rotation.
+    [ -n "$ECHO_ELF" ] || { echo "SKIP scenario_rollback: no 'echo' ELF" >&2; return 0; }
+    cp "$ECHO_ELF" "$install_dir/gt-real-bin"
+    chmod 0755 "$install_dir/gt-real-bin"
+    local incumbent_ino
+    incumbent_ino="$(stat -c '%i' "$install_dir/gt-real-bin" 2>/dev/null || stat -f '%i' "$install_dir/gt-real-bin")"
+
+    cat > "$install_dir/gt" <<'WRAPPER'
+#!/usr/bin/env bash
+# gt wrapper — guarantees the current validation model-mix on `gt sling`.
+WRAPPER
+    chmod 0755 "$install_dir/gt"
+
+    # New build: a DIFFERENT real ELF (true). Install it behind the wrapper.
+    local new_elf="$tmp/new-gt"
+    make_elf_fixture "$new_elf" || return 0
+    INSTALL_DIR="$install_dir" BINARY="gt" HOME="$tmp/home" \
+        bash -c "source '$LIB'; gt_install_preserve_wrapper '$new_elf'" >"$tmp/install.out" 2>&1
+    local installed_ino
+    installed_ino="$(stat -c '%i' "$install_dir/gt-real-bin" 2>/dev/null || stat -f '%i' "$install_dir/gt-real-bin")"
+    if [ "$installed_ino" = "$incumbent_ino" ]; then
+        fail "scenario_rollback: new install did not replace incumbent (precondition)"
+        return
+    fi
+    pass "scenario_rollback: new ELF installed (snapshot of incumbent taken)"
+
+    # Roll back to the previous snapshot.
+    local rc
+    set +e
+    INSTALL_DIR="$install_dir" BINARY="gt" HOME="$tmp/home" \
+        bash -c "source '$LIB'; gt_install_rollback" >"$tmp/rollback.out" 2>&1
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+        fail "scenario_rollback: gt_install_rollback failed (rc=$rc)"
+        cat "$tmp/rollback.out" >&2
+        return
+    fi
+    pass "scenario_rollback: gt_install_rollback exited 0"
+
+    # The live slot must now hold the incumbent ELF again (the rollback
+    # restored from a .bak that was a copy of the incumbent). Compare bytes
+    # because the restore is cp+mv (fresh inode).
+    if cmp -s "$install_dir/gt-real-bin" "$ECHO_ELF"; then
+        pass "scenario_rollback: live binary matches the incumbent ELF"
+    else
+        fail "scenario_rollback: live binary does not match incumbent"
+    fi
+
+    # The rollback itself snapshotted the (new) binary first, so it is reversible.
+    if ls "$install_dir"/gt-real-bin.bak.pre-rollback.* >/dev/null 2>&1; then
+        pass "scenario_rollback: rollback was reversible (pre-rollback snapshot exists)"
+    else
+        fail "scenario_rollback: no pre-rollback snapshot found"
+    fi
+}
+
+# Scenario 10 (gastown-cet.12.9): rollback with no snapshot available must
+# fail cleanly rather than clobbering the live binary.
+scenario_rollback_no_snapshot_fails() {
+    local tmp
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    local install_dir="$tmp/home/.local/bin"
+    mkdir -p "$install_dir"
+    # A healthy incumbent ELF (true) behind a wrapper, but NO .bak snapshots.
+    make_elf_fixture "$install_dir/gt-real-bin" 2>/dev/null || cp "$TRUE_ELF" "$install_dir/gt-real-bin"
+    chmod 0755 "$install_dir/gt-real-bin"
+    local live_ino
+    live_ino="$(stat -c '%i' "$install_dir/gt-real-bin" 2>/dev/null || stat -f '%i' "$install_dir/gt-real-bin")"
+
+    cat > "$install_dir/gt" <<'WRAPPER'
+#!/usr/bin/env bash
+# gt wrapper — guarantees the current validation model-mix on `gt sling`.
+WRAPPER
+    chmod 0755 "$install_dir/gt"
+
+    # No .bak snapshots exist.
+    local rc
+    set +e
+    INSTALL_DIR="$install_dir" BINARY="gt" HOME="$tmp/home" \
+        bash -c "source '$LIB'; gt_install_rollback" >"$tmp/norb.out" 2>&1
+    rc=$?
+    set -e
+
+    if [ "$rc" -eq 0 ]; then
+        fail "scenario_rollback_no_snapshot_fails: rollback succeeded with no snapshot"
+    else
+        pass "scenario_rollback_no_snapshot_fails: rollback failed cleanly (rc=$rc)"
+    fi
+    case "$(cat "$tmp/norb.out")" in
+        *"no rollback snapshot"*) pass "scenario_rollback_no_snapshot_fails: output explains missing snapshot" ;;
+        *)                        fail "scenario_rollback_no_snapshot_fails: output missing explanation -- got: $(cat "$tmp/norb.out")" ;;
+    esac
+    # Live binary untouched.
+    local now_ino
+    now_ino="$(stat -c '%i' "$install_dir/gt-real-bin" 2>/dev/null || stat -f '%i' "$install_dir/gt-real-bin")"
+    if [ "$now_ino" = "$live_ino" ]; then
+        pass "scenario_rollback_no_snapshot_fails: live binary left untouched"
+    else
+        fail "scenario_rollback_no_snapshot_fails: live binary was modified"
+    fi
+}
+
+# Scenario 11 (gastown-cet.12.9 rework, codex finding #2): a no-argument
+# rollback must select the newest NORMAL install backup, NOT a pre-rollback
+# snapshot. The pre-rollback snapshot captures whatever binary was live just
+# before a rollback — i.e. the bad build being recovered from. Under the old
+# glob `bak.*` + `sort -r`, "pre-rollback" sorted after digit timestamps
+# ('p' > '2'), so a second rollback would restore the bad-current binary.
+# This test forces that ordering (newer timestamped install backup AND a
+# pre-rollback snapshot both present) and asserts the install backup wins.
+scenario_rollback_skips_pre_rollback_snapshots() {
+    local tmp
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    local install_dir="$tmp/home/.local/bin"
+    mkdir -p "$install_dir"
+
+    # Known-good incumbent: echo (exits 0 → canary passes). This is the binary
+    # we want rollback to restore.
+    [ -n "$ECHO_ELF" ] || { echo "SKIP scenario_rollback_pre_rollback: no 'echo' ELF" >&2; return 0; }
+    cp "$ECHO_ELF" "$install_dir/gt-real-bin"
+    chmod 0755 "$install_dir/gt-real-bin"
+
+    # A known-bad ELF: false (exits 1 → canary rejects). This is the bad build
+    # that was live before the (simulated) first rollback and got snapshotted
+    # as a pre-rollback artifact. Rollback must NEVER select it.
+    [ -n "$FALSE_ELF" ] || { echo "SKIP scenario_rollback_pre_rollback: no 'false' ELF" >&2; return 0; }
+
+    cat > "$install_dir/gt" <<'WRAPPER'
+#!/usr/bin/env bash
+# gt wrapper — guarantees the current validation model-mix on `gt sling`.
+WRAPPER
+    chmod 0755 "$install_dir/gt"
+
+    # Plant a NORMAL install backup of the known-good incumbent. Use a
+    # deliberately LATER timestamp than the pre-rollback snapshot below so the
+    # two are clearly ordered — the bug was that pre-rollback won regardless of
+    # timestamp because of the lexical 'p' > digit sort.
+    local good_bak="$install_dir/gt-real-bin.bak.20260627T235959Z"
+    cp "$ECHO_ELF" "$good_bak"; chmod 0644 "$good_bak"
+
+    # Plant a pre-rollback snapshot of the BAD build, with an EARLIER timestamp
+    # than the install backup. The old glob (bak.*) + sort -r would still pick
+    # THIS one first because "pre-rollback" > "20260627..." lexically.
+    local bad_pre="$install_dir/gt-real-bin.bak.pre-rollback.20260627T000000Z"
+    cp "$FALSE_ELF" "$bad_pre"; chmod 0644 "$bad_pre"
+
+    # Make the LIVE binary the bad one too, so a naive rollback that picks the
+    # pre-rollback snapshot would (after its own canary rejects the bad
+    # candidate) fail — but more importantly, we assert WHICH snapshot was
+    # selected by checking the restore source reported in the output.
+    cp "$FALSE_ELF" "$install_dir/gt-real-bin"
+    chmod 0755 "$install_dir/gt-real-bin"
+
+    local rc out
+    set +e
+    INSTALL_DIR="$install_dir" BINARY="gt" HOME="$tmp/home" \
+        bash -c "source '$LIB'; gt_install_rollback" >"$tmp/rb.out" 2>&1
+    rc=$?
+    set -e
+    out="$(cat "$tmp/rb.out")"
+
+    if [ "$rc" -ne 0 ]; then
+        fail "scenario_rollback_skips_pre_rollback: rollback failed (rc=$rc)"
+        echo "$out" >&2
+        return
+    fi
+
+    # The rollback MUST have restored from the known-good install backup, not
+    # the pre-rollback bad-build snapshot. Assert by the reported source path.
+    case "$out" in
+        *"restored $good_bak"*)
+            pass "scenario_rollback_skips_pre_rollback: selected normal install backup, not pre-rollback snapshot"
+            ;;
+        *"restored $bad_pre"*)
+            fail "scenario_rollback_skips_pre_rollback: selected the pre-rollback (bad-build) snapshot"
+            ;;
+        *)
+            fail "scenario_rollback_skips_pre_rollback: unexpected restore source -- got: $out"
+            ;;
+    esac
+
+    # And the live binary must now be the known-good incumbent.
+    if cmp -s "$install_dir/gt-real-bin" "$ECHO_ELF"; then
+        pass "scenario_rollback_skips_pre_rollback: live binary is the known-good install backup"
+    else
+        fail "scenario_rollback_skips_pre_rollback: live binary is not the known-good backup (bad build left live?)"
+    fi
+}
+
+# Scenario 12 (gastown-cet.12.9 rework, codex finding #3): the pre-install
+# canary must run on the EXACT staged bytes that will be installed, inside the
+# lock — not on the source before the lock with a later copy of the source.
+# Deterministic proof of the TOCTOU the old code had: the old implementation
+# canaried $src BEFORE acquiring the lock, then copied $src again inside the
+# lock. We make the installer canary a GOOD symlinked source, then flip the
+# symlink to BAD while a blocker holds the lock — so by the time the installer
+# acquires the lock and copies, $src points at the bad binary.
+#   - OLD code: canary (pre-lock) blessed the good bytes; the locked copy then
+#     reads the now-bad symlink → BAD ELF installed, live binary changed.
+#   - FIXED code: the freeze (cp $src→staged) + canary both run AFTER acquiring
+#     the lock, so they see the already-flipped BAD source and REJECT before the
+#     live slot is touched.
+# The blocker acquires the lock first and flips AFTER a short delay (so the
+# installer's canary has run on the good source and is blocked waiting for the
+# lock), matching the suite's existing sleep-based coordination.
+scenario_canary_freezes_staged_bytes_under_lock() {
+    local tmp
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    local install_dir="$tmp/home/.local/bin"
+    mkdir -p "$install_dir"
+
+    [ -n "$TRUE_ELF" ] || { echo "SKIP scenario_canary_freeze: no 'true' ELF" >&2; return 0; }
+    [ -n "$FALSE_ELF" ] || { echo "SKIP scenario_canary_freeze: no 'false' ELF" >&2; return 0; }
+
+    # The wrapper so the install takes the Case-B real-bin path.
+    cat > "$install_dir/gt" <<'WRAPPER'
+#!/usr/bin/env bash
+# gt wrapper — guarantees the current validation model-mix on `gt sling`.
+WRAPPER
+    chmod 0755 "$install_dir/gt"
+
+    # Plant a healthy incumbent so we can prove a rejected install left it alone.
+    cp "$TRUE_ELF" "$install_dir/gt-real-bin"
+    chmod 0755 "$install_dir/gt-real-bin"
+    local live_ino
+    live_ino="$(stat -c '%i' "$install_dir/gt-real-bin" 2>/dev/null || stat -f '%i' "$install_dir/gt-real-bin")"
+
+    # Symlinked source that starts GOOD. The blocker will flip it to BAD while
+    # holding the install lock, after the installer has already canaried it.
+    local good_target="$tmp/good-gt"; cp "$TRUE_ELF"  "$good_target"; chmod 0755 "$good_target"
+    local bad_target="$tmp/bad-gt";  cp "$FALSE_ELF" "$bad_target";  chmod 0755 "$bad_target"
+    local symlinked_src="$tmp/src-gt"
+    ln -s "$good_target" "$symlinked_src"
+
+    # Blocker: acquire the install lock immediately, hold it, flip the symlink
+    # good→bad after a short delay (so the installer's pre-lock canary runs on
+    # the good source first and then blocks on the lock), hold briefly, release.
+    INSTALL_DIR="$install_dir" BINARY="gt" HOME="$tmp/home" bash -c '
+        source "$0"
+        exec 9>"$(gt_install_lock_path)"
+        flock -n 9 || exit 0
+        sleep 0.6
+        ln -sfn "$1" "$2"
+        sleep 0.5
+    ' "$LIB" "$bad_target" "$symlinked_src" &
+    local blocker=$!
+    # Let the blocker acquire the lock first.
+    sleep 0.2
+
+    local rc out
+    set +e
+    INSTALL_DIR="$install_dir" BINARY="gt" HOME="$tmp/home" GT_INSTALL_LOCK_TIMEOUT=10 \
+        bash -c "source '$LIB'; gt_install_preserve_wrapper '$symlinked_src'" \
+        >"$tmp/freeze.out" 2>&1
+    rc=$?
+    set -e
+    wait "$blocker" 2>/dev/null || true
+    out="$(cat "$tmp/freeze.out")"
+
+    # The install MUST have been rejected (canary saw the bad staged bytes).
+    if [ "$rc" -eq 0 ]; then
+        fail "scenario_canary_freezes_staged_bytes: install accepted a symlinked source flipped to bad under the lock (rc=$rc)"
+    else
+        pass "scenario_canary_freezes_staged_bytes: install rejected staged bad bytes under lock (rc=$rc)"
+    fi
+    case "$out" in
+        *"canary"*) pass "scenario_canary_freezes_staged_bytes: output mentions canary gate" ;;
+        *)          fail "scenario_canary_freezes_staged_bytes: output missing canary mention -- got: $out" ;;
+    esac
+
+    # The live binary must be untouched (the bad candidate never reached it).
+    local now_ino
+    now_ino="$(stat -c '%i' "$install_dir/gt-real-bin" 2>/dev/null || stat -f '%i' "$install_dir/gt-real-bin")"
+    if [ "$now_ino" = "$live_ino" ]; then
+        pass "scenario_canary_freezes_staged_bytes: live binary left untouched"
+    else
+        fail "scenario_canary_freezes_staged_bytes: live binary was modified despite canary"
+    fi
+
+    # No stale staging file left behind.
+    if ls "$install_dir"/.gt-install.stage.* >/dev/null 2>&1; then
+        fail "scenario_canary_freezes_staged_bytes: staging file leaked"
+    else
+        pass "scenario_canary_freezes_staged_bytes: staging file cleaned up"
+    fi
+}
+
+# Scenario 13 (gastown-cet.12.9 rework, codex finding #2): the pre-install
+# canary must FAIL CLOSED when GNU `timeout` is unavailable. The prior code
+# fell back to running the candidate unbounded while the install/rollback
+# flock was held — a hung binary would hold the lock forever and a bad/hung
+# candidate would never be detected. The fix refuses to probe at all when
+# the bound cannot be enforced. We prove this deterministically by invoking
+# gt_install_canary with a PATH that contains NO `timeout`, against a GOOD
+# ELF (true) that would otherwise pass the unbounded probe. The canary must
+# refuse it — proving fail-closed, not fail-open-on-the-timer.
+scenario_canary_fail_closed_when_timeout_missing() {
+    local tmp
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    [ -n "$TRUE_ELF" ] || { echo "SKIP scenario_canary_fail_closed: no 'true' ELF" >&2; return 0; }
+
+    # A GOOD ELF: `true` exits 0. Under the old fail-open code path (run
+    # unbounded when timeout missing), this candidate would be ACCEPTED.
+    # Under the fail-closed fix, it must be REJECTED because the bound cannot
+    # be enforced.
+    local good_elf="$tmp/good-gt"
+    cp "$TRUE_ELF" "$good_elf"; chmod 0755 "$good_elf"
+
+    # Build a PATH that contains every binary the canary's own machinery needs
+    # (bash, dd, od, tr, head, grep, command, stat, etc.) but NOT `timeout`.
+    # The canary probes `command -v timeout`, so removing it forces the
+    # fail-closed path. We copy/symlink the needed utilities from the real PATH.
+    local stripped_path
+    stripped_path="$(mktemp -d)"
+    local needed="bash dd od tr head grep date command ls stat cmp cat cp mv chmod mkdir flock"
+    local p dir
+    for p in $needed; do
+        for dir in /bin /usr/bin /usr/local/bin; do
+            if [ -e "$dir/$p" ]; then
+                ln -sf "$dir/$p" "$stripped_path/$p" 2>/dev/null
+                break
+            fi
+        done
+    done
+    # Sanity: confirm `timeout` is genuinely hidden from this PATH, and bash
+    # (needed to launch the subshell) is present.
+    if PATH="$stripped_path" command -v timeout >/dev/null 2>&1; then
+        fail "scenario_canary_fail_closed: test harness could not hide timeout (precondition)"
+        return
+    fi
+    if ! PATH="$stripped_path" command -v bash >/dev/null 2>&1; then
+        fail "scenario_canary_fail_closed: test harness lost bash (precondition)"
+        return
+    fi
+
+    local rc out
+    set +e
+    # GT_INSTALL_CANARY_TIMEOUT is the default (>0), so the probe path is taken
+    # and must hit the missing-timeout fail-closed branch. Run the canary in a
+    # subshell with the stripped PATH so `command -v timeout` returns false.
+    PATH="$stripped_path" \
+        bash -c 'source "$1"; gt_install_canary "$2"' _ "$LIB" "$good_elf" \
+        >"$tmp/canary-mt.out" 2>&1
+    rc=$?
+    set -e
+    out="$(cat "$tmp/canary-mt.out")"
+
+    if [ "$rc" -eq 0 ]; then
+        fail "scenario_canary_fail_closed: canary accepted a candidate with timeout unavailable (fail-open bug)"
+    else
+        pass "scenario_canary_fail_closed: canary refused candidate with timeout unavailable (rc=$rc)"
+    fi
+    case "$out" in
+        *"GNU timeout unavailable"*|*"cannot bound"*)
+            pass "scenario_canary_fail_closed: output explains the missing-bound refusal"
+            ;;
+        *)
+            fail "scenario_canary_fail_closed: output missing fail-closed explanation -- got: $out"
+            ;;
+    esac
+
+    # Counter-proof: with timeout RESTORED, the same good ELF must be ACCEPTED.
+    # This rules out a false pass caused by the candidate itself being bad.
+    local rc2
+    set +e
+    bash -c 'source "$1"; gt_install_canary "$2"' _ "$LIB" "$good_elf" \
+        >"$tmp/canary-ok.out" 2>&1
+    rc2=$?
+    set -e
+    if [ "$rc2" -eq 0 ]; then
+        pass "scenario_canary_fail_closed: same candidate accepted once timeout is available (refusal was bound-driven)"
+    else
+        fail "scenario_canary_fail_closed: candidate rejected even with timeout available -- got: $(cat "$tmp/canary-ok.out")"
+    fi
+}
+
+# Scenario 14 (gastown-cet.12.9 rework, codex finding #2): the canary's
+# version probe must actually be BOUNDED — a candidate that HANGS (never
+# returns) must be killed at the timeout and rejected, not run unbounded.
+# This proves the bound is real (not just present in code) and that a hung
+# build cannot hold the install flock forever.
+#
+# Hung-ELF construction: copy the system `cat` ELF to a temp dir whose CWD
+# also contains a fifo NAMED `version`. The canary runs
+# `<elf> version` → `cat version` → cat opens the fifo for reading and
+# BLOCKS forever (no writer). `timeout` kills it at the budget. We run the
+# canary in the background and assert it returns within a small wall-clock
+# budget with a timeout report, never hanging.
+scenario_canary_bounds_hung_candidate() {
+    local tmp
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    local cat_elf
+    cat_elf="$(real_elf cat)"
+    [ -n "$cat_elf" ] || { echo "SKIP scenario_canary_bounds_hung: no 'cat' ELF" >&2; return 0; }
+
+    local hung_elf="$tmp/hung-gt"
+    cp "$cat_elf" "$hung_elf"; chmod 0755 "$hung_elf"
+
+    # A fifo NAMED "version" in the work dir: `cat version` opens it for
+    # reading and blocks until a writer appears (one never does).
+    mkfifo "$tmp/version"
+
+    local start elapsed rc out
+    start="$(date +%s)"
+    # Run the canary in the background so the test is not itself hung if the
+    # bound is broken. Short budget (2s) keeps the scenario fast.
+    set +e
+    (
+        cd "$tmp"
+        GT_INSTALL_CANARY_TIMEOUT=2 \
+            bash -c 'source "$1"; gt_install_canary "$2"' _ "$LIB" "$hung_elf"
+    ) >"$tmp/canary-hang.out" 2>&1 &
+    local probe_pid=$!
+
+    # Wait up to 12s for the canary to return on its own. If it does not, the
+    # bound is broken and we must kill it to avoid hanging the suite.
+    local waited=0
+    while kill -0 "$probe_pid" 2>/dev/null; do
+        waited=$((waited + 1))
+        if [ "$waited" -ge 12 ]; then break; fi
+        sleep 1
+    done
+    if kill -0 "$probe_pid" 2>/dev/null; then
+        kill -TERM "$probe_pid" 2>/dev/null || true
+        wait "$probe_pid" 2>/dev/null
+        rc=999  # sentinel: the probe outlived the budget (bound broken)
+    else
+        wait "$probe_pid" 2>/dev/null
+        rc=$?
+    fi
+    set -e
+    elapsed=$(( $(date +%s) - start ))
+    out="$(cat "$tmp/canary-hang.out" 2>/dev/null || true)"
+
+    # The canary must have REJECTED the hung candidate (non-zero), and it must
+    # have done so within roughly the 2s budget (not run unbounded).
+    if [ "$rc" -eq 0 ]; then
+        fail "scenario_canary_bounds_hung: canary accepted a hung candidate (rc=$rc)"
+    else
+        pass "scenario_canary_bounds_hung: canary rejected the hung candidate (rc=$rc)"
+    fi
+    case "$out" in
+        *"timed out"*|*"failed or timed out"*)
+            pass "scenario_canary_bounds_hung: output reports the timeout"
+            ;;
+        *)
+            fail "scenario_canary_bounds_hung: output missing timeout report -- got: $out"
+            ;;
+    esac
+    if [ "$elapsed" -lt 10 ]; then
+        pass "scenario_canary_bounds_hung: probe was bounded (${elapsed}s < 10s)"
+    else
+        fail "scenario_canary_bounds_hung: probe ran unbounded (${elapsed}s); bound not enforced"
+    fi
 }
 
 echo "Running wrapper-topology smoke tests..."
@@ -274,6 +931,15 @@ scenario_wrapper_preserved
 scenario_realbin_rotated
 scenario_topology_assertion_fails
 scenario_non_wrapper_script_treated_as_plain
+scenario_canary_rejects_bad_elf
+scenario_canary_skip_installs_synthetic_elf
+scenario_concurrent_installs_serialized
+scenario_rollback_restores_previous_binary
+scenario_rollback_no_snapshot_fails
+scenario_rollback_skips_pre_rollback_snapshots
+scenario_canary_freezes_staged_bytes_under_lock
+scenario_canary_fail_closed_when_timeout_missing
+scenario_canary_bounds_hung_candidate
 
 echo ""
 echo "Result: $PASS passed, $FAIL failed"

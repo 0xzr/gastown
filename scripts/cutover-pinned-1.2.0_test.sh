@@ -125,6 +125,121 @@ else
   cat "${EXPECTED_RECORD}" || true
 fi
 
+# --- Regression (gastown-cet.12.9 rework, codex finding #1) ---------------
+# The final post-cutover verification — `gt witness rework-deferred dry-run`
+# via the wrapper — runs AFTER `make safe-install` has already installed the
+# new binary. If it fails, the script MUST invoke cutover_rollback (which
+# restores the pre-cutover binary) rather than a bare `exit 1`, otherwise a
+# bad pinned build is left live — the exact failure mode this cutover guards.
+# The prior MR exited 1 directly here. Assert every verification failure
+# path in the non-dry-run block routes through cutover_rollback instead.
+
+# Extract the non-dry-run verify region: from the cutover_rollback() definition
+# through the end of the throttle dry-run block (the "# Record durable cutover
+# evidence" comment marks where verification ends and evidence recording begins).
+# This is the region where a failed verify must not strand a bad binary.
+VERIFY_BLOCK="$(sed -n '/^  cutover_rollback() {$/,/^# Record durable cutover evidence/p' "${CUTOVER_SCRIPT}" | sed '${/^# Record durable cutover evidence/d;}')"
+
+# The whole non-dry-run cutover body (everything inside `else ... fi` after
+# the dry-run branch) is used by the Finding #3 static assertion to scan for
+# any direct `cp` over the live real-bin path outside the library restore.
+CUTOVER_BODY="$(sed -n '/^  # Build the pinned 1.2.0 runtime binary/,/^# Record durable cutover evidence/p' "${CUTOVER_SCRIPT}")"
+
+# Split the verify region into cutover_rollback's OWN body (everything from the
+# `cutover_rollback() {` definition through its closing `}`) and the POST-
+# rollback verify region (the `if ! ... ` checks that must call cutover_rollback
+# on failure). A bare `exit 1` is legitimate ONLY inside cutover_rollback's body
+# (the function's terminal exits — the success-path return, the missing-backup
+# fail-closed, and the locked-rollback-failed fail-closed). Any `exit 1` in the
+# POST-rollback verify region strands a bad binary: it skips the restore.
+ROLLBACK_BODY="$(printf '%s\n' "${VERIFY_BLOCK}" | awk '/^  cutover_rollback\(\) \{/,/^  \}$/')"
+POST_ROLLBACK_VERIFY="$(printf '%s\n' "${VERIFY_BLOCK}" | sed '1,/^  \}$/d')"
+# Exclude comment lines (which may mention "exit 1" in prose) from the count.
+POST_EXITS="$(printf '%s\n' "${POST_ROLLBACK_VERIFY}" | grep -v '^[[:space:]]*#' | grep -c 'exit 1' || true)"
+if [ "${POST_EXITS}" -eq 0 ]; then
+  pass "no bare exit 1 outside cutover_rollback in the verify region"
+else
+  fail "verify region has ${POST_EXITS} 'exit 1' outside cutover_rollback; a verify path strands a bad binary"
+  printf '%s\n' "${POST_ROLLBACK_VERIFY}" | grep -v '^[[:space:]]*#' | grep 'exit 1' >&2
+fi
+
+# The throttle dry-run is the FINAL post-install verify, the one codex flagged:
+# it runs after safe-install installed the new binary, so its failure MUST roll
+# back rather than exit. Assert it routes failures to cutover_rollback.
+THROTTLE_BLOCK="$(sed -n '/Running REWORK_DEFERRED throttle dry-run/,/^  echo ""$/p' "${CUTOVER_SCRIPT}" | head -25)"
+if printf '%s\n' "${THROTTLE_BLOCK}" | grep -q 'cutover_rollback'; then
+  pass "final throttle dry-run failure invokes cutover_rollback"
+else
+  fail "final throttle dry-run failure does NOT invoke cutover_rollback (bad build left live)"
+  printf '%s\n' "${THROTTLE_BLOCK}" >&2
+fi
+
+# Every post-install verify step must route through cutover_rollback. Count the
+# cutover_rollback invocations in the verify region (excluding the function
+# definition line itself): topology, real-bin executable, version, pinned-line,
+# hardening-fixes, and the throttle dry-run (missing-timeout fail-closed) = >=6.
+ROLLBACK_CALLS="$(printf '%s\n' "${VERIFY_BLOCK}" | grep -c 'cutover_rollback "' || true)"
+if [ "${ROLLBACK_CALLS}" -ge 6 ]; then
+  pass "all post-cutover verify failures route through cutover_rollback (${ROLLBACK_CALLS} sites)"
+else
+  fail "only ${ROLLBACK_CALLS} cutover_rollback verify sites (expected >=6); a verify path strands a bad binary"
+fi
+
+# --- Regression (gastown-cet.12.9 rework, codex finding #1): bounded verify ---
+# The final post-install verification (the throttle dry-run via the wrapper)
+# MUST be bounded by a timeout, and the inability to enforce one (GNU timeout
+# missing) must route to cutover_rollback rather than run unbounded. The prior
+# code ran the wrapper dry-run with no bound: a candidate that hung there would
+# never reach cutover_rollback and would leave the bad binary live. Assert the
+# verify region wraps the wrapper probe in `timeout` and fail-closes on a
+# missing timeout into rollback.
+THROTTLE_VERIFY="$(printf '%s\n' "${THROTTLE_BLOCK}")"
+if printf '%s\n' "${THROTTLE_VERIFY}" | grep -qE 'timeout "\$\{?CUTOVER_VERIFY_TIMEOUT\}?".*\$\{?WRAPPER_PATH\}?'; then
+  pass "final throttle dry-run is wrapped in a bounded timeout"
+else
+  fail "final throttle dry-run is NOT bounded by a timeout (could hang and strand a bad binary)"
+  printf '%s\n' "${THROTTLE_VERIFY}" >&2
+fi
+# A missing GNU timeout must route to cutover_rollback, not run unbounded. The
+# guard is `if ! command -v timeout ...; then <echo lines>; cutover_rollback`.
+# Look for cutover_rollback within the few lines following the timeout check.
+if printf '%s\n' "${VERIFY_BLOCK}" | grep -q 'command -v timeout'; then
+  if printf '%s\n' "${VERIFY_BLOCK}" | grep -A5 'command -v timeout' | grep -q 'cutover_rollback'; then
+    pass "missing-timeout in verify routes to cutover_rollback (fail-closed)"
+  else
+    fail "missing-timeout in verify does NOT route to cutover_rollback (could run unbounded)"
+  fi
+else
+  fail "verify region has no missing-timeout fail-closed guard"
+fi
+
+# --- Regression (gastown-cet.12.9 rework, codex finding #3): no direct cp ---
+# cutover_rollback must funnel the restore EXCLUSIVELY through the library's
+# gt_install_rollback (flock-serialized, canary-checked, atomic). The prior
+# version fell back to a bare `cp <backup> <real-bin>` over the live slot when
+# the library rollback failed — bypassing the lock, the rollback canary, and
+# the atomic rename, racing an installer or restoring bytes the health gate
+# had rejected. Assert the cutover script contains NO direct cp of the backup
+# over REAL_BIN_PATH anywhere (the only restore path is gt_install_rollback).
+#
+# Pattern to forbid: a `cp` whose target is the live real-bin path. The
+# legitimate `cp` calls in the script copy TO the backup or stage files, never
+# cp-back-over-live. We scan the whole script (excluding comments) for any
+# `cp ... <REAL_BIN_PATH>` or `cp ... "${REAL_BIN_PATH}"`.
+DIRECT_CP="$(printf '%s\n' "${CUTOVER_BODY}" | grep -v '^[[:space:]]*#' | grep -E 'cp[[:space:]].*(\$\{?REAL_BIN_PATH\}?|gt-real-bin)' || true)"
+if [ -z "${DIRECT_CP}" ]; then
+  pass "cutover script performs no direct cp over the live real-bin"
+else
+  fail "cutover script still direct-copies over the live real-bin (codex finding #3 not fixed)"
+  printf '%s\n' "${DIRECT_CP}" >&2
+fi
+# And assert the only restore path IS the library gt_install_rollback.
+if printf '%s\n' "${CUTOVER_BODY}" | grep -q 'gt_install_rollback'; then
+  pass "cutover rollback restores via the library gt_install_rollback"
+else
+  fail "cutover rollback does not use gt_install_rollback (no locked/canaried restore)"
+fi
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 [ "${FAIL}" -eq 0 ]
