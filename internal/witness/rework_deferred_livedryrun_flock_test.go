@@ -255,6 +255,106 @@ func TestRemoveLiveDryRunRecords_RemovesOnlyPrefixedRecordsUnderNoContention(t *
 	}
 }
 
+// TestRemoveLiveDryRunRecords_FailsClosedWhenFlockAcquireErrors is the
+// gastown-9rc rework regression. The prior fix added the cross-process flock
+// but treated an FlockAcquire error as best-effort, silently continuing the
+// read-modify-write WITHOUT the lock — preserving the exact lost-update path
+// the bead exists to kill whenever the lock file cannot be opened/acquired.
+//
+// This forces an acquisition failure through the package-level
+// reworkDeferredFlockAcquire seam and asserts the fail-closed contract:
+//   - removeLiveDryRunRecords returns an error (not nil),
+//   - it does NOT load, modify, or save throttle state through the unlocked
+//     path — the pre-existing production record is byte-for-byte intact on
+//     disk (no save at all), and no live-dryrun- record is dropped.
+//
+// On the prior best-effort code this FAILS: removeLiveDryRunRecords returns
+// (2, nil) and rewrites the state file, having proceeded without the lock.
+func TestRemoveLiveDryRunRecords_FailsClosedWhenFlockAcquireErrors(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "witness"), 0o755); err != nil {
+		t.Fatalf("mkdir witness dir: %v", err)
+	}
+
+	// Seed one live-dryrun- record that WOULD be removed by an unlocked pass,
+	// plus a production record that must survive untouched. Both go through
+	// the real EvaluateReworkDeferred path (which uses the real flock).
+	start := time.Date(2026, 6, 27, 10, 0, 0, 0, time.UTC)
+	origNow := reworkDeferredNow
+	reworkDeferredNow = func() time.Time { return start }
+	t.Cleanup(func() { reworkDeferredNow = origNow })
+
+	if dec := EvaluateReworkDeferred(townRoot, "real-rig", "real-bead", "real-polecat",
+		"merge_failed", "prod", mayor.DecisionDefer, 1*time.Hour); dec.Action != ActionEmit {
+		t.Fatalf("seed prod: Action = %q, want emit", dec.Action)
+	}
+	if dec := EvaluateReworkDeferred(townRoot, "live-rig", liveDryRunPrefix+"bead-a",
+		liveDryRunPrefix+"alpha", "merge_failed", "dryrun a", mayor.DecisionHold, 1*time.Hour); dec.Action != ActionEmit {
+		t.Fatalf("seed live-dryrun: Action = %q, want emit", dec.Action)
+	}
+
+	// Snapshot the durable state file BEFORE the cleanup attempt. Fail-closed
+	// means no save happens on a flock error, so this exact byte content must
+	// still be on disk afterwards.
+	statePath := ReworkDeferredStateFile(townRoot)
+	beforeBytes, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state before: %v", err)
+	}
+
+	// Inject an FlockAcquire failure for the live-dry-run cleanup path only.
+	origAcquire := reworkDeferredFlockAcquire
+	reworkDeferredFlockAcquire = func(path string) (func(), error) {
+		return nil, fmt.Errorf("injected flock acquire failure (gastown-9rc rework)")
+	}
+	t.Cleanup(func() { reworkDeferredFlockAcquire = origAcquire })
+
+	removed, err := removeLiveDryRunRecords(townRoot)
+
+	// Contract: returns an error, not a silent success.
+	if err == nil {
+		t.Fatalf("removeLiveDryRunRecords returned (removed=%d, nil); want a non-nil error when the cross-process flock cannot be acquired (fail-closed)", removed)
+	}
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0 (must not drop records without the lock)", removed)
+	}
+
+	// Contract: no save through the unlocked path. The state file must be
+	// byte-for-byte identical — fail-closed returned before
+	// loadReworkDeferredState, so the live-dryrun- record was not dropped and
+	// the production record was not rewritten.
+	afterBytes, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state after: %v", err)
+	}
+	if string(beforeBytes) != string(afterBytes) {
+		t.Errorf("durable throttle state was mutated despite flock acquire failure (fail-closed violated)\nbefore:\n%s\nafter:\n%s",
+			beforeBytes, afterBytes)
+	}
+
+	// And the records must all still be present, including the live-dryrun-
+	// one that an unlocked pass would have removed.
+	records := ListReworkDeferredRecords(townRoot)
+	if len(records) != 2 {
+		t.Fatalf("after failed cleanup: %d records, want 2 (prod + live-dryrun both intact)", len(records))
+	}
+	var liveFound, prodFound bool
+	for _, rec := range records {
+		if rec.BeadID == liveDryRunPrefix+"bead-a" {
+			liveFound = true
+		}
+		if rec.BeadID == "real-bead" {
+			prodFound = true
+		}
+	}
+	if !liveFound {
+		t.Error("live-dryrun- record was dropped despite fail-closed; cleanup mutated unlocked state")
+	}
+	if !prodFound {
+		t.Error("production record was lost despite fail-closed; cleanup mutated unlocked state")
+	}
+}
+
 // runFlockHoldingHelper is the helper-process entry point. It simulates an
 // active witness mid read-modify-write on the durable throttle state file:
 // acquires the cross-process flock, loads state, signals the parent, and only

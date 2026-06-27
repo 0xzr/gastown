@@ -429,6 +429,16 @@ func capturedSuppressedCount(router *captureRouter, before int) int {
 	return n
 }
 
+// reworkDeferredFlockAcquire is the cross-process flock acquirer used by
+// removeLiveDryRunRecords. It is a package-level indirection (mirroring
+// reworkDeferredNow and ReworkDeferredStateFile) so the fail-closed regression
+// can inject an acquisition failure deterministically without depending on
+// the OS being unable to open a lock file. It defaults to the real
+// lock.FlockAcquire used everywhere else in this package.
+var reworkDeferredFlockAcquire = func(path string) (func(), error) {
+	return lock.FlockAcquire(path)
+}
+
 // removeLiveDryRunRecords drops every record whose BeadID or PolecatName
 // starts with liveDryRunPrefix, regardless of who created it. The prefix is
 // the contract: production records never use it, so this is safe to call
@@ -443,14 +453,28 @@ func capturedSuppressedCount(router *captureRouter, before int) int {
 // diagnostic into a corruptor of durable throttle state (gastown-9rc). The
 // in-process reworkDeferredMu alone only serializes callers within this
 // process; it cannot stop a separate witness process from racing the save.
+//
+// Unlike the throttle decision functions (EvaluateReworkDeferred et al.), which
+// treat a flock acquisition error as best-effort and proceed without the lock,
+// this cleanup is a DIAGNOSTIC path that mutates durable production state. It
+// must FAIL CLOSED: if the cross-process flock cannot be acquired it returns
+// the error WITHOUT loading or saving throttle state, rather than racing the
+// read-modify-write unlocked and clobbering concurrent witnesses (gastown-9rc
+// rework). This is deliberately stricter than the live emit/suppress paths,
+// whose save errors are documented non-fatal.
 func removeLiveDryRunRecords(townRoot string) (int, error) {
 	reworkDeferredMu.Lock()
 	defer reworkDeferredMu.Unlock()
 
-	unlock, flockErr := lock.FlockAcquire(ReworkDeferredStateFile(townRoot) + ".flock")
-	if flockErr == nil {
-		defer unlock()
+	// Fail closed: do NOT touch durable throttle state without the
+	// cross-process flock. Returning here, before loadReworkDeferredState,
+	// guarantees an acquisition error cannot load, modify, or save records
+	// through the unlocked path.
+	unlock, flockErr := reworkDeferredFlockAcquire(ReworkDeferredStateFile(townRoot) + ".flock")
+	if flockErr != nil {
+		return 0, fmt.Errorf("acquiring cross-process flock for live dry-run cleanup: %w", flockErr)
 	}
+	defer unlock()
 
 	state := loadReworkDeferredState(townRoot)
 	kept := state.Records[:0]
