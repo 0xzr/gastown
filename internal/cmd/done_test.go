@@ -542,12 +542,22 @@ func TestBranchHasPushedWorkEvidenceRejectsBadInputs(t *testing.T) {
 // must return false — that is the case where a polecat touched no work but
 // gt done is invoked anyway. The empty-hook recovery (gastown-age) must NOT
 // fabricate an MR in that scenario.
+//
+// The branch is a real non-default branch (not "master") so the call reaches
+// the actual CommitsAhead/BranchPushedToRemote git-evidence checks rather than
+// short-circuiting on the default-branch guard. A repo with no origin/main
+// tracking ref and no remote has no pushed evidence, so the guard must still
+// fail closed.
 func TestBranchHasPushedWorkEvidenceEmptyGitRepo(t *testing.T) {
 	repo := initTestGitRepo(t)
 	g := gitpkg.NewGit(repo)
 
-	// HEAD is on master with no commits ahead of origin — helper must reject.
-	if got := branchHasPushedWorkEvidence(g, "master", "main"); got {
+	// Create a real polecat branch so the default-branch guard is passed and
+	// the git-evidence path (CommitsAhead over origin/main, then the remote
+	// check) is actually exercised. There is no remote and no commits ahead
+	// of origin/main, so the helper must reject.
+	runGitIn(t, repo, "checkout", "-b", "polecat/quartz/gastown-age@empty")
+	if got := branchHasPushedWorkEvidence(g, "polecat/quartz/gastown-age@empty", "main"); got {
 		t.Errorf("branchHasPushedWorkEvidence on empty repo = true, want false")
 	}
 }
@@ -574,6 +584,151 @@ func initTestGitRepo(t *testing.T) string {
 		}
 	}
 	return repo
+}
+
+// initTestRepoWithLocalRemote mirrors internal/git.initTestRepoWithRemote but
+// is duplicated here in package cmd so branchHasPushedWorkEvidence regression
+// tests can exercise the meaningful recovery path — a real branch, ahead of
+// the default branch, that has been pushed to a real (local bare) remote —
+// without depending on internal/git test helpers.
+//
+// It returns the local repo directory and the default branch name.
+func initTestRepoWithLocalRemote(t *testing.T) (localDir, defaultBranch string) {
+	t.Helper()
+	tmp := t.TempDir()
+
+	remoteDir := filepath.Join(tmp, "remote.git")
+	if err := exec.Command("git", "init", "--bare", remoteDir).Run(); err != nil {
+		t.Fatalf("git init --bare remote: %v", err)
+	}
+
+	localDir = filepath.Join(tmp, "local")
+	if err := os.MkdirAll(localDir, 0755); err != nil {
+		t.Fatalf("mkdir local: %v", err)
+	}
+	for _, args := range [][]string{
+		{"git", "init", "--initial-branch=main"},
+		{"git", "config", "user.email", "test@test.com"},
+		{"git", "config", "user.name", "Test User"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = localDir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("%s: %v", args, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "README.md"), []byte("# Test\n"), 0644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	for _, args := range [][]string{
+		{"git", "add", "."},
+		{"git", "commit", "-m", "initial"},
+		{"git", "remote", "add", "origin", remoteDir},
+		{"git", "push", "-u", "origin", "main"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = localDir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("%s: %v", args, err)
+		}
+	}
+	return localDir, "main"
+}
+
+// runGitIn runs a git command in dir, failing the test on error.
+func runGitIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s in %s: %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+}
+
+// TestBranchHasPushedWorkEvidenceRealPushedBranch exercises the meaningful
+// empty-hook recovery path (gastown-age) that the rejected MR's tests missed:
+// a real branch, ahead of the default branch, that has been pushed to origin.
+// This is the case where gt done must tolerate an auto-closed molecule because
+// git evidence — not hook presence — proves the work is real.
+//
+// It also covers the negative cases the prior bad-input table could not reach
+// with a real git handle: a branch with no commits ahead (unpushed work) and a
+// branch ahead but not yet pushed. Both must return false so a phantom MR is
+// never fabricated.
+func TestBranchHasPushedWorkEvidenceRealPushedBranch(t *testing.T) {
+	localDir, defaultBranch := initTestRepoWithLocalRemote(t)
+	g := gitpkg.NewGit(localDir)
+	branch := "polecat/quartz/gastown-age@abc123"
+
+	// Create the polecat branch and add a commit on top of origin/main.
+	runGitIn(t, localDir, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(localDir, "work.go"), []byte("package work\n"), 0644); err != nil {
+		t.Fatalf("write work.go: %v", err)
+	}
+	runGitIn(t, localDir, "add", "work.go")
+	runGitIn(t, localDir, "commit", "-m", "polecat work (gastown-age)")
+
+	// NOT pushed yet: even though commits are ahead, the branch is not on the
+	// remote, so there is no durable pushed evidence. Must return false.
+	if got := branchHasPushedWorkEvidence(g, branch, defaultBranch); got {
+		t.Errorf("branchHasPushedWorkEvidence before push = true, want false (branch not yet on remote)")
+	}
+
+	// Push it. Now the branch is ahead of origin/main AND fully pushed.
+	runGitIn(t, localDir, "push", "origin", branch)
+	if got := branchHasPushedWorkEvidence(g, branch, defaultBranch); !got {
+		t.Errorf("branchHasPushedWorkEvidence after push = false, want true (branch ahead of default and pushed)")
+	}
+
+	// Add an unpushed commit on top of a pushed branch: the branch is no longer
+	// fully pushed, so evidence must fail closed.
+	if err := os.WriteFile(filepath.Join(localDir, "more.go"), []byte("package more\n"), 0644); err != nil {
+		t.Fatalf("write more.go: %v", err)
+	}
+	runGitIn(t, localDir, "add", "more.go")
+	runGitIn(t, localDir, "commit", "-m", "unpushed follow-up (gastown-age)")
+	if got := branchHasPushedWorkEvidence(g, branch, defaultBranch); got {
+		t.Errorf("branchHasPushedWorkEvidence with unpushed commits = true, want false (not fully pushed)")
+	}
+}
+
+// TestBranchHasPushedWorkEvidenceFailsClosedOnUnreachableRemote verifies the
+// lifecycle guard (gastown-age) fails closed when the remote query errors or
+// times out, instead of hanging gt done indefinitely. The remote ls-remote is
+// bounded by git.remoteQueryTimeout; here the remote points at a path that
+// does not exist, so ls-remote errors fast and the guard returns false rather
+// than blocking. This is the codex-2 fail-closed guarantee on the guard path.
+func TestBranchHasPushedWorkEvidenceFailsClosedOnUnreachableRemote(t *testing.T) {
+	localDir, defaultBranch := initTestRepoWithLocalRemote(t)
+	g := gitpkg.NewGit(localDir)
+	branch := "polecat/quartz/gastown-age@def456"
+
+	// Branch ahead of default (real local work).
+	runGitIn(t, localDir, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(localDir, "work.go"), []byte("package work\n"), 0644); err != nil {
+		t.Fatalf("write work.go: %v", err)
+	}
+	runGitIn(t, localDir, "add", "work.go")
+	runGitIn(t, localDir, "commit", "-m", "polecat work (gastown-age)")
+
+	// Repoint origin at a non-existent remote so the ls-remote query errors.
+	// A real branch with real commits ahead, but no reachable remote: the guard
+	// must fail closed (false) and must not hang waiting for the remote.
+	runGitIn(t, localDir, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "does-not-exist.git"))
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- branchHasPushedWorkEvidence(g, branch, defaultBranch)
+	}()
+
+	select {
+	case got := <-done:
+		if got {
+			t.Errorf("branchHasPushedWorkEvidence on unreachable remote = true, want false (must fail closed)")
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatalf("branchHasPushedWorkEvidence hung on unreachable remote — remote query is not bounded (gastown-age)")
+	}
 }
 
 // TestIsPolecatActor verifies that isPolecatActor correctly identifies

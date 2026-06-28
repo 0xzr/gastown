@@ -2227,9 +2227,11 @@ func lastSourceIssueForAgentBead(cwd, agentBeadID string) string {
 // when the branch is real but the hook is empty, git evidence — not hook
 // presence — is what proves the work is finished.
 //
-// Returns false (conservatively) when any git check fails or cwd is gone,
-// so a missing network or stale remote ref does not let a phantom branch
-// slip through to the merge queue.
+// The remote verification (ls-remote via BranchPushedToRemote) is bounded by
+// git.remoteQueryTimeout: a hung or unreachable remote fails closed instead
+// of blocking the gt done lifecycle guard indefinitely. Every git error —
+// timeout, network failure, or a missing/stale remote ref — returns false so
+// a phantom branch cannot slip through to the merge queue.
 func branchHasPushedWorkEvidence(g *git.Git, branch, defaultBranch string) bool {
 	if g == nil || branch == "" || defaultBranch == "" {
 		return false

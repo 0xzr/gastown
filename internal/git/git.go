@@ -128,6 +128,15 @@ func (g *Git) run(args ...string) (string, error) {
 // (e.g. GitLab) is unreachable or slow.
 const pushTimeout = 60 * time.Second
 
+// remoteQueryTimeout is the maximum time a read-only remote query (ls-remote)
+// is allowed to run before being killed. Read-only remote checks back the
+// gt done lifecycle guard (gastown-age): an unbounded ls-remote on a hung or
+// unreachable remote could block gt done indefinitely instead of failing
+// closed. Callers on the recovery path treat any timeout/error as "no
+// evidence" rather than hanging the submit step. Local queries against a
+// fork or bare remote finish well within this budget.
+const remoteQueryTimeout = 30 * time.Second
+
 // runWithTimeout executes a git command with a deadline. If the command does
 // not finish within the timeout, the process is killed and an error is returned.
 func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _ error) { //nolint:unparam // string return kept for consistency with Run()
@@ -2051,8 +2060,13 @@ func (g *Git) IsEmpty() (bool, error) {
 // RemoteBranchExists checks if a branch exists on the remote.
 // NOTE: For named remotes with a separate pushurl, this checks the fetch URL.
 // Use PushRemoteBranchExists to verify branches that were pushed.
+//
+// The ls-remote query is bounded by remoteQueryTimeout so a hung or
+// unreachable remote cannot block callers (notably the gt done lifecycle
+// guard, gastown-age) indefinitely. Callers on the recovery path treat the
+// resulting timeout/error as "branch not found" rather than hanging.
 func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
-	out, err := g.run("ls-remote", "--heads", remote, branch)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", remote, branch)
 	if err != nil {
 		return false, err
 	}
@@ -2061,8 +2075,10 @@ func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
 
 // RemoteBranchTip returns the SHA at refs/heads/<branch> on the remote.
 // An empty SHA with nil error means the branch is missing.
+//
+// The ls-remote query is bounded by remoteQueryTimeout (see RemoteBranchExists).
 func (g *Git) RemoteBranchTip(remote, branch string) (string, error) {
-	out, err := g.run("ls-remote", "--heads", remote, branch)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", remote, branch)
 	if err != nil {
 		return "", err
 	}
@@ -2074,13 +2090,15 @@ func (g *Git) RemoteBranchTip(remote, branch string) (string, error) {
 // the push URL but ls-remote resolves the fetch URL. This method queries the push
 // URL directly so verification matches where the branch was actually pushed.
 // Falls back to RemoteBranchExists when no custom push URL is configured.
+//
+// The ls-remote query is bounded by remoteQueryTimeout (see RemoteBranchExists).
 func (g *Git) PushRemoteBranchExists(remote, branch string) (bool, error) {
 	fetchURL, fetchErr := g.RemoteURL(remote)
 	pushURL, pushErr := g.GetPushURL(remote)
 	if fetchErr != nil || pushErr != nil || pushURL == fetchURL {
 		return g.RemoteBranchExists(remote, branch)
 	}
-	out, err := g.run("ls-remote", "--heads", pushURL, branch)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", pushURL, branch)
 	if err != nil {
 		return false, err
 	}
