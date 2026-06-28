@@ -1110,6 +1110,50 @@ type GitStatus struct {
 	Unmerged  []string
 }
 
+// CleanExcludingRuntime returns true if the worktree has no uncommitted changes
+// apart from toolchain-managed runtime artifacts covered by the centralized
+// exclusion policy.
+//
+// Unlike UncommittedWorkStatus.CleanExcludingRuntime, this is computed purely
+// from local porcelain state (git status --porcelain) and never reaches a
+// remote. Callers that must avoid network git commands — such as the gt prime
+// post-submit stand-down directive (gastown-t7l) — should use this instead of
+// CheckUncommittedWork, which transitively runs an unbounded `git ls-remote`.
+//
+// Modified, Added, and Deleted entries are all treated as real local changes
+// (mirroring CheckUncommittedWork, which folds Added and Deleted into its
+// ModifiedFiles slice), so a staged new file or deletion is not silently
+// reported as clean.
+func (s *GitStatus) CleanExcludingRuntime() bool {
+	if s == nil {
+		return false
+	}
+	if len(s.Unmerged) > 0 {
+		return false
+	}
+	for _, f := range s.Modified {
+		if !isGasTownRuntimePath(f) {
+			return false
+		}
+	}
+	for _, f := range s.Added {
+		if !isGasTownRuntimePath(f) {
+			return false
+		}
+	}
+	for _, f := range s.Deleted {
+		if !isGasTownRuntimePath(f) {
+			return false
+		}
+	}
+	for _, f := range s.Untracked {
+		if !isGasTownRuntimePath(f) {
+			return false
+		}
+	}
+	return true
+}
+
 type porcelainStatusEntry struct {
 	Code       string
 	Path       string

@@ -24,8 +24,16 @@ type postSubmitEmptyHookState struct {
 }
 
 // gitWorktreeChecker is the subset of git.Git needed for post-submit detection.
+//
+// It deliberately exposes only LOCAL git operations. The stand-down directive
+// is rendered whenever a polecat has an open MR and an empty hook — it must not
+// hang on remote/network git state merely to print corroboration. Reaching
+// CheckUncommittedWork here transitively ran an unbounded `git ls-remote`
+// (UnpushedCommits -> RemoteBranchTip), which could hang gt prime after
+// submit (gastown-t7l). Status() and CurrentBranch() read only the local
+// worktree and fail closed on error.
 type gitWorktreeChecker interface {
-	CheckUncommittedWork() (*git.UncommittedWorkStatus, error)
+	Status() (*git.GitStatus, error)
 	CurrentBranch() (string, error)
 }
 
@@ -111,9 +119,11 @@ func postSubmitGitState(ctx RoleContext) (clean bool, onMain bool) {
 // postSubmitGitStateWithChecker is the testable implementation of
 // postSubmitGitState.
 func postSubmitGitStateWithChecker(ctx RoleContext, g gitWorktreeChecker) (clean bool, onMain bool) {
-	ws, err := g.CheckUncommittedWork()
-	if err == nil {
-		clean = !ws.HasUncommittedChanges || ws.CleanExcludingRuntime()
+	// Local-only: git status --porcelain. Never touches the remote, so a
+	// post-submit gt prime cannot hang on network git state while rendering a
+	// stand-down directive (gastown-t7l). Fail closed (not clean) on error.
+	if status, err := g.Status(); err == nil {
+		clean = status.Clean || status.CleanExcludingRuntime()
 	}
 
 	defaultBranch := postSubmitDefaultBranch(ctx)

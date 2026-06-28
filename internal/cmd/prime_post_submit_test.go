@@ -18,16 +18,20 @@ func (f *fakePostSubmitIssueShower) Show(id string) (*beads.Issue, error) {
 	return f.issue, f.err
 }
 
-// fakePostSubmitGit implements gitWorktreeChecker for tests.
+// fakePostSubmitGit implements gitWorktreeChecker for tests. It exposes only
+// the LOCAL git operations the interface requires: Status() and CurrentBranch().
+// It deliberately has no UnpushedCommits/RemoteBranchTip surface so tests
+// cannot accidentally exercise a remote git path on the stand-down directive
+// (gastown-t7l).
 type fakePostSubmitGit struct {
-	workStatus *git.UncommittedWorkStatus
-	workErr    error
-	branch     string
-	branchErr  error
+	status    *git.GitStatus
+	statusErr error
+	branch    string
+	branchErr error
 }
 
-func (f *fakePostSubmitGit) CheckUncommittedWork() (*git.UncommittedWorkStatus, error) {
-	return f.workStatus, f.workErr
+func (f *fakePostSubmitGit) Status() (*git.GitStatus, error) {
+	return f.status, f.statusErr
 }
 
 func (f *fakePostSubmitGit) CurrentBranch() (string, error) {
@@ -77,8 +81,8 @@ active_mr: null
 	openMR := &beads.Issue{ID: "gt-mr-epj", Status: string(beads.StatusOpen)}
 	closedMR := &beads.Issue{ID: "gt-mr-epj", Status: string(beads.StatusClosed)}
 	cleanGit := &fakePostSubmitGit{
-		workStatus: &git.UncommittedWorkStatus{HasUncommittedChanges: false},
-		branch:     "",
+		status: &git.GitStatus{Clean: true},
+		branch: "",
 	}
 
 	cases := []struct {
@@ -152,9 +156,9 @@ active_mr: null
 			agentBD: &fakePostSubmitIssueShower{issue: agentWithActiveMR},
 			mrBD:    &fakePostSubmitIssueShower{issue: openMR},
 			g: &fakePostSubmitGit{
-				workStatus: &git.UncommittedWorkStatus{
-					HasUncommittedChanges: true,
-					ModifiedFiles:         []string{"file.go"},
+				status: &git.GitStatus{
+					Clean:    false,
+					Modified: []string{"file.go"},
 				},
 				branch: "main",
 			},
@@ -222,3 +226,98 @@ func TestOutputPostSubmitStandDownDirective(t *testing.T) {
 		t.Errorf("output should not instruct running gt done:\n%s", output)
 	}
 }
+
+// recordingPostSubmitGit is a fakePostSubmitGit that records which methods the
+// stand-down path invokes. It is the regression sentinel for gastown-t7l: the
+// prior implementation reached CheckUncommittedWork -> UnpushedCommits ->
+// RemoteBranchTip -> `git ls-remote` (an unbounded network call) merely to
+// render a directive. The narrowed gitWorktreeChecker interface no longer
+// exposes any remote-reaching method, so this recording asserts the directive
+// is computed from local git state alone.
+type recordingPostSubmitGit struct {
+	fakePostSubmitGit
+	calls []string
+}
+
+func (r *recordingPostSubmitGit) Status() (*git.GitStatus, error) {
+	r.calls = append(r.calls, "Status")
+	return r.fakePostSubmitGit.status, r.fakePostSubmitGit.statusErr
+}
+
+func (r *recordingPostSubmitGit) CurrentBranch() (string, error) {
+	r.calls = append(r.calls, "CurrentBranch")
+	return r.fakePostSubmitGit.branch, r.fakePostSubmitGit.branchErr
+}
+
+// TestPostSubmitGitStateAvoidsRemoteGit is the gastown-t7l regression. The
+// stand-down directive path must never contact a remote: a post-submit gt prime
+// runs after the work is already in the merge queue, and an unreachable remote
+// would otherwise hang gt prime indefinitely while rendering corroboration.
+// This would fail against the prior implementation, which routed through
+// CheckUncommittedWork (and onward to an unbounded `git ls-remote`).
+func TestPostSubmitGitStateAvoidsRemoteGit(t *testing.T) {
+	t.Parallel()
+
+	rec := &recordingPostSubmitGit{
+		fakePostSubmitGit: fakePostSubmitGit{
+			status: &git.GitStatus{Clean: true},
+			branch: "main",
+		},
+	}
+
+	clean, onMain := postSubmitGitStateWithChecker(RoleContext{
+		Role:     RolePolecat,
+		Rig:      "gastown",
+		Polecat:  "jasper",
+		TownRoot: "/tmp/town",
+	}, rec)
+
+	if !clean || !onMain {
+		t.Fatalf("expected clean=true onMain=true, got clean=%v onMain=%v", clean, onMain)
+	}
+
+	// Only local-only methods may be invoked. Any remote git path would have to
+	// be reachable through gitWorktreeChecker, which it no longer is — but assert
+	// the call set explicitly so a future regression is caught here, not in prod.
+	for _, c := range rec.calls {
+		if c != "Status" && c != "CurrentBranch" {
+			t.Errorf("post-submit git state invoked %q; only Status/CurrentBranch (local) are permitted", c)
+		}
+	}
+	if len(rec.calls) == 0 {
+		t.Fatal("expected at least one local git call, got none")
+	}
+}
+
+// TestPostSubmitGitStateFailsClosedOnStatusError ensures a local git failure
+// (e.g. a detached-HEAD worktree with no HEAD) does not panic or fabricate a
+// "clean" corroboration. It must fail closed: not clean.
+func TestPostSubmitGitStateFailsClosedOnStatusError(t *testing.T) {
+	t.Parallel()
+
+	rec := &recordingPostSubmitGit{
+		fakePostSubmitGit: fakePostSubmitGit{
+			statusErr: assertErr("local status unavailable"),
+			branch:    "",
+		},
+	}
+
+	clean, onMain := postSubmitGitStateWithChecker(RoleContext{
+		Role:     RolePolecat,
+		Rig:      "gastown",
+		Polecat:  "jasper",
+		TownRoot: "/tmp/town",
+	}, rec)
+
+	if clean {
+		t.Errorf("expected clean=false when local status errors (fail closed), got clean=true")
+	}
+	// A detached HEAD (empty branch) is still the expected post-done state.
+	if !onMain {
+		t.Errorf("expected onMain=true for empty branch (detached HEAD), got onMain=%v", onMain)
+	}
+}
+
+type assertErr string
+
+func (e assertErr) Error() string { return string(e) }

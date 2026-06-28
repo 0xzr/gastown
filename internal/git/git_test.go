@@ -2371,6 +2371,55 @@ func TestCleanExcludingRuntime(t *testing.T) {
 	}
 }
 
+// TestGitStatusCleanExcludingRuntime covers the local-only clean view used by
+// the gt prime post-submit stand-down path (gastown-t7l). It mirrors the
+// UncommittedWorkStatus semantics exactly, but is computed from porcelain
+// state with no remote contact.
+func TestGitStatusCleanExcludingRuntime(t *testing.T) {
+	tests := []struct {
+		name string
+		s    GitStatus
+		want bool
+	}{
+		{name: "clean", s: GitStatus{Clean: true}, want: true},
+		{name: "empty is clean", s: GitStatus{}, want: true},
+		{name: "only runtime artifacts", s: GitStatus{
+			Untracked: []string{".claude/", ".opencode/plugins/gastown.js", ".runtime/state.json"},
+		}, want: true},
+		{name: "real code changes", s: GitStatus{Modified: []string{"src/main.go"}}, want: false},
+		{name: "staged new source file blocks", s: GitStatus{Added: []string{"newfile.go"}}, want: false},
+		{name: "deleted source file blocks", s: GitStatus{Deleted: []string{"src/main.go"}}, want: false},
+		{name: "staged runtime artifact is clean", s: GitStatus{Added: []string{".claude/settings.json"}}, want: true},
+		{name: "unmerged blocks even when runtime", s: GitStatus{
+			Unmerged: []string{".opencode/plugins/gastown.js"},
+		}, want: false},
+		{name: "mix of runtime and real", s: GitStatus{
+			Untracked: []string{".claude/settings.json"}, Modified: []string{"src/main.go"},
+		}, want: false},
+		{name: "pycache untracked", s: GitStatus{
+			Untracked: []string{"__pycache__/foo.pyc", ".beads/db"},
+		}, want: true},
+		{name: "nested dependency and cache artifacts", s: GitStatus{
+			Untracked: []string{
+				"services/cyrus/workflow-cyrus-edge/node_modules/pkg/index.js",
+				"dashboard/public/meridian-dashboard/.vite/vitest/hash/results.json",
+				"api/.pytest_cache/v/cache/nodeids",
+				"src/__pycache__/module.cpython-312.pyc",
+			},
+		}, want: true},
+		{name: "CLAUDE.local.md is runtime artifact", s: GitStatus{
+			Untracked: []string{"CLAUDE.local.md"},
+		}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.s.CleanExcludingRuntime(); got != tt.want {
+				t.Errorf("GitStatus.CleanExcludingRuntime() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRuntimeArtifactPaths(t *testing.T) {
 	status := UncommittedWorkStatus{
 		HasUncommittedChanges: true,
