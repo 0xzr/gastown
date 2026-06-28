@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
@@ -475,6 +476,11 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getting current directory: %w", err)
+	}
+
 	var target string
 	if len(args) > 0 {
 		target = normalizeHookShowTarget(args[0])
@@ -496,6 +502,7 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("not in a beads workspace: %w", err)
 	}
+	townRoot, _ := workspace.FindFromCwd()
 	if len(args) > 0 && !isTownLevelRole(target) {
 		townRoot, townErr := workspace.FindFromCwd()
 		if townErr == nil && townRoot != "" {
@@ -566,15 +573,25 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Recovery fallback (gastown-dg1): if the normal hook lookup found nothing,
+	// try to derive the authoritative source bead from the current branch name.
+	// This prevents the wrapper empty-hook done guard from stranding a polecat when
+	// the hooked molecule/wisp was closed or reaped but the work branch remains.
+	sourceBead := ""
+	if len(hookedBeads) == 0 {
+		sourceBead = resolveSourceBeadFromBranch(cwd, target, townRoot, b)
+	}
+
 	// JSON output
 	if moleculeJSON {
 		type compactInfo struct {
-			Agent  string `json:"agent"`
-			BeadID string `json:"bead_id,omitempty"`
-			Title  string `json:"title,omitempty"`
-			Status string `json:"status"`
+			Agent      string `json:"agent"`
+			BeadID     string `json:"bead_id,omitempty"`
+			Title      string `json:"title,omitempty"`
+			Status     string `json:"status"`
+			SourceBead string `json:"source_bead,omitempty"`
 		}
-		info := compactInfo{Agent: target}
+		info := compactInfo{Agent: target, SourceBead: sourceBead}
 		if len(hookedBeads) > 0 {
 			info.BeadID = hookedBeads[0].ID
 			info.Title = hookedBeads[0].Title
@@ -586,6 +603,12 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 		return enc.Encode(info)
 	}
 
+	// Human-readable output - surface recovered source bead when present.
+	if len(hookedBeads) == 0 && sourceBead != "" {
+		fmt.Printf("%s: (empty) [source: %s]\n", target, sourceBead)
+		return nil
+	}
+
 	// Compact one-line output
 	if len(hookedBeads) == 0 {
 		fmt.Printf("%s: (empty)\n", target)
@@ -595,6 +618,80 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 	bead := hookedBeads[0]
 	fmt.Printf("%s: %s '%s' [%s]\n", target, bead.ID, bead.Title, bead.Status)
 	return nil
+}
+
+// resolveSourceBeadFromBranch attempts to recover the authoritative source bead
+// from the current git branch when the normal hook lookup returns nothing. This
+// handles the case where a hooked molecule/wisp has been closed or reaped but
+// the underlying work branch still exists and is assigned to the agent.
+//
+// It is intentionally conservative: the parsed issue must exist, must be assigned
+// to the expected agent, and must not be in a terminal status. This preserves the
+// fail-closed behavior of the empty-hook done guard while allowing recovery when
+// durable evidence (a real assigned work bead) is present.
+func resolveSourceBeadFromBranch(cwd, target, townRoot string, b *beads.Beads) string {
+	if cwd == "" || b == nil {
+		return ""
+	}
+
+	g := git.NewGit(cwd)
+	if !g.IsRepo() {
+		return ""
+	}
+	branch, err := g.CurrentBranch()
+	if err != nil || branch == "" || branch == "main" || branch == "master" {
+		return ""
+	}
+
+	info := parseBranchName(branch)
+	issueID := info.Issue
+	if issueID == "" {
+		return ""
+	}
+
+	// The wrapper guard sometimes passes a misresolved target (e.g. "rig/rig")
+	// when gt done is invoked from outside the polecat worktree. Prefer the
+	// canonical agent identity from the session environment when available.
+	expectedAgent := target
+	if actual := actualPolecatTargetFromEnv(); actual != "" {
+		expectedAgent = actual
+	}
+
+	var candidates []*beads.Issue
+	if issue, err := b.Show(issueID); err == nil && issue != nil {
+		candidates = append(candidates, issue)
+	}
+	if len(candidates) == 0 && townRoot != "" {
+		townBeadsDir := filepath.Join(townRoot, ".beads")
+		if _, err := os.Stat(townBeadsDir); err == nil {
+			if issue, err := beads.New(townBeadsDir).Show(issueID); err == nil && issue != nil {
+				candidates = append(candidates, issue)
+			}
+		}
+	}
+
+	for _, issue := range candidates {
+		if issue.Assignee != expectedAgent {
+			continue
+		}
+		if beads.IssueStatus(issue.Status).IsTerminal() {
+			continue
+		}
+		return issue.ID
+	}
+	return ""
+}
+
+// actualPolecatTargetFromEnv returns the canonical agent identity from the
+// session environment. This matches the identity used by gt done when it
+// reconstructs the polecat worktree from GT_RIG/GT_POLECAT.
+func actualPolecatTargetFromEnv() string {
+	rig := os.Getenv("GT_RIG")
+	pc := os.Getenv("GT_POLECAT")
+	if rig == "" || pc == "" {
+		return ""
+	}
+	return rig + "/polecats/" + pc
 }
 
 func ensureCurrentHookWorktreeIntegrity() error {

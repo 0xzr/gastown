@@ -26,6 +26,7 @@ Available guards:
 
 External guards (standalone scripts, not compiled into gt):
   context-budget   - scripts/guards/context-budget-guard.sh
+  done-empty-hook  - scripts/guards/done-empty-hook-guard.sh
 
 Example hook configuration:
   {
