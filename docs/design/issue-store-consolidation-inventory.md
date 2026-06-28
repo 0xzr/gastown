@@ -238,6 +238,77 @@ It is preserved as a snapshot of the state at `2026-06-24T12:22:00Z`. If it
 becomes active, it should be re-created in the canonical town store and this
 backup copy referenced as provenance.
 
+#### 4.2.1 Remediation status (`gastown-cet.1.2.2`, 2026-06-28)
+
+This remediation bead (`gastown-cet.1.2.2`, polecat jasper, 2026-06-28)
+records the concrete archival disposition for the orphan backup. The audit
+decision is **ARCHIVE preserved as historical evidence** (Option B from the
+bead's acceptance criteria), not recreate-and-duplicate-close: the dg1
+empty-hook guard fix is already merged to main (commit `0c6980cc` + recovery
+`1ffb5f0a`), addressing the most-observed symptom class of hq-27q, so
+canonical recreation is not warranted at this time.
+
+**Disposition chosen:** **preserve-as-provenance** — backup retained on disk,
+`hq-27q` left in-place inside the snapshot, no canonical twin created.
+
+**Target state 1 — Backup directory preserved on disk**
+
+```text
+$ ls -ld /home/ubuntu/gt-town-backups/gastown-orphan-beadstore-20260624T162212Z
+drwxr-x---  3 ubuntu ubuntu 4096 Jun 24 22:46 \
+  /home/ubuntu/gt-town-backups/gastown-orphan-beadstore-20260624T162212Z
+```
+
+Result: **PASS**. Backup directory remains at its original path, intact.
+
+**Target state 2 — Embedded Dolt commit hash unchanged from snapshot**
+
+```text
+$ cat /home/ubuntu/gt-town-backups/gastown-orphan-beadstore-20260624T162212Z/.beads/export-state.json
+{"last_dolt_commit":"ob3iqp954f1q7sk4rudp2a2b0n43a4d3","timestamp":"2026-06-24T12:22:00.551341407-04:00","issues":1,"memories":0}
+```
+
+Result: **PASS**. Last Dolt commit is still `ob3iqp954f1q7sk4rudp2a2b0n43a4d3`
+(matches the snapshot hash recorded in §1 footnote \*), confirming zero raw
+edits to the embedded store.
+
+**Target state 3 — `hq-27q` readable from backup, issue count unchanged**
+
+```text
+$ cd /home/ubuntu/gt-town-backups/gastown-orphan-beadstore-20260624T162212Z && \
+    bd list --status=open
+○ hq-27q ● P0 Fix MQ lifecycle: do not close source beads until Refinery terminal merge
+--------------------------------------------------------------------------------
+Total: 1 issues (1 open, 0 in progress)
+```
+
+Result: **PASS**. `hq-27q` remains open in the backup; `issues:1` from
+`export-state.json` matches the live `bd list` count. No `bd close` was run
+against the backup.
+
+**Target state 4 — `hq-27q` NOT re-created in canonical HQ store**
+
+```text
+$ bd show hq-27q
+Error fetching hq-27q: no issue found matching "hq-27q"
+```
+
+Result: **PASS (by design)**. Canonical town store
+(`/home/ubuntu/gt-town/.beads`) has no `hq-27q`, consistent with the
+preserve-as-provenance disposition. If the underlying MQ-lifecycle defect
+becomes active again (e.g., new witness/rework-bounce failures not covered by
+dg1), the corrective action per the audit is: `bd create --repo=hq` to
+re-introduce `hq-27q` with a provenance note pointing to this backup, then
+update §4.2 with a new remediation subsection.
+
+**Acceptance criteria for `gastown-cet.1.2.2`:**
+- [x] `hq-27q` has a documented disposition: preserved-as-provenance in the
+      orphan backup; not re-created in canonical town store.
+- [x] This §4.2 inventory updated with remediation status (this §4.2.1 block).
+- [x] No raw `.dolt/`, `noms/`, `LOCK`, `manifest`, or JSONL files modified in
+      the backup. Verified via unchanged `last_dolt_commit` and unchanged
+      `issues:1` count in `export-state.json`.
+
 ### 4.3 `bdglobal` and `beads_global`
 
 **Decision:** REGISTER as protected legacy empty stores.
