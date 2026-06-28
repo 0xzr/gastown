@@ -52,7 +52,18 @@ func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluati
 	// Record the merge-candidate diff basis so the review packet identifies the
 	// exact diff reviewed (gastown-cet.8). A verdict against intermediate
 	// commit history is distinguished from one against the final candidate.
-	basis := p.mergeCandidateBasis(prNumber)
+	basis, basisErr := p.mergeCandidateBasis(prNumber)
+	if basisErr != nil {
+		// Fail closed when the destination branch cannot be authoritatively
+		// resolved; do not silently fall back to origin/main (gastown-cet.12.6.6).
+		return &ReviewEvaluation{
+			State:            ReviewStateUnavailable,
+			Results:          []ReviewerResult{{Reviewer: "bitbucket", Verdict: ReviewerVerdictUnavailable, Evidence: basisErr.Error(), DiffBasis: basis}},
+			UnavailableCount: 1,
+			DiffBasis:        basis,
+			Error:            basisErr.Error(),
+		}, nil
+	}
 
 	participants, err := p.git.GetBitbucketPRParticipants(p.workspace, p.repoSlug, prNumber)
 	if err != nil {
@@ -110,28 +121,30 @@ func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluati
 // mergeCandidateBasis returns the merge-candidate diff basis for the PR under
 // review. The base branch is the PR's actual destination — not hardcoded to
 // main — so PRs targeting release/ or other non-default branches diff against
-// the correct range (gastown-cet.12.6.6). Best-effort resolution; an empty
-// component means "unknown" (treated as a merge-candidate basis, the safe
-// default).
-//
-// Fallback order for the base branch:
-//  1. Resolve the PR's destination branch via the Bitbucket REST API. If
-//     non-empty, use origin/<branch>.
-//  2. On provider error (no token, network failure, timeout), fall back to
-//     origin/main so existing single-target deployments keep working. The
-//     bug the fix addresses (hardcoded origin/main when target differs) only
-//     manifests when the API succeeds; degraded failures were already latent
-//     and remain so by design.
-func (p *bitbucketPRProvider) mergeCandidateBasis(prNumber int) DiffBasis {
-	target := "main"
-	if p.resolveTarget != nil {
-		if name, err := p.resolveTarget(p.workspace, p.repoSlug, prNumber); err == nil && name != "" {
-			target = name
-		}
+// the correct range (gastown-cet.12.6.6). If the destination branch cannot be
+// authoritatively resolved (resolver error or empty result), this function
+// returns an error so GetReviewEvaluation fails closed instead of silently
+// falling back to origin/main.
+func (p *bitbucketPRProvider) mergeCandidateBasis(prNumber int) (DiffBasis, error) {
+	if p.resolveTarget == nil {
+		return DiffBasis{}, fmt.Errorf("no target branch resolver configured")
 	}
-	base, _ := p.git.RemoteBranchTip("origin", target)
+	target, err := p.resolveTarget(p.workspace, p.repoSlug, prNumber)
+	if err != nil {
+		return DiffBasis{}, fmt.Errorf("cannot resolve PR destination branch: %w", err)
+	}
+	if target == "" {
+		return DiffBasis{}, fmt.Errorf("PR destination branch unresolved (empty)")
+	}
+	base, err := p.git.RemoteBranchTip("origin", target)
+	if err != nil {
+		return DiffBasis{}, fmt.Errorf("cannot resolve merge target tip origin/%s: %w", target, err)
+	}
+	if base == "" {
+		return DiffBasis{}, fmt.Errorf("merge target tip origin/%s not found", target)
+	}
 	head, _ := p.git.Rev("HEAD")
-	return MergeCandidateBasis(base, head)
+	return MergeCandidateBasis(base, head), nil
 }
 
 func (p *bitbucketPRProvider) MergePR(prNumber int, method string) (string, error) {
