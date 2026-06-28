@@ -6059,3 +6059,49 @@ func TestBuildStartupCommandWithAgentOverride_PolecatBlocksPlanMode(t *testing.T
 		t.Errorf("plan mode survived override normalization: %q", cmd)
 	}
 }
+
+// TestBuildStartupCommand_PolecatBlocksPlanMode exercises the plain
+// BuildStartupCommand path (no WithAgentOverride) end-to-end. The plan-mode
+// flag must be replaced with bypassPermissions by the polecat normalization
+// at loader.go:2299, even when the rig resolves the polecat to a planner
+// alias that declares --permission-mode plan.
+//
+// This complements TestBuildStartupCommandWithAgentOverride_PolecatBlocksPlanMode
+// (covers the override path) and TestResolveRoleAgentConfig_PolecatPermissionMode
+// (covers the resolve-only path). Without this test, the BuildStartupCommand
+// defense-in-depth normalization has no direct coverage.
+func TestBuildStartupCommand_PolecatBlocksPlanMode(t *testing.T) {
+	// Cannot use t.Parallel — uses t.Setenv
+	binDir := t.TempDir()
+	writeAgentStub(t, binDir, "claude")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	rigSettings := NewRigSettings()
+	rigSettings.RoleAgents = map[string]string{
+		constants.RolePolecat: "claude-planner",
+	}
+	rigSettings.Agents = map[string]*RuntimeConfig{
+		"claude-planner": {
+			Command: "claude",
+			Args:    []string{"--permission-mode", "plan", "--model", "sonnet"},
+		},
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd := BuildStartupCommand(
+		map[string]string{"GT_ROLE": constants.RolePolecat},
+		rigPath,
+		"[GAS TOWN] test polecat",
+	)
+	if !strings.Contains(cmd, "--permission-mode bypassPermissions") {
+		t.Errorf("expected --permission-mode bypassPermissions in command, got: %q", cmd)
+	}
+	if strings.Contains(cmd, "--permission-mode plan") {
+		t.Errorf("plan mode survived BuildStartupCommand normalization: %q", cmd)
+	}
+}
