@@ -46,15 +46,44 @@ func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluati
 
 	participants, err := p.git.GetBitbucketPRParticipants(p.workspace, p.repoSlug, prNumber)
 	if err != nil {
-		return &ReviewEvaluation{
-			State:            ReviewStateUnavailable,
-			Results:          []ReviewerResult{{Reviewer: "bitbucket", Verdict: ReviewerVerdictUnavailable, Evidence: err.Error(), DiffBasis: basis}},
-			UnavailableCount: 1,
-			DiffBasis:        basis,
-			Error:            err.Error(),
-		}, nil
+		return classifyBitbucketUnavailableError(err, basis), nil
 	}
 
+	return classifyBitbucketParticipants(participants, basis), nil
+}
+
+// classifyBitbucketUnavailableError maps a failed Bitbucket participants call
+// onto a single-reviewer UNAVAILABLE evaluation. Extracted so the
+// network-failure path is unit-testable without live HTTP calls
+// (gastown-cet.12.6.3).
+func classifyBitbucketUnavailableError(callErr error, basis DiffBasis) *ReviewEvaluation {
+	return &ReviewEvaluation{
+		State:            ReviewStateUnavailable,
+		Results:          []ReviewerResult{{Reviewer: "bitbucket", Verdict: ReviewerVerdictUnavailable, Evidence: callErr.Error(), DiffBasis: basis}},
+		UnavailableCount: 1,
+		DiffBasis:        basis,
+		Error:            callErr.Error(),
+	}
+}
+
+// classifyBitbucketParticipants maps each Bitbucket participant onto a
+// ReviewerResult under Bitbucket Cloud semantics, and aggregates them through
+// EvaluateReviews. Extracted so the role/approved classification is
+// unit-testable without live HTTP calls (gastown-cet.12.6.3).
+//
+// Semantics:
+//   - REVIEWER + approved                       -> PASS
+//   - REVIEWER + not approved                    -> NO_VERDICT
+//     (Bitbucket's participants API does not expose CHANGES_REQUESTED; a
+//     reviewer who has weighed in without approving is non-blocking.)
+//   - any non-REVIEWER role (PARTICIPANT, etc.) -> skipped entirely;
+//     non-reviewer participants do not count as reviewers and must not dilute
+//     the quorum or generate blocker signals.
+//
+// The caller-facing empty-participants or all-non-reviewers case lands in the
+// NO_VERDICT catch-all so the merge cannot proceed authoritatively without a
+// surfaceable reviewer row.
+func classifyBitbucketParticipants(participants []git.BitbucketParticipant, basis DiffBasis) *ReviewEvaluation {
 	if len(participants) == 0 {
 		return &ReviewEvaluation{
 			State:          ReviewStateNoVerdict,
@@ -62,7 +91,7 @@ func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluati
 			NoVerdictCount: 1,
 			DiffBasis:      basis,
 			Error:          "no participants",
-		}, nil
+		}
 	}
 
 	results := make([]ReviewerResult, 0, len(participants))
@@ -89,12 +118,12 @@ func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluati
 			NoVerdictCount: 1,
 			DiffBasis:      basis,
 			Error:          "no reviewers",
-		}, nil
+		}
 	}
 
 	ev := EvaluateReviews(results, DegradedQuorumRule{})
 	ev.DiffBasis = basis
-	return &ev, nil
+	return &ev
 }
 
 // mergeCandidateBasis returns the merge-candidate diff basis for the PR under

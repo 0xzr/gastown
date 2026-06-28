@@ -1,6 +1,8 @@
 package refinery
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/git"
@@ -231,5 +233,130 @@ func TestCollapseReviews_CaseInsensitiveReviewer(t *testing.T) {
 	ev := evaluateGitHubReviews(reviews)
 	if ev.State != ReviewStatePass {
 		t.Errorf("expected PASS (case-insensitive collapse), got %s", ev.State)
+	}
+}
+
+// TestClassifyGitHubEmptyReviews covers the no-individual-review-reachable path
+// in classifyGitHubEmptyReviews (gastown-cet.12.6.3). When the gh pr-reviews
+// call returns no rows but the overall PR reviewDecision is CHANGES_REQUESTED
+// (typically from a branch-protection rule), the merge must be blocked even
+// without a surfaceable reviewer; otherwise the absence of reviews is a soft
+// no-verdict state, not a hard failure.
+func TestClassifyGitHubEmptyReviews(t *testing.T) {
+	basis := MergeCandidateBasis("origin/main", "head-sha")
+
+	t.Run("changes_requested_blocks_merge", func(t *testing.T) {
+		ev := classifyGitHubEmptyReviews("CHANGES_REQUESTED", basis)
+		if ev.State != ReviewStateFail {
+			t.Fatalf("branch-protection CHANGES_REQUESTED with no reviews must FAIL, got %s: %s", ev.State, ev.Error)
+		}
+		if ev.FailCount != 1 {
+			t.Errorf("expected FailCount=1, got %d", ev.FailCount)
+		}
+		if len(ev.Results) != 1 {
+			t.Fatalf("expected single synthetic result, got %d", len(ev.Results))
+		}
+		r := ev.Results[0]
+		if r.Reviewer != "github" {
+			t.Errorf("synthetic result reviewer should be github sentinel, got %q", r.Reviewer)
+		}
+		if r.Verdict != ReviewerVerdictFail {
+			t.Errorf("synthetic result verdict should be FAIL, got %s", r.Verdict)
+		}
+		if r.DiffBasis != basis {
+			t.Errorf("synthetic result basis=%+v, want %+v", r.DiffBasis, basis)
+		}
+		if !strings.Contains(ev.Error, "CHANGES_REQUESTED") {
+			t.Errorf("error must surface the branch-protection signal, got %q", ev.Error)
+		}
+	})
+
+	t.Run("review_required_is_no_verdict", func(t *testing.T) {
+		// REVIEW_REQUIRED is the GitHub "no approvers yet" default and must
+		// not be treated as a blocker on its own.
+		ev := classifyGitHubEmptyReviews("REVIEW_REQUIRED", basis)
+		if ev.State != ReviewStateNoVerdict {
+			t.Fatalf("REVIEW_REQUIRED with no reviews must be NO_VERDICT, got %s: %s", ev.State, ev.Error)
+		}
+		if ev.NoVerdictCount != 1 {
+			t.Errorf("expected NoVerdictCount=1, got %d", ev.NoVerdictCount)
+		}
+		if ev.FailCount != 0 {
+			t.Errorf("REVIEW_REQUIRED must not count as FAIL, got FailCount=%d", ev.FailCount)
+		}
+	})
+
+	t.Run("approved_is_no_verdict", func(t *testing.T) {
+		// gh returns APPROVED only when an approving review row exists, so a
+		// no-row + APPROVED combination is an upstream quirk we still must not
+		// treat as a hard FAIL on these inputs alone.
+		ev := classifyGitHubEmptyReviews("APPROVED", basis)
+		if ev.State != ReviewStateNoVerdict {
+			t.Fatalf("APPROVED with no surfaceable reviews must be NO_VERDICT, got %s", ev.State)
+		}
+	})
+
+	t.Run("empty_decision_is_no_verdict", func(t *testing.T) {
+		// "" / no-decision is the empty-response fallback and must be soft.
+		for _, d := range []string{"", "UNKNOWN"} {
+			ev := classifyGitHubEmptyReviews(d, basis)
+			if ev.State != ReviewStateNoVerdict {
+				t.Errorf("decision=%q must be NO_VERDICT, got %s: %s", d, ev.State, ev.Error)
+			}
+			if ev.Error != "no reviews" {
+				t.Errorf("error should be the canonical 'no reviews', got %q", ev.Error)
+			}
+		}
+	})
+
+	t.Run("diff_basis_propagated_to_results", func(t *testing.T) {
+		// Any basis the caller supplies must reach the synthetic result so
+		// the review packet can attribute the verdict to the correct diff.
+		ev := classifyGitHubEmptyReviews("CHANGES_REQUESTED", basis)
+		for _, r := range ev.Results {
+			if r.DiffBasis != basis {
+				t.Errorf("basis not propagated to result %+v", r)
+			}
+		}
+	})
+}
+
+// TestClassifyGitHubUnavailableError covers the network-failure path
+// (gastown-cet.12.6.3). A failed gh pr-reviews call must downgrade to a
+// single-reviewer UNAVAILABLE verdict rather than a hard merge failure or a
+// silent PASS, so the merge gates defer rather than approving on
+// unconfirmed state.
+func TestClassifyGitHubUnavailableError(t *testing.T) {
+	basis := MergeCandidateBasis("origin/main", "head-sha")
+	netErr := fmt.Errorf("gh: connection refused: timeout after 45s")
+
+	ev := classifyGitHubUnavailableError(netErr, basis)
+	if ev.State != ReviewStateUnavailable {
+		t.Fatalf("gh call failure must map to UNAVAILABLE, got %s", ev.State)
+	}
+	if ev.UnavailableCount != 1 {
+		t.Errorf("expected UnavailableCount=1, got %d", ev.UnavailableCount)
+	}
+	if ev.FailCount != 0 || ev.PassCount != 0 || ev.NoVerdictCount != 0 {
+		t.Errorf("UNAVAILABLE must have no other counters set, got %+v", ev)
+	}
+	if len(ev.Results) != 1 {
+		t.Fatalf("expected a single synthetic result, got %d", len(ev.Results))
+	}
+	r := ev.Results[0]
+	if r.Reviewer != "github" {
+		t.Errorf("synthetic reviewer should be the github sentinel, got %q", r.Reviewer)
+	}
+	if r.Verdict != ReviewerVerdictUnavailable {
+		t.Errorf("synthetic verdict should be UNAVAILABLE, got %s", r.Verdict)
+	}
+	if !strings.Contains(r.Evidence, "connection refused") {
+		t.Errorf("evidence must carry the underlying error so the audit trail is useful, got %q", r.Evidence)
+	}
+	if !strings.Contains(ev.Error, "connection refused") {
+		t.Errorf("top-level error must carry the underlying cause, got %q", ev.Error)
+	}
+	if r.DiffBasis != basis {
+		t.Errorf("basis not propagated to unavailable result: got %+v want %+v", r.DiffBasis, basis)
 	}
 }

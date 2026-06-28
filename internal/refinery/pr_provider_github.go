@@ -37,36 +37,16 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 	if err != nil {
 		// If we cannot reach the review provider at all, treat as a single
 		// unavailable reviewer rather than a hard merge failure.
-		return &ReviewEvaluation{
-			State:            ReviewStateUnavailable,
-			Results:          []ReviewerResult{{Reviewer: "github", Verdict: ReviewerVerdictUnavailable, Evidence: err.Error(), DiffBasis: basis}},
-			UnavailableCount: 1,
-			DiffBasis:        basis,
-			Error:            err.Error(),
-		}, nil
+		return classifyGitHubUnavailableError(err, basis), nil
 	}
 
 	if len(reviews) == 0 {
-		// No reviews at all is a no-verdict state, not a failure.
+		// No reviews at all is a no-verdict state, not a failure. The overall
+		// PR decision can still surface CHANGES_REQUESTED via branch protection,
+		// which is a hard blocking signal even when no individual review row is
+		// reachable.
 		decision, _ := p.git.GetPRReviewDecision(prNumber)
-		if decision == "CHANGES_REQUESTED" {
-			// The overall PR decision can be changes-requested even when there are
-			// no individual reviews reachable (e.g. branch protection rule).
-			return &ReviewEvaluation{
-				State:     ReviewStateFail,
-				Results:   []ReviewerResult{{Reviewer: "github", Verdict: ReviewerVerdictFail, Evidence: "overall review decision: CHANGES_REQUESTED", DiffBasis: basis}},
-				FailCount: 1,
-				DiffBasis: basis,
-				Error:     "overall review decision: CHANGES_REQUESTED",
-			}, nil
-		}
-		return &ReviewEvaluation{
-			State:          ReviewStateNoVerdict,
-			Results:        []ReviewerResult{{Reviewer: "github", Verdict: ReviewerVerdictNoVerdict, Evidence: "no reviews", DiffBasis: basis}},
-			NoVerdictCount: 1,
-			DiffBasis:      basis,
-			Error:          "no reviews",
-		}, nil
+		return classifyGitHubEmptyReviews(decision, basis), nil
 	}
 
 	results := classifyCollapsedReviews(collapseReviews(reviews), basis)
@@ -74,6 +54,44 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 	ev := EvaluateReviews(results, DegradedQuorumRule{})
 	ev.DiffBasis = basis
 	return &ev, nil
+}
+
+// classifyGitHubUnavailableError maps a failed gh pr-reviews call onto a
+// single-reviewer UNAVAILABLE evaluation. Extracted so the network-failure
+// path is unit-testable without shelling to gh (gastown-cet.12.6.3).
+func classifyGitHubUnavailableError(callErr error, basis DiffBasis) *ReviewEvaluation {
+	return &ReviewEvaluation{
+		State:            ReviewStateUnavailable,
+		Results:          []ReviewerResult{{Reviewer: "github", Verdict: ReviewerVerdictUnavailable, Evidence: callErr.Error(), DiffBasis: basis}},
+		UnavailableCount: 1,
+		DiffBasis:        basis,
+		Error:            callErr.Error(),
+	}
+}
+
+// classifyGitHubEmptyReviews resolves the no-individual-review-reachable case.
+// The overall PR decision can be CHANGES_REQUESTED (e.g. via a branch
+// protection rule applied without surfaceable reviewer rows), which is a hard
+// blocking signal; otherwise the absence of any review is a non-fatal
+// no-verdict state. Extracted so the branch-protection path is unit-testable
+// without shelling to gh (gastown-cet.12.6.3).
+func classifyGitHubEmptyReviews(decision string, basis DiffBasis) *ReviewEvaluation {
+	if decision == "CHANGES_REQUESTED" {
+		return &ReviewEvaluation{
+			State:     ReviewStateFail,
+			Results:   []ReviewerResult{{Reviewer: "github", Verdict: ReviewerVerdictFail, Evidence: "overall review decision: CHANGES_REQUESTED", DiffBasis: basis}},
+			FailCount: 1,
+			DiffBasis: basis,
+			Error:     "overall review decision: CHANGES_REQUESTED",
+		}
+	}
+	return &ReviewEvaluation{
+		State:          ReviewStateNoVerdict,
+		Results:        []ReviewerResult{{Reviewer: "github", Verdict: ReviewerVerdictNoVerdict, Evidence: "no reviews", DiffBasis: basis}},
+		NoVerdictCount: 1,
+		DiffBasis:      basis,
+		Error:          "no reviews",
+	}
 }
 
 // classifyCollapsedReviews maps each per-reviewer effective review (already
