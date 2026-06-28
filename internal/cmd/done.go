@@ -78,6 +78,22 @@ const (
 	ExitDeferred  = "DEFERRED"
 )
 
+// mrContextForDeferral reports whether the source bead close should be
+// deferred to the Refinery so it can stamp "Merged in <MR>" provenance.
+//
+// The decision keys strictly off the completion metadata from the current
+// gt done invocation (MRID + failure flags + exit type). When a polecat
+// completes with a successful MR submission, the Refinery will close the
+// source issue with a "Merged in <MR>" reason after the merge; closing it
+// here would leave a generic "Closed" provenance stamp instead.
+//
+// If no MR exists or the MR/push failed, the Refinery cannot merge, so
+// gt done must close the source bead itself (or leave it open for the
+// Witness if it is already terminal).
+func mrContextForDeferral(exitType, mrID string, mrFailed, pushFailed bool) bool {
+	return exitType == ExitCompleted && mrID != "" && !mrFailed && !pushFailed
+}
+
 func doneContaminationBaseRef(defaultBranch, explicitTarget string) string {
 	targetBranch := defaultBranch
 	if explicitTarget != "" {
@@ -1533,7 +1549,7 @@ notifyWitness:
 	}
 
 	// Update agent bead state (ZFC: self-report completion)
-	updateAgentStateOnDone(cwd, townRoot, exitType, issueID)
+	updateAgentStateOnDone(cwd, townRoot, exitType, issueID, mrID, mrFailed, pushFailed)
 
 	// Nudge witness only after hook/cleanup state is updated. Otherwise witness can
 	// evaluate slot availability against stale hook_bead or cleanup_status and emit
@@ -1894,6 +1910,12 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 // Uses issueID directly to find the hooked bead instead of reading the agent bead's
 // hook_bead slot (hq-l6mm5: direct bead tracking).
 //
+// When exitType is COMPLETED and the polecat successfully submitted an MR (mrID
+// is set, neither the MR submission nor the push failed), the source bead close
+// is deferred to the Refinery so it can be closed with a "Merged in <MR>"
+// reason. For all other paths (no MR, push/MR failure, ESCALATED, DEFERRED) gt
+// done closes the source bead itself.
+//
 // Per gt-zecmc: observable states ("done", "idle") removed - use tmux to discover.
 // Non-observable states ("stuck", "awaiting-gate") are still set since they represent
 // intentional agent decisions that can't be observed from tmux.
@@ -1903,7 +1925,7 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 // BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
 // If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
 // All errors are warnings, not failures - gt done must complete even if bead ops fail.
-func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
+func updateAgentStateOnDone(cwd, townRoot, exitType, issueID, mrID string, mrFailed, pushFailed bool) {
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
 	if err != nil {
@@ -2029,10 +2051,18 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 				}
 			}
 
+			// Defer the source bead close to the Refinery when the polecat
+			// successfully submitted an MR. The Refinery will close it with
+			// "Merged in <MR>" provenance after the merge; closing it here would
+			// overwrite that with a generic "Closed" reason (gastown-5oy).
+			deferSourceBeadClose := mrContextForDeferral(exitType, mrID, mrFailed, pushFailed)
+
 			// Acceptance criteria gate: skip close if criteria are unchecked.
 			if unchecked := beads.HasUncheckedCriteria(hookedBead); unchecked > 0 {
 				style.PrintWarning("hooked bead %s has %d unchecked acceptance criteria — skipping close", hookedBeadID, unchecked)
 				fmt.Fprintf(os.Stderr, "  The bead will remain open for witness/mayor review.\n")
+			} else if deferSourceBeadClose {
+				fmt.Fprintf(os.Stderr, "Source bead %s close deferred to Refinery (%s)\n", hookedBeadID, mrID)
 			} else if err := bd.Close(hookedBeadID); err != nil {
 				// Non-fatal: warn but continue
 				fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, err)
