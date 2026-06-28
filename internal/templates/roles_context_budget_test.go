@@ -218,8 +218,11 @@ func TestRenderRole_GLMContextBudget_TemplateUsesCmdFunc(t *testing.T) {
 			t.Errorf("%s: GLM budget section does not use {{ cmd }} — CLI references are hardcoded", file)
 		}
 		// It must NOT contain hardcoded `` `gt <subcommand>` `` command literals
-		// (backtick-quoted gt commands) that would ignore GT_COMMAND.
-		for _, lit := range []string{"`gt handoff", "`gt nudge", "`gt convoy", "`gt status"} {
+		// (backtick-quoted gt commands) that would ignore GT_COMMAND. The list
+		// covers every gt subcommand used in the role templates so a regression
+		// that re-hardcodes any of them fails this test instead of silently
+		// breaking GT_COMMAND overrides in production.
+		for _, lit := range []string{"`gt handoff", "`gt nudge", "`gt convoy", "`gt status", "`gt prime", "`gt peek", "`gt mail send", "`gt sling", "`gt patrol", "`gt tap"} {
 			if strings.Contains(section, lit) {
 				t.Errorf("%s: GLM budget section contains hardcoded %q instead of {{ cmd }}", file, lit)
 			}

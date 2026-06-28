@@ -256,14 +256,24 @@ patrols (30s base, exponential backoff to 15m max).
 
 ### GLM-Safe Context Budget (apply when Witness runs on umans-glm-5.2)
 
-The Witness compaction path was changed from `gt prime --hook` to
-`{{ cmd }} handoff --cycle --reason compaction --yes` *because* umans-glm-5.2
-has a smaller effective context window and degrades before the hard limit —
-re-priming the same fat session kept the accumulated context and caused the
-stalls that motivated the change. The lessons below are the GLM-safe context
-budget rules; they apply whenever this role is routed to GLM.
+umans-glm-5.2 (the Claude-CLI transport routed to the GLM backend) has a
+smaller **effective** context window than Claude/Codex defaults, and it
+degrades *before* the hard context limit — latency and judgment drift show
+up early, not at the cliff. The GLM Witness rollout and the report-audit
+review rounds both failed this way: long-lived Witness sessions accumulated
+patrol output, nudge logs, and recovery escalations until mid-task stalls
+and repeated bad resubmissions occurred.
 
-1. **Small prompts, bounded tool output.** Do not dump full `gt peek` output,
+Witness recovery after compaction runs `{{ cmd }} prime --hook` (the role's
+recovery line at the top of this file) — the crew/mayor pre-compact cycle
+of `{{ cmd }} handoff --cycle --reason compaction --yes` is wired in
+`internal/hooks/config.go` for `crew` and `mayor` only, not for Witness.
+The context-budget rules below are the lessons that pre-compact cycle was
+built on, and Witness must internalize them because Witness sessions are
+the ones that accumulate across the longest continuous windows in the
+town. Apply them whenever this role is routed to GLM.
+
+1. **Small prompts, bounded tool output.** Do not dump full `{{ cmd }} peek` output,
    full patrol scans, or full bead dumps into a prompt. Extract polecat name,
    state, and the one-line action needed. Full output lives at its source;
    you do not need it resident.
