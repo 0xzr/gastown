@@ -15,9 +15,9 @@ const (
 // Default advisory thresholds — used for recommendations in the report.
 // These are defaults; override via DoctorDogConfig fields.
 const (
-	defaultDoctorDogLatencyAlertMs      = 5000.0
-	defaultDoctorDogOrphanAlertCount    = 20
-	defaultDoctorDogBackupStaleSeconds  = 3600.0
+	defaultDoctorDogLatencyAlertMs     = 5000.0
+	defaultDoctorDogOrphanAlertCount   = 20
+	defaultDoctorDogBackupStaleSeconds = 3600.0
 )
 
 // DoctorDogConfig holds configuration for the doctor_dog patrol.

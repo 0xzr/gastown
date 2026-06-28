@@ -102,10 +102,10 @@ func TestStateManager_GenericType(t *testing.T) {
 	// Test that StateManager works with different types
 
 	type ComplexState struct {
-		Name      string   `json:"name"`
-		Values    []int    `json:"values"`
-		Enabled   bool     `json:"enabled"`
-		Nested    struct {
+		Name    string `json:"name"`
+		Values  []int  `json:"values"`
+		Enabled bool   `json:"enabled"`
+		Nested  struct {
 			X int `json:"x"`
 		} `json:"nested"`
 	}

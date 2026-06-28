@@ -14,13 +14,13 @@ import (
 
 // ScanResult holds the result of scanning a single tmux session.
 type ScanResult struct {
-	Session       string    `json:"session"`                  // tmux session name
-	AccountHandle string    `json:"account_handle,omitempty"` // resolved account handle
-	ConfigDir     string    `json:"config_dir,omitempty"`     // CLAUDE_CONFIG_DIR (even if account unknown)
-	RateLimited   bool      `json:"rate_limited"`             // whether hard rate-limit was detected
-	NearLimit     bool      `json:"near_limit"`               // whether approaching-limit signal was detected
-	MatchedLine   string    `json:"matched_line,omitempty"`   // the line that matched (hard or warning)
-	ResetsAt      string    `json:"resets_at,omitempty"`      // parsed reset time if available
+	Session       string `json:"session"`                  // tmux session name
+	AccountHandle string `json:"account_handle,omitempty"` // resolved account handle
+	ConfigDir     string `json:"config_dir,omitempty"`     // CLAUDE_CONFIG_DIR (even if account unknown)
+	RateLimited   bool   `json:"rate_limited"`             // whether hard rate-limit was detected
+	NearLimit     bool   `json:"near_limit"`               // whether approaching-limit signal was detected
+	MatchedLine   string `json:"matched_line,omitempty"`   // the line that matched (hard or warning)
+	ResetsAt      string `json:"resets_at,omitempty"`      // parsed reset time if available
 }
 
 // TmuxClient is the interface for tmux operations needed by the scanner.

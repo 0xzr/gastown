@@ -96,9 +96,9 @@ func TestSaveAndLoadAutoPruneState(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	state := &AutoPruneState{
-		LastPruneTime: time.Now().UTC().Truncate(time.Second),
-		PruneCount:    5,
-		TotalPruned:   100,
+		LastPruneTime:   time.Now().UTC().Truncate(time.Second),
+		PruneCount:      5,
+		TotalPruned:     100,
 		TotalBytesFreed: 50000,
 		LastResult: &PruneResult{
 			EventsPruned: 20,

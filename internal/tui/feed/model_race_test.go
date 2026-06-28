@@ -157,10 +157,10 @@ func TestAddEventLocked(t *testing.T) {
 	m := NewModel(nil)
 
 	tests := []struct {
-		name        string
-		event       Event
-		wantUpdate  bool
-		wantEvents  int // expected event count after this event
+		name       string
+		event      Event
+		wantUpdate bool
+		wantEvents int // expected event count after this event
 	}{
 		{
 			name: "normal event adds to feed",

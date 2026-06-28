@@ -113,7 +113,7 @@ func (c *Client) GetPRApprovalStatus(ctx context.Context, workspace, repoSlug st
 func (c *Client) GetPRComments(ctx context.Context, workspace, repoSlug string, prID int) ([]PRComment, error) {
 	var resp struct {
 		Values []struct {
-			ID      int64  `json:"id"`
+			ID      int64 `json:"id"`
 			Content struct {
 				Raw string `json:"raw"`
 			} `json:"content"`
@@ -172,7 +172,7 @@ func (c *Client) ReplyToPRComment(ctx context.Context, workspace, repoSlug strin
 // Valid strategies: "merge_commit", "squash", "fast_forward".
 func (c *Client) MergePR(ctx context.Context, workspace, repoSlug string, prID int, strategy string) error {
 	reqBody := map[string]any{
-		"merge_strategy":       strategy,
+		"merge_strategy":      strategy,
 		"close_source_branch": true,
 	}
 	path := fmt.Sprintf("/repositories/%s/%s/pullrequests/%d/merge", workspace, repoSlug, prID)

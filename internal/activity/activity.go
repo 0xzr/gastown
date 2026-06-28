@@ -22,10 +22,10 @@ const (
 
 // Info holds activity information for display.
 type Info struct {
-	LastActivity time.Time // Raw timestamp of last activity
+	LastActivity time.Time     // Raw timestamp of last activity
 	Duration     time.Duration // Time since last activity
-	FormattedAge string    // Human-readable age (e.g., "2m", "1h")
-	ColorClass   string    // CSS class for coloring (green, yellow, red, unknown)
+	FormattedAge string        // Human-readable age (e.g., "2m", "1h")
+	ColorClass   string        // CSS class for coloring (green, yellow, red, unknown)
 }
 
 // Calculate computes activity info from a last-activity timestamp.
@@ -99,7 +99,7 @@ func formatDays(d time.Duration) string {
 // This avoids importing strconv for simple integer formatting in the activity package.
 func formatInt(n int) string {
 	if n < 10 {
-		return string(rune('0'+n))
+		return string(rune('0' + n))
 	}
 	// For larger numbers, use standard conversion
 	result := ""

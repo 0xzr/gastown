@@ -57,10 +57,10 @@ func TestConfigSaveLoad(t *testing.T) {
 	}
 
 	cfg := &Config{
-		Upstream:   "steveyegge/wl-commons",
-		ForkOrg:    "alice-dev",
-		ForkDB:     "wl-commons",
-		LocalDir:   "/tmp/test/wl-commons",
+		Upstream:  "steveyegge/wl-commons",
+		ForkOrg:   "alice-dev",
+		ForkDB:    "wl-commons",
+		LocalDir:  "/tmp/test/wl-commons",
 		RigHandle: "alice-dev",
 	}
 

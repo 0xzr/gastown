@@ -9,9 +9,9 @@ import (
 
 func TestParseRecoveredBeadSubject(t *testing.T) {
 	tests := []struct {
-		subject  string
-		wantID   string
-		wantOK   bool
+		subject string
+		wantID  string
+		wantOK  bool
 	}{
 		{"RECOVERED_BEAD gt-abc123", "gt-abc123", true},
 		{"RECOVERED_BEAD bd-xyz", "bd-xyz", true},

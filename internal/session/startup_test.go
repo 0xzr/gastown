@@ -7,12 +7,12 @@ import (
 
 func TestBeaconRecipient(t *testing.T) {
 	tests := []struct {
-		name     string
-		role     string
-		agentNm  string
-		rig      string
-		want     string
-		wantNot  []string // must NOT contain these (path separators, etc.)
+		name    string
+		role    string
+		agentNm string
+		rig     string
+		want    string
+		wantNot []string // must NOT contain these (path separators, etc.)
 	}{
 		{
 			name:    "polecat with rig",

@@ -67,7 +67,8 @@ func (w *WLCommons) DBName() string {
 	return w.dbName
 }
 
-func (w *WLCommons) EnsureDB() error           { return EnsureWLCommons(w.townRoot) }
+func (w *WLCommons) EnsureDB() error { return EnsureWLCommons(w.townRoot) }
+
 // DatabaseExists checks whether db exists. Tries the host filesystem first;
 // falls back to a live SHOW DATABASES query so containerised Dolt is handled.
 func (w *WLCommons) DatabaseExists(db string) bool {

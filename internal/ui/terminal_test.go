@@ -201,7 +201,7 @@ func TestIsAgentMode_GT_AGENT_MODE(t *testing.T) {
 }
 
 func TestIsAgentMode_CLAUDE_CODE(t *testing.T) {
- oldAgentMode := os.Getenv("GT_AGENT_MODE")
+	oldAgentMode := os.Getenv("GT_AGENT_MODE")
 	oldClaudeCode := os.Getenv("CLAUDE_CODE")
 	defer func() {
 		if oldAgentMode != "" {

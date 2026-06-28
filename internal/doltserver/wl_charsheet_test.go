@@ -254,10 +254,10 @@ func TestComputeTopStamps_FiltersAndSorts(t *testing.T) {
 	t.Parallel()
 	stamps := []StampRecord{
 		{Author: "a", Valence: `{"quality":5}`, Confidence: 1.0, ContextType: "completion", Message: "great"},
-		{Author: "b", Valence: `{"quality":3}`, Confidence: 1.0, ContextType: "completion", Message: "ok"},           // quality < 4, excluded
-		{Author: "c", Valence: `{"quality":4}`, Confidence: 0.5, ContextType: "endorsement", Message: "nice"},         // ew=2.0
-		{Author: "d", Valence: `{"quality":4}`, Confidence: 1.0, ContextType: "boot_block", Message: "boot"},          // wrong context type
-		{Author: "e", Valence: `{"quality":4}`, Confidence: 0.9, ContextType: "completion", Message: "solid"},          // ew=3.6
+		{Author: "b", Valence: `{"quality":3}`, Confidence: 1.0, ContextType: "completion", Message: "ok"},    // quality < 4, excluded
+		{Author: "c", Valence: `{"quality":4}`, Confidence: 0.5, ContextType: "endorsement", Message: "nice"}, // ew=2.0
+		{Author: "d", Valence: `{"quality":4}`, Confidence: 1.0, ContextType: "boot_block", Message: "boot"},  // wrong context type
+		{Author: "e", Valence: `{"quality":4}`, Confidence: 0.9, ContextType: "completion", Message: "solid"}, // ew=3.6
 	}
 
 	top := computeTopStamps(stamps, 5)

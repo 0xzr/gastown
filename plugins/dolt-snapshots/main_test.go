@@ -93,8 +93,8 @@ func TestIsSystemDB(t *testing.T) {
 		{"lora_forge", false},
 		{"node0", false},
 		// Edge cases: names that start with system prefixes but aren't
-		{"testdb", false},        // exactly "testdb" with no underscore
-		{"beads", false},         // exactly "beads"
+		{"testdb", false},           // exactly "testdb" with no underscore
+		{"beads", false},            // exactly "beads"
 		{"beads_production", false}, // doesn't match beads_t or beads_pt
 	}
 

@@ -42,9 +42,9 @@ type Rotator struct {
 	tmuxExec       TmuxExecutor                         // write: pane lifecycle operations
 	mgr            *Manager                             // quota state persistence
 	accounts       *config.AccountsConfig               // registered accounts
-	restartCommand func(session string) (string, error)  // builds the respawn command
+	restartCommand func(session string) (string, error) // builds the respawn command
 	log            Logger                               // non-fatal warning output
-	sessionLinker  SessionLinker                         // optional: symlinks session for resume (nil = no resume)
+	sessionLinker  SessionLinker                        // optional: symlinks session for resume (nil = no resume)
 	townRoot       string                               // needed for session discovery
 	agentName      string                               // needed for BuildResumeCommand (default "claude")
 }

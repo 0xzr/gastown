@@ -10,7 +10,7 @@ import (
 func TestDeprecatedMergeQueueKeysCheck_Clean(t *testing.T) {
 	townRoot := setupTownWithSettings(t, map[string]interface{}{
 		"merge_queue": map[string]interface{}{
-			"enabled":    true,
+			"enabled":     true,
 			"on_conflict": "assign_back",
 		},
 	})
@@ -44,8 +44,8 @@ func TestDeprecatedMergeQueueKeysCheck_DetectsTargetBranch(t *testing.T) {
 func TestDeprecatedMergeQueueKeysCheck_DetectsIntegrationBranches(t *testing.T) {
 	townRoot := setupTownWithSettings(t, map[string]interface{}{
 		"merge_queue": map[string]interface{}{
-			"enabled":               true,
-			"integration_branches":  true,
+			"enabled":              true,
+			"integration_branches": true,
 		},
 	})
 

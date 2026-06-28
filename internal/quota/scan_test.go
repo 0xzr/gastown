@@ -389,10 +389,10 @@ func TestIsGasTownSession(t *testing.T) {
 		{"gt-crew-bear", true},
 		{"gt-witness", true},
 		{"bd-refinery", true},
-		{"my-app", false},       // has dash but not a known prefix
-		{"dev-server", false},   // has dash but not a known prefix
-		{"myapp", false},        // no dash, no known prefix
-		{"devserver", false},    // no dash, no known prefix
+		{"my-app", false},     // has dash but not a known prefix
+		{"dev-server", false}, // has dash but not a known prefix
+		{"myapp", false},      // no dash, no known prefix
+		{"devserver", false},  // no dash, no known prefix
 	}
 
 	for _, tt := range tests {

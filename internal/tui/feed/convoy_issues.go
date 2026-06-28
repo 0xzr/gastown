@@ -16,7 +16,6 @@ type trackedStatus struct {
 	Status string
 }
 
-
 // getTrackedIssueStatus queries tracked issues and their status.
 func getTrackedIssueStatus(beadsDir, convoyID string) []trackedStatus {
 	if !convoyIDPattern.MatchString(convoyID) {

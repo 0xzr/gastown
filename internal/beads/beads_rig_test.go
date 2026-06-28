@@ -7,10 +7,10 @@ import (
 
 func TestFormatRigDescription(t *testing.T) {
 	tests := []struct {
-		name   string
+		name    string
 		rigName string
-		fields *RigFields
-		want   []string
+		fields  *RigFields
+		want    []string
 	}{
 		{
 			name:    "nil fields",

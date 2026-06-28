@@ -2,8 +2,8 @@
 package session
 
 import (
-	"github.com/steveyegge/gastown/internal/cli"
 	"fmt"
+	"github.com/steveyegge/gastown/internal/cli"
 	"time"
 )
 

@@ -146,9 +146,9 @@ func TestPruner_Prune(t *testing.T) {
 	now := time.Now().UTC()
 
 	events := []struct {
-		ts     time.Time
-		typ    string
-		actor  string
+		ts    time.Time
+		typ   string
+		actor string
 	}{
 		// Expired (older than 7 days default)
 		{now.Add(-10 * 24 * time.Hour), "test_event", "actor1"},

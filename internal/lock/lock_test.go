@@ -26,8 +26,8 @@ func TestNew(t *testing.T) {
 
 func TestLockInfo_IsStale(t *testing.T) {
 	tests := []struct {
-		name     string
-		pid      int
+		name      string
+		pid       int
 		wantStale bool
 	}{
 		{"current process", os.Getpid(), false},

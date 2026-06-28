@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-
 )
 
 // OverseerConfig represents the human operator's identity (mayor/overseer.json).
@@ -202,7 +201,7 @@ func detectFromEnvironment() *OverseerConfig {
 	if username == "" {
 		// Try whoami as last resort
 		cmd := exec.Command("whoami")
-	
+
 		if out, err := cmd.Output(); err == nil {
 			username = strings.TrimSpace(string(out))
 		}

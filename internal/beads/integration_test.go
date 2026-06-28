@@ -400,7 +400,7 @@ func TestDetectIntegrationBranch(t *testing.T) {
 
 	t.Run("no epic in parent chain returns empty", func(t *testing.T) {
 		shower := &mockIssueShower{issues: map[string]*Issue{
-			"gt-task": {ID: "gt-task", Type: "task", Parent: "gt-other"},
+			"gt-task":  {ID: "gt-task", Type: "task", Parent: "gt-other"},
 			"gt-other": {ID: "gt-other", Type: "task", Parent: ""},
 		}}
 		checker := &mockBranchChecker{}

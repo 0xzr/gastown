@@ -12,11 +12,11 @@ import (
 // NotificationSlot tracks a pending notification for deduplication.
 // Only the latest notification per slot matters - earlier ones are replaced.
 type NotificationSlot struct {
-	Slot      string    `json:"slot"`
-	Session   string    `json:"session"`
-	Message   string    `json:"message"`
-	SentAt    time.Time `json:"sent_at"`
-	Consumed  bool      `json:"consumed"`
+	Slot       string    `json:"slot"`
+	Session    string    `json:"session"`
+	Message    string    `json:"message"`
+	SentAt     time.Time `json:"sent_at"`
+	Consumed   bool      `json:"consumed"`
 	ConsumedAt time.Time `json:"consumed_at,omitempty"`
 }
 

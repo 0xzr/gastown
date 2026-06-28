@@ -163,12 +163,12 @@ type DecayInfo struct {
 
 // DecayReport summarizes forensic value decay across all event types.
 type DecayReport struct {
-	Types       []DecayInfo   `json:"types"`
-	TotalEvents int           `json:"total_events"`
-	TotalScore  float64       `json:"total_score"` // weighted average
-	AtRisk      int           `json:"at_risk"`     // events with score < 0.25
-	Expired     int           `json:"expired"`     // events with score = 0
-	Generated   time.Time     `json:"generated"`
+	Types       []DecayInfo `json:"types"`
+	TotalEvents int         `json:"total_events"`
+	TotalScore  float64     `json:"total_score"` // weighted average
+	AtRisk      int         `json:"at_risk"`     // events with score < 0.25
+	Expired     int         `json:"expired"`     // events with score = 0
+	Generated   time.Time   `json:"generated"`
 }
 
 // GenerateDecayReport builds a forensic value decay report from stats.

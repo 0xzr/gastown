@@ -618,17 +618,17 @@ func SetConvoyFields(issue *Issue, fields *ConvoyFields) string {
 // MRFields holds the structured fields for a merge-request issue.
 // These fields are stored as key: value lines in the issue description.
 type MRFields struct {
-	Branch      string // Source branch name (e.g., "polecat/Nux/gt-xyz")
-	Target      string // Target branch (e.g., "main" or "integration/gt-epic")
-	SourceIssue string // The work item being merged (e.g., "gt-xyz")
-	Worker      string // Who did the work
-	Rig         string // Which rig
-	CommitSHA   string // HEAD commit SHA at submission time (GH#3032: dedup key)
-	BaseSHA     string // Merge-base SHA at submission time (gastown-cet.2.3: full-diff scope key)
-	CommitsAhead int   // Commits on the branch ahead of the merge-base (gastown-cet.2.3)
-	MergeCommit string // SHA of merge commit (set on close)
-	CloseReason string // Reason for closing: merged, rejected, conflict, superseded
-	AgentBead   string // Agent bead ID that created this MR (for traceability)
+	Branch       string // Source branch name (e.g., "polecat/Nux/gt-xyz")
+	Target       string // Target branch (e.g., "main" or "integration/gt-epic")
+	SourceIssue  string // The work item being merged (e.g., "gt-xyz")
+	Worker       string // Who did the work
+	Rig          string // Which rig
+	CommitSHA    string // HEAD commit SHA at submission time (GH#3032: dedup key)
+	BaseSHA      string // Merge-base SHA at submission time (gastown-cet.2.3: full-diff scope key)
+	CommitsAhead int    // Commits on the branch ahead of the merge-base (gastown-cet.2.3)
+	MergeCommit  string // SHA of merge commit (set on close)
+	CloseReason  string // Reason for closing: merged, rejected, conflict, superseded
+	AgentBead    string // Agent bead ID that created this MR (for traceability)
 
 	// Conflict resolution fields (for priority scoring)
 	RetryCount      int    // Number of conflict-resolution cycles

@@ -7,9 +7,9 @@ import (
 
 func TestCalculateActivity_Green(t *testing.T) {
 	tests := []struct {
-		name     string
-		age      time.Duration
-		wantAge  string
+		name      string
+		age       time.Duration
+		wantAge   string
 		wantColor string
 	}{
 		{"just now", 0, "<1m", ColorGreen},
@@ -37,9 +37,9 @@ func TestCalculateActivity_Green(t *testing.T) {
 
 func TestCalculateActivity_Yellow(t *testing.T) {
 	tests := []struct {
-		name     string
-		age      time.Duration
-		wantAge  string
+		name      string
+		age       time.Duration
+		wantAge   string
 		wantColor string
 	}{
 		{"5 minutes", 5 * time.Minute, "5m", ColorYellow},
@@ -65,9 +65,9 @@ func TestCalculateActivity_Yellow(t *testing.T) {
 
 func TestCalculateActivity_Red(t *testing.T) {
 	tests := []struct {
-		name     string
-		age      time.Duration
-		wantAge  string
+		name      string
+		age       time.Duration
+		wantAge   string
 		wantColor string
 	}{
 		{"10 minutes", 10 * time.Minute, "10m", ColorRed},

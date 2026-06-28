@@ -36,7 +36,7 @@ func TestKeychainServiceName_DefaultDir(t *testing.T) {
 func TestKeychainServiceName_AccountDir(t *testing.T) {
 	got := KeychainServiceName("/Users/testuser/.claude-accounts/work")
 	// Should have the base name plus an 8-char hex suffix
-	if len(got) != len("Claude Code-credentials-") + 8 {
+	if len(got) != len("Claude Code-credentials-")+8 {
 		t.Errorf("expected service name with 8-char hex suffix, got %q (len=%d)", got, len(got))
 	}
 	if got[:len("Claude Code-credentials-")] != "Claude Code-credentials-" {

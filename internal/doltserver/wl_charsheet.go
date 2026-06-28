@@ -105,9 +105,9 @@ type LeaderboardEntry struct {
 
 // TierThreshold defines the requirements for a tier level.
 type TierThreshold struct {
-	Name             string
-	MinStamps        int
-	MinAvgEffWeight  float64
+	Name              string
+	MinStamps         int
+	MinAvgEffWeight   float64
 	MinClusterBreadth int
 }
 

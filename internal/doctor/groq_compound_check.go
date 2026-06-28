@@ -10,7 +10,6 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 )
 
-
 // GroqCompoundCheck probes the groq-compound agent for JSON output compliance.
 // It is skipped when groq-compound is not configured in any role.
 type GroqCompoundCheck struct {

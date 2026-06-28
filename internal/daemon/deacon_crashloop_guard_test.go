@@ -84,9 +84,9 @@ func TestCheckDeaconHeartbeat_RespectsCrashLoopGuard(t *testing.T) {
 	}
 
 	d := &Daemon{
-		config:        &Config{TownRoot: townRoot},
-		logger:        log.New(io.Discard, "", 0),
-		tmux:          tmux.NewTmux(),
+		config:         &Config{TownRoot: townRoot},
+		logger:         log.New(io.Discard, "", 0),
+		tmux:           tmux.NewTmux(),
 		restartTracker: rt,
 	}
 

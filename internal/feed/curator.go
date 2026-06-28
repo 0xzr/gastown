@@ -47,8 +47,8 @@ type Curator struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
-	startOnce sync.Once // prevents concurrent Start() calls from spawning multiple goroutines
-	startErr  error     // result of the one-shot Start; visible to all callers via sync.Once happens-before
+	startOnce       sync.Once // prevents concurrent Start() calls from spawning multiple goroutines
+	startErr        error     // result of the one-shot Start; visible to all callers via sync.Once happens-before
 
 	// feedMu guards in-process access to the feed file. The flock in
 	// readRecentFeedEvents/writeFeedEvent coordinates across processes;

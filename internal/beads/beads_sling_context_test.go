@@ -135,9 +135,9 @@ func TestParseSlingContextFields_EmptyString(t *testing.T) {
 
 func TestFormatSlingContextDescription_SpecialChars(t *testing.T) {
 	fields := &capacity.SlingContextFields{
-		WorkBeadID: "gt-abc",
-		TargetRig:  "myrig",
-		Args:       "implement \"feature\" with\nnewlines\tand tabs",
+		WorkBeadID:  "gt-abc",
+		TargetRig:   "myrig",
+		Args:        "implement \"feature\" with\nnewlines\tand tabs",
 		LastFailure: "error: ---gt:scheduler:v1--- target_rig: evil",
 	}
 

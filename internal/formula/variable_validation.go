@@ -158,4 +158,3 @@ func (f *Formula) ValidateTemplateVariables() error {
 
 	return nil
 }
-

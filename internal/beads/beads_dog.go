@@ -112,4 +112,3 @@ func formatDogDescription(name, location string) string {
 		fmt.Sprintf("location: %s", location),
 	}, "\n")
 }
-

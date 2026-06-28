@@ -29,10 +29,10 @@ type processEntry32 struct {
 }
 
 var (
-	kernel32              = syscall.NewLazyDLL("kernel32.dll")
-	createToolhelp32Snap  = kernel32.NewProc("CreateToolhelp32Snapshot")
-	process32FirstW       = kernel32.NewProc("Process32FirstW")
-	process32NextW        = kernel32.NewProc("Process32NextW")
+	kernel32             = syscall.NewLazyDLL("kernel32.dll")
+	createToolhelp32Snap = kernel32.NewProc("CreateToolhelp32Snapshot")
+	process32FirstW      = kernel32.NewProc("Process32FirstW")
+	process32NextW       = kernel32.NewProc("Process32NextW")
 )
 
 // hasDescendantWithNamesWindows enumerates all processes via the Toolhelp32 API
