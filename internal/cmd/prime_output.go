@@ -588,6 +588,42 @@ func outputStartupDirective(ctx RoleContext) {
 	}
 }
 
+// outputPostSubmitStandDownDirective emits a stand-down message for a polecat
+// whose hook is empty but whose previous work has already been submitted as an
+// open merge request. This prevents the post-submit empty-hook misfire where
+// gt prime tells the polecat to run gt done again, which fails with
+// empty_hook_no_evidence.
+func outputPostSubmitStandDownDirective(ctx RoleContext, state *postSubmitEmptyHookState) {
+	fmt.Println()
+	fmt.Println("---")
+	fmt.Println()
+	fmt.Printf("%s\n\n", style.Bold.Render("🛡️ STAND DOWN: Work already submitted"))
+	fmt.Println("Your hook is empty because your previous work has already been submitted to the merge queue.")
+	fmt.Println("This is expected after a successful `gt done`.")
+	fmt.Println()
+	if state.ActiveMR != "" {
+		fmt.Printf("  Active MR: %s", style.Bold.Render(state.ActiveMR))
+		if state.MRStatus != "" {
+			fmt.Printf(" (%s)", state.MRStatus)
+		}
+		fmt.Println()
+	}
+	if state.SourceIssue != "" {
+		fmt.Printf("  Source issue: %s\n", state.SourceIssue)
+	}
+	if state.Branch != "" {
+		fmt.Printf("  Branch: %s\n", state.Branch)
+	}
+	if state.WorktreeClean {
+		fmt.Println("  Worktree: clean")
+	}
+	fmt.Println()
+	fmt.Printf("**Do NOT run `%s done` again.** Your work is already in the Refinery queue.\n", cli.Name())
+	fmt.Println("Do NOT create HELP escalations for an empty hook — there is no lost work.")
+	fmt.Println("Exit cleanly and allow the Witness/reaper to complete cleanup.")
+	fmt.Println()
+}
+
 // outputAttachmentStatus checks for attached work molecule and outputs status.
 // This is key for the autonomous overnight work pattern.
 // The Propulsion Principle: "If you find something on your hook, YOU RUN IT."

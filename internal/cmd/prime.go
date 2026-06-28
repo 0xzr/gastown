@@ -238,6 +238,17 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 
 	if !hasSlungWork {
 		explain(true, "Startup directive: normal mode (no hooked work)")
+
+		// Post-submit empty-hook guard (gastown-t7l): a polecat whose work was
+		// already submitted to the Refinery ends up with an empty hook after gt
+		// done returns. Telling it to run gt done again produces an
+		// empty_hook_no_evidence rejection. Detect the in-flight MR and emit a
+		// clean stand-down directive instead.
+		if postSubmitState, ok := detectPostSubmitEmptyHook(ctx); ok {
+			outputPostSubmitStandDownDirective(ctx, postSubmitState)
+			return nil
+		}
+
 		outputStartupDirective(ctx)
 	}
 
