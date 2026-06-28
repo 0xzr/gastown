@@ -98,10 +98,17 @@ type PatrolScanZombieItem struct {
 }
 
 // PatrolScanStallOutput holds stall detection results.
+//
+// ActiveMRGates is split out from Stalls so a live lane owned by the refinery
+// (a polecat whose post-submit MR is still draining through the merge queue)
+// is never summarized as a fleet-empty or stalled condition. Witness/fleet
+// summaries can count active implementation polecats, post-submit gates, and
+// recovery-held slots independently (gastown-72v).
 type PatrolScanStallOutput struct {
-	Checked int                   `json:"checked"`
-	Found   int                   `json:"found"`
-	Stalls  []PatrolScanStallItem `json:"stalls,omitempty"`
+	Checked       int                       `json:"checked"`
+	Found         int                       `json:"found"`
+	Stalls        []PatrolScanStallItem     `json:"stalls,omitempty"`
+	ActiveMRGates []PatrolScanActiveMRGate  `json:"active_mr_gates,omitempty"`
 }
 
 // PatrolScanStallItem is a single stall detection in scan output.
@@ -110,6 +117,14 @@ type PatrolScanStallItem struct {
 	StallType string `json:"stall_type"`
 	Action    string `json:"action"`
 	Error     string `json:"error,omitempty"`
+}
+
+// PatrolScanActiveMRGate is the JSON view of a live polecat parked on an open
+// merge request. Surfaced separately from Stalls so post-submit gates cannot
+// be mistaken for stalled or fleet-empty poles (gastown-72v).
+type PatrolScanActiveMRGate struct {
+	Polecat string `json:"polecat"`
+	MRID    string `json:"mr_id,omitempty"`
 }
 
 // PatrolScanCompleteOutput holds completion discovery results.
@@ -165,7 +180,7 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 		return witness.DetectZombiePolecats(bd, workDir, rigName, router)
 	})
 	stallResult := runPatrolScanPhase(diagnostics, "stall detection", func() *witness.DetectStalledPolecatsResult {
-		return witness.DetectStalledPolecats(workDir, rigName)
+		return witness.DetectStalledPolecats(bd, workDir, rigName)
 	})
 	completionResult := runPatrolScanPhase(diagnostics, "completion discovery", func() *witness.DiscoverCompletionsResult {
 		return witness.DiscoverCompletions(bd, workDir, rigName, router)
@@ -398,6 +413,14 @@ func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.Detec
 			}
 			so.Stalls = append(so.Stalls, item)
 		}
+		// ActiveMRGates is reported separately from Stalls so post-submit poles
+		// are not summarized as fleet-empty by the witness (gastown-72v).
+		for _, g := range stallResult.ActiveMRGates {
+			so.ActiveMRGates = append(so.ActiveMRGates, PatrolScanActiveMRGate{
+				Polecat: g.Polecat,
+				MRID:    g.MRID,
+			})
+		}
 		output.Stalls = so
 	}
 
@@ -491,6 +514,28 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 		fmt.Println()
 	}
 
+	// Active MR gates — post-submit lanes owned by the refinery, NOT stalls.
+	// Surfaced separately so witness/fleet summaries can count active
+	// implementation polecats, post-submit gates, and recovery-held slots
+	// independently (gastown-72v).
+	if stallResult != nil && (len(stallResult.ActiveMRGates) > 0 || patrolScanVerbose) {
+		fmt.Printf("%s Active MR Gates: %d polecat(s) parked on open merge request(s)\n",
+			style.Bold.Render("🛂"), len(stallResult.ActiveMRGates))
+		if len(stallResult.ActiveMRGates) == 0 {
+			fmt.Printf("  %s\n", style.Dim.Render("No active MR gates"))
+		} else {
+			for _, g := range stallResult.ActiveMRGates {
+				line := fmt.Sprintf("  ● %s", g.Polecat)
+				if g.MRID != "" {
+					line += fmt.Sprintf("  mr=%s", g.MRID)
+				}
+				fmt.Println(line)
+			}
+			fmt.Printf("  %s\n", style.Dim.Render("These lanes are owned by the refinery gate, not by a dead session. Do not escalate as fleet-empty."))
+		}
+		fmt.Println()
+	}
+
 	// Completions
 	if completionResult != nil && (len(completionResult.Discovered) > 0 || patrolScanVerbose) {
 		fmt.Printf("%s Completion Discovery: checked %d polecat(s)\n",
@@ -522,19 +567,21 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 		activeCount = countActiveWorkZombies(zombieResult)
 	}
 	stallCount := 0
+	activeMRCount := 0
 	if stallResult != nil {
 		stallCount = len(stallResult.Stalled)
+		activeMRCount = len(stallResult.ActiveMRGates)
 	}
 	completionCount := 0
 	if completionResult != nil {
 		completionCount = len(completionResult.Discovered)
 	}
 
-	if zombieCount == 0 && stallCount == 0 && completionCount == 0 {
+	if zombieCount == 0 && stallCount == 0 && activeMRCount == 0 && completionCount == 0 {
 		fmt.Printf("%s All clear — no issues detected\n", style.Success.Render("✓"))
 	} else {
-		fmt.Printf("Summary: %d zombie(s) (%d active-work), %d stall(s), %d completion(s)\n",
-			zombieCount, activeCount, stallCount, completionCount)
+		fmt.Printf("Summary: %d zombie(s) (%d active-work), %d stall(s), %d active-mr gate(s), %d completion(s)\n",
+			zombieCount, activeCount, stallCount, activeMRCount, completionCount)
 	}
 
 	return nil

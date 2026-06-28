@@ -1711,15 +1711,50 @@ func TestDetectStalledPolecatsResult_Empty(t *testing.T) {
 	if len(result.Stalled) != 0 {
 		t.Errorf("Stalled length = %d, want 0", len(result.Stalled))
 	}
+	// gastown-72v: ActiveMRGates is split out from Stalled so a live MR gate
+	// cannot be conflated with a stalled polecat or with fleet-empty output.
+	if len(result.ActiveMRGates) != 0 {
+		t.Errorf("ActiveMRGates length = %d, want 0", len(result.ActiveMRGates))
+	}
 	if len(result.Errors) != 0 {
 		t.Errorf("Errors length = %d, want 0", len(result.Errors))
+	}
+}
+
+// TestActiveMRGate_RecordShape is the shape regression guard for gastown-72v:
+// fleet summaries surface post-submit gates separately from stalls, with the
+// polecat name and the open MR ID preserved. This is the data shape that
+// `gt patrol scan --json` ships and that witness/fleet summaries consume.
+func TestActiveMRGate_RecordShape(t *testing.T) {
+	t.Parallel()
+	gate := ActiveMRGate{Polecat: "quartz", MRID: "gastown-wisp-e3a"}
+	if gate.Polecat != "quartz" {
+		t.Errorf("Polecat = %q, want quartz", gate.Polecat)
+	}
+	if gate.MRID != "gastown-wisp-e3a" {
+		t.Errorf("MRID = %q, want gastown-wisp-e3a", gate.MRID)
+	}
+
+	result := &DetectStalledPolecatsResult{
+		Checked:       1,
+		Stalled:       nil, // post-submit is NOT a stall
+		ActiveMRGates: []ActiveMRGate{gate},
+	}
+	if len(result.Stalled) != 0 {
+		t.Errorf("Stalled length = %d, want 0 (gastown-72v: active MR gate must not be reported as a stall)", len(result.Stalled))
+	}
+	if len(result.ActiveMRGates) != 1 {
+		t.Fatalf("ActiveMRGates length = %d, want 1", len(result.ActiveMRGates))
+	}
+	if result.ActiveMRGates[0].MRID != "gastown-wisp-e3a" {
+		t.Errorf("ActiveMRGates[0].MRID = %q, want gastown-wisp-e3a", result.ActiveMRGates[0].MRID)
 	}
 }
 
 func TestDetectStalledPolecats_NoPolecats(t *testing.T) {
 	t.Parallel()
 	// Should handle missing polecats directory gracefully
-	result := DetectStalledPolecats("/nonexistent/path", "testrig")
+	result := DetectStalledPolecats(nil, "/nonexistent/path", "testrig")
 
 	if result.Checked != 0 {
 		t.Errorf("Checked = %d, want 0 for nonexistent dir", result.Checked)
@@ -1742,7 +1777,7 @@ func TestDetectStalledPolecats_EmptyPolecatsDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DetectStalledPolecats(tmpDir, rigName)
+	result := DetectStalledPolecats(nil, tmpDir, rigName)
 
 	if result.Checked != 0 {
 		t.Errorf("Checked = %d, want 0 for empty polecats dir", result.Checked)
@@ -1775,7 +1810,7 @@ func TestDetectStalledPolecats_NoSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DetectStalledPolecats(tmpDir, rigName)
+	result := DetectStalledPolecats(nil, tmpDir, rigName)
 
 	// Should count 2 polecats (skip hidden)
 	if result.Checked != 2 {

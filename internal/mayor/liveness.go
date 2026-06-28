@@ -357,6 +357,16 @@ func VerifyMayorModel(townRoot, gtPath string) *ModelVerification {
 }
 
 // parseModelStatusOutput handles both JSON and plain-text model-status output.
+//
+// The model-status command is implemented by an external wrapper (e.g. a
+// Python dropin that injects --agent into gt sling). The wrapper's JSON
+// payload is intentionally NOT trusted for rig scoping: it can report a
+// misleading `rig` field (gastown-72v observed `rig: polybot` while the
+// model-status output mixed in Gastown queued/session context). Model
+// verification is a town-wide identity check, not a rig-scoping check, so
+// only `model` and `name` are read here. The `rig` field, if present, is
+// ignored on purpose — see gastown-72v for the rig-scoping concern and the
+// suggested fix location in the wrapper.
 func parseModelStatusOutput(output []byte) string {
 	trimmed := strings.TrimSpace(string(output))
 	if trimmed == "" {
@@ -364,10 +374,18 @@ func parseModelStatusOutput(output []byte) string {
 	}
 
 	if trimmed[0] == '{' {
+		// Rig is captured but intentionally discarded. The wrapper's `rig`
+		// field has been observed to be misleading (gastown-72v); the
+		// verified-model check is a town-wide identity match, not a rig
+		// scoping concern. Reading it into a local variable also makes the
+		// discard auditable in review and prevents future contributors from
+		// accidentally promoting it into the verified identity.
 		var payload struct {
 			Model string `json:"model"`
 			Name  string `json:"name"`
+			Rig   string `json:"rig"`
 		}
+		_ = payload.Rig // intentionally ignored; see function comment.
 		if err := json.Unmarshal(output, &payload); err == nil {
 			if payload.Model != "" {
 				return payload.Model

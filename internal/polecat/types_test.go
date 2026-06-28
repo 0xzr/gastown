@@ -74,6 +74,9 @@ func TestState_IsStalled(t *testing.T) {
 		{StateDone, false},
 		{StateStuck, false},
 		{StateZombie, false},
+		// gastown-72v: post-submit gates must NOT be classified as stalls.
+		// They are owned by the refinery, not by a dead session.
+		{StatePendingMR, false},
 		{State("unknown"), false},
 	}
 	for _, tt := range tests {
@@ -82,6 +85,46 @@ func TestState_IsStalled(t *testing.T) {
 				t.Errorf("State(%q).IsStalled() = %v, want %v", tt.state, got, tt.expect)
 			}
 		})
+	}
+}
+
+func TestState_IsPendingMR(t *testing.T) {
+	tests := []struct {
+		state  State
+		expect bool
+	}{
+		{StatePendingMR, true},
+		{StateStalled, false},
+		{StateWorking, false},
+		{StateIdle, false},
+		{StateDone, false},
+		{StateReviewNeeded, false},
+		{StateZombie, false},
+		{State("unknown"), false},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.state), func(t *testing.T) {
+			if got := tt.state.IsPendingMR(); got != tt.expect {
+				t.Errorf("State(%q).IsPendingMR() = %v, want %v", tt.state, got, tt.expect)
+			}
+		})
+	}
+}
+
+// TestState_PendingMR_DistinctFromStalled is the regression guard for
+// gastown-72v: a polecat whose tmux heartbeat is stale but whose agent bead
+// has an open MR in the refinery must be classified as StatePendingMR, NOT
+// StateStalled. Lumping the two together caused witness/fleet summaries to
+// report an empty fleet while a live MR gate was still draining.
+func TestState_PendingMR_DistinctFromStalled(t *testing.T) {
+	if StatePendingMR.IsStalled() {
+		t.Errorf("StatePendingMR.IsStalled() = true, want false (gastown-72v)")
+	}
+	if StateStalled.IsPendingMR() {
+		t.Errorf("StateStalled.IsPendingMR() = true, want false (gastown-72v)")
+	}
+	if string(StatePendingMR) == string(StateStalled) {
+		t.Errorf("StatePendingMR string %q must not collide with StateStalled %q", StatePendingMR, StateStalled)
 	}
 }
 

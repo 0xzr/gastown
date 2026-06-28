@@ -160,6 +160,51 @@ func TestParseModelStatusOutput_Text(t *testing.T) {
 	}
 }
 
+// TestParseModelStatusOutput_IgnoresMisleadingRig is the regression guard for
+// gastown-72v: the model-status wrapper has been observed to report a
+// misleading `rig` field (e.g., `rig: polybot` while the output mixes in
+// Gastown queued/session context). Model verification is a town-wide identity
+// check, so the parser must not propagate the wrapper's rig value into the
+// returned model identity — only `model` and `name` are read.
+func TestParseModelStatusOutput_IgnoresMisleadingRig(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "rig mismatch on JSON",
+			input: `{"model":"umans-glm-5.2","rig":"polybot","queued":["gastown"]}`,
+			want:  "umans-glm-5.2",
+		},
+		{
+			name:  "rig-only when no model field is present",
+			input: `{"rig":"polybot","queued":["gastown"],"name":"umans-glm-5.2"}`,
+			want:  "umans-glm-5.2",
+		},
+		{
+			name:  "rig field is silently discarded when model is set",
+			input: `{"model":"claude-sonnet-4-6","rig":"polybot","name":"ignored"}`,
+			want:  "claude-sonnet-4-6",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseModelStatusOutput([]byte(tc.input))
+			if got != tc.want {
+				t.Errorf("parseModelStatusOutput(%q) = %q, want %q (gastown-72v: misleading rig field must not affect model identity)", tc.input, got, tc.want)
+			}
+			// Defense in depth: the returned model identity must never contain
+			// the wrapper's `rig` value, even if future refactors change the
+			// extraction path. This is the explicit guard against the
+			// wrong-rig / fleet-empty misclassification observed in gastown-72v.
+			if strings.Contains(got, "polybot") {
+				t.Errorf("parseModelStatusOutput(%q) leaked rig value into model identity: %q", tc.input, got)
+			}
+		})
+	}
+}
+
 func TestCaptureContextSnapshot(t *testing.T) {
 	tmpDir := t.TempDir()
 

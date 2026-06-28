@@ -2335,9 +2335,22 @@ type StalledResult struct {
 
 // DetectStalledPolecatsResult holds aggregate results.
 type DetectStalledPolecatsResult struct {
-	Checked int             // Number of live polecats inspected
-	Stalled []StalledResult // Stalled polecats found and processed
-	Errors  []error         // Transient errors
+	Checked       int                       // Number of live polecats inspected
+	Stalled       []StalledResult           // Stalled polecats found and processed
+	ActiveMRGates []ActiveMRGate            // Live polecats whose MR is open in refinery — NOT stalls (gastown-72v)
+	Errors        []error                   // Transient errors
+}
+
+// ActiveMRGate describes a live polecat that is parked waiting for an open
+// merge request to land in the refinery. These lanes are owned by the gate,
+// not by the agent — they must not be reported as stalls or fleet failures
+// even when the underlying tmux session shows zero recent activity. Surfaced
+// separately in `gt patrol scan` so witness/fleet summaries can count active
+// implementation polecats, post-submit gates, and recovery-held slots
+// independently (gastown-72v).
+type ActiveMRGate struct {
+	Polecat string // Polecat name (without rig prefix)
+	MRID    string // Open merge-request bead ID
 }
 
 // DetectStalledPolecats checks live polecat sessions for agents stuck at
@@ -2350,11 +2363,16 @@ type DetectStalledPolecatsResult struct {
 //   - It is older than StartupStallThreshold (90s)
 //   - Its last tmux activity is older than StartupActivityGrace (60s)
 //
+// Post-submit polecats whose active_mr is still open in the refinery are
+// surfaced in ActiveMRGates instead of Stalled — their lane is owned by the
+// gate, not by the agent, and the witness must not escalate them as fleet
+// failures (gastown-72v).
+//
 // When a startup stall is detected, DismissStartupDialogsBlind is called to
 // send blind key sequences that dismiss known blocking dialogs (workspace trust,
 // bypass permissions) without screen-scraping pane content. This avoids coupling
 // to third-party TUI strings that can change with any Claude Code update.
-func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult {
+func DetectStalledPolecats(bd *BdCli, workDir, rigName string) *DetectStalledPolecatsResult {
 	result := &DetectStalledPolecatsResult{}
 
 	// Find town root for path resolution and session naming
@@ -2378,6 +2396,7 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 
 	t := tmux.NewTmux()
 	now := time.Now()
+	prefix := beads.GetPrefixForRig(townRoot, rigName)
 
 	for _, entry := range entries {
 		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
@@ -2409,6 +2428,28 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 			if time.Since(hb.Timestamp) < polecat.SessionHeartbeatStaleThreshold {
 				continue // Fresh v2 heartbeat — agent is alive, not stalled
 			}
+		}
+
+		// Pre-fetch the agent bead so we can (a) classify post-submit lanes as
+		// ActiveMRGates instead of stalls and (b) avoid duplicating bd show
+		// calls across the patrol cycle (gt-2gra, gastown-72v).
+		agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
+		snap := fetchAgentBeadSnapshot(bd, workDir, agentBeadID)
+		if hasPendingMRFromSnapshot(bd, workDir, rigName, polecatName, snap) {
+			// Lane is owned by the refinery gate — not a stall even when the
+			// tmux pane has gone quiet waiting for the merge to land.
+			gateMR := ""
+			if snap != nil {
+				gateMR = snap.ActiveMR
+				if gateMR == "" && snap.Fields != nil {
+					gateMR = snap.Fields.ActiveMR
+				}
+			}
+			result.ActiveMRGates = append(result.ActiveMRGates, ActiveMRGate{
+				Polecat: polecatName,
+				MRID:    gateMR,
+			})
+			continue
 		}
 
 		// Legacy: Use structured signals to detect startup stalls:

@@ -61,12 +61,23 @@ const (
 	// process is dead. This typically happens after disk space exhaustion, OOM,
 	// or other system failures that kill sessions without cleanup.
 	// Unlike "stuck" (polecat self-reports), stalled is detected externally.
+	// Note: a polecat whose tmux heartbeat is stale but has an open MR in the
+	// refinery is NOT stalled — it is StatePendingMR (gastown-72v).
 	StateStalled State = "stalled"
 
 	// StateZombie means a tmux session exists but has no corresponding worktree directory.
 	// This is a detected condition: the polecat was incompletely nuked or has a
 	// session naming mismatch, leaving an orphaned tmux session.
 	StateZombie State = "zombie"
+
+	// StatePendingMR means the polecat has submitted its work and is waiting for
+	// the refinery to merge its MR. The agent session may still be alive (post-merge
+	// cleanup) or the heartbeat may be stale (waiting for MR to land), but the
+	// active_mr field on the agent bead references an open MR. This state is
+	// distinct from StateStalled because the lane is owned by the refinery gate,
+	// not by a dead session — witness/fleet summaries must not lump it in with
+	// stalled polecats or recovery-held slots (gastown-72v).
+	StatePendingMR State = "pending-mr"
 )
 
 // IsWorking returns true if the polecat is currently working.
@@ -75,6 +86,8 @@ func (s State) IsWorking() bool {
 }
 
 // IsStalled returns true if the polecat's session has died while work was assigned.
+// StatePendingMR is intentionally NOT stalled: a post-submit polecat waiting on the
+// refinery is owned by the gate, not by a dead session (gastown-72v).
 func (s State) IsStalled() bool {
 	return s == StateStalled
 }
@@ -82,6 +95,14 @@ func (s State) IsStalled() bool {
 // IsIdle returns true if the polecat has completed work and is available for reuse.
 func (s State) IsIdle() bool {
 	return s == StateIdle
+}
+
+// IsPendingMR returns true if the polecat has submitted work and is waiting for
+// the refinery to merge its open merge request. Witness/fleet summaries must
+// surface these lanes separately from real stalls and from idle poles so a
+// live MR gate is not summarized as "no active work" (gastown-72v).
+func (s State) IsPendingMR() bool {
+	return s == StatePendingMR
 }
 
 // Polecat represents a worker agent in a rig.

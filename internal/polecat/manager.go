@@ -2671,6 +2671,12 @@ func activeWorkBeadsForCleanup(issues []*beads.Issue) []*beads.Issue {
 //  4. Live session without active issue + clean cleanup → idle
 //  5. Live session without active issue + non-clean/unknown cleanup → review-needed
 //  6. Beads query failure + live/dead session → review-needed/stalled fallback
+//
+// After the above, the result is overridden to StatePendingMR whenever the agent
+// bead's active_mr field points at an open merge request (gastown-72v). This
+// stops witness/fleet summaries from reporting a post-submit gate owner as a
+// stalled polecat just because the agent's heartbeat went stale while waiting
+// for refinery to land the MR.
 func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	// Use clonePath which handles both new (polecats/<name>/<rigname>/)
 	// and old (polecats/<name>/) structures
@@ -2697,6 +2703,11 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	sessionRunning, sessionStale := m.polecatSessionState(name)
 	sessionDead := m.tmux != nil && (!sessionRunning || sessionStale)
 
+	// activeMRPending records whether this polecat has an open merge request in
+	// the refinery. Used below to convert stalled-looking lanes into pending-mr
+	// gates so witness/fleet summaries don't classify them as failures (gastown-72v).
+	activeMRPending, activeMRID := m.activeMRStatusForPolecat(name)
+
 	// Primary source: the work bead itself (status=hooked + assignee).
 	// This is the direct-tracking model introduced in hq-l6mm5.
 	hookedBeads, hookedErr := m.beads.List(beads.ListOptions{
@@ -2709,14 +2720,16 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 		if sessionDead {
 			state = StateStalled
 		}
-		return &Polecat{
+		p := &Polecat{
 			Name:      name,
 			Rig:       m.rig.Name,
 			State:     state,
 			ClonePath: clonePath,
 			Branch:    branchName,
 			Issue:     hookedBeads[0].ID,
-		}, nil
+		}
+		overridePendingMRState(p, activeMRPending, activeMRID)
+		return p, nil
 	}
 
 	// Compatibility fallback: if legacy hook_bead is still set, only trust it when
@@ -2731,14 +2744,16 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 			if sessionDead {
 				state = StateStalled
 			}
-			return &Polecat{
+			p := &Polecat{
 				Name:      name,
 				Rig:       m.rig.Name,
 				State:     state,
 				ClonePath: clonePath,
 				Branch:    branchName,
 				Issue:     fields.HookBead,
-			}, nil
+			}
+			overridePendingMRState(p, activeMRPending, activeMRID)
+			return p, nil
 		}
 	}
 
@@ -2754,13 +2769,15 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 		} else if sessionRunning {
 			state = StateReviewNeeded
 		}
-		return &Polecat{
+		p := &Polecat{
 			Name:      name,
 			Rig:       m.rig.Name,
 			State:     state,
 			ClonePath: clonePath,
 			Branch:    branchName,
-		}, nil
+		}
+		overridePendingMRState(p, activeMRPending, activeMRID)
+		return p, nil
 	}
 
 	// Persistent model: only an active issue means working. A live tmux session
@@ -2781,14 +2798,69 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 		state = StateReviewNeeded
 	}
 
-	return &Polecat{
+	p := &Polecat{
 		Name:      name,
 		Rig:       m.rig.Name,
 		State:     state,
 		ClonePath: clonePath,
 		Branch:    branchName,
 		Issue:     issueID,
-	}, nil
+	}
+	overridePendingMRState(p, activeMRPending, activeMRID)
+	return p, nil
+}
+
+// activeMRStatusForPolecat reports whether the named polecat has an open merge
+// request in the refinery merge queue, along with the MR bead ID. It is the
+// shared MR-gate check used by loadFromBeads to override StateStalled into
+// StatePendingMR so post-submit polecats are not classified as stalled.
+//
+// A "pending" MR here is an open merge-request bead whose source issue is not
+// already terminal, mirroring the assessment used by capacity admission and
+// witness zombie detection (gt-6a9d, gastown-72v).
+func (m *Manager) activeMRStatusForPolecat(name string) (bool, string) {
+	agentID := m.agentBeadID(name)
+	_, fields, err := m.beads.GetAgentBead(agentID)
+	if err != nil || fields == nil {
+		return false, ""
+	}
+	activeMR := strings.TrimSpace(fields.ActiveMR)
+	if activeMR == "" {
+		return false, ""
+	}
+	sourceHint := strings.TrimSpace(fields.LastSourceIssue)
+	if sourceHint == "" {
+		sourceHint = strings.TrimSpace(fields.HookBead)
+	}
+	assessment := AssessActiveMR(m.beads, ActiveMRInput{
+		ActiveMR:        activeMR,
+		SourceIssueHint: sourceHint,
+	})
+	if !assessment.Pending {
+		return false, activeMR
+	}
+	return true, activeMR
+}
+
+// overridePendingMRState converts a stalled-looking lane into StatePendingMR
+// when the agent bead's active_mr points at an open merge request. The MR ID
+// is preserved on the polecat for callers that want to surface the gate. Other
+// states pass through unchanged. (gastown-72v)
+func overridePendingMRState(p *Polecat, activeMRPending bool, activeMRID string) {
+	if p == nil || !activeMRPending || activeMRID == "" {
+		return
+	}
+	// Only override when the session-derived state is problematic. A live
+	// working polecat whose MR is already pending does not need to be relabeled
+	// — the working signal remains accurate. The override exists specifically
+	// to stop a stale session from being reported as a hard failure.
+	if p.State != StateStalled && p.State != StateReviewNeeded {
+		return
+	}
+	p.State = StatePendingMR
+	if p.Issue == "" {
+		p.Issue = activeMRID
+	}
 }
 
 func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {
