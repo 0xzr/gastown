@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -355,5 +357,74 @@ func TestSendZombieNotification_AggregatesRepeatedAlerts(t *testing.T) {
 		if !strings.Contains(issue.Description, "**Total occurrences**: 3") {
 			t.Errorf("expected 3 occurrences in %s: %s", issue.Title, issue.Description)
 		}
+	}
+}
+
+func TestOutputPatrolScanJSON_FleetSummary(t *testing.T) {
+	t.Parallel()
+
+	fleet := &witness.DetectFleetStateResult{
+		Checked: 3,
+		ActiveImplementation: []witness.FleetPolecat{
+			{Name: "bravo", State: "working", Issue: "gt-work-bravo", SessionRunning: true},
+		},
+		ActiveMQGates: []witness.FleetPolecat{
+			{Name: "alpha", State: "awaiting-gate", ActiveMR: "gt-mr-alpha", SessionRunning: true},
+		},
+		RecoveryHeldSlots: []witness.FleetPolecat{
+			{Name: "charlie", State: "stalled", Issue: "gt-work-charlie"},
+		},
+		OpenMRGates: []witness.FleetMQGate{
+			{MRID: "gt-mr-alpha", SourceIssue: "gt-src-alpha", Status: "open"},
+		},
+	}
+
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+
+	if err := outputPatrolScanJSON("gastown", "2026-06-28T00:00:00Z", nil, nil, nil, fleet, nil); err != nil {
+		os.Stdout = old
+		t.Fatalf("outputPatrolScanJSON failed: %v", err)
+	}
+	w.Close()
+	os.Stdout = old
+
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+
+	var got PatrolScanOutput
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal output: %v\n%s", err, buf.String())
+	}
+
+	if got.Fleet == nil {
+		t.Fatal("Fleet section missing from patrol scan JSON")
+	}
+	if got.Fleet.Checked != 3 {
+		t.Errorf("Fleet.Checked = %d, want 3", got.Fleet.Checked)
+	}
+	if len(got.Fleet.ActiveImplementation) != 1 {
+		t.Errorf("ActiveImplementation = %d, want 1", len(got.Fleet.ActiveImplementation))
+	}
+	if len(got.Fleet.ActiveMQGates) != 1 {
+		t.Errorf("ActiveMQGates = %d, want 1", len(got.Fleet.ActiveMQGates))
+	}
+	if got.Fleet.ActiveMQGates[0].Name != "alpha" {
+		t.Errorf("ActiveMQGates[0].Name = %q, want alpha", got.Fleet.ActiveMQGates[0].Name)
+	}
+	if len(got.Fleet.RecoveryHeldSlots) != 1 {
+		t.Errorf("RecoveryHeldSlots = %d, want 1", len(got.Fleet.RecoveryHeldSlots))
+	}
+	if len(got.Fleet.OpenMRGates) != 1 {
+		t.Errorf("OpenMRGates = %d, want 1", len(got.Fleet.OpenMRGates))
+	}
+	if got.Fleet.OpenMRGates[0].MRID != "gt-mr-alpha" {
+		t.Errorf("OpenMRGates[0].MRID = %q, want gt-mr-alpha", got.Fleet.OpenMRGates[0].MRID)
 	}
 }

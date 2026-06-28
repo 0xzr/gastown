@@ -74,7 +74,33 @@ type PatrolScanOutput struct {
 	Zombies     *PatrolScanZombieOutput   `json:"zombies"`
 	Stalls      *PatrolScanStallOutput    `json:"stalls,omitempty"`
 	Completions *PatrolScanCompleteOutput `json:"completions,omitempty"`
+	Fleet       *PatrolScanFleetOutput    `json:"fleet,omitempty"`
 	Receipts    []witness.PatrolReceipt   `json:"receipts,omitempty"`
+}
+
+// PatrolScanFleetOutput holds the classified fleet summary.
+type PatrolScanFleetOutput struct {
+	Checked              int                      `json:"checked"`
+	ActiveImplementation []PatrolScanFleetPolecat `json:"active_implementation,omitempty"`
+	ActiveMQGates        []PatrolScanFleetPolecat `json:"active_mq_gates,omitempty"`
+	RecoveryHeldSlots    []PatrolScanFleetPolecat `json:"recovery_held_slots,omitempty"`
+	OpenMRGates          []PatrolScanFleetMQGate  `json:"open_mr_gates,omitempty"`
+}
+
+// PatrolScanFleetPolecat is a single polecat in the fleet summary.
+type PatrolScanFleetPolecat struct {
+	Name           string `json:"name"`
+	State          string `json:"state"`
+	Issue          string `json:"issue,omitempty"`
+	ActiveMR       string `json:"active_mr,omitempty"`
+	SessionRunning bool   `json:"session_running"`
+}
+
+// PatrolScanFleetMQGate is a live merge-queue / refinery gate.
+type PatrolScanFleetMQGate struct {
+	MRID        string `json:"mr_id"`
+	SourceIssue string `json:"source_issue,omitempty"`
+	Status      string `json:"status,omitempty"`
 }
 
 // PatrolScanZombieOutput holds zombie detection results.
@@ -165,10 +191,13 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 		return witness.DetectZombiePolecats(bd, workDir, rigName, router)
 	})
 	stallResult := runPatrolScanPhase(diagnostics, "stall detection", func() *witness.DetectStalledPolecatsResult {
-		return witness.DetectStalledPolecats(workDir, rigName)
+		return witness.DetectStalledPolecats(bd, workDir, rigName)
 	})
 	completionResult := runPatrolScanPhase(diagnostics, "completion discovery", func() *witness.DiscoverCompletionsResult {
 		return witness.DiscoverCompletions(bd, workDir, rigName, router)
+	})
+	fleetResult := runPatrolScanPhase(diagnostics, "fleet summary", func() *witness.DetectFleetStateResult {
+		return witness.DetectFleetState(bd, workDir, rigName)
 	})
 
 	// Build patrol receipts for zombies
@@ -191,10 +220,10 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	}
 
 	if patrolScanJSON {
-		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, receipts)
+		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, fleetResult, receipts)
 	}
 
-	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, receipts)
+	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, fleetResult, receipts)
 }
 
 func runPatrolScanPhase[T any](diagnostics io.Writer, name string, fn func() T) T {
@@ -347,7 +376,7 @@ func alertResIssueID(res *alerts.RecordResult) string {
 	return res.IssueID
 }
 
-func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, receipts []witness.PatrolReceipt) error {
+func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, fleetResult *witness.DetectFleetStateResult, receipts []witness.PatrolReceipt) error {
 	output := PatrolScanOutput{
 		Rig:       rigName,
 		Timestamp: timestamp,
@@ -423,12 +452,32 @@ func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.Detec
 		output.Completions = co
 	}
 
+	// Fleet summary
+	if fleetResult != nil {
+		fo := &PatrolScanFleetOutput{
+			Checked: fleetResult.Checked,
+		}
+		for _, p := range fleetResult.ActiveImplementation {
+			fo.ActiveImplementation = append(fo.ActiveImplementation, PatrolScanFleetPolecat(p))
+		}
+		for _, p := range fleetResult.ActiveMQGates {
+			fo.ActiveMQGates = append(fo.ActiveMQGates, PatrolScanFleetPolecat(p))
+		}
+		for _, p := range fleetResult.RecoveryHeldSlots {
+			fo.RecoveryHeldSlots = append(fo.RecoveryHeldSlots, PatrolScanFleetPolecat(p))
+		}
+		for _, g := range fleetResult.OpenMRGates {
+			fo.OpenMRGates = append(fo.OpenMRGates, PatrolScanFleetMQGate(g))
+		}
+		output.Fleet = fo
+	}
+
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(output)
 }
 
-func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, _ []witness.PatrolReceipt) error {
+func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, fleetResult *witness.DetectFleetStateResult, _ []witness.PatrolReceipt) error {
 	fmt.Printf("%s Patrol scan: %s\n\n", style.Bold.Render("🔍"), rigName)
 
 	// Zombies
@@ -510,6 +559,33 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 				fmt.Println()
 				fmt.Printf("    Action: %s\n", d.Action)
 			}
+		}
+		fmt.Println()
+	}
+
+	// Fleet summary
+	if fleetResult != nil && (len(fleetResult.ActiveImplementation) > 0 || len(fleetResult.ActiveMQGates) > 0 || len(fleetResult.RecoveryHeldSlots) > 0 || len(fleetResult.OpenMRGates) > 0 || patrolScanVerbose) {
+		fmt.Printf("%s Fleet State: checked %d polecat(s)\n",
+			style.Bold.Render("🚦"), fleetResult.Checked)
+
+		fmt.Printf("  Active implementation: %d\n", len(fleetResult.ActiveImplementation))
+		for _, p := range fleetResult.ActiveImplementation {
+			fmt.Printf("    • %s  %s  %s\n", p.Name, p.State, style.Dim.Render(p.Issue))
+		}
+
+		fmt.Printf("  Active MQ gates: %d\n", len(fleetResult.ActiveMQGates))
+		for _, p := range fleetResult.ActiveMQGates {
+			fmt.Printf("    • %s  %s  %s\n", p.Name, p.State, style.Dim.Render(p.ActiveMR))
+		}
+
+		fmt.Printf("  Open MR gates: %d\n", len(fleetResult.OpenMRGates))
+		for _, g := range fleetResult.OpenMRGates {
+			fmt.Printf("    • %s  %s\n", g.MRID, style.Dim.Render(g.SourceIssue))
+		}
+
+		fmt.Printf("  Recovery-held slots: %d\n", len(fleetResult.RecoveryHeldSlots))
+		for _, p := range fleetResult.RecoveryHeldSlots {
+			fmt.Printf("    • %s  %s  %s\n", p.Name, p.State, style.Dim.Render(p.Issue+p.ActiveMR))
 		}
 		fmt.Println()
 	}

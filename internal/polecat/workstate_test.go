@@ -39,6 +39,16 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: "idle-pr-open"},
 		},
 		{
+			name: "awaiting-gate live with open mr is pending mr",
+			in:   WorkstateInput{State: StateAwaitingGate, CleanupStatus: CleanupClean, ActiveMR: "gt-mr-open", ActiveMRBlocker: "active_mr=gt-mr-open status=open", SessionRunning: true, ProcessAlive: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active_mr=gt-mr-open status=open", ReuseStatus: "idle-pr-open", CountsTowardCapacity: true},
+		},
+		{
+			name: "awaiting-gate without blocker still counts as pending mr",
+			in:   WorkstateInput{State: StateAwaitingGate, CleanupStatus: CleanupClean, ActiveMR: "gt-mr-open", SessionRunning: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "awaiting-gate", ReuseStatus: "idle-pr-open", CountsTowardCapacity: true},
+		},
+		{
 			name: "working counts as working capacity",
 			in:   WorkstateInput{State: StateWorking, CleanupStatus: CleanupClean},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "working", NeedsRecovery: false, CountsTowardCapacity: true},
@@ -62,6 +72,15 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 				t.Fatalf("DecideWorkstate() = %+v, want fields %+v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestStateAwaitingGateHelpers(t *testing.T) {
+	if !StateAwaitingGate.IsAwaitingGate() {
+		t.Errorf("StateAwaitingGate.IsAwaitingGate() = false, want true")
+	}
+	if StateWorking.IsAwaitingGate() {
+		t.Errorf("StateWorking.IsAwaitingGate() = true, want false")
 	}
 }
 

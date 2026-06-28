@@ -1719,7 +1719,7 @@ func TestDetectStalledPolecatsResult_Empty(t *testing.T) {
 func TestDetectStalledPolecats_NoPolecats(t *testing.T) {
 	t.Parallel()
 	// Should handle missing polecats directory gracefully
-	result := DetectStalledPolecats("/nonexistent/path", "testrig")
+	result := DetectStalledPolecats(nil, "/nonexistent/path", "testrig")
 
 	if result.Checked != 0 {
 		t.Errorf("Checked = %d, want 0 for nonexistent dir", result.Checked)
@@ -1742,7 +1742,7 @@ func TestDetectStalledPolecats_EmptyPolecatsDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DetectStalledPolecats(tmpDir, rigName)
+	result := DetectStalledPolecats(nil, tmpDir, rigName)
 
 	if result.Checked != 0 {
 		t.Errorf("Checked = %d, want 0 for empty polecats dir", result.Checked)
@@ -1775,7 +1775,7 @@ func TestDetectStalledPolecats_NoSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DetectStalledPolecats(tmpDir, rigName)
+	result := DetectStalledPolecats(nil, tmpDir, rigName)
 
 	// Should count 2 polecats (skip hidden)
 	if result.Checked != 2 {
@@ -2847,5 +2847,138 @@ func TestHandleZombieRestart_RestartsWhenBranchNotMerged(t *testing.T) {
 	// Should NOT take the archive path.
 	if strings.Contains(z.Action, "work-already-merged") {
 		t.Errorf("action = %q, should not archive when work is not merged", z.Action)
+	}
+}
+
+// installFleetMockBd installs a mock bd binary that returns agent-bead fields
+// for the fleet-state tests:
+//   - alpha: no hook, active_mr=gt-mr-alpha (open gate)
+//   - bravo: hook_bead=gt-work-bravo (active implementation if live)
+//   - charlie: hook_bead=gt-work-charlie but no active MR (recovery-held if dead)
+//   - gt-mr-alpha: open merge-request bead
+func installFleetMockBd(t *testing.T) {
+	t.Helper()
+
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+# Mock bd for fleet-state tests.
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;; # skip flags
+    *) cmd="$arg"; break ;;
+  esac
+done
+
+case "$cmd" in
+  show)
+    id=""
+    seen_show=0
+    for arg in "$@"; do
+      if [ "$seen_show" = 0 ]; then
+        [ "$arg" = "show" ] && seen_show=1
+        continue
+      fi
+      case "$arg" in --*) continue ;; esac
+      id="$arg"
+      break
+    done
+    case "$id" in
+      *polecat-alpha|gt-testrig-polecat-alpha|gt-alpha)
+        printf '[{"id":"gt-testrig-polecat-alpha","title":"alpha","issue_type":"agent","description":"agent\\n\\nrole_type: polecat\\nagent_state: idle\\nhook_bead: null\\ncleanup_status: clean\\nactive_mr: gt-mr-alpha\\nlast_source_issue: gt-src-alpha"}]\n'
+        ;;
+      *polecat-bravo|gt-testrig-polecat-bravo|gt-bravo)
+        printf '[{"id":"gt-testrig-polecat-bravo","title":"bravo","issue_type":"agent","description":"agent\\n\\nrole_type: polecat\\nagent_state: idle\\nhook_bead: null\\ncleanup_status: clean\\nactive_mr: null"}]\n'
+        ;;
+      *polecat-charlie|gt-testrig-polecat-charlie|gt-charlie)
+        printf '[{"id":"gt-testrig-polecat-charlie","title":"charlie","issue_type":"agent","description":"agent\\n\\nrole_type: polecat\\nagent_state: idle\\nhook_bead: gt-work-charlie\\ncleanup_status: clean\\nactive_mr: null"}]\n'
+        ;;
+      gt-mr-alpha)
+        printf '[{"id":"gt-mr-alpha","status":"open","description":"source_issue: gt-src-alpha"}]\n'
+        ;;
+      *)
+        printf '[]\n'
+        ;;
+    esac
+    ;;
+  list)
+    joined="$*"
+    case "$joined" in
+      *merge-request*)
+        printf '[{"id":"gt-mr-alpha","status":"open","description":"source_issue: gt-src-alpha"}]\n'
+        ;;
+      *)
+        printf '[]\n'
+        ;;
+    esac
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestDetectFleetState_GateNotFleetEmpty(t *testing.T) {
+	// Not parallel: helpers use t.Setenv for the mock bd PATH.
+	installFleetMockBd(t)
+	installFakeTmuxNoServer(t)
+
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, ".gt-root"), []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rigName := "testrig"
+	polecatsDir := filepath.Join(tmpDir, rigName, "polecats")
+	for _, name := range []string{"alpha", "bravo", "charlie"} {
+		if err := os.MkdirAll(filepath.Join(polecatsDir, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result := DetectFleetState(DefaultBdCli(), tmpDir, rigName)
+	if result == nil {
+		t.Fatal("result should not be nil")
+	}
+	if result.Checked != 3 {
+		t.Errorf("Checked = %d, want 3", result.Checked)
+	}
+
+	// Alpha is awaiting a refinery gate — it must NOT be reported as empty fleet.
+	if len(result.ActiveMQGates) != 1 {
+		t.Fatalf("ActiveMQGates = %d, want 1 (alpha awaiting gate)", len(result.ActiveMQGates))
+	}
+	if result.ActiveMQGates[0].Name != "alpha" {
+		t.Errorf("ActiveMQGates[0].Name = %q, want alpha", result.ActiveMQGates[0].Name)
+	}
+	if result.ActiveMQGates[0].State != string(polecat.StateAwaitingGate) {
+		t.Errorf("ActiveMQGates[0].State = %q, want awaiting-gate", result.ActiveMQGates[0].State)
+	}
+
+	// The open MR gate itself is reported separately.
+	if len(result.OpenMRGates) != 1 {
+		t.Fatalf("OpenMRGates = %d, want 1", len(result.OpenMRGates))
+	}
+	if result.OpenMRGates[0].MRID != "gt-mr-alpha" {
+		t.Errorf("OpenMRGates[0].MRID = %q, want gt-mr-alpha", result.OpenMRGates[0].MRID)
+	}
+
+	// Bravo has no live session in this fixture, so active implementation is empty.
+	if len(result.ActiveImplementation) != 0 {
+		t.Errorf("ActiveImplementation = %d, want 0 (no live sessions)", len(result.ActiveImplementation))
+	}
+
+	// Charlie has hooked work but no live session and no active MR → recovery-held.
+	if len(result.RecoveryHeldSlots) != 1 {
+		t.Errorf("RecoveryHeldSlots = %d, want 1 (charlie)", len(result.RecoveryHeldSlots))
+	}
+	if result.RecoveryHeldSlots[0].Name != "charlie" {
+		t.Errorf("RecoveryHeldSlots[0].Name = %q, want charlie", result.RecoveryHeldSlots[0].Name)
 	}
 }

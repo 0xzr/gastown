@@ -2781,6 +2781,25 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 		state = StateReviewNeeded
 	}
 
+	// A live polecat with no hooked work but a pending active MR is waiting for
+	// the refinery gate. Report it as awaiting-gate rather than idle/review-needed
+	// so fleet summaries do not treat a live MR gate as empty capacity.
+	if (state == StateIdle || state == StateReviewNeeded) && sessionRunning && !sessionDead {
+		if fields := m.agentBeadFields(name); fields != nil && fields.ActiveMR != "" {
+			sourceHint := fields.LastSourceIssue
+			if sourceHint == "" {
+				sourceHint = fields.HookBead
+			}
+			if assessment := AssessActiveMR(m.beads, ActiveMRInput{
+				ActiveMR:        fields.ActiveMR,
+				SourceIssueHint: sourceHint,
+				RequireGitSafe:  false,
+			}); assessment.Pending {
+				state = StateAwaitingGate
+			}
+		}
+	}
+
 	return &Polecat{
 		Name:      name,
 		Rig:       m.rig.Name,
@@ -2789,6 +2808,16 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 		Branch:    branchName,
 		Issue:     issueID,
 	}, nil
+}
+
+// agentBeadFields loads and parses the agent bead fields for a polecat.
+func (m *Manager) agentBeadFields(name string) *beads.AgentFields {
+	agentID := m.agentBeadID(name)
+	_, fields, err := m.beads.GetAgentBead(agentID)
+	if err != nil || fields == nil {
+		return nil
+	}
+	return fields
 }
 
 func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {

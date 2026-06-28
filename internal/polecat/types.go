@@ -44,6 +44,12 @@ const (
 	// the cleanup failed and the session is stuck.
 	StateDone State = "done"
 
+	// StateAwaitingGate means the polecat has submitted its work to the merge
+	// queue and is waiting for the refinery gate to close. The session may
+	// still be live, but it no longer has hooked work. Counting this as idle
+	// or stalled would report a live MR gate as empty fleet.
+	StateAwaitingGate State = "awaiting-gate"
+
 	// StateReviewNeeded means a tmux session is still live but no current hooked
 	// or assigned work bead exists, and cleanup status is not clean enough to
 	// reuse safely. This prevents reporting "working" with Issue:none without
@@ -82,6 +88,12 @@ func (s State) IsStalled() bool {
 // IsIdle returns true if the polecat has completed work and is available for reuse.
 func (s State) IsIdle() bool {
 	return s == StateIdle
+}
+
+// IsAwaitingGate returns true if the polecat has submitted work and is waiting
+// for a merge queue / refinery gate to close.
+func (s State) IsAwaitingGate() bool {
+	return s == StateAwaitingGate
 }
 
 // Polecat represents a worker agent in a rig.

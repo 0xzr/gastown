@@ -230,6 +230,25 @@ func decideNonIdleWorkstate(in WorkstateInput) WorkstateDisposition {
 		} else {
 			d.Confidence = WorkstateConfidenceMedium
 		}
+	case StateAwaitingGate:
+		if in.ActiveMRBlocker != "" {
+			d.Verdict = WorkstateVerdictPendingMR
+			d.Reason = in.ActiveMRBlocker
+			d.ReuseStatus = "idle-pr-open"
+		} else {
+			d.Verdict = WorkstateVerdictPendingMR
+			d.Reason = "awaiting-gate"
+			d.ReuseStatus = "idle-pr-open"
+		}
+		d.CountsTowardCapacity = true
+		d.Signals = append([]string{stateSignal}, allSignals(in)...)
+		if live {
+			d.Confidence = WorkstateConfidenceHigh
+		} else if hasAnyLiveSignal(in) {
+			d.Confidence = WorkstateConfidenceMedium
+		} else {
+			d.Confidence = WorkstateConfidenceLow
+		}
 	default:
 		if live && hooked {
 			// Live session + active hook = working even if persisted state is

@@ -2354,7 +2354,11 @@ type DetectStalledPolecatsResult struct {
 // send blind key sequences that dismiss known blocking dialogs (workspace trust,
 // bypass permissions) without screen-scraping pane content. This avoids coupling
 // to third-party TUI strings that can change with any Claude Code update.
-func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult {
+//
+// Polecats waiting on a pending refinery/MQ gate are skipped: post-submit
+// last activity is expected while the gate is open, so terminal inactivity alone
+// must not classify them as stalled.
+func DetectStalledPolecats(bd *BdCli, workDir, rigName string) *DetectStalledPolecatsResult {
 	result := &DetectStalledPolecatsResult{}
 
 	// Find town root for path resolution and session naming
@@ -2400,6 +2404,14 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 		}
 		if !t.IsAgentAlive(sessionName) {
 			continue // Dead agent — zombie detection handles this
+		}
+
+		// Skip post-submit polecats awaiting a refinery/MR gate. Terminal
+		// inactivity is expected while the gate is open; relying on last activity
+		// would report them as stalled (gastown-72v).
+		if bd != nil && hasPendingMR(bd, workDir, rigName, polecatName,
+			beads.PolecatBeadIDWithPrefix(beads.GetPrefixForRig(townRoot, rigName), rigName, polecatName)) {
+			continue
 		}
 
 		// Heartbeat v2 check (gt-3vr5): if the agent has a fresh heartbeat,
@@ -2454,7 +2466,150 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 	return result
 }
 
-// CompletionDiscovery represents a polecat completion discovered from agent bead
+// FleetPolecat captures the lightweight summary of a polecat for fleet reporting.
+type FleetPolecat struct {
+	Name           string `json:"name"`
+	State          string `json:"state"`
+	Issue          string `json:"issue,omitempty"`
+	ActiveMR       string `json:"active_mr,omitempty"`
+	SessionRunning bool   `json:"session_running"`
+}
+
+// FleetMQGate captures a live merge-queue / refinery gate.
+type FleetMQGate struct {
+	MRID        string `json:"mr_id"`
+	SourceIssue string `json:"source_issue,omitempty"`
+	Status      string `json:"status,omitempty"`
+}
+
+// DetectFleetStateResult holds the classified fleet view for a rig.
+type DetectFleetStateResult struct {
+	Checked              int            `json:"checked"`
+	ActiveImplementation []FleetPolecat `json:"active_implementation,omitempty"`
+	ActiveMQGates        []FleetPolecat `json:"active_mq_gates,omitempty"`
+	RecoveryHeldSlots    []FleetPolecat `json:"recovery_held_slots,omitempty"`
+	OpenMRGates          []FleetMQGate  `json:"open_mr_gates,omitempty"`
+}
+
+// DetectFleetState classifies every polecat lane in a rig into one of three
+// operational buckets:
+//
+//   - Active implementation: live session with real hooked work.
+//   - Active MQ gate: post-submit polecat waiting on a refinery/MR gate.
+//   - Recovery-held slot: dead session, stuck state, or other work at risk.
+//
+// It also returns the rig's open MR beads as a separate list so witness patrol
+// output can show active gates independently of polecats.
+func DetectFleetState(bd *BdCli, workDir, rigName string) *DetectFleetStateResult {
+	result := &DetectFleetStateResult{}
+
+	townRoot, err := workspace.Find(workDir)
+	if err != nil || townRoot == "" {
+		townRoot = workDir
+	}
+	initRegistryFromTownRoot(townRoot)
+
+	rigPath := filepath.Join(townRoot, rigName)
+	polecatsDir := filepath.Join(rigPath, "polecats")
+	entries, err := os.ReadDir(polecatsDir)
+	if err != nil {
+		return result
+	}
+
+	t := tmux.NewTmux()
+	prefix := beads.GetPrefixForRig(townRoot, rigName)
+	b := beads.New(rigPath)
+	shower := beadCLIShower{bd: bd, workDir: workDir}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+
+		name := entry.Name()
+		result.Checked++
+
+		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), name)
+		running, _ := t.HasSession(sessionName)
+
+		agentID := beads.PolecatBeadIDWithPrefix(prefix, rigName, name)
+		_, fields, err := b.GetAgentBead(agentID)
+		if err != nil {
+			fields = nil
+		}
+
+		item := FleetPolecat{
+			Name:           name,
+			SessionRunning: running,
+		}
+		if fields != nil {
+			item.State = strings.TrimSpace(fields.AgentState)
+			item.Issue = fields.HookBead
+			item.ActiveMR = fields.ActiveMR
+		}
+		if item.State == "" {
+			item.State = string(polecat.StateIdle)
+		}
+
+		hasHook := item.Issue != ""
+		pendingMR := false
+		if item.ActiveMR != "" {
+			sourceHint := ""
+			if fields != nil {
+				sourceHint = fields.LastSourceIssue
+				if sourceHint == "" {
+					sourceHint = fields.HookBead
+				}
+			}
+			assessment := polecat.AssessActiveMR(shower, polecat.ActiveMRInput{
+				ActiveMR:        item.ActiveMR,
+				SourceIssueHint: sourceHint,
+				RequireGitSafe:  false,
+			})
+			pendingMR = assessment.Pending
+		}
+
+		switch {
+		case hasHook && running:
+			// Live implementation session with active work.
+			result.ActiveImplementation = append(result.ActiveImplementation, item)
+		case item.ActiveMR != "" && pendingMR:
+			// Post-submit gate ownership.
+			item.State = string(polecat.StateAwaitingGate)
+			result.ActiveMQGates = append(result.ActiveMQGates, item)
+		case !running && (hasHook || item.ActiveMR != ""):
+			// Dead session with work or an MR at risk.
+			result.RecoveryHeldSlots = append(result.RecoveryHeldSlots, item)
+		case item.State == string(polecat.StateStuck) || item.State == string(polecat.StateStalled):
+			// Explicitly stuck/stalled polecats even if session signal is unclear.
+			result.RecoveryHeldSlots = append(result.RecoveryHeldSlots, item)
+		}
+	}
+
+	// Open MR beads in the rig's merge queue are a separate signal: a gate may be
+	// live even when its owning polecat session has already exited.
+	if mrs, err := b.List(beads.ListOptions{
+		Label:  "gt:merge-request",
+		Status: "all",
+	}); err == nil {
+		for _, mr := range mrs {
+			if mr.Status == "closed" {
+				continue
+			}
+			gate := FleetMQGate{
+				MRID:   mr.ID,
+				Status: mr.Status,
+			}
+			if f := beads.ParseMRFields(mr); f != nil {
+				gate.SourceIssue = f.SourceIssue
+			}
+			result.OpenMRGates = append(result.OpenMRGates, gate)
+		}
+	}
+
+	return result
+}
+
 // metadata rather than POLECAT_DONE mail. This is the primary discovery mechanism
 // for polecat state transitions (gt-w0br).
 type CompletionDiscovery struct {
