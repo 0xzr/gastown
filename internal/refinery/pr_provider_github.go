@@ -41,7 +41,19 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 	// makes the review packet identify the exact diff reviewed (gastown-cet.8),
 	// so a verdict against intermediate commit history can be distinguished
 	// from a verdict against the final merge candidate.
-	basis := p.mergeCandidateBasis(prNumber)
+	basis, basisErr := p.mergeCandidateBasis(prNumber)
+	if basisErr != nil {
+		// If we cannot authoritatively resolve the merge target, fail closed:
+		// do not fall back to origin/main and do not allow an authoritative PASS
+		// against the wrong basis (gastown-cet.12.6.6).
+		return &ReviewEvaluation{
+			State:            ReviewStateUnavailable,
+			Results:          []ReviewerResult{{Reviewer: "github", Verdict: ReviewerVerdictUnavailable, Evidence: basisErr.Error(), DiffBasis: basis}},
+			UnavailableCount: 1,
+			DiffBasis:        basis,
+			Error:            basisErr.Error(),
+		}, nil
+	}
 
 	reviews, err := p.git.GetPRReviews(prNumber)
 	if err != nil {
@@ -201,28 +213,30 @@ func collapseReviews(reviews []git.PRReview) []git.PRReview {
 // review. Base is the merge target tip (origin/<target>); head is the branch
 // tip. The base branch is the PR's actual target — not hardcoded to main —
 // so PRs targeting release/ or other non-default branches diff against the
-// correct range (gastown-cet.12.6.6). Both components are resolved on a
-// best-effort basis — an empty component means "unknown", which
-// EvaluateReviews treats as a merge-candidate basis (the safe default) rather
-// than a commit-history basis.
-//
-// Fallback order for the base branch:
-//  1. Resolve the PR's baseRefName via gh. If non-empty, use origin/<branch>.
-//  2. On provider error (gh unavailable, auth failure, timeout), fall back to
-//     origin/main so existing single-target deployments keep working. The bug
-//     the fix addresses (hardcoded origin/main when target differs) only
-//     manifests when gh succeeds; degraded failures were already latent and
-//     remain so by design.
-func (p *githubPRProvider) mergeCandidateBasis(prNumber int) DiffBasis {
-	target := "main"
-	if p.resolveTarget != nil {
-		if name, err := p.resolveTarget(prNumber); err == nil && name != "" {
-			target = name
-		}
+// correct range (gastown-cet.12.6.6). If the PR target branch cannot be
+// authoritatively resolved (resolver error or empty result), this function
+// returns an error so GetReviewEvaluation fails closed instead of silently
+// falling back to origin/main.
+func (p *githubPRProvider) mergeCandidateBasis(prNumber int) (DiffBasis, error) {
+	if p.resolveTarget == nil {
+		return DiffBasis{}, fmt.Errorf("no target branch resolver configured")
 	}
-	base, _ := p.git.RemoteBranchTip("origin", target)
+	target, err := p.resolveTarget(prNumber)
+	if err != nil {
+		return DiffBasis{}, fmt.Errorf("cannot resolve PR target branch: %w", err)
+	}
+	if target == "" {
+		return DiffBasis{}, fmt.Errorf("PR target branch unresolved (empty)")
+	}
+	base, err := p.git.RemoteBranchTip("origin", target)
+	if err != nil {
+		return DiffBasis{}, fmt.Errorf("cannot resolve merge target tip origin/%s: %w", target, err)
+	}
+	if base == "" {
+		return DiffBasis{}, fmt.Errorf("merge target tip origin/%s not found", target)
+	}
 	head, _ := p.git.Rev("HEAD")
-	return MergeCandidateBasis(base, head)
+	return MergeCandidateBasis(base, head), nil
 }
 
 func (p *githubPRProvider) MergePR(prNumber int, method string) (string, error) {

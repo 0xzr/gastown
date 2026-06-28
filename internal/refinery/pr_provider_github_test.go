@@ -245,10 +245,10 @@ func TestCollapseReviews_CaseInsensitiveReviewer(t *testing.T) {
 // The bug: mergeCandidateBasis hardcoded "origin/main" as the merge target,
 // mis-identifying the final merge candidate for PRs targeting release/ or
 // other non-default branches. The fix routes the base through the PR's
-// actual target branch via a resolver seam. These tests pin both the success
-// path (non-main target → non-main SHA) and the fallback paths (resolver
-// error / empty result → origin/main), using a real temp git repo so the
-// RemoteBranchTip lookup exercises actual git refs.
+// actual target branch via a resolver seam. These tests pin the success path
+// (non-main target → non-main SHA) and the fail-closed paths (resolver error /
+// empty result → error, no fallback to origin/main), using a real temp git
+// repo so the RemoteBranchTip lookup exercises actual git refs.
 // ---------------------------------------------------------------------------
 
 // initProviderTestRepo creates a fresh git repo with a real bare `origin`
@@ -395,6 +395,18 @@ type fakeBaseResolver struct {
 
 func (f *fakeBaseResolver) resolve(int) (string, error) { return f.branch, f.err }
 
+// fakeBitbucketBaseResolver is the Bitbucket-side counterpart of
+// fakeBaseResolver: it returns a canned destination branch (or an error) so
+// bitbucket provider tests can drive mergeCandidateBasis without shelling out.
+type fakeBitbucketBaseResolver struct {
+	branch string
+	err    error
+}
+
+func (f *fakeBitbucketBaseResolver) resolve(_, _ string, _ int) (string, error) {
+	return f.branch, f.err
+}
+
 // TestGithubMergeCandidateBasis_NonMainTarget is the central regression test
 // for gastown-cet.12.6.6: a PR whose target branch is NOT main must produce
 // a basis whose Base is the SHA of origin/<target>, not the SHA of
@@ -409,7 +421,10 @@ func TestGithubMergeCandidateBasis_NonMainTarget(t *testing.T) {
 		resolveTarget: (&fakeBaseResolver{branch: "release/2026-07"}).resolve,
 	}
 
-	basis := p.mergeCandidateBasis(42)
+	basis, err := p.mergeCandidateBasis(42)
+	if err != nil {
+		t.Fatalf("mergeCandidateBasis: %v", err)
+	}
 	if !basis.IsMergeCandidate() {
 		t.Fatalf("basis must be merge_candidate, got kind=%q", basis.Kind)
 	}
@@ -436,19 +451,22 @@ func TestGithubMergeCandidateBasis_MainTargetKeepsMain(t *testing.T) {
 		resolveTarget: (&fakeBaseResolver{branch: "main"}).resolve,
 	}
 
-	basis := p.mergeCandidateBasis(42)
+	basis, err := p.mergeCandidateBasis(42)
+	if err != nil {
+		t.Fatalf("mergeCandidateBasis: %v", err)
+	}
 	if basis.Base != headSHA {
 		t.Errorf("basis.Base=%q, want %q (origin/main SHA)", basis.Base, headSHA)
 	}
 }
 
-// TestGithubMergeCandidateBasis_ResolverErrorFallsBackToMain pins the
-// degraded-failure fallback: when the provider cannot resolve the PR's
-// target (gh unavailable, auth failure, timeout), the basis falls back to
-// origin/main so existing single-target deployments keep working. The bug
-// the fix addresses only manifests on success; degraded failures were
-// already latent and remain so by design.
-func TestGithubMergeCandidateBasis_ResolverErrorFallsBackToMain(t *testing.T) {
+// TestGithubMergeCandidateBasis_ResolverErrorIsUnavailable pins the
+// fail-closed behavior: when the provider cannot resolve the PR's target
+// (gh unavailable, auth failure, timeout), mergeCandidateBasis returns an
+// error and must not silently fall back to origin/main. A transient resolver
+// failure must not produce an authoritative PASS basis for a PR that actually
+// targets a different branch (gastown-cet.12.6.6).
+func TestGithubMergeCandidateBasis_ResolverErrorIsUnavailable(t *testing.T) {
 	workDir, headSHA, _ := initProviderTestRepo(t, "")
 
 	g := git.NewGit(workDir)
@@ -457,17 +475,24 @@ func TestGithubMergeCandidateBasis_ResolverErrorFallsBackToMain(t *testing.T) {
 		resolveTarget: (&fakeBaseResolver{err: fmt.Errorf("gh unavailable")}).resolve,
 	}
 
-	basis := p.mergeCandidateBasis(42)
-	if basis.Base != headSHA {
-		t.Errorf("fallback basis.Base=%q, want %q (origin/main SHA on resolver error)", basis.Base, headSHA)
+	basis, err := p.mergeCandidateBasis(42)
+	if err == nil {
+		t.Fatalf("expected error on resolver failure, got basis=%+v", basis)
+	}
+	if basis.Base == headSHA {
+		t.Errorf("basis must not fall back to origin/main SHA %q on resolver error", headSHA)
+	}
+	if basis.Base != "" {
+		t.Errorf("basis.Base=%q, want empty on resolver error", basis.Base)
 	}
 }
 
-// TestGithubMergeCandidateBasis_EmptyTargetFallsBackToMain covers the case
+// TestGithubMergeCandidateBasis_EmptyTargetIsUnavailable covers the case
 // where the provider call succeeds but returns no branch (e.g., an oddly
-// configured PR with no baseRefName). We must not produce a malformed
-// "origin/" ref; fall back to main.
-func TestGithubMergeCandidateBasis_EmptyTargetFallsBackToMain(t *testing.T) {
+// configured PR with no baseRefName). Without an authoritative target the
+// basis must fail closed and must not fall back to origin/main
+// (gastown-cet.12.6.6).
+func TestGithubMergeCandidateBasis_EmptyTargetIsUnavailable(t *testing.T) {
 	workDir, headSHA, _ := initProviderTestRepo(t, "")
 
 	g := git.NewGit(workDir)
@@ -476,9 +501,15 @@ func TestGithubMergeCandidateBasis_EmptyTargetFallsBackToMain(t *testing.T) {
 		resolveTarget: (&fakeBaseResolver{branch: ""}).resolve,
 	}
 
-	basis := p.mergeCandidateBasis(42)
-	if basis.Base != headSHA {
-		t.Errorf("fallback basis.Base=%q, want %q (origin/main SHA on empty target)", basis.Base, headSHA)
+	basis, err := p.mergeCandidateBasis(42)
+	if err == nil {
+		t.Fatalf("expected error on empty target, got basis=%+v", basis)
+	}
+	if basis.Base == headSHA {
+		t.Errorf("basis must not fall back to origin/main SHA %q on empty target", headSHA)
+	}
+	if basis.Base != "" {
+		t.Errorf("basis.Base=%q, want empty on empty target", basis.Base)
 	}
 }
 
@@ -494,14 +525,69 @@ func TestBitbucketMergeCandidateBasis_NonMainTarget(t *testing.T) {
 		git:           g,
 		workspace:     "ws",
 		repoSlug:      "repo",
-		resolveTarget: func(_, _ string, _ int) (string, error) { return "release/2026-07", nil },
+		resolveTarget: (&fakeBitbucketBaseResolver{branch: "release/2026-07"}).resolve,
 	}
 
-	basis := p.mergeCandidateBasis(99)
+	basis, err := p.mergeCandidateBasis(99)
+	if err != nil {
+		t.Fatalf("mergeCandidateBasis: %v", err)
+	}
 	if basis.Base != releaseSHA {
 		t.Errorf("basis.Base=%q, want %q (origin/release/2026-07 SHA); the bug was hardcoding origin/main", basis.Base, releaseSHA)
 	}
 	if basis.Base == headSHA {
 		t.Errorf("basis.Base must NOT be origin/main SHA %q when destination is release/2026-07", headSHA)
+	}
+}
+
+// TestBitbucketMergeCandidateBasis_ResolverErrorIsUnavailable ensures a
+// Bitbucket resolver error does not silently fall back to origin/main and
+// cannot produce an authoritative PASS basis (gastown-cet.12.6.6).
+func TestBitbucketMergeCandidateBasis_ResolverErrorIsUnavailable(t *testing.T) {
+	workDir, headSHA, _ := initProviderTestRepo(t, "")
+
+	g := git.NewGit(workDir)
+	p := &bitbucketPRProvider{
+		git:           g,
+		workspace:     "ws",
+		repoSlug:      "repo",
+		resolveTarget: (&fakeBitbucketBaseResolver{err: fmt.Errorf("bitbucket API unavailable")}).resolve,
+	}
+
+	basis, err := p.mergeCandidateBasis(99)
+	if err == nil {
+		t.Fatalf("expected error on resolver failure, got basis=%+v", basis)
+	}
+	if basis.Base == headSHA {
+		t.Errorf("basis must not fall back to origin/main SHA %q on resolver error", headSHA)
+	}
+	if basis.Base != "" {
+		t.Errorf("basis.Base=%q, want empty on resolver error", basis.Base)
+	}
+}
+
+// TestBitbucketMergeCandidateBasis_EmptyTargetIsUnavailable ensures an empty
+// Bitbucket destination result does not silently fall back to origin/main and
+// cannot produce an authoritative PASS basis (gastown-cet.12.6.6).
+func TestBitbucketMergeCandidateBasis_EmptyTargetIsUnavailable(t *testing.T) {
+	workDir, headSHA, _ := initProviderTestRepo(t, "")
+
+	g := git.NewGit(workDir)
+	p := &bitbucketPRProvider{
+		git:           g,
+		workspace:     "ws",
+		repoSlug:      "repo",
+		resolveTarget: (&fakeBitbucketBaseResolver{branch: ""}).resolve,
+	}
+
+	basis, err := p.mergeCandidateBasis(99)
+	if err == nil {
+		t.Fatalf("expected error on empty target, got basis=%+v", basis)
+	}
+	if basis.Base == headSHA {
+		t.Errorf("basis must not fall back to origin/main SHA %q on empty target", headSHA)
+	}
+	if basis.Base != "" {
+		t.Errorf("basis.Base=%q, want empty on empty target", basis.Base)
 	}
 }
