@@ -524,6 +524,35 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		}
 	}
 
+	// Empty-hook recovery (gastown-age): when the hooked molecule auto-closes
+	// before gt done runs (e.g. a wisp bead is reaped mid-flight, or the
+	// previous gt done run closed the molecule as part of its submit step),
+	// the hook is empty but the agent bead's last_source_issue field
+	// preserves the bead ID (hq-l6mm5). Fall back to it when the branch
+	// carries durable git evidence — commits ahead of origin and pushed —
+	// so the done guard keys off git state, not hook presence. Without
+	// this, polecats whose molecule auto-closes hit the empty-hook reject
+	// path even though their work is correctly committed and pushed.
+	//
+	// Resolve the default branch before the git-evidence check so the check
+	// uses the same target the merge queue will use.
+	defaultBranch := "main" // fallback
+	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
+		defaultBranch = rigCfg.DefaultBranch
+	}
+	if issueID == "" && sender != "" && agentBeadID != "" && cwdAvailable {
+		if lastSource := lastSourceIssueForAgentBead(cwd, agentBeadID); lastSource != "" {
+			if hasEvidence := branchHasPushedWorkEvidence(g, branch, defaultBranch); hasEvidence {
+				style.PrintWarning("hook is empty (molecule auto-closed?); using last_source_issue %s from agent bead (gastown-age)", lastSource)
+				fmt.Printf("  Branch has commits ahead of origin and is pushed — git evidence confirms the work is real.\n")
+				issueID = lastSource
+			} else {
+				style.PrintWarning("hook is empty and branch %s has no pushed commits ahead of origin — refusing to fabricate MR against last_source_issue %s", branch, lastSource)
+				fmt.Printf("  Re-hook the bead with `gt hook <issue>` or pass --issue explicitly.\n")
+			}
+		}
+	}
+
 	// Stale-branch guard (hq-l0fj): a redispatched polecat that reuses its
 	// previous work branch carries the OLD bead-id in the branch name, which
 	// would mis-attribute this MR (close credit goes to a closed bead; the
@@ -567,12 +596,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	// Parallel to done-intent label for backwards compat during migration.
 	if sessionName := os.Getenv("GT_SESSION"); sessionName != "" && townRoot != "" {
 		polecat.TouchSessionHeartbeatWithState(townRoot, sessionName, polecat.HeartbeatExiting, "gt done", issueID)
-	}
-
-	// Get configured default branch for this rig
-	defaultBranch := "main" // fallback
-	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
-		defaultBranch = rigCfg.DefaultBranch
 	}
 
 	// For COMPLETED, we need an issue ID and branch must not be the default branch
@@ -2165,6 +2188,74 @@ func isStaleBranchIssue(branchIssue, hookedIssue string) bool {
 		return false
 	}
 	return branchIssue != hookedIssue && !strings.HasPrefix(branchIssue, hookedIssue+".")
+}
+
+// lastSourceIssueForAgentBead reads the last_source_issue field from an agent
+// bead. The field is preserved on the agent bead after the hook_bead slot is
+// cleared (hq-l6mm5), so it remains readable when the hooked molecule has
+// auto-closed and the live hook query returns nothing.
+//
+// Returns an empty string when the agent bead is missing, the field is unset,
+// or the bead read fails. Errors are non-fatal: a missing field is the common
+// case for a fresh polecat that has never completed work, and we want gt done
+// to fall through to its existing reject path rather than fabricate a
+// last_source_issue value.
+func lastSourceIssueForAgentBead(cwd, agentBeadID string) string {
+	if agentBeadID == "" || cwd == "" {
+		return ""
+	}
+	bd := beads.New(cwd).ForAgentBead()
+	if bd == nil {
+		return ""
+	}
+	issue, err := bd.Show(agentBeadID)
+	if err != nil || issue == nil {
+		return ""
+	}
+	fields := beads.ParseAgentFields(issue.Description)
+	if fields == nil {
+		return ""
+	}
+	return fields.LastSourceIssue
+}
+
+// branchHasPushedWorkEvidence reports whether the current branch carries
+// durable git evidence that the polecat's work was actually completed and
+// submitted: at least one commit ahead of origin/<defaultBranch> AND the
+// branch is fully pushed to origin (no unpushed commits). This is the
+// signal that lets gt done tolerate an auto-closed molecule (gastown-age):
+// when the branch is real but the hook is empty, git evidence — not hook
+// presence — is what proves the work is finished.
+//
+// Returns false (conservatively) when any git check fails or cwd is gone,
+// so a missing network or stale remote ref does not let a phantom branch
+// slip through to the merge queue.
+func branchHasPushedWorkEvidence(g *git.Git, branch, defaultBranch string) bool {
+	if g == nil || branch == "" || defaultBranch == "" {
+		return false
+	}
+	if branch == defaultBranch || branch == "master" {
+		return false
+	}
+
+	originDefault := "origin/" + defaultBranch
+	aheadCount, err := g.CommitsAhead(originDefault, "HEAD")
+	if err != nil {
+		// Fallback to local branch comparison when origin is unreachable.
+		aheadCount, err = g.CommitsAhead(defaultBranch, branch)
+		if err != nil || aheadCount <= 0 {
+			return false
+		}
+	}
+	if aheadCount <= 0 {
+		return false
+	}
+
+	pushed, unpushed, err := g.BranchPushedToRemote(branch, "origin")
+	if err != nil || !pushed || unpushed > 0 {
+		return false
+	}
+	return true
 }
 
 // selectAssignedIssue returns the one authoritative assignment to use for

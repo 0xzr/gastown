@@ -483,6 +483,99 @@ func TestIsStaleBranchIssue(t *testing.T) {
 	}
 }
 
+// TestLastSourceIssueForAgentBeadEmptyInputs verifies the helper bails out
+// cleanly when called with the empty inputs gt done uses on its non-polecat
+// paths (no agent bead yet, no cwd). The function must NEVER panic on the
+// empty-hook recovery path even when the agent bead is absent.
+func TestLastSourceIssueForAgentBeadEmptyInputs(t *testing.T) {
+	tests := []struct {
+		name       string
+		cwd        string
+		agentBead  string
+		wantOutput string
+	}{
+		{"empty cwd returns empty", "", "test-agent", ""},
+		{"empty agentBead returns empty", "/tmp", "", ""},
+		{"both empty returns empty", "", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := lastSourceIssueForAgentBead(tt.cwd, tt.agentBead)
+			if got != tt.wantOutput {
+				t.Errorf("lastSourceIssueForAgentBead(%q, %q) = %q, want %q",
+					tt.cwd, tt.agentBead, got, tt.wantOutput)
+			}
+		})
+	}
+}
+
+// TestBranchHasPushedWorkEvidenceRejectsBadInputs verifies the empty-hook
+// recovery guard (gastown-age) never fabricates evidence when its inputs are
+// missing. A missing git handle, empty branch, or default-branch target must
+// all return false so a malformed caller cannot produce a phantom MR.
+//
+// These are the inputs gt done would feed to the helper on a stale or
+// dead worktree; the helper must fail closed rather than guess.
+func TestBranchHasPushedWorkEvidenceRejectsBadInputs(t *testing.T) {
+	tests := []struct {
+		name          string
+		branch        string
+		defaultBranch string
+	}{
+		{"nil git handle", "", "main"}, // branchHasPushedWorkEvidence(nil, ...) is checked first; pass empty branch to avoid further deref
+		{"empty branch", "", "main"},
+		{"empty default branch", "polecat/quartz/gastown-age@abc", ""},
+		{"branch is default branch", "main", "main"},
+		{"branch is master", "master", "main"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := branchHasPushedWorkEvidence(nil, tt.branch, tt.defaultBranch); got {
+				t.Errorf("branchHasPushedWorkEvidence(nil, %q, %q) = true, want false", tt.branch, tt.defaultBranch)
+			}
+		})
+	}
+}
+
+// TestBranchHasPushedWorkEvidenceEmptyGitRepo exercises the helper against a
+// real (but empty) git repository. A repo with no commits ahead of origin
+// must return false — that is the case where a polecat touched no work but
+// gt done is invoked anyway. The empty-hook recovery (gastown-age) must NOT
+// fabricate an MR in that scenario.
+func TestBranchHasPushedWorkEvidenceEmptyGitRepo(t *testing.T) {
+	repo := initTestGitRepo(t)
+	g := gitpkg.NewGit(repo)
+
+	// HEAD is on master with no commits ahead of origin — helper must reject.
+	if got := branchHasPushedWorkEvidence(g, "master", "main"); got {
+		t.Errorf("branchHasPushedWorkEvidence on empty repo = true, want false")
+	}
+}
+
+// initTestGitRepo creates a minimal local git repo with a single empty
+// commit on master. Used by TestBranchHasPushedWorkEvidenceEmptyGitRepo to
+// exercise branchHasPushedWorkEvidence against a real git binary without
+// requiring a Dolt or network connection.
+func initTestGitRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+
+	cmds := [][]string{
+		{"git", "init", "--initial-branch=master"},
+		{"git", "config", "user.email", "test@example.com"},
+		{"git", "config", "user.name", "Test"},
+		{"git", "commit", "--allow-empty", "-m", "initial"},
+	}
+	for _, args := range cmds {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+	return repo
+}
+
 // TestIsPolecatActor verifies that isPolecatActor correctly identifies
 // polecat actors vs other roles based on the BD_ACTOR format.
 func TestIsPolecatActor(t *testing.T) {
