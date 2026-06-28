@@ -1,18 +1,19 @@
 package cmd
 
 import (
+	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/mayor"
 )
 
-// setupTestTown creates a minimal Gas Town workspace marker so
+// setupTestTownForDecision creates a minimal Gas Town workspace marker so
 // workspace.FindFromCwdOrError resolves the temp dir as a town root.
 // It returns the town root and chdir's into it (restored on cleanup).
 func setupTestTownForDecision(t *testing.T) string {
@@ -47,13 +48,88 @@ func resetDecisionFlags() {
 	mayorDecisionMayor = ""
 }
 
+// executeMayorDecision runs `gt mayor decision <args...>` through the full
+// cobra command tree (rootCmd → mayorCmd → mayorDecisionCmd → leaf) and
+// returns the captured stdout/stderr plus any error from
+// traversal/parsing/RunE.
+//
+// Cobra forwards Execute() to the root command when called on a non-root
+// subcommand (see cobra command.go ExecuteC), so we must invoke rootCmd with
+// the full "mayor decision ..." arg path to actually exercise the wiring.
+//
+// Exercising the cobra tree — rather than calling runMayorDecisionRecord /
+// runMayorDecisionList / runMayorDecisionShow directly — ensures the test
+// catches:
+//   - unwired or missing subcommands under mayorDecisionCmd
+//   - arg-parsing regressions (e.g., ExactArgs, Required flags)
+//   - flag-binding regressions on --reason / --mayor
+//
+// The previous direct-func tests proved the data layer (decisions.go) but
+// could not catch a broken wiring, which is why gastown-cet.7 split-verdict
+// flagged this as test debt (gastown-l9j / gastown-cet.7 test adequacy).
+//
+// Output capture: cobra's SetOut/SetErr only redirect cobra's internal
+// writers. The run* functions also call fmt.Printf to os.Stdout directly, so
+// we must redirect os.Stdout/os.Stderr as well. We use two separate
+// bytes.Buffers — one for cobra's writers, one for os-level stdio drained
+// in a goroutine — because concurrent writes to a single bytes.Buffer from
+// cobra and the drain goroutine race and silently corrupt the buffer.
+func executeMayorDecision(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+
+	// Reset package-level flag vars so a prior Execute doesn't leak into this run.
+	// These are bound to the leaf cobra commands via Flags().StringVar in init().
+	resetDecisionFlags()
+
+	fullArgs := append([]string{"mayor", "decision"}, args...)
+	rootCmd.SetArgs(fullArgs)
+
+	var cobraBuf bytes.Buffer
+	rootCmd.SetOut(&cobraBuf)
+	rootCmd.SetErr(&cobraBuf)
+
+	// Capture os.Stdout/os.Stderr as well (run* funcs use fmt.Printf directly,
+	// and persistentPreRun uses fmt.Fprintf(os.Stderr, ...)). We must drain
+	// concurrently — otherwise any subprocess spawned during Execute (e.g., a
+	// `bd version` subprocess) that inherits the pipe will block once the 4KB
+	// OS buffer fills, deadlocking the test run.
+	var osBuf bytes.Buffer
+	origStdout, origStderr := os.Stdout, os.Stderr
+	stdr, stdw, _ := os.Pipe()
+	os.Stdout = stdw
+	os.Stderr = stdw
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(&osBuf, stdr)
+		close(done)
+	}()
+
+	err := rootCmd.Execute()
+
+	_ = stdw.Close()
+	os.Stdout = origStdout
+	os.Stderr = origStderr
+	<-done
+	_ = stdr.Close()
+
+	// Clear args so subsequent Execute calls don't inherit them.
+	rootCmd.SetArgs(nil)
+
+	// Combine cobra + os-level output. Either alone is incomplete: cobra
+	// emits errors/help via its Err writer; run* funcs print results via
+	// fmt.Printf → os.Stdout.
+	return cobraBuf.String() + osBuf.String(), err
+}
+
 func TestMayorDecision_DeferBlocksAndShowLists(t *testing.T) {
 	townRoot := setupTestTownForDecision(t)
 	t.Cleanup(resetDecisionFlags)
 
-	mayorDecisionReason = "deprioritized"
-	if err := runMayorDecisionRecord("polybot-uiu", mayor.DecisionDefer); err != nil {
-		t.Fatalf("record defer: %v", err)
+	// Record defer via the cobra tree; --reason exercises the --reason flag binding.
+	out, err := executeMayorDecision(t, "defer", "polybot-uiu", "--reason", "deprioritized")
+	if err != nil {
+		t.Fatalf("gt mayor decision defer via cobra: %v\n%s", err, out)
 	}
 
 	// Active decision present and blocking.
@@ -69,14 +145,13 @@ func TestMayorDecision_DeferBlocksAndShowLists(t *testing.T) {
 		t.Errorf("unexpected decision: %+v", d)
 	}
 
-	// List should include the recorded bead.
-	out := captureStdout(t, func() {
-		if err := runMayorDecisionList(&cobra.Command{}, nil); err != nil {
-			t.Fatalf("list: %v", err)
-		}
-	})
-	if !strings.Contains(out, "polybot-uiu") || !strings.Contains(out, "defer") {
-		t.Errorf("list output missing bead/type, got: %s", out)
+	// List via the cobra tree — must also go through the wiring, not the func.
+	listOut, err := executeMayorDecision(t, "list")
+	if err != nil {
+		t.Fatalf("gt mayor decision list via cobra: %v\n%s", err, listOut)
+	}
+	if !strings.Contains(listOut, "polybot-uiu") || !strings.Contains(listOut, "defer") {
+		t.Errorf("list output missing bead/type, got: %s", listOut)
 	}
 }
 
@@ -84,11 +159,11 @@ func TestMayorDecision_ResumeOverridesDefer(t *testing.T) {
 	townRoot := setupTestTownForDecision(t)
 	t.Cleanup(resetDecisionFlags)
 
-	if err := runMayorDecisionRecord("gt-resume-cli", mayor.DecisionHold); err != nil {
-		t.Fatalf("record hold: %v", err)
+	if _, err := executeMayorDecision(t, "hold", "gt-resume-cli"); err != nil {
+		t.Fatalf("hold via cobra: %v", err)
 	}
-	if err := runMayorDecisionRecord("gt-resume-cli", mayor.DecisionResume); err != nil {
-		t.Fatalf("record resume: %v", err)
+	if _, err := executeMayorDecision(t, "resume", "gt-resume-cli"); err != nil {
+		t.Fatalf("resume via cobra: %v", err)
 	}
 
 	state, err := mayor.LoadDecisions(townRoot)
@@ -106,19 +181,30 @@ func TestMayorDecision_ResumeOverridesDefer(t *testing.T) {
 
 func TestMayorDecision_ShowNoDecision(t *testing.T) {
 	setupTestTownForDecision(t)
-	out := captureStdout(t, func() {
-		if err := runMayorDecisionShow(&cobra.Command{}, []string{"gt-none"}); err != nil {
-			t.Fatalf("show: %v", err)
-		}
-	})
+	out, err := executeMayorDecision(t, "show", "gt-none")
+	if err != nil {
+		t.Fatalf("gt mayor decision show via cobra: %v\n%s", err, out)
+	}
 	if !strings.Contains(out, "No active Mayor decision") {
 		t.Errorf("expected no-decision message, got: %s", out)
 	}
 }
 
-func TestMayorDecision_InvalidTypeRejected(t *testing.T) {
+// TestMayorDecision_InvalidArgCountRejected exercises the cobra tree's
+// ExactArgs validation. The leaf subcommands all declare cobra.ExactArgs(1)
+// for the bead-id; passing extra args must surface as a parse error rather
+// than silently dropping the trailing args. This is the cobra-tree analogue
+// of the previous direct-func "invalid type" test — both guard against a
+// regression that would let malformed input reach the decision store.
+func TestMayorDecision_InvalidArgCountRejected(t *testing.T) {
 	setupTestTownForDecision(t)
-	if err := runMayorDecisionRecord("gt-x", mayor.DecisionType("bogus")); err == nil {
-		t.Error("expected error recording invalid decision type")
+	out, err := executeMayorDecision(t, "defer", "gt-x", "extra-positional-arg")
+	if err == nil {
+		t.Errorf("expected error for 'defer' with extra positional arg, got nil\noutput: %s", out)
+	}
+	// Cobra prints the accepts-N-args error to its Err writer, which we
+	// captured into `out`.
+	if !strings.Contains(out, "accepts 1 arg") {
+		t.Errorf("expected error output to mention 'accepts 1 arg', got: %s", out)
 	}
 }
