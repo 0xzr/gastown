@@ -1,17 +1,21 @@
 package polecat
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	beadsSDK "github.com/steveyegge/beads"
+	gtbeads "github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
@@ -1165,5 +1169,153 @@ func TestReadModelAssignment_MalformedJSONReturnsEmpty(t *testing.T) {
 	}
 	if got := readModelAssignment(tmpTown, "gastown-bad"); got != "" {
 		t.Errorf("readModelAssignment(bad json) = %q, want empty", got)
+	}
+}
+
+// fakeBeadsStore is a minimal beadsdk.Storage implementation for readHookBead
+// unit tests. It supports only the methods needed for agent-bead and issue
+// lookups; unimplemented methods panic via the embedded interface.
+type fakeBeadsStore struct {
+	beadsSDK.Storage
+	issues map[string]*beadsSDK.Issue
+	labels map[string][]string
+}
+
+func (f *fakeBeadsStore) GetIssue(_ context.Context, id string) (*beadsSDK.Issue, error) {
+	issue, ok := f.issues[id]
+	if !ok {
+		return nil, fmt.Errorf("issue %s not found", id)
+	}
+	return issue, nil
+}
+
+func (f *fakeBeadsStore) GetLabels(_ context.Context, issueID string) ([]string, error) {
+	return f.labels[issueID], nil
+}
+
+func (f *fakeBeadsStore) Close() error { return nil }
+
+// newFakeBeadsForSessionManager creates a Beads wrapper backed by fakeBeadsStore.
+func newFakeBeadsForSessionManager(t *testing.T, workDir string, issues map[string]*beadsSDK.Issue) *gtbeads.Beads {
+	t.Helper()
+	store := &fakeBeadsStore{issues: issues, labels: make(map[string][]string)}
+	return gtbeads.NewWithStore(workDir, store)
+}
+
+// TestEnsureCanonicalSessionBranch_ReadHookBeadFallback exercises the
+// readHookBead fallback path: when opts.Issue is empty, the branch should be
+// inferred from the agent bead's hook_bead if and only if that work bead is
+// still currently hooked and assigned to the polecat (gastown-cet.10).
+func TestEnsureCanonicalSessionBranch_ReadHookBeadFallback(t *testing.T) {
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	agentID := sm.agentBeadIDForSession("toast")
+	assignee := "gastown/polecats/toast"
+	issueID := "gt-9qb"
+
+	issues := map[string]*beadsSDK.Issue{
+		agentID: {
+			ID:          agentID,
+			Title:       "Agent bead for toast",
+			Description: "hook_bead: " + issueID + "\n",
+			IssueType:   beadsSDK.IssueType("agent"),
+			Status:      beadsSDK.StatusOpen,
+		},
+		issueID: {
+			ID:        issueID,
+			Title:     "Fallback hooked issue",
+			IssueType: beadsSDK.TypeTask,
+			Status:    beadsSDK.Status("hooked"),
+			Assignee:  assignee,
+		},
+	}
+	sm.beadsForTest = newFakeBeadsForSessionManager(t, workDir, issues)
+
+	branch, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{})
+	if err != nil {
+		t.Fatalf("ensureCanonicalSessionBranch: %v", err)
+	}
+	if !strings.Contains(branch, "/gt-9qb@") {
+		t.Fatalf("expected branch to use hook_bead issue gt-9qb, got %q", branch)
+	}
+}
+
+// TestEnsureCanonicalSessionBranch_ReadHookBeadFallback_Stale verifies that a
+// stale hook_bead (work bead no longer hooked) is ignored, so the branch does
+// not silently inherit an old assignment (gastown-cet.10).
+func TestEnsureCanonicalSessionBranch_ReadHookBeadFallback_Stale(t *testing.T) {
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	agentID := sm.agentBeadIDForSession("toast")
+	assignee := "gastown/polecats/toast"
+	issueID := "gt-9qb"
+
+	issues := map[string]*beadsSDK.Issue{
+		agentID: {
+			ID:          agentID,
+			Title:       "Agent bead for toast",
+			Description: "hook_bead: " + issueID + "\n",
+			IssueType:   beadsSDK.IssueType("agent"),
+			Status:      beadsSDK.StatusOpen,
+		},
+		issueID: {
+			ID:        issueID,
+			Title:     "Closed stale issue",
+			IssueType: beadsSDK.TypeTask,
+			Status:    beadsSDK.StatusClosed,
+			Assignee:  assignee,
+		},
+	}
+	sm.beadsForTest = newFakeBeadsForSessionManager(t, workDir, issues)
+
+	branch, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{})
+	if err != nil {
+		t.Fatalf("ensureCanonicalSessionBranch: %v", err)
+	}
+	if strings.Contains(branch, "gt-9qb") {
+		t.Fatalf("expected stale hook_bead gt-9qb to be ignored, got branch %q", branch)
+	}
+}
+
+// TestEnsureCanonicalSessionBranch_QuarantineRefUniqueSuffix verifies that the
+// quarantine ref includes a unique random suffix so two polecats quarantining
+// within the same millisecond cannot collide (gastown-cet.10).
+func TestEnsureCanonicalSessionBranch_QuarantineRefUniqueSuffix(t *testing.T) {
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+
+	// Create an abandoned WIP branch for a different issue with local commits.
+	oldBranch := "polecat/toast/gt-old@seed"
+	if err := repoGit.CheckoutNewBranch(oldBranch, "main"); err != nil {
+		t.Fatalf("checkout old WIP branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "abandoned.txt"), []byte("abandoned\n"), 0644); err != nil {
+		t.Fatalf("write abandoned.txt: %v", err)
+	}
+	if err := repoGit.Add("abandoned.txt"); err != nil {
+		t.Fatalf("git add abandoned.txt: %v", err)
+	}
+	if err := repoGit.Commit("abandoned WIP commit"); err != nil {
+		t.Fatalf("git commit abandoned.txt: %v", err)
+	}
+
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	if _, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-new"}); err != nil {
+		t.Fatalf("ensureCanonicalSessionBranch: %v", err)
+	}
+
+	refs, err := repoGit.ListRefs("refs/quarantine/polecat/gastown/toast/*")
+	if err != nil {
+		t.Fatalf("list quarantine refs: %v", err)
+	}
+	if len(refs) == 0 {
+		t.Fatalf("expected a quarantine ref for the abandoned branch, found none")
+	}
+	quarantineRef := refs[0]
+
+	// Expected format with 8-character random suffix: refs/quarantine/polecat/gastown/toast/<component>-<ts>-<suffix>
+	if matched, _ := regexp.MatchString(`refs/quarantine/polecat/gastown/toast/[^/]+-[a-z0-9]+-[a-z0-9]{8}$`, quarantineRef); !matched {
+		t.Fatalf("quarantine ref %q does not match expected format with unique suffix", quarantineRef)
 	}
 }
