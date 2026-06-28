@@ -1620,11 +1620,10 @@ func (g *Git) GetPRReviewDecision(prNumber int) (string, error) {
 // Returns the merge commit SHA on success.
 func (g *Git) GhPrMerge(prNumber int, method string) (string, error) {
 	args := []string{"pr", "merge", fmt.Sprintf("%d", prNumber), "--" + method, "--delete-branch"}
-	cmd := exec.Command("gh", args...)
-	cmd.Dir = g.workDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("gh pr merge failed: %s: %w", strings.TrimSpace(string(out)), err)
+	// Bounded via runProviderCommand so a hung gh merge cannot keep the merge
+	// queue waiting, and any error message does not embed the raw argv.
+	if _, err := runProviderCommand("gh", args, g.workDir, "github pr-merge"); err != nil {
+		return "", err
 	}
 
 	// After merge, pull the target branch to get the merge commit locally
@@ -1754,14 +1753,17 @@ func (g *Git) BitbucketPRMerge(workspace, repoSlug string, prID int, strategy st
 	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d/merge",
 		workspace, repoSlug, prID)
 	body := fmt.Sprintf(`{"merge_strategy":"%s","close_source_branch":true}`, strategy)
-	cmd := exec.Command("curl", "-s", "-X", "POST",
-		"-H", "Authorization: Bearer "+token,
+	// Bounded via runProviderCommand so a hung curl cannot keep the merge queue
+	// waiting; the token is passed as a redactedToken so any echo / error text
+	// is scrubbed to [REDACTED] and never surfaces in returned errors.
+	result, err := runProviderCommand("curl", []string{
+		"-s", "-X", "POST",
+		"-H", "Authorization: Bearer " + token,
 		"-H", "Content-Type: application/json",
-		"-d", body, url)
-	cmd.Dir = g.workDir
-	out, err := cmd.CombinedOutput()
+		"-d", body, url,
+	}, g.workDir, "bitbucket pr-merge", token)
 	if err != nil {
-		return "", fmt.Errorf("bitbucket merge failed: %s: %w", strings.TrimSpace(string(out)), err)
+		return "", err
 	}
 
 	var resp struct {
@@ -1769,7 +1771,7 @@ func (g *Git) BitbucketPRMerge(workspace, repoSlug string, prID int, strategy st
 			Hash string `json:"hash"`
 		} `json:"merge_commit"`
 	}
-	if err := json.Unmarshal(bytes.TrimSpace(out), &resp); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &resp); err != nil {
 		// Merge may have succeeded but response parsing failed — pull to get SHA.
 		if _, pullErr := g.run("pull", "origin"); pullErr == nil {
 			if sha, revErr := g.Rev("HEAD"); revErr == nil {
