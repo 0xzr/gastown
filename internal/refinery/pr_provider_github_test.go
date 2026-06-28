@@ -16,7 +16,14 @@ func review(reviewer, state, submittedAt, body string) git.PRReview {
 // GitHub provider uses, without shelling to gh. It is the characterization
 // seam for the final-diff selection fix.
 func evaluateGitHubReviews(reviews []git.PRReview) ReviewEvaluation {
-	results := classifyCollapsedReviews(collapseReviews(reviews), DiffBasis{})
+	return evaluateGitHubReviewsAtHead(reviews, "")
+}
+
+// evaluateGitHubReviewsAtHead runs classifyCollapsedReviews against the supplied
+// current head SHA, so tests can exercise commit-history detection.
+func evaluateGitHubReviewsAtHead(reviews []git.PRReview, head string) ReviewEvaluation {
+	mergeBasis := MergeCandidateBasis("base-sha", head)
+	results := classifyCollapsedReviews(collapseReviews(reviews), mergeBasis, head)
 	return EvaluateReviews(results, DegradedQuorumRule{})
 }
 
@@ -231,5 +238,113 @@ func TestCollapseReviews_CaseInsensitiveReviewer(t *testing.T) {
 	ev := evaluateGitHubReviews(reviews)
 	if ev.State != ReviewStatePass {
 		t.Errorf("expected PASS (case-insensitive collapse), got %s", ev.State)
+	}
+}
+
+// reviewOnCommit is a compact constructor that also sets the commit SHA the
+// review was submitted against.
+func reviewOnCommit(reviewer, state, submittedAt, body, commitID string) git.PRReview {
+	r := review(reviewer, state, submittedAt, body)
+	r.CommitID = commitID
+	return r
+}
+
+// TestClassifyCollapsedReviews_CurrentCommitUsesMergeCandidateBasis confirms a
+// review whose CommitID matches the current PR head is stamped with the final
+// merge-candidate DiffBasis, so a FAIL remains authoritative.
+func TestClassifyCollapsedReviews_CurrentCommitUsesMergeCandidateBasis(t *testing.T) {
+	head := "final-head-sha"
+	reviews := []git.PRReview{
+		reviewOnCommit("luba", "CHANGES_REQUESTED", "2026-06-20T10:00:00Z", "- blocker: race", head),
+	}
+	ev := evaluateGitHubReviewsAtHead(reviews, head)
+	if ev.State != ReviewStateFail {
+		t.Fatalf("review on current head must be authoritative FAIL, got %s: %s", ev.State, ev.Error)
+	}
+	if !ev.Results[0].DiffBasis.IsMergeCandidate() {
+		t.Errorf("review on current head must have merge-candidate basis, got %+v", ev.Results[0].DiffBasis)
+	}
+}
+
+// TestClassifyCollapsedReviews_StaleCommitUsesCommitHistoryBasis covers the
+// hq-luba incident class (gastown-cet.12.6.7): a review submitted against an
+// earlier push is stamped with commit_history DiffBasis, so a FAIL is
+// reclassified to a no-verdict audit gap rather than blocking the merge.
+func TestClassifyCollapsedReviews_StaleCommitUsesCommitHistoryBasis(t *testing.T) {
+	head := "final-head-sha"
+	stale := "stale-head-sha"
+	reviews := []git.PRReview{
+		reviewOnCommit("alice", "APPROVED", "2026-06-20T10:00:00Z", "lgtm", head),
+		reviewOnCommit("luba", "CHANGES_REQUESTED", "2026-06-20T09:00:00Z", "- blocker: race", stale),
+	}
+	mergeBasis := MergeCandidateBasis("base-sha", head)
+	results := classifyCollapsedReviews(collapseReviews(reviews), mergeBasis, head)
+	ev := EvaluateReviews(results, DegradedQuorumRule{Enabled: true, MinPassReviews: 1})
+
+	// The stale commit-history FAIL must not produce a hard FAIL state.
+	if ev.State == ReviewStateFail {
+		t.Fatalf("stale commit-history FAIL must not authoritatively reject the merge candidate, got state %s (cause=%s): %s", ev.State, ev.CauseKey, ev.Error)
+	}
+	if ev.FailCount != 0 {
+		t.Errorf("expected FailCount=0 after reclassifying stale FAIL, got %d", ev.FailCount)
+	}
+	if ev.NoVerdictCount != 1 {
+		t.Errorf("expected NoVerdictCount=1 (reclassified luba), got %d", ev.NoVerdictCount)
+	}
+	if ev.State != ReviewStateDegradedQuorum {
+		t.Errorf("expected DEGRADED_QUORUM (proceed under audit), got %s", ev.State)
+	}
+
+	// The stale review must carry a commit_history basis.
+	var found bool
+	for _, r := range ev.Results {
+		if r.Reviewer == "luba" {
+			found = true
+			if r.DiffBasis.Kind != "commit_history" {
+				t.Errorf("stale review must have commit_history basis, got %+v", r.DiffBasis)
+			}
+			if r.DiffBasis.Head != stale {
+				t.Errorf("stale review basis head must be the review commit %s, got %s", stale, r.DiffBasis.Head)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected luba in results, got %+v", ev.Results)
+	}
+}
+
+// TestClassifyCollapsedReviews_MissingCommitIDDefaultsToMergeCandidate confirms
+// backward compatibility: reviews that do not carry a CommitID are treated as
+// merge-candidate verdicts. This avoids reclassifying real FAILs when the
+// provider field is unavailable.
+func TestClassifyCollapsedReviews_MissingCommitIDDefaultsToMergeCandidate(t *testing.T) {
+	reviews := []git.PRReview{
+		review("luba", "CHANGES_REQUESTED", "2026-06-20T10:00:00Z", "- blocker: race"),
+	}
+	ev := evaluateGitHubReviewsAtHead(reviews, "any-head-sha")
+	if ev.State != ReviewStateFail {
+		t.Fatalf("review without CommitID must remain authoritative FAIL, got %s: %s", ev.State, ev.Error)
+	}
+	if !ev.Results[0].DiffBasis.IsMergeCandidate() {
+		t.Errorf("review without CommitID must default to merge-candidate basis, got %+v", ev.Results[0].DiffBasis)
+	}
+}
+
+// TestClassifyCollapsedReviews_UnknownHeadDefaultsToMergeCandidate confirms that
+// when the current head cannot be resolved, reviews do not get stamped as
+// commit_history just because they carry a CommitID. Reclassifying every
+// verdict as history would silently bypass real rejections.
+func TestClassifyCollapsedReviews_UnknownHeadDefaultsToMergeCandidate(t *testing.T) {
+	reviews := []git.PRReview{
+		reviewOnCommit("luba", "CHANGES_REQUESTED", "2026-06-20T10:00:00Z", "- blocker: race", "some-commit-sha"),
+	}
+	mergeBasis := MergeCandidateBasis("base-sha", "")
+	results := classifyCollapsedReviews(collapseReviews(reviews), mergeBasis, "")
+	ev := EvaluateReviews(results, DegradedQuorumRule{})
+	if ev.State != ReviewStateFail {
+		t.Fatalf("review with unknown head must remain authoritative FAIL, got %s: %s", ev.State, ev.Error)
+	}
+	if !ev.Results[0].DiffBasis.IsMergeCandidate() {
+		t.Errorf("review with unknown head must default to merge-candidate basis, got %+v", ev.Results[0].DiffBasis)
 	}
 }

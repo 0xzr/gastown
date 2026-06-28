@@ -1489,6 +1489,13 @@ type PRReview struct {
 	State    string `json:"state"`
 	Body     string `json:"body,omitempty"`
 
+	// CommitID is the SHA of the PR head the review was submitted against.
+	// GitHub reviews are bound to the commit that existed when the review was
+	// opened; if the branch is later force-pushed, this lets the evaluator
+	// distinguish a verdict on the final merge candidate from a verdict on
+	// intermediate commit history (gastown-cet.12.6.7 / hq-luba).
+	CommitID string `json:"commit_id,omitempty"`
+
 	// SubmittedAt is the RFC3339 timestamp the review was submitted, used to order
 	// a reviewer's review history chronologically when collapsing to the final
 	// effective review (gastown-cet.12.6.1). Empty when the provider did not
@@ -1535,6 +1542,9 @@ func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
 			State       string `json:"state"`
 			Body        string `json:"body"`
 			SubmittedAt string `json:"submittedAt"`
+			Commit      struct {
+				Oid string `json:"oid"`
+			} `json:"commit"`
 		} `json:"reviews"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &parsed); err != nil {
@@ -1546,6 +1556,7 @@ func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
 			Reviewer:    r.Author.Login,
 			State:       r.State,
 			Body:        r.Body,
+			CommitID:    r.Commit.Oid,
 			SubmittedAt: r.SubmittedAt,
 		})
 	}

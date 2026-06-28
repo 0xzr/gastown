@@ -69,7 +69,7 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 		}, nil
 	}
 
-	results := classifyCollapsedReviews(collapseReviews(reviews), basis)
+	results := classifyCollapsedReviews(collapseReviews(reviews), basis, basis.Head)
 
 	ev := EvaluateReviews(results, DegradedQuorumRule{})
 	ev.DiffBasis = basis
@@ -80,9 +80,24 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 // collapsed to its final state by collapseReviews) onto a ReviewerResult,
 // applying GitHub review-state semantics. Extracted so the collapse + classify
 // path is unit-testable without shelling to gh (gastown-cet.12.6.1).
-func classifyCollapsedReviews(reviews []git.PRReview, basis DiffBasis) []ReviewerResult {
+//
+// mergeBasis is the DiffBasis for the final merge candidate. head is the
+// current PR head SHA; a review whose CommitID differs from head is treated
+// as a verdict against intermediate commit history, not the merge candidate
+// (gastown-cet.12.6.7 / hq-luba).
+func classifyCollapsedReviews(reviews []git.PRReview, mergeBasis DiffBasis, head string) []ReviewerResult {
 	results := make([]ReviewerResult, 0, len(reviews))
 	for _, r := range reviews {
+		basis := mergeBasis
+		// A non-empty CommitID that differs from the current head means the
+		// verdict was submitted against an earlier commit and does not apply
+		// to the final merge candidate. Only perform this check when both the
+		// current head and the review commit are known; an unknown head must
+		// keep the safe merge-candidate default rather than reclassifying all
+		// verdicts as history.
+		if head != "" && r.CommitID != "" && r.CommitID != head {
+			basis = CommitHistoryBasis(mergeBasis.Base, r.CommitID)
+		}
 		result := ReviewerResult{Reviewer: r.Reviewer, DiffBasis: basis}
 		switch strings.ToUpper(r.State) {
 		case "APPROVED":

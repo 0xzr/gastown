@@ -190,6 +190,14 @@ func MergeCandidateBasis(base, head string) DiffBasis {
 	return DiffBasis{Base: base, Head: head, Kind: "merge_candidate"}
 }
 
+// CommitHistoryBasis returns a DiffBasis describing a review submitted against
+// an intermediate commit of the PR, not the final merge candidate. Verdicts on
+// this basis are not authoritative for the merge candidate and are reclassified
+// to no-verdict audit gaps by EvaluateReviews (hq-luba).
+func CommitHistoryBasis(base, head string) DiffBasis {
+	return DiffBasis{Base: base, Head: head, Kind: "commit_history"}
+}
+
 // EvaluateReviews aggregates per-reviewer results into an overall decision.
 //
 // Rules, in order:

@@ -257,6 +257,22 @@ func TestMergeCandidateBasis_DiffBasis(t *testing.T) {
 	}
 }
 
+// TestCommitHistoryBasis_DiffBasis confirms the constructor for intermediate
+// commit history uses the expected kind and reports IsMergeCandidate=false
+// (gastown-cet.12.6.7).
+func TestCommitHistoryBasis_DiffBasis(t *testing.T) {
+	hist := CommitHistoryBasis("origin/main", "stale-head-sha")
+	if hist.IsMergeCandidate() {
+		t.Error("CommitHistoryBasis must report IsMergeCandidate=false")
+	}
+	if hist.Kind != "commit_history" {
+		t.Errorf("expected kind commit_history, got %s", hist.Kind)
+	}
+	if hist.Base != "origin/main" || hist.Head != "stale-head-sha" {
+		t.Errorf("unexpected base/head: %+v", hist)
+	}
+}
+
 // --- Core multi-model refinery quorum (gastown-cet.17) ----------------------
 //
 // These tests pin the source-controlled counterpart of the live runtime gate
