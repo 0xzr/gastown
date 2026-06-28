@@ -195,6 +195,39 @@ func TestEvaluateReviews_CommitHistoryFailNotAuthoritative(t *testing.T) {
 	}
 }
 
+// TestEvaluateReviews_CommitHistoryPassNotAuthoritative covers the stale-
+// approval side of the hq-luba incident class (gastown-cet.12.6.7): a reviewer
+// approved an intermediate commit, but the final squashed merge candidate may
+// differ. A PASS whose DiffBasis is "commit_history" must NOT count toward
+// quorum; it is reclassified to an audit-gap so it cannot authorize the merge.
+func TestEvaluateReviews_CommitHistoryPassNotAuthoritative(t *testing.T) {
+	results := []ReviewerResult{
+		{Reviewer: "alice", Verdict: ReviewerVerdictPass, DiffBasis: MergeCandidateBasis("base-sha", "head-sha")},
+		{Reviewer: "luba", Verdict: ReviewerVerdictPass,
+			DiffBasis: CommitHistoryBasis("base-sha", "old-head-sha")},
+	}
+	ev := EvaluateReviews(results, DegradedQuorumRule{Enabled: true, MinPassReviews: 1})
+
+	if ev.PassCount != 1 {
+		t.Errorf("expected PassCount=1 (only alice's merge-candidate PASS), got %d", ev.PassCount)
+	}
+	if ev.NoVerdictCount != 1 {
+		t.Errorf("expected NoVerdictCount=1 (luba reclassified), got %d", ev.NoVerdictCount)
+	}
+	if ev.State != ReviewStateDegradedQuorum {
+		t.Fatalf("expected DEGRADED_QUORUM with one current PASS and one stale approval audit-gap, got %s", ev.State)
+	}
+	found := false
+	for _, r := range ev.AuditReviewers {
+		if r == "luba" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected luba in audit reviewers for stale approval, got %v", ev.AuditReviewers)
+	}
+}
+
 // TestEvaluateReviews_MergeCandidateFailIsAuthoritative confirms the
 // counterpart: a FAIL against the actual merge-candidate diff (or an unknown
 // basis, which defaults to merge-candidate) remains a hard rejection with a
@@ -646,6 +679,46 @@ func TestCoreQuorum_EmptyDiffKnownM3Writer(t *testing.T) {
 	}
 	if ev.CauseKey != "empty_diff_degenerate_pass" {
 		t.Errorf("expected cause key empty_diff_degenerate_pass, got %s", ev.CauseKey)
+	}
+}
+
+// TestCoreQuorum_CommitHistoryPassNotAuthoritative covers the core-review path
+// for a reviewer probe that returned PASS against intermediate commit history
+// rather than the final merge candidate (gastown-cet.12.6.7). Such a PASS must
+// not count toward the required peer count; the merge defers with the reviewer
+// recorded as an audit obligation.
+func TestCoreQuorum_CommitHistoryPassNotAuthoritative(t *testing.T) {
+	q := CoreReviewerQuorum{Writer: "unknown"}
+	selected := q.SelectedCoreReviewers()
+
+	results := make([]ReviewerResult, 0, len(selected))
+	for _, n := range selected {
+		db := MergeCandidateBasis("base-sha", "head-sha")
+		if n == "codex" {
+			db = CommitHistoryBasis("base-sha", "old-head-sha")
+		}
+		results = append(results, ReviewerResult{
+			Reviewer:  n,
+			Verdict:   ReviewerVerdictPass,
+			DiffBasis: db,
+		})
+	}
+
+	ev := EvaluateCoreReviewerQuorum(results, q)
+	if ev.State != ReviewStateNoVerdict {
+		t.Fatalf("commit-history PASS must defer core quorum, got %s: %s", ev.State, ev.Error)
+	}
+	if ev.PassCount != 3 {
+		t.Errorf("expected PassCount=3 (codex excluded), got %d", ev.PassCount)
+	}
+	found := false
+	for _, r := range ev.AuditReviewers {
+		if r == "codex" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected codex in audit reviewers for stale core approval, got %v", ev.AuditReviewers)
 	}
 }
 

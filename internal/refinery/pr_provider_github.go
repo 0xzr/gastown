@@ -30,8 +30,11 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 	// PR head, which is the diff the squash merge will land. Recording this
 	// makes the review packet identify the exact diff reviewed (gastown-cet.8),
 	// so a verdict against intermediate commit history can be distinguished
-	// from a verdict against the final merge candidate.
-	basis := p.mergeCandidateBasis()
+	// from a verdict against the final merge candidate. The PR head is read
+	// from the GitHub API because the refinery merge path checks out the
+	// target branch before this runs, so local HEAD no longer points at the
+	// PR head (gastown-cet.12.6.7).
+	basis := p.mergeCandidateBasis(prNumber)
 
 	reviews, err := p.git.GetPRReviews(prNumber)
 	if err != nil {
@@ -76,6 +79,22 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 	return &ev, nil
 }
 
+// reviewBasis selects the appropriate DiffBasis for a single collapsed review.
+// If the review's commitID matches the current PR head (or the head is unknown),
+// the review is treated as against the merge candidate. Otherwise it reviewed an
+// earlier commit in the PR's history and is stamped as commit_history so it
+// cannot authoritatively approve or reject the final candidate
+// (gastown-cet.12.6.7).
+func reviewBasis(review git.PRReview, mergeBase DiffBasis) DiffBasis {
+	if mergeBase.Head == "" {
+		return mergeBase
+	}
+	if review.CommitID == "" || review.CommitID == mergeBase.Head {
+		return mergeBase
+	}
+	return CommitHistoryBasis(mergeBase.Base, review.CommitID)
+}
+
 // classifyCollapsedReviews maps each per-reviewer effective review (already
 // collapsed to its final state by collapseReviews) onto a ReviewerResult,
 // applying GitHub review-state semantics. Extracted so the collapse + classify
@@ -83,7 +102,7 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 func classifyCollapsedReviews(reviews []git.PRReview, basis DiffBasis) []ReviewerResult {
 	results := make([]ReviewerResult, 0, len(reviews))
 	for _, r := range reviews {
-		result := ReviewerResult{Reviewer: r.Reviewer, DiffBasis: basis}
+		result := ReviewerResult{Reviewer: r.Reviewer, DiffBasis: reviewBasis(r, basis)}
 		switch strings.ToUpper(r.State) {
 		case "APPROVED":
 			result.Verdict = ReviewerVerdictPass
@@ -188,13 +207,19 @@ func collapseReviews(reviews []git.PRReview) []git.PRReview {
 }
 
 // mergeCandidateBasis returns the merge-candidate diff basis for the PR under
-// review. Base is the merge target tip (origin/<target>); head is the branch
-// tip. Both are resolved on a best-effort basis — an empty component means
-// "unknown", which EvaluateReviews treats as a merge-candidate basis (the safe
-// default) rather than a commit-history basis.
-func (p *githubPRProvider) mergeCandidateBasis() DiffBasis {
+// review. Base is the merge target tip (origin/<target>); head is the PR head
+// OID from the GitHub API so the basis is correct even when the local checkout
+// has already moved to the target branch (gastown-cet.12.6.7). Empty
+// components are resolved on a best-effort basis — an empty head falls back to
+// local HEAD, and an empty component overall means "unknown", which
+// EvaluateReviews treats as a merge-candidate basis (the safe default) rather
+// than a commit-history basis.
+func (p *githubPRProvider) mergeCandidateBasis(prNumber int) DiffBasis {
 	base, _ := p.git.RemoteBranchTip("origin", "main")
-	head, _ := p.git.Rev("HEAD")
+	head, _ := p.git.GetPRHeadOID(prNumber)
+	if head == "" {
+		head, _ = p.git.Rev("HEAD")
+	}
 	return MergeCandidateBasis(base, head)
 }
 

@@ -190,6 +190,15 @@ func MergeCandidateBasis(base, head string) DiffBasis {
 	return DiffBasis{Base: base, Head: head, Kind: "merge_candidate"}
 }
 
+// CommitHistoryBasis returns a DiffBasis describing the per-commit history
+// that a reviewer examined (base..head double-dot). A verdict against this
+// basis is not authoritative against the final squashed merge candidate, so
+// both PASS approvals and FAIL rejections must be reclassified as audit gaps
+// rather than allowed to authorize or block the merge (gastown-cet.12.6.7).
+func CommitHistoryBasis(base, head string) DiffBasis {
+	return DiffBasis{Base: base, Head: head, Kind: "commit_history"}
+}
+
 // EvaluateReviews aggregates per-reviewer results into an overall decision.
 //
 // Rules, in order:
@@ -221,7 +230,19 @@ func EvaluateReviews(results []ReviewerResult, rule DegradedQuorumRule) ReviewEv
 		r := &results[i]
 		switch r.Verdict {
 		case ReviewerVerdictPass:
-			if r.IsEmptyReview() {
+			if !r.DiffBasis.IsMergeCandidate() {
+				// The reviewer approved intermediate commit history, not the
+				// final squashed merge candidate. Stale approvals must not
+				// authorize the current merge candidate (gastown-cet.12.6.7).
+				// Reclassify as an audit-gap; the PASS does not count toward
+				// quorum and the reviewer becomes an audit obligation under
+				// degraded-quorum handling.
+				auditGaps = append(auditGaps, r.Reviewer)
+				r.Verdict = ReviewerVerdictNoVerdict
+				r.Blockers = nil
+				r.CauseKey = ""
+				ev.NoVerdictCount++
+			} else if r.IsEmptyReview() {
 				// Empty-review guard: PASS on a known-empty diff is a
 				// degenerate zero-content verdict, not evidence of approval.
 				// Reclassify as a hard FAIL with a stable cause key so the
@@ -255,7 +276,7 @@ func EvaluateReviews(results []ReviewerResult, rule DegradedQuorumRule) ReviewEv
 		}
 	}
 	if len(auditGaps) > 0 {
-		ev.Error = fmt.Sprintf("reviewer(s) reviewed commit history, not merge candidate: %s", strings.Join(auditGaps, ", "))
+		ev.Error = fmt.Sprintf("reviewer(s) reviewed commit history or approved a stale commit, not merge candidate: %s", strings.Join(auditGaps, ", "))
 	}
 
 	// Any authoritative FAIL with concrete blockers is a hard rejection.
@@ -435,8 +456,11 @@ func EvaluateCoreReviewerQuorum(results []ReviewerResult, q CoreReviewerQuorum) 
 	}
 	// index verdicts by reviewer for quick lookup; last one wins if duplicated.
 	byName := make(map[string]ReviewerVerdict, len(results))
+	resultByName := make(map[string]ReviewerResult, len(results))
 	for _, r := range results {
-		byName[strings.ToLower(r.Reviewer)] = r.Verdict
+		key := strings.ToLower(r.Reviewer)
+		byName[key] = r.Verdict
+		resultByName[key] = r
 	}
 
 	ev := ReviewEvaluation{
@@ -487,13 +511,17 @@ func EvaluateCoreReviewerQuorum(results []ReviewerResult, q CoreReviewerQuorum) 
 		return ev
 	}
 
-	// Evaluate the core panel: every selected reviewer must PASS.
+	// Evaluate the core panel: every selected reviewer must PASS against the
+	// merge candidate. A PASS stamped against commit history (not the final
+	// candidate) is not authoritative and is treated as a missing verdict
+	// (gastown-cet.12.6.7).
 	corePass := 0
 	coreUnavailable := 0
 	coreNoVerdict := 0
 	var missing []string
 	for _, name := range selected {
-		v, ok := byName[strings.ToLower(name)]
+		key := strings.ToLower(name)
+		v, ok := byName[key]
 		switch {
 		case !ok || v == ReviewerVerdictNoVerdict:
 			coreNoVerdict++
@@ -502,6 +530,11 @@ func EvaluateCoreReviewerQuorum(results []ReviewerResult, q CoreReviewerQuorum) 
 			coreUnavailable++
 			missing = append(missing, name)
 		case v == ReviewerVerdictPass:
+			if r, found := resultByName[key]; found && !r.DiffBasis.IsMergeCandidate() {
+				coreNoVerdict++
+				missing = append(missing, name)
+				break
+			}
 			corePass++
 		}
 	}
