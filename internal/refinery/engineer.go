@@ -26,6 +26,7 @@ import (
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/refinery/mrtelemetry"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -453,6 +454,114 @@ func (e *Engineer) SetOutput(w io.Writer) {
 	e.output = w
 }
 
+// telemetryStore returns the per-rig durable MR-telemetry store. All
+// refinery-path telemetry calls (refinery_started, validation, codex
+// review, final outcome) flow through this single accessor so the file
+// location is consistent with what gt mq submit writes at submission
+// time. Telemetry failures are non-fatal — the caller is expected to
+// wrap calls in best-effort guards so a broken telemetry store never
+// stalls an MR.
+func (e *Engineer) telemetryStore() *mrtelemetry.Store {
+	if e.rig == nil || e.rig.Path == "" {
+		return nil
+	}
+	return mrtelemetry.NewStore(mrtelemetry.DefaultStorePath(e.rig.Path))
+}
+
+// recordTelemetry is a best-effort wrapper for telemetry mutations. It
+// logs (but never propagates) errors so a malformed or read-only
+// telemetry file cannot stall MR processing.
+func (e *Engineer) recordTelemetry(fn func(*mrtelemetry.Store) error) {
+	store := e.telemetryStore()
+	if store == nil {
+		return
+	}
+	if err := fn(store); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Note: MR telemetry update: %v\n", err)
+	}
+}
+
+// recordRefineryStarted stamps the refinery_started_at timestamp on the
+// MR's telemetry row (gastown-wjk). Called once at the start of
+// ProcessMRInfo so the report's "refinery → verdict" duration is
+// accurate even when validation is short-circuited by the pre-verified
+// fast path.
+func (e *Engineer) recordRefineryStarted(mrID string) {
+	e.recordTelemetry(func(s *mrtelemetry.Store) error {
+		return s.RecordRefineryStarted(context.Background(), mrID, time.Now().UTC())
+	})
+}
+
+// recordValidation stamps validation_started_at, validation_finished_at,
+// and validation_passed (gastown-wjk).
+func (e *Engineer) recordValidation(mrID string, started, finished time.Time, passed bool) {
+	e.recordTelemetry(func(s *mrtelemetry.Store) error {
+		return s.RecordValidation(context.Background(), mrID, started, finished, passed)
+	})
+}
+
+// recordCodexReview stamps codex_review timing, the verdict, and any
+// per-reviewer results. The mrtelemetry store recomputes
+// submit→verdict and refinery→verdict durations automatically.
+func (e *Engineer) recordCodexReview(mrID string, started, finished time.Time, verdict string, reviewers []mrtelemetry.ReviewerResult) {
+	e.recordTelemetry(func(s *mrtelemetry.Store) error {
+		return s.RecordCodexReview(context.Background(), mrID, started, finished, verdict, reviewers)
+	})
+}
+
+// recordFinalOutcome stamps the terminal decision (merged or rejected),
+// failure class, and merge/published commits.
+func (e *Engineer) recordFinalOutcome(mrID, finalGateDecision, failureClass string, mergedAt, rejectedAt time.Time, mergeCommit, publishedCommit string) {
+	e.recordTelemetry(func(s *mrtelemetry.Store) error {
+		return s.RecordFinalOutcome(context.Background(), mrID, finalGateDecision, failureClass, mergedAt, rejectedAt, mergeCommit, publishedCommit)
+	})
+}
+
+// recordWriterOverwriteIfUnknown upgrades a writer_model="unknown" row
+// to the durableReviewWriter value when the refinery can resolve a
+// more authoritative attribution. This closes the gap when mq_submit
+// couldn't find a model-assignment file at submit time but the rig's
+// durable writer is now known. We never overwrite a non-"unknown"
+// writer — submit-time attribution is authoritative when present.
+func (e *Engineer) recordWriterOverwriteIfUnknown(mrID string) {
+	if mrID == "" {
+		return
+	}
+	store := e.telemetryStore()
+	if store == nil {
+		return
+	}
+	rec, err := store.GetByMRID(mrID)
+	if err != nil || rec == nil {
+		return
+	}
+	if rec.WriterModel != "" && rec.WriterModel != "unknown" {
+		return
+	}
+	if writer := e.durableReviewWriterFromSource(rec.SourceBead); writer != "" {
+		e.recordTelemetry(func(s *mrtelemetry.Store) error {
+			return s.UpdateByMRID(mrID, func(a *mrtelemetry.MRAttempt) {
+				if a.WriterModel == "" || a.WriterModel == "unknown" {
+					a.WriterModel = writer
+					a.WriterModelSource = "refinery_resolved"
+				}
+			})
+		})
+	}
+}
+
+// durableReviewWriterFromSource is a thin adapter around the existing
+// durableReviewWriter family that accepts just the source-issue string
+// (no MRInfo dependency) so it can be called from telemetry paths. It
+// only consults the model-assignment file because we don't have an
+// MRInfo (and hence no AgentBead) at the point telemetry is upgraded.
+func (e *Engineer) durableReviewWriterFromSource(sourceIssue string) string {
+	if sourceIssue == "" {
+		return ""
+	}
+	return e.durableReviewWriterFromAssignment(sourceIssue)
+}
+
 // LoadConfig loads merge queue configuration from the rig's config.json.
 func (e *Engineer) LoadConfig() error {
 	configPath := filepath.Join(e.rig.Path, "config.json")
@@ -872,11 +981,22 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	// verified, refreshed base), skip deterministic gate execution — the polecat
 	// already ran gates after rebasing. The durable multi-model review/HMAC gate
 	// is still enforced separately and cannot be bypassed by the fast path.
+	validationStarted := time.Now()
 	if shouldSkipGates {
 		_, _ = fmt.Fprintln(e.output, "[Engineer] Skipping gates (pre-verified by polecat)")
+		// gastown-wjk: even when gates are skipped, record validation
+		// telemetry so the report knows whether this MR ran gates at all.
+		// treat pre-verified as "passed" since the polecat already ran
+		// gates on the rebased branch.
+		if mr != nil && mr.ID != "" {
+			e.recordValidation(mr.ID, validationStarted, time.Now(), true)
+		}
 	} else if len(e.config.Gates) > 0 {
 		// New gates system: run configured quality gates
 		gateResult := e.runGates(ctx)
+		if mr != nil && mr.ID != "" {
+			e.recordValidation(mr.ID, validationStarted, time.Now(), gateResult.Success)
+		}
 		if !gateResult.Success {
 			return gateResult
 		}
@@ -884,6 +1004,9 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 		// Legacy test command path (backward compatible)
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Running tests: %s\n", e.config.TestCommand)
 		result := e.runTests(ctx)
+		if mr != nil && mr.ID != "" {
+			e.recordValidation(mr.ID, validationStarted, time.Now(), result.Success)
+		}
 		if !result.Success {
 			return ProcessResult{
 				Success:     false,
@@ -2265,6 +2388,13 @@ func (e *Engineer) ProcessMRInfo(ctx context.Context, mr *MRInfo) ProcessResult 
 	_, _ = fmt.Fprintf(e.output, "  Worker: %s\n", mr.Worker)
 	_, _ = fmt.Fprintf(e.output, "  Source: %s\n", mr.SourceIssue)
 
+	// gastown-wjk: stamp refinery_started_at and (best-effort) upgrade
+	// writer attribution when submit-time could not resolve a model.
+	// Done before validation so the refinery→verdict duration is
+	// accurate even when the pre-verified fast path skips gates.
+	e.recordRefineryStarted(mr.ID)
+	e.recordWriterOverwriteIfUnknown(mr.ID)
+
 	// Phase 3: Check pre-verification fast-path.
 	// If the polecat already rebased onto the target and ran gates, and the target
 	// hasn't moved since, we can skip running gates entirely (~5s merge).
@@ -2445,6 +2575,12 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 
 	// 5. Log success
 	_, _ = fmt.Fprintf(e.output, "[Engineer] ✓ Merged: %s (commit: %s)\n", mr.ID, result.MergeCommit)
+
+	// gastown-wjk: stamp the terminal merge outcome so the report counts
+	// this attempt as merged rather than leaving it as "in flight". Failure
+	// to write the telemetry row is non-fatal — log and continue.
+	e.recordFinalOutcome(mr.ID, "merged", "", time.Now().UTC(), time.Time{},
+		result.MergeCommit, result.PublishedCommit)
 }
 
 func (e *Engineer) clearAgentActiveMR(agentBeadID string) error {
@@ -2904,6 +3040,26 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	} else if result.TestsFailed {
 		failureType = "tests"
 	}
+
+	// gastown-wjk: stamp the terminal failure outcome so the report can
+	// separate deterministic_validation failures from implementation_quality
+	// from infra noise. Failure class is a coarse summary used for the
+	// excluded_infra count and for distinguishing substantive FAIL counts
+	// from reviewer_unavailable / timeout / infra_noise.
+	telemetryFailureClass := "implementation_quality"
+	switch {
+	case result.Conflict:
+		telemetryFailureClass = "merge_conflict"
+	case result.TestsFailed:
+		telemetryFailureClass = "deterministic_validation"
+	case result.NeedsRework:
+		telemetryFailureClass = "implementation_quality"
+	case result.ConventionFailed:
+		telemetryFailureClass = "convention_violation"
+	}
+	e.recordFinalOutcome(mr.ID, "rejected", telemetryFailureClass,
+		time.Time{}, time.Now().UTC(), "", "")
+
 	polecatName := strings.TrimPrefix(mr.Worker, "polecats/")
 	nudgeTarget := fmt.Sprintf("%s/%s", e.rig.Name, polecatName)
 	nudgeMsg := fmt.Sprintf("MERGE_FAILED: branch=%s issue=%s type=%s error=%s — fix and resubmit with 'gt done'",
