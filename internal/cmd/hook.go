@@ -496,6 +496,15 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting current directory: %w", err)
 	}
 
+	// When GT_RIG/GT_POLECAT identify a polecat session, read the branch from
+	// the canonical worktree rather than from the process cwd. This prevents
+	// cwd-drift false rejects after a polecat's session cwd moves to the town
+	// or rig root (gastown-dg1 regression).
+	branchWorktree := cwd
+	if canonical := canonicalPolecatWorktree(); canonical != "" {
+		branchWorktree = canonical
+	}
+
 	// Find beads directory.
 	// For remote rig-level targets (e.g. "myndy_monorepo/refinery"), resolve the
 	// rig's actual beads dir using the same rig-aware routing as runHook (attach).
@@ -598,7 +607,7 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 		// This lets the wrapper empty-hook done guard recover when a molecule or
 		// wisp was closed/reaped but the work branch remains.
 		if len(hookedBeads) == 0 {
-			info.SourceBead = resolveSourceBeadFromBranch(cwd, target, b)
+			info.SourceBead = resolveSourceBeadFromBranch(branchWorktree, target, b)
 		}
 
 		enc := json.NewEncoder(os.Stdout)
@@ -607,7 +616,7 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 
 	// Compact one-line output: surface recovered source bead when present.
 	if len(hookedBeads) == 0 {
-		sourceBead := resolveSourceBeadFromBranch(cwd, target, b)
+		sourceBead := resolveSourceBeadFromBranch(branchWorktree, target, b)
 		if sourceBead != "" {
 			fmt.Printf("%s: (empty) [source: %s]\n", target, sourceBead)
 			return nil
@@ -682,6 +691,33 @@ func actualPolecatTargetFromEnv() string {
 		return ""
 	}
 	return rig + "/polecats/" + pc
+}
+
+// canonicalPolecatWorktree returns the canonical polecat git worktree path
+// derived from GT_RIG/GT_POLECAT and the town root, or "" when the variables
+// are unset or the worktree cannot be located. It prefers the newer
+// ${town}/${rig}/polecats/${pc}/${rig} layout and falls back to the older
+// ${town}/${rig}/polecats/${pc} layout.
+func canonicalPolecatWorktree() string {
+	rig := os.Getenv("GT_RIG")
+	pc := os.Getenv("GT_POLECAT")
+	if rig == "" || pc == "" {
+		return ""
+	}
+
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil || townRoot == "" {
+		return ""
+	}
+
+	newPath := filepath.Join(townRoot, rig, "polecats", pc, rig)
+	oldPath := filepath.Join(townRoot, rig, "polecats", pc)
+	for _, p := range []string{newPath, oldPath} {
+		if _, err := os.Stat(filepath.Join(p, ".git")); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 func ensureCurrentHookWorktreeIntegrity() error {

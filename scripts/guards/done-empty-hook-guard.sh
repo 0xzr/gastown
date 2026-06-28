@@ -6,39 +6,35 @@
 #   GT_DONE_EMPTY_HOOK_GUARD=shadow|enforce        Guard mode (default: shadow)
 #   GT_DONE_EMPTY_HOOK_OVERRIDE=1                  Bypass the guard
 #   GT_RIG, GT_POLECAT                             Canonical polecat identity;
-#                                                  used when cwd-based resolution
-#                                                  misresolves the target.
-#   GT_GATE_ATTEST_DIR                             Refinery gate attestation
-#                                                  directory (used for keyed
-#                                                  commit evidence; defaults to
-#                                                  /home/ubuntu/.gt-gate-attestations).
+#                                                  used to resolve the canonical
+#                                                  worktree when cwd has drifted.
+#   GT_TOWN, GT_ROOT, GT_TOWN_ROOT                 Gas Town root directory
+#                                                  (defaults to /home/ubuntu/gt-town).
 #
 # Rejects gt done from an empty hook with no durable evidence of work. When
 # evidence exists (a hooked/in-progress bead, a source_bead recovered from the
-# work branch, an open MR with an exact-matching source_issue, a refinery HMAC
-# attestation file for the current tree, or override/shadow mode), the guard
-# passes.
+# work branch, an open MR with an exact-matching source_issue, or
+# override/shadow mode), the guard passes.
 #
 # This script is intended to replace the operational dropin at:
 #   $HOME/gastown-spike/dropin/gt-done-empty-hook-guard.sh
 #
 # Differences from the original dropin:
-#   - Uses GT_RIG/GT_POLECAT to build the canonical target when available,
-#     fixing the "rig/rig" misresolution that caused spurious empty_hook
-#     rejections after a polecat's cwd drifted to the town/rig root.
+#   - Uses GT_RIG/GT_POLECAT/GT_TOWN to locate the canonical polecat worktree,
+#     fixing spurious empty_hook rejections after a polecat's cwd drifted to the
+#     town or rig root. Branch evidence is read from the canonical worktree, not
+#     from the process cwd.
 #   - Honors the source_bead recovery field emitted by `gt hook show`, which
 #     lets gt done recover when a molecule/wisp was deleted but the work
 #     branch remains.
 #   - MR evidence checks parse the merge-queue JSON and look up the source
-#     bead by EXACT field match (using the same needle semantics as
-#     beads.MatchesMRSourceIssue) rather than raw substring grep over the
-#     serialized JSON. This avoids spurious matches against unrelated MRs
-#     that happen to embed the bead ID in commit messages, branches, or
-#     other fields.
-#   - Commit evidence checks for a keyed HMAC attestation file under
-#     $GT_GATE_ATTEST_DIR/<tree-hash> instead of trusting unbounded
-#     `git log --grep` substring matches. The keyed file must exist and be
-#     non-empty for evidence to count.
+#     bead by EXACT field match (or a literal substring match against the
+#     description with the same needle semantics as beads.MatchesMRSourceIssue)
+#     rather than a regex test(). This avoids spurious matches against unrelated
+#     IDs that happen to embed the source ID (e.g. dots matching any character).
+#   - Does NOT treat refinery commit-attestation files as standalone enforce-mode
+#     evidence. Arbitrary non-empty files under $GT_GATE_ATTEST_DIR must not
+#     satisfy the guard; durable HMAC attestation is the refinery's job.
 #   - Emits a specific actionable recovery path on rejection instead of only
 #     printing the reason.
 #
@@ -71,7 +67,6 @@ MODE="${GT_DONE_EMPTY_HOOK_GUARD:-shadow}"
 [ "${GT_DONE_EMPTY_HOOK_OVERRIDE:-0}" = "1" ] && MODE="override"
 
 TOWN="${GT_TOWN:-${GT_ROOT:-${GT_TOWN_ROOT:-/home/ubuntu/gt-town}}}"
-ATTEST_DIR="${GT_GATE_ATTEST_DIR:-/home/ubuntu/.gt-gate-attestations}"
 
 # Prefer canonical session identity over cwd-derived slot. The wrapper derives
 # rig/slot from $PWD, but gt done itself reconstructs the worktree from
@@ -81,6 +76,30 @@ if [ -n "${GT_RIG:-}" ] && [ -n "${GT_POLECAT:-}" ]; then
   TARGET="$GT_RIG/polecats/$GT_POLECAT"
 else
   TARGET="$RIG/$SLOT"
+fi
+
+# Resolve the authoritative git worktree. When GT_RIG/GT_POLECAT identify a
+# polecat session, the canonical worktree is under the town root, even if the
+# process cwd has drifted to the rig or town root. The canonical worktree is
+# used for branch evidence (source_bead recovery) so a deleted molecule does not
+# strand a polecat with no durable evidence.
+canonical_worktree() {
+  if [ -z "${GT_RIG:-}" ] || [ -z "${GT_POLECAT:-}" ]; then
+    return 0
+  fi
+  local new_path old_path
+  new_path="$TOWN/$GT_RIG/polecats/$GT_POLECAT/$GT_RIG"
+  old_path="$TOWN/$GT_RIG/polecats/$GT_POLECAT"
+  if [ -e "$new_path/.git" ]; then
+    printf '%s' "$new_path"
+  elif [ -e "$old_path/.git" ]; then
+    printf '%s' "$old_path"
+  fi
+}
+
+WORKTREE="$(canonical_worktree)"
+if [ -z "$WORKTREE" ]; then
+  WORKTREE="$(pwd -P 2>/dev/null || pwd)"
 fi
 
 # Probe hook show for the canonical target first, then the cwd-derived
@@ -105,49 +124,23 @@ if [ -n "$hook_json" ] && command -v jq >/dev/null 2>&1; then
 fi
 
 # If a source was explicitly supplied (e.g. gt done --issue), trust it for MR
-# and refinery evidence checks; otherwise fall back to the recovered
-# source_bead from hook show.
+# evidence checks; otherwise fall back to the recovered source_bead from hook show.
 SOURCE="${SOURCE:-${hook_source:-}}"
 
 # Evidence from the merge queue: an OPEN MR whose source_issue field matches
-# SOURCE EXACTLY. We parse the JSON via jq and use the same needle semantics
-# as beads.MatchesMRSourceIssue ("source_issue: <id>\n") so partial IDs
-# (e.g. "gt-abc" matching "gt-abcdef") cannot spuriously pass.
+# SOURCE EXACTLY. We use literal/field semantics matching
+# beads.MatchesMRSourceIssue ("source_issue: <id>\n") so partial or
+# regex-shaped IDs cannot spuriously pass (e.g. "gastown-cet.2.3" must not
+# match "gastown-cetX2X3" through dot-as-any-character).
 has_mr_evidence=0
 if [ -n "$SOURCE" ] && command -v jq >/dev/null 2>&1; then
   mr_json="$(timeout 3 gt mq list "$RIG" --json --status=open 2>/dev/null || true)"
   if [ -n "$mr_json" ] && [ "$mr_json" != "[]" ] && [ "$mr_json" != "null" ]; then
-    needle="source_issue: ${SOURCE}\\n"
     matched="$(jq -r --arg n "$SOURCE" \
-      '[.[] | select((.description // "") | test("source_issue: " + $n + "\n"))] | length' \
+      '[.[] | select(((.source_issue // "") == $n) or ((.description // "") | contains("source_issue: " + $n + "\n")))] | length' \
       <<< "$mr_json" 2>/dev/null || echo 0)"
     if [ "${matched:-0}" -ge 1 ]; then
       has_mr_evidence=1
-    fi
-    # Silence unused-variable warning while keeping the needle visible for
-    # future readers.
-    : "${needle:=$needle}"
-  fi
-fi
-
-# Evidence from refinery HMAC attestations keyed by tree hash. The refinery
-# writes one attestation file per reviewed tree under $GT_GATE_ATTEST_DIR;
-# keyed-by-tree is strictly tighter than `git log --grep` substring matching
-# over commit messages because:
-#   - The tree hash commits to the exact reviewed content, not the message.
-#   - There is no risk of a stale or unrelated commit message matching.
-# We only require the file exists and is non-empty; HMAC verification is the
-# refinery's job (gastown-6n7). This is best-effort evidence: a missing
-# attestation simply means the durable review gate hasn't completed yet for
-# this tree.
-has_commit_evidence=0
-if [ -n "$SOURCE" ] && [ -d "$ATTEST_DIR" ] && command -v git >/dev/null 2>&1; then
-  cwd="$(pwd -P 2>/dev/null || pwd)"
-  # See branch-evidence block above for why we use `-e` (not `-d`) on .git.
-  if [ -e "$cwd/.git" ]; then
-    tree="$(git -C "$cwd" rev-parse HEAD^{tree} 2>/dev/null || true)"
-    if [ -n "$tree" ] && [ -s "$ATTEST_DIR/$tree" ]; then
-      has_commit_evidence=1
     fi
   fi
 fi
@@ -157,15 +150,14 @@ fi
 # is empty — but we only count it when the bead is ASSIGNED to the expected
 # agent (validated by source_bead from hook show). Without that validation
 # we'd accept arbitrary branches.
-cwd="$(pwd -P 2>/dev/null || pwd)"
 branch=""
 branch_issue=""
 has_branch_evidence=0
 # `git -C <dir>` works whether `.git` is a directory (real repo) or a file
 # (worktree pointer); the command itself does the resolution. We only need
 # to gate on `command -v git`, not on the filesystem shape of `.git`.
-if command -v git >/dev/null 2>&1 && [ -e "$cwd/.git" ]; then
-  branch="$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+if command -v git >/dev/null 2>&1 && [ -e "$WORKTREE/.git" ]; then
+  branch="$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 fi
 if [ -n "$branch" ] && [[ "$branch" == polecat/*/* ]]; then
   rest="${branch#polecat/*/}"
@@ -185,13 +177,10 @@ fi
 
 if [ "$empty_hook" -eq 0 ] || \
    [ "$has_mr_evidence" -eq 1 ] || \
-   [ "$has_commit_evidence" -eq 1 ] || \
    [ "$has_branch_evidence" -eq 1 ]; then
   action="allow"
   if [ "$has_mr_evidence" -eq 1 ]; then
     action="mr_evidence"
-  elif [ "$has_commit_evidence" -eq 1 ]; then
-    action="commit_evidence"
   elif [ "$has_branch_evidence" -eq 1 ]; then
     action="branch_evidence"
   elif [ -n "$hook_source" ]; then

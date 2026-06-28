@@ -121,8 +121,9 @@ setup_fake_env() {
   #     * toast  → hooked (gastown-abc)
   #     * shiny  → empty + source_bead (gastown-recov) for recovery
   #     * envcat → hooked (gastown-env) for env-canonical-target test
-  #     * void   → empty, no source_bead, used as the default for rejection tests
+  #     * jasper → empty + source_bead (gastown-dg1) for cwd-drift test
   #     * branchmatch → empty + source_bead (gastown-bm), paired with FAKE_BRANCH
+  #     * void   → empty, no source_bead, used as the default for rejection tests
   #   - mq list --json emits a list of MRs. The default list contains both a
   #     precise MR (gastown-mrsrc with source_issue on its own line) and a
   #     substring-confusable MR (gastown-mrsrc-extended whose description
@@ -141,6 +142,9 @@ if [ "${1:-}" = "hook" ] && [ "${2:-}" = "show" ]; then
       ;;
     gastown/envcat|gastown/polecats/envcat)
       echo '{"agent":"gastown/polecats/envcat","bead_id":"gastown-env","status":"hooked"}'
+      ;;
+    gastown/jasper|gastown/polecats/jasper)
+      echo '{"agent":"gastown/polecats/jasper","bead_id":"","status":"empty","source_bead":"gastown-dg1"}'
       ;;
     gastown/branchmatch|gastown/polecats/branchmatch)
       echo '{"agent":"gastown/polecats/branchmatch","bead_id":"","status":"empty","source_bead":"gastown-bm"}'
@@ -167,6 +171,20 @@ JSON
       cat <<JSON
 [
   {"id":"gastown-wisp-mr-confusable","description":"branch: polecat/jasper/gastown-mrsrc-extended@x\nnote: contains gastown-mrsrc substring\n"}
+]
+JSON
+      ;;
+    dotted-confusable)
+      cat <<JSON
+[
+  {"id":"gastown-wisp-dot","description":"branch: polecat/jasper/gastown-cetX12X6X2@x\nsource_issue: gastown-cetX12X6X2\n"}
+]
+JSON
+      ;;
+    dotted-exact)
+      cat <<JSON
+[
+  {"id":"gastown-wisp-dot-exact","description":"branch: polecat/jasper/gastown-cet.12.6.2@x\nsource_issue: gastown-cet.12.6.2\n"}
 ]
 JSON
       ;;
@@ -231,7 +249,7 @@ exec /usr/bin/jq "$@"
 EOF
   chmod +x "$tmpdir/bin/jq"
 
-  # .git marker so the guard's `if [ -d "$cwd/.git" ]` branch evaluates true.
+  # .git marker so the guard's `if [ -e "$WORKTREE/.git" ]` branch evaluates true.
   mkdir -p "$tmpdir/git/.git"
 
   echo "$tmpdir"
@@ -406,10 +424,47 @@ assert_contains "shadow mode logs shadow:" "shadow:" "$body"
 assert_contains "shadow mode logs empty_hook_no_evidence" "empty_hook_no_evidence" "$body"
 rm -rf "$tmpdir"
 
-# Test 12: keyed attestation grants commit_evidence.
-# Regression for codex finding #2: keyed tree attestation must succeed,
-# unbounded `git log --grep` must NOT.
-echo "Test: keyed attestation file grants commit_evidence"
+# Test 12: dotted bead ID uses literal, not regex, matching.
+# The confusable MR's source_issue differs in characters where dots would
+# match any character under a regex. The guard MUST reject because there is
+# no exact source_issue match.
+echo "Test: dotted bead ID rejects regex-style false match"
+tmpdir=$(setup_fake_env)
+out=$(env -u GT_DONE_EMPTY_HOOK_GUARD -u GT_DONE_EMPTY_HOOK_OVERRIDE \
+        -u GT_RIG -u GT_POLECAT -u GT_TOWN -u GT_TOWN_ROOT -u GT_ROOT \
+        PATH="$tmpdir/bin:${PATH:-/usr/bin:/bin}" \
+        GT_DONE_EMPTY_HOOK_GUARD=enforce GT_MQ_JSON_MODE=dotted-confusable \
+        bash "$GUARD" --rig gastown --slot void --source gastown-cet.12.6.2 2>&1
+      ec=$?
+      printf '__EXIT__%s\n' "$ec")
+code=$(guard_code "$out")
+body=$(guard_body "$out")
+assert_exit "dotted confusable MR exits 1" "1" "$code"
+assert_contains "rejection mentions empty_hook_no_evidence" "empty_hook_no_evidence" "$body"
+assert_not_contains "rejection does NOT claim mr_evidence" "action=mr_evidence" "$body"
+rm -rf "$tmpdir"
+
+# Test 13: exact dotted bead ID matches when present.
+echo "Test: exact dotted bead ID matches literally"
+tmpdir=$(setup_fake_env)
+out=$(env -u GT_DONE_EMPTY_HOOK_GUARD -u GT_DONE_EMPTY_HOOK_OVERRIDE \
+        -u GT_RIG -u GT_POLECAT -u GT_TOWN -u GT_TOWN_ROOT -u GT_ROOT \
+        PATH="$tmpdir/bin:${PATH:-/usr/bin:/bin}" \
+        GT_DONE_EMPTY_HOOK_GUARD=enforce GT_MQ_JSON_MODE=dotted-exact \
+        bash "$GUARD" --rig gastown --slot void --source gastown-cet.12.6.2 2>&1
+      ec=$?
+      printf '__EXIT__%s\n' "$ec")
+code=$(guard_code "$out")
+body=$(guard_body "$out")
+assert_exit "exact dotted MR exits 0" "0" "$code"
+assert_contains "action reports mr_evidence" "action=mr_evidence" "$body"
+rm -rf "$tmpdir"
+
+# Test 14: forged commit attestation does not grant evidence.
+# Regression for codex finding #3: a non-empty file named after the tree hash
+# under $GT_GATE_ATTEST_DIR must not satisfy the guard. Durable HMAC
+# attestation is enforced by the refinery merge path, not by this script.
+echo "Test: forged commit attestation is rejected"
 tmpdir=$(setup_fake_env)
 attest_dir="$tmpdir/attest"
 mkdir -p "$attest_dir"
@@ -424,33 +479,45 @@ out=$(env -u GT_DONE_EMPTY_HOOK_GUARD -u GT_DONE_EMPTY_HOOK_OVERRIDE \
       printf '__EXIT__%s\n' "$ec")
 code=$(guard_code "$out")
 body=$(guard_body "$out")
-assert_exit "keyed attestation exits 0" "0" "$code"
-assert_contains "action reports commit_evidence" "action=commit_evidence" "$body"
+assert_exit "forged attestation exits 1" "1" "$code"
+assert_contains "rejection mentions empty_hook_no_evidence" "empty_hook_no_evidence" "$body"
+assert_not_contains "rejection does NOT claim commit_evidence" "action=commit_evidence" "$body"
 rm -rf "$tmpdir"
 
-# Test 13: empty attestation file does NOT count as evidence.
-echo "Test: empty attestation file does not grant commit_evidence"
+# Test 15: canonical worktree overrides cwd drift for branch evidence.
+# Regression for cwd-drift false reject: the process cwd is a non-git
+# directory, but GT_RIG/GT_POLECAT/GT_TOWN locate the real polecat worktree.
+# The guard reads the branch from the canonical worktree and recovers via
+# branch_evidence.
+echo "Test: canonical worktree recovers from cwd drift"
 tmpdir=$(setup_fake_env)
-attest_dir="$tmpdir/attest"
-mkdir -p "$attest_dir"
-: > "$attest_dir/1234567890abcdef1234567890abcdef12345678"   # truncate
-out=$(env -u GT_DONE_EMPTY_HOOK_GUARD -u GT_DONE_EMPTY_HOOK_OVERRIDE \
-        -u GT_RIG -u GT_POLECAT -u GT_TOWN -u GT_TOWN_ROOT -u GT_ROOT \
-        PATH="$tmpdir/bin:${PATH:-/usr/bin:/bin}" \
-        GT_DONE_EMPTY_HOOK_GUARD=enforce GT_MQ_JSON_MODE=empty \
-        GT_GATE_ATTEST_DIR="$attest_dir" FAKE_TREE=1234567890abcdef1234567890abcdef12345678 \
-        bash "$GUARD" --rig gastown --slot void --source gastown-mrsrc 2>&1
-      ec=$?
-      printf '__EXIT__%s\n' "$ec")
+mkdir -p "$tmpdir/town/gastown/polecats/jasper/gastown"
+touch "$tmpdir/town/gastown/polecats/jasper/gastown/.git"
+mkdir -p "$tmpdir/drift"
+out=$(
+  set +e
+  cd "$tmpdir/drift"
+  env -u GT_DONE_EMPTY_HOOK_GUARD -u GT_DONE_EMPTY_HOOK_OVERRIDE \
+      -u GT_TOWN -u GT_TOWN_ROOT -u GT_ROOT -u GT_MQ_JSON_MODE -u GT_GATE_ATTEST_DIR \
+      PATH="$tmpdir/bin:${PATH:-/usr/bin:/bin}" \
+      GT_DONE_EMPTY_HOOK_GUARD=enforce \
+      GT_RIG=gastown GT_POLECAT=jasper GT_TOWN="$tmpdir/town" \
+      FAKE_BRANCH="polecat/jasper/gastown-dg1@mqx" \
+      bash "$GUARD" --rig gastown --slot jasper 2>&1
+  ec=$?
+  printf '__EXIT__%s\n' "$ec"
+)
 code=$(guard_code "$out")
-assert_exit "empty attestation exits 1" "1" "$code"
+body=$(guard_body "$out")
+assert_exit "cwd drift canonical worktree exits 0" "0" "$code"
+assert_contains "action reports branch_evidence" "action=branch_evidence" "$body"
 rm -rf "$tmpdir"
 
-# Test 14: helper records real exit code.
-# Regression for codex finding #3: the test helper MUST NOT mask failures.
+# Test 16: helper records real exit code.
+# Regression for prior helper bug: the helper MUST NOT mask failures.
 # If a future helper introduces `|| true` before recording $?, this test
 # would falsely report exit=0 here, so it asserts exit=1 explicitly.
-echo "Test: helper records real exit code (codex finding #3 regression)"
+echo "Test: helper records real exit code"
 tmpdir=$(setup_fake_env)
 out=$(env -u GT_DONE_EMPTY_HOOK_GUARD -u GT_DONE_EMPTY_HOOK_OVERRIDE \
         -u GT_RIG -u GT_POLECAT -u GT_TOWN -u GT_TOWN_ROOT -u GT_ROOT \
