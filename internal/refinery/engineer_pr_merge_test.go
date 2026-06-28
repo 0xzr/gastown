@@ -127,7 +127,7 @@ func TestDoMergePR_NoPR_ReturnsError(t *testing.T) {
 
 	createFeatureBranch(t, workDir, "feat/no-pr", "test.txt", "hello")
 
-	result := e.doMergePR(context.Background(), "feat/no-pr", "main", nil)
+	result := e.doMergePR(context.Background(), "feat/no-pr", "main", nil, nil)
 
 	if result.Success {
 		t.Error("expected failure when no PR exists")
@@ -239,7 +239,7 @@ func TestDoMergePR_NoVerdict_NotTreatedAsFail(t *testing.T) {
 		mergePR: nil,
 	}
 
-	result := e.doMergePR(context.Background(), "feat/no-verdict", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+	result := e.doMergePR(context.Background(), "feat/no-verdict", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"}, nil)
 
 	if !result.NeedsApproval {
 		t.Errorf("expected NeedsApproval for no-verdict, got %+v", result)
@@ -279,7 +279,7 @@ func TestDoMergePR_ParsedFail_RoutesToNeedsRework(t *testing.T) {
 		mergePR: nil,
 	}
 
-	result := e.doMergePR(context.Background(), "feat/fail", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+	result := e.doMergePR(context.Background(), "feat/fail", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"}, nil)
 
 	if result.Success || result.NeedsApproval {
 		t.Errorf("expected hard rejection (not success, not approval hold), got %+v", result)
@@ -323,7 +323,7 @@ func TestDoMergePR_ParsedFail_DefaultCauseWhenNoneSupplied(t *testing.T) {
 		mergePR: nil,
 	}
 
-	result := e.doMergePR(context.Background(), "feat/fail-nocause", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+	result := e.doMergePR(context.Background(), "feat/fail-nocause", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"}, nil)
 
 	if result.NeedsApproval {
 		t.Errorf("codex concrete FAIL must NOT be mislabeled REVIEW_UNAVAILABLE_HOLD (NeedsApproval), got %+v", result)
@@ -383,7 +383,7 @@ func TestDoMergePR_DegradedQuorum_ProceedsAndCreatesAudit(t *testing.T) {
 		},
 	}
 
-	result := e.doMergePR(context.Background(), "feat/degraded", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+	result := e.doMergePR(context.Background(), "feat/degraded", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"}, nil)
 
 	if !result.Success {
 		t.Errorf("expected success under degraded quorum, got %+v", result)
@@ -438,7 +438,7 @@ func TestDoMergePR_DegradedQuorum_MergeFail_NoAuditBead(t *testing.T) {
 		},
 	}
 
-	result := e.doMergePR(context.Background(), "feat/degraded-fail", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+	result := e.doMergePR(context.Background(), "feat/degraded-fail", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"}, nil)
 
 	if result.Success {
 		t.Fatalf("expected merge failure, got success %+v", result)
@@ -495,7 +495,7 @@ func TestDoMergePR_DegradedQuorum_PushVerifyFail_NoAuditBead(t *testing.T) {
 		},
 	}
 
-	result := e.doMergePR(context.Background(), "feat/degraded-verify", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+	result := e.doMergePR(context.Background(), "feat/degraded-verify", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"}, nil)
 
 	if result.Success {
 		t.Fatalf("expected push-verification failure, got success %+v", result)
@@ -564,7 +564,7 @@ func TestDoMergePR_DegradedQuorum_Success_RecordsAuditBeadAfterMerge(t *testing.
 		},
 	}
 
-	result := e.doMergePR(context.Background(), "feat/degraded-ok", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+	result := e.doMergePR(context.Background(), "feat/degraded-ok", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"}, nil)
 
 	if !result.Success {
 		t.Fatalf("expected success under degraded quorum, got %+v", result)
@@ -577,5 +577,77 @@ func TestDoMergePR_DegradedQuorum_Success_RecordsAuditBeadAfterMerge(t *testing.
 	}
 	if auditMR == nil || auditMR.ID != "gt-test" {
 		t.Errorf("audit bead should be recorded against the MR, got %+v", auditMR)
+	}
+}
+
+// TestDoMergePR_SurfaceAcceptedFailure_RecordsAuditBead guards gastown-w5o on
+// the PR merge path: doMergePR returns early from doMerge before the post-push
+// audit block, so a surface-accepted pre-merge failure must still record its
+// audit obligation here. Without this, PR-strategy rigs would silently merge a
+// suppressed real failure with no durable trail.
+func TestDoMergePR_SurfaceAcceptedFailure_RecordsAuditBead(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = "pr"
+	// No require_review: take the simple success path through finishPRMerge.
+	defer logEngineerOutputOnFail(t, e)
+
+	createFeatureBranch(t, workDir, "feat/surface-pr", "test.txt", "hello")
+
+	surfaceAuditCalled := false
+	var surfaceAuditMR *MRInfo
+	var surfaceAuditSuppressed map[string][]string
+	e.recordSurfaceAcceptanceAuditBeadFunc = func(mr *MRInfo, suppressed map[string][]string) (string, error) {
+		surfaceAuditCalled = true
+		surfaceAuditMR = mr
+		surfaceAuditSuppressed = suppressed
+		return "gt-surface-audit-pr", nil
+	}
+
+	e.prProvider = &reviewerMockPRProvider{
+		findPRNumber: func(string) (int, error) { return 42, nil },
+		isPRApproved: func(int) (bool, error) { return true, nil },
+		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
+			return &ReviewEvaluation{State: ReviewStatePass}, nil
+		},
+		mergePR: func(int, string) (string, error) {
+			if err := g.Checkout("main"); err != nil {
+				return "", err
+			}
+			if err := g.MergeSquash("feat/surface-pr", "feat: add test.txt"); err != nil {
+				return "", err
+			}
+			sha, err := g.Rev("HEAD")
+			if err != nil {
+				return "", err
+			}
+			if err := g.Push("origin", "main", false); err != nil {
+				return "", err
+			}
+			return sha, nil
+		},
+	}
+
+	suppressed := map[string][]string{"test": {"example.com/test/unrelated"}}
+	result := e.doMergePR(context.Background(), "feat/surface-pr", "main",
+		&MRInfo{ID: "gt-test", SourceIssue: "gt-src"}, suppressed)
+
+	if !result.Success {
+		t.Fatalf("expected success, got %+v", result)
+	}
+	if !surfaceAuditCalled {
+		t.Error("surface-scope audit bead must be recorded on the PR path after a successful merge")
+	}
+	if !result.SurfaceAcceptedFailure {
+		t.Error("expected SurfaceAcceptedFailure=true")
+	}
+	if result.SurfaceScopeAuditBead != "gt-surface-audit-pr" {
+		t.Errorf("expected SurfaceScopeAuditBead=gt-surface-audit-pr, got %q", result.SurfaceScopeAuditBead)
+	}
+	if surfaceAuditMR == nil || surfaceAuditMR.ID != "gt-test" {
+		t.Errorf("surface audit bead should be recorded against the MR, got %+v", surfaceAuditMR)
+	}
+	if len(surfaceAuditSuppressed) != 1 {
+		t.Errorf("expected suppressed gates passed through, got %v", surfaceAuditSuppressed)
 	}
 }

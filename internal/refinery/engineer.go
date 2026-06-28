@@ -143,6 +143,16 @@ type GateResult struct {
 	// Output is the combined stdout/stderr of the gate command. It is kept
 	// even on failure so scoped gates can inspect the failure surface.
 	Output string
+	// SurfaceAccepted is true when the gate actually failed but the surface-scope
+	// rule accepted it because every failing package was outside the MR's touched
+	// surface. This is a real failure that was suppressed, not a clean pass, so it
+	// must leave a durable audit trail (gastown-w5o): a suppressed failure merging
+	// silently is the path by which broken code lands without an explicit review.
+	SurfaceAccepted bool
+	// SurfaceAcceptedFailures lists the failing package import paths that the
+	// surface-scope rule classified as unrelated. Populated only when
+	// SurfaceAccepted is true, for the audit bead.
+	SurfaceAcceptedFailures []string
 }
 
 // gateSurface defines the git range whose changed packages are considered
@@ -385,6 +395,13 @@ type Engineer struct {
 	// gastown-cet.12.6.2). Production code leaves this nil and uses the real
 	// beads.Create path.
 	recordReviewerAuditBeadFunc func(mr *MRInfo, ev *ReviewEvaluation) (string, error)
+
+	// recordSurfaceAcceptanceAuditBeadFunc is a test seam for the surface-scope
+	// audit bead created when a gate failure is suppressed by the surface rule.
+	// When non-nil it replaces the real recordSurfaceAcceptanceAuditBead call so
+	// tests can assert that the audit bead is recorded only after a successful
+	// merge (gastown-w5o: never orphan an audit bead against a failed merge).
+	recordSurfaceAcceptanceAuditBeadFunc func(mr *MRInfo, suppressed map[string][]string) (string, error)
 }
 
 // DefaultReworkRouterTimeout bounds the external `gt mq reject` call that
@@ -703,6 +720,27 @@ type ProcessResult struct {
 	// or reviewer-unavailability cases.
 	AuditBead string
 
+	// SurfaceAcceptedFailure is true when at least one gate actually failed but
+	// the surface-scope rule accepted it as a pass because the failing packages
+	// were outside the MR's touched surface. This is a real failure that was
+	// suppressed, so the merge must record a durable audit obligation before it
+	// can land — a suppressed failure merging silently is the path by which broken
+	// code lands without an explicit reviewer PASS on the actual failure
+	// (gastown-w5o).
+	SurfaceAcceptedFailure bool
+
+	// SurfaceAcceptedGates records the gates whose failures the surface-scope
+	// rule suppressed, keyed by gate name, with the failing package import
+	// paths. Populated only when SurfaceAcceptedFailure is true, for the audit
+	// bead.
+	SurfaceAcceptedGates map[string][]string
+
+	// SurfaceScopeAuditBead is the ID of the follow-up audit task recorded when a
+	// real gate failure was suppressed by the surface-scope rule and the merge
+	// landed. Distinct from AuditBead (the degraded-quorum reviewer audit) so the
+	// two obligations can co-exist without one clobbering the other (gastown-w5o).
+	SurfaceScopeAuditBead string
+
 	// ConventionFailed is true when the branch's commit message violates the
 	// repo convention (e.g., starts with "WIP:"). It is treated as a queue
 	// conflict rather than a build/test failure so the MR is removed from the
@@ -768,6 +806,12 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	// is restored at the end of doMerge.
 	e.surface = &gateSurface{base: target, head: branch}
 	defer func() { e.surface = nil }()
+
+	// suppressedGates accumulates gates (across pre-merge and post-squash phases)
+	// that passed only because the surface-scope rule suppressed a real failure.
+	// If non-empty after a successful push, an audit obligation is recorded so the
+	// suppressed failure can never merge silently (gastown-w5o).
+	var suppressedGates map[string][]string
 
 	// Step 2: Checkout the target branch
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Checking out target branch %s...\n", target)
@@ -880,6 +924,10 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 		if !gateResult.Success {
 			return gateResult
 		}
+		// A pre-merge gate may have passed only because the surface-scope rule
+		// suppressed a real failure. Accumulate it; the audit bead is recorded
+		// after a successful push so a failed merge cannot orphan it (gastown-w5o).
+		suppressedGates = mergeSurfaceSuppressed(suppressedGates, gateResult.SurfaceAcceptedGates)
 	} else if e.config.RunTests && e.config.TestCommand != "" {
 		// Legacy test command path (backward compatible)
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Running tests: %s\n", e.config.TestCommand)
@@ -898,8 +946,12 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	// instead of local squash merge + direct push. This respects branch
 	// protection/restriction rules and preserves the PR audit trail.
 	// The VCS provider (GitHub, Bitbucket) is selected via vcs_provider config.
+	//
+	// suppressedGates is passed through so a surface-accepted pre-merge failure
+	// still records its audit obligation on the PR path — otherwise the PR early
+	// return would drop the trail and re-open the silent-merge gap (gastown-w5o).
 	if e.config.MergeStrategy == "pr" {
-		return e.doMergePR(ctx, branch, target, mr)
+		return e.doMergePR(ctx, branch, target, mr, suppressedGates)
 	}
 
 	// Step 5: Perform the actual merge using squash merge
@@ -952,6 +1004,11 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	// Step 5.5: Run post-squash gates on the merged result.
 	// These validate the actual combined code before it goes anywhere.
 	// On failure, reset the merge to undo the local squash commit.
+	//
+	// Post-squash gates are never eligible for surface-scope acceptance: they run
+	// on the combined merged tree, so an "unrelated" failing package can be a real
+	// regression caused by the merge (gastown-w5o). surfaceAcceptsFailure enforces
+	// this, so a post-squash gate cannot pass via surface acceptance here.
 	if !shouldSkipGates {
 		postResult := e.runGatesForPhase(ctx, GatePhasePostSquash)
 		if !postResult.Success {
@@ -960,6 +1017,7 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 			}
 			return postResult
 		}
+		suppressedGates = mergeSurfaceSuppressed(suppressedGates, postResult.SurfaceAcceptedGates)
 	}
 
 	// Step 5.6: Enforce the durable multi-model review gate on the merge
@@ -1058,7 +1116,14 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	if e.config.AutoPush {
 		result.PublishedCommit = mergeCommit
 	}
-	return result
+
+	// Record the surface-scope acceptance audit obligation for any gate whose
+	// real failure was suppressed. This is done only after the merge is durably
+	// published: the obligation exists because broken code landed, and a merge
+	// that failed before publishing has nothing to audit (gastown-cet.12.6.2
+	// principle — never orphan an audit bead against a failed MR). Local-only
+	// merges (auto_push=false) are not published, so they carry no audit bead.
+	return e.recordSurfaceAcceptanceAuditIfSuppressed(mr, suppressedGates, result)
 }
 
 // doMergePR handles merging via the VCS provider's PR merge API (merge_strategy=pr).
@@ -1066,8 +1131,13 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 // The VCS provider (GitHub, Bitbucket) is selected via vcs_provider config.
 // Called from doMerge after quality gates have passed.
 //
+// suppressedGates carries any pre-merge gates that passed only because the
+// surface-scope rule suppressed a real failure. Like the reviewer audit bead, the
+// surface-acceptance audit obligation is recorded only after a successful merge so
+// a failed merge cannot orphan it (gastown-w5o, gastown-cet.12.6.2).
+//
 //nolint:unparam // ctx is reserved for future use when git methods accept context
-func (e *Engineer) doMergePR(ctx context.Context, branch, target string, mr *MRInfo) ProcessResult {
+func (e *Engineer) doMergePR(ctx context.Context, branch, target string, mr *MRInfo, suppressedGates map[string][]string) ProcessResult {
 	_ = ctx
 	provider := e.config.VCSProvider
 	if provider == "" {
@@ -1146,7 +1216,9 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string, mr *MRI
 					result.AuditBead = auditBead
 				}
 			}
-			return result
+			// Also record the surface-scope acceptance audit obligation for any
+			// pre-merge gate whose real failure was suppressed (gastown-w5o).
+			return e.recordSurfaceAcceptanceAuditIfSuppressed(mr, suppressedGates, result)
 		default:
 			// NO_VERDICT or UNAVAILABLE: keep MR in queue for retry rather than failing.
 			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d awaiting reviewer verdict (%s) — deferring merge\n", prNumber, ev.State)
@@ -1158,7 +1230,10 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string, mr *MRI
 		}
 	}
 
-	return e.finishPRMerge(prNumber, branch, target, false)
+	result := e.finishPRMerge(prNumber, branch, target, false)
+	// Record the surface-scope acceptance audit obligation for any pre-merge gate
+	// whose real failure was suppressed (gastown-w5o).
+	return e.recordSurfaceAcceptanceAuditIfSuppressed(mr, suppressedGates, result)
 }
 
 // finishPRMerge performs the actual PR merge and syncs local state.
@@ -1272,6 +1347,139 @@ Verify whether a retroactive review is needed and close this task when audited.`
 	}
 
 	return task.ID, nil
+}
+
+// buildMergedCloseReason constructs the source-issue close reason for a published
+// merge. It records the merge commit, the degraded-quorum review state (if any),
+// and — critically for gastown-w5o — the surface-scope acceptance trail when a
+// real gate failure was suppressed. Extracted so the trail markers are unit-
+// testable without a Dolt server.
+func buildMergedCloseReason(mr *MRInfo, result ProcessResult) string {
+	closeReason := fmt.Sprintf("Merged in %s", mr.ID)
+	if result.MergeCommit != "" {
+		closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, result.MergeCommit)
+	}
+	if result.DegradedQuorum {
+		closeReason = fmt.Sprintf("%s\nreview_state: degraded_quorum", closeReason)
+		if result.AuditBead != "" {
+			closeReason = fmt.Sprintf("%s\naudit_bead: %s", closeReason, result.AuditBead)
+		}
+	}
+	if result.SurfaceAcceptedFailure {
+		// A real gate failure was suppressed by the surface-scope rule and the
+		// merge landed. Surface this on the source close reason so the suppressed
+		// failure is visible in the durable history, not silent (gastown-w5o).
+		closeReason = fmt.Sprintf("%s\nsurface_scope_acceptance: suppressed_real_failure", closeReason)
+		if result.SurfaceScopeAuditBead != "" {
+			closeReason = fmt.Sprintf("%s\nsurface_scope_audit_bead: %s", closeReason, result.SurfaceScopeAuditBead)
+		}
+	}
+	return closeReason
+}
+
+// recordSurfaceAcceptanceAuditBead creates a follow-up audit task when a quality
+// gate actually failed but the surface-scope rule accepted it because every
+// failing package was outside the MR's touched surface. The suppressed failure
+// was a real failure, so the merge must leave a durable trail — without this
+// obligation, broken code can land with no explicit reviewer PASS on the actual
+// failure (gastown-w5o). Like the reviewer audit bead, this is recorded only
+// after a successful merge so a failed merge cannot orphan it (gastown-cet.12.6.2).
+func (e *Engineer) recordSurfaceAcceptanceAuditBead(mr *MRInfo, suppressed map[string][]string) (string, error) {
+	if mr == nil || len(suppressed) == 0 {
+		return "", nil
+	}
+
+	task, err := e.beads.Create(beads.CreateOptions{
+		Title:       surfaceAcceptanceAuditTitle(mr),
+		Labels:      []string{"gt:audit", "gt:task", "surface-scope"},
+		Priority:    mr.Priority,
+		Description: surfaceAcceptanceAuditDescription(mr, suppressed),
+		Actor:       e.rig.Name + "/refinery",
+		Rig:         e.rig.Name,
+	})
+	if err != nil {
+		return "", fmt.Errorf("creating surface-scope acceptance audit bead: %w", err)
+	}
+
+	return task.ID, nil
+}
+
+// recordSurfaceAcceptanceAuditIfSuppressed records the surface-scope acceptance
+// audit obligation onto a successful merge result when any gate had a real
+// failure suppressed. Used by the PR merge path, which returns early from doMerge
+// before the post-push audit block, so the suppressed-failure trail is not lost
+// (gastown-w5o). No-op when nothing was suppressed or the merge is not published.
+func (e *Engineer) recordSurfaceAcceptanceAuditIfSuppressed(mr *MRInfo, suppressedGates map[string][]string, result ProcessResult) ProcessResult {
+	if result.PublishedCommit == "" || len(suppressedGates) == 0 {
+		return result
+	}
+	result.SurfaceAcceptedFailure = true
+	result.SurfaceAcceptedGates = suppressedGates
+	auditFn := e.recordSurfaceAcceptanceAuditBead
+	if e.recordSurfaceAcceptanceAuditBeadFunc != nil {
+		auditFn = e.recordSurfaceAcceptanceAuditBeadFunc
+	}
+	auditBead, auditErr := auditFn(mr, suppressedGates)
+	if auditErr != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to record surface-scope acceptance audit bead: %v\n", auditErr)
+	} else {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Recorded surface-scope acceptance audit bead: %s\n", auditBead)
+		result.SurfaceScopeAuditBead = auditBead
+	}
+	return result
+}
+
+// surfaceAcceptanceAuditTitle returns the title for the surface-scope acceptance
+// audit bead recorded for an MR.
+func surfaceAcceptanceAuditTitle(mr *MRInfo) string {
+	return fmt.Sprintf("Surface-scope acceptance audit: %s", mr.ID)
+}
+
+// surfaceAcceptanceAuditDescription builds the durable description recorded when
+// a real gate failure was suppressed by the surface-scope rule. Extracted so the
+// content is unit-testable without a Dolt server (gastown-w5o).
+func surfaceAcceptanceAuditDescription(mr *MRInfo, suppressed map[string][]string) string {
+	// Deterministic ordering for the audit record.
+	names := make([]string, 0, len(suppressed))
+	for name := range suppressed {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	for _, name := range names {
+		pkgs := suppressed[name]
+		sort.Strings(pkgs)
+		fmt.Fprintf(&b, "- Gate %q: %d failing package(s) outside the touched surface: %s\n",
+			name, len(pkgs), strings.Join(pkgs, ", "))
+	}
+
+	return fmt.Sprintf(`Surface-scope gate acceptance audit obligation
+
+## Metadata
+- MR: %s
+- Branch: %s
+- Source issue: %s
+- Merge target: %s
+
+## Suppressed failures
+The following quality gate(s) actually failed, but the surface-scope rule
+accepted them as passes because every failing Go package was outside the MR's
+touched surface. These were REAL failures that were suppressed, not clean passes.
+
+%s
+## Notes
+A real failure merged without an explicit reviewer PASS on the failing code.
+Verify whether a retroactive review/fix is needed for each suppressed failure and
+close this task when audited. This obligation exists because surface-scope
+acceptance is only safe when the failing packages are genuinely unrelated to the
+merged change; an unrelated-looking failure can mask a real regression.`,
+		mr.ID,
+		mr.Branch,
+		mr.SourceIssue,
+		mr.Target,
+		b.String(),
+	)
 }
 
 func (e *Engineer) acquireMainPushSlot(ctx context.Context) (string, error) {
@@ -1453,12 +1661,21 @@ func (e *Engineer) runGate(ctx context.Context, name string, gate *GateConfig) G
 	}
 
 	// Surface-scoped acceptance: if all failures are outside the changed
-	// surface, treat the gate as having passed.
-	if e.surfaceAcceptsFailure(gate, result) {
+	// surface, treat the gate as having passed. This is only safe for pre-merge
+	// gates, where the surface is the branch diff. Post-squash gates run on the
+	// combined merged tree, so an "unrelated" failing package there can be a real
+	// breakage caused by the merged change — accepting it silently merges broken
+	// code (gastown-w5o). surfaceAcceptsFailure enforces that invariant.
+	if accepted, failed := e.surfaceAcceptsFailure(gate, result); accepted {
 		result.Success = true
 		result.Error = ""
+		// This was a real failure that the surface rule suppressed. Keep a durable
+		// trail on the result so the merge path records an audit obligation before
+		// the suppressed failure can land (gastown-w5o). It must never merge silently.
+		result.SurfaceAccepted = true
+		result.SurfaceAcceptedFailures = failed
 
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Gate %q: failures limited to packages outside the changed surface; treating as passed\n", name)
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Gate %q: failures limited to packages outside the changed surface; treating as passed (audit obligation required)\n", name)
 	} else {
 		if output != "" {
 			// Cap error message to avoid huge failure strings
@@ -1471,6 +1688,40 @@ func (e *Engineer) runGate(ctx context.Context, name string, gate *GateConfig) G
 	}
 
 	return result
+}
+
+// mergeSurfaceSuppressed merges a per-phase set of surface-suppressed gates
+// into an accumulator, deduplicating failing packages per gate name. Both
+// pre-merge and post-squash phases can contribute; the merged map drives a
+// single audit obligation recorded after a successful merge (gastown-w5o).
+func mergeSurfaceSuppressed(dst, src map[string][]string) map[string][]string {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string][]string)
+	}
+	for name, pkgs := range src {
+		seen := make(map[string]struct{}, len(dst[name])+len(pkgs))
+		merged := make([]string, 0, len(dst[name])+len(pkgs))
+		for _, p := range dst[name] {
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			merged = append(merged, p)
+		}
+		for _, p := range pkgs {
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			merged = append(merged, p)
+		}
+		sort.Strings(merged)
+		dst[name] = merged
+	}
+	return dst
 }
 
 // surfaceScope returns the effective surface scope for a gate. Empty config
@@ -1488,37 +1739,61 @@ func (e *Engineer) surfaceScope(gate *GateConfig) string {
 }
 
 // surfaceAcceptsFailure decides whether a failed gate can be accepted because
-// its failures are limited to the packages outside the changed surface.
-func (e *Engineer) surfaceAcceptsFailure(gate *GateConfig, result GateResult) bool {
+// its failures are limited to the packages outside the changed surface. On
+// acceptance it also returns the failing package import paths that were
+// suppressed, so the caller can record a durable audit obligation.
+//
+// Post-squash gates are NEVER eligible for surface acceptance. Post-squash runs
+// on the combined merged tree (target + squashed branch), so a failing package
+// outside the branch diff may actually be a real breakage introduced by the
+// merge itself. Accepting it would merge broken code with no explicit reviewer
+// PASS on the actual failure (gastown-w5o). Only pre-merge gates, whose surface
+// is the branch diff, can safely treat out-of-surface failures as unrelated.
+func (e *Engineer) surfaceAcceptsFailure(gate *GateConfig, result GateResult) (bool, []string) {
 	if result.Success {
-		return false
+		return false, nil
 	}
 	if e.surface == nil {
-		return false
+		return false, nil
+	}
+	// Forbid surface acceptance after the squash merge. The surface (branch diff)
+	// no longer describes what the combined tree actually contains, so an
+	// "unrelated" failure can be a real regression caused by the merge.
+	phase := gate.Phase
+	if phase == "" {
+		phase = GatePhasePreMerge
+	}
+	if phase == GatePhasePostSquash {
+		return false, nil
 	}
 	scope := e.surfaceScope(gate)
 	if scope != SurfaceScopeGoPackages {
-		return false
+		return false, nil
 	}
 
 	changed, err := e.changedGoPackages(e.surface.base, e.surface.head)
 	if err != nil || len(changed) == 0 {
-		return false
+		return false, nil
 	}
 
 	failed := parseGoFailingPackages(result.Output)
 	if len(failed) == 0 {
 		// We couldn't identify the failing packages, so we can't safely
 		// classify the failure as unrelated.
-		return false
+		return false, nil
 	}
 
 	for pkg := range failed {
 		if _, ok := changed[pkg]; ok {
-			return false
+			return false, nil
 		}
 	}
-	return true
+	suppressed := make([]string, 0, len(failed))
+	for pkg := range failed {
+		suppressed = append(suppressed, pkg)
+	}
+	sort.Strings(suppressed)
+	return true, suppressed
 }
 
 // changedGoPackages returns the set of Go package import paths touched between
@@ -1661,9 +1936,15 @@ func (e *Engineer) runGatesForPhase(ctx context.Context, phase GatePhase) Proces
 
 	// Report results
 	var failures []string
+	suppressed := map[string][]string{}
 	for _, r := range results {
 		if r.Success {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Gate %q: passed (%v)\n", r.Name, r.Elapsed.Truncate(time.Millisecond))
+			if r.SurfaceAccepted {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Gate %q: passed via surface-scope acceptance (%v) — suppressed failures require audit\n", r.Name, r.Elapsed.Truncate(time.Millisecond))
+				suppressed[r.Name] = r.SurfaceAcceptedFailures
+			} else {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Gate %q: passed (%v)\n", r.Name, r.Elapsed.Truncate(time.Millisecond))
+			}
 		} else {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Gate %q: FAILED (%v) - %s\n", r.Name, r.Elapsed.Truncate(time.Millisecond), r.Error)
 			failures = append(failures, fmt.Sprintf("%s: %s", r.Name, r.Error))
@@ -1678,8 +1959,17 @@ func (e *Engineer) runGatesForPhase(ctx context.Context, phase GatePhase) Proces
 		}
 	}
 
+	pr := ProcessResult{Success: true}
+	if len(suppressed) > 0 {
+		// One or more gates passed only because the surface-scope rule suppressed
+		// real failures. The merge may still proceed, but it must record a durable
+		// audit obligation so the suppressed failure is never silently merged
+		// (gastown-w5o).
+		pr.SurfaceAcceptedFailure = true
+		pr.SurfaceAcceptedGates = suppressed
+	}
 	_, _ = fmt.Fprintln(e.output, "[Engineer] All quality gates passed")
-	return ProcessResult{Success: true}
+	return pr
 }
 
 // effectiveDurableReviewTarget returns the branch the durable review gate
@@ -2363,16 +2653,7 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 		if !canCloseSource {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Merge not yet published — leaving source issue open: %s\n", mr.SourceIssue)
 		} else {
-			closeReason := fmt.Sprintf("Merged in %s", mr.ID)
-			if result.MergeCommit != "" {
-				closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, result.MergeCommit)
-			}
-			if result.DegradedQuorum {
-				closeReason = fmt.Sprintf("%s\nreview_state: degraded_quorum", closeReason)
-				if result.AuditBead != "" {
-					closeReason = fmt.Sprintf("%s\naudit_bead: %s", closeReason, result.AuditBead)
-				}
-			}
+			closeReason := buildMergedCloseReason(mr, result)
 			if err := e.beads.ForceCloseWithReason(closeReason, mr.SourceIssue); err != nil {
 				// Check if already closed (by polecat's gt done) — that's fine
 				if issue, showErr := e.beads.Show(mr.SourceIssue); showErr == nil && beads.IssueStatus(issue.Status).IsTerminal() {
