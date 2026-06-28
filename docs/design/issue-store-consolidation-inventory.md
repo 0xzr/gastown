@@ -175,6 +175,47 @@ It is preserved as a snapshot of the state at `2026-06-24T12:22:00Z`. If it
 becomes active, it should be re-created in the canonical town store and this
 backup copy referenced as provenance.
 
+**Remediation status (gastown-cet.1.2.2, 2026-06-28):** Disposition recorded
+as **preserved-as-provenance**. The `hq-27q` issue remains in the orphan
+backup; no state change is applied to the embedded Dolt store and no new
+`hq-` issue is created in the canonical town store.
+
+Cross-store defect-class mapping (same root cause, distinct trackers):
+
+| Tracker | Store | Status | Notes |
+|---|---|---|---|
+| `hq-27q` | orphan backup (this section) | open, P0 | Provenance-only per audit §4.2 |
+| `hq-4y8` | `mayor/gastown/.beads` embedded (noncanonical, §4.1) | open, P0 | "GT must not close source issue before MR actually merges" — same defect class, also noncanonical, preserved read-only |
+
+No canonical tracker for this defect class exists in the town store
+(`/home/ubuntu/gt-town/.beads`) or the gastown rig store
+(`/home/ubuntu/gt-town/gastown/mayor/rig/.beads`) as of the search performed
+on 2026-06-28 (queries: `MQ lifecycle`, `Refinery terminal merge`,
+`do not close source beads`, `close source issue`, labels
+`mq`/`refinery`/`lifecycle`/`rework-bounce`). The closest canonicalization
+workstream is `gastown-cet.4` (Closure provenance and bd/Dolt data-plane
+alignment, P1 epic), which has not yet produced a tracker issue for this
+specific defect.
+
+**Re-promotion path** (not executed in this remediation; reserved for
+`gastown-cet.4` / `gastown-cet.1.2` coordination):
+
+1. Create one canonical tracker (likely P0 bug) in the town store via
+   `bd create --repo=hq ...` describing the source-bead MQ lifecycle defect,
+   with reference to both `hq-27q` (orphan backup provenance) and `hq-4y8`
+   (embedded store provenance) in the description and `--notes`.
+2. Close `hq-4y8` as a duplicate of the new canonical tracker with reason
+   "canonical tracker is <new-id>; this noncanonical embedded-store copy is
+   preserved as historical evidence" (mirrors the `hq-pwx` → `gastown-73a`
+   pattern in §2.2).
+3. Append a dated note to this section: "Re-promoted: canonical tracker
+   `<new-id>` created; orphan `hq-27q` retained for provenance."
+4. Do NOT modify the orphan backup Dolt store; provenance is preserved by
+   leaving `hq-27q` untouched on disk.
+
+No raw `.dolt/`, `noms/`, `LOCK`, `manifest`, or JSONL files were edited in
+the orphan backup during this remediation.
+
 ### 4.3 `bdglobal` and `beads_global`
 
 **Decision:** REGISTER as protected legacy empty stores.
