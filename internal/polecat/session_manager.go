@@ -38,7 +38,6 @@ var (
 	ErrSessionRunning                 = errors.New("session already running")
 	ErrSessionNotFound                = errors.New("session not found")
 	ErrIssueInvalid                   = errors.New("issue not found or tombstoned")
-	ErrNoAssignedHook                 = errors.New("no assigned hook for worktree")
 	ErrBranchContaminatedNoAssignment = errors.New("branch has abandoned commits and no hook assignment")
 )
 
@@ -46,6 +45,16 @@ var (
 type SessionManager struct {
 	tmux *tmux.Tmux
 	rig  *rig.Rig
+
+	// beadsForTest allows tests to inject Beads instances for the agent-bead
+	// and rig work-bead lookups independently. When nil, production wrappers
+	// are constructed on demand (beads.New(rig.Path).ForAgentBead() and
+	// beads.New(rig.Path) respectively). Splitting the two matters because in
+	// production, agent beads live in the town DB (noRoute) while work beads
+	// live in the rig DB (prefix-routed); a single fake store would mask the
+	// routing split and let stale hook_bead checks pass against the wrong DB.
+	agentBeadsForTest *beads.Beads
+	workBeadsForTest  *beads.Beads
 }
 
 // NewSessionManager creates a new polecat session manager for a rig.
@@ -54,6 +63,26 @@ func NewSessionManager(t *tmux.Tmux, r *rig.Rig) *SessionManager {
 		tmux: t,
 		rig:  r,
 	}
+}
+
+// agentBeads returns the Beads instance used for agent-bead lookups.
+// In production this points at the town DB with prefix routing disabled
+// (because agent beads carry the rig prefix but live in town).
+func (m *SessionManager) agentBeads() *beads.Beads {
+	if m.agentBeadsForTest != nil {
+		return m.agentBeadsForTest
+	}
+	return beads.New(m.rig.Path).ForAgentBead()
+}
+
+// workBeads returns the Beads instance used for verifying rig work beads.
+// Uses normal prefix routing so work beads in the rig DB resolve correctly,
+// unlike agent beads which require ForAgentBead().
+func (m *SessionManager) workBeads() *beads.Beads {
+	if m.workBeadsForTest != nil {
+		return m.workBeadsForTest
+	}
+	return beads.New(m.rig.Path)
 }
 
 // SessionStartOptions configures polecat session startup.
@@ -356,7 +385,7 @@ func (m *SessionManager) ensureCanonicalSessionBranch(g *git.Git, polecat string
 		if component == "" {
 			component = "unknown"
 		}
-		quarantineRef := fmt.Sprintf("refs/quarantine/polecat/%s/%s/%s-%s", m.rig.Name, polecat, component, ts)
+		quarantineRef := fmt.Sprintf("refs/quarantine/polecat/%s/%s/%s-%s-%s", m.rig.Name, polecat, component, ts, uuid.New().String()[:8])
 		if err := g.CreateRef(quarantineRef, tipSHA); err != nil {
 			return "", fmt.Errorf("quarantining %s tip (%s) to %s: %w", currentBranch, tipSHA, quarantineRef, err)
 		}
@@ -511,14 +540,35 @@ func (m *SessionManager) persistAssignedAgent(polecat, agent string) {
 // in the polecat's agent bead. It mirrors ReadPersistedAssignedAgent: best-
 // effort and non-fatal, because session start must degrade gracefully when
 // beads is temporarily unavailable.
+//
+// The returned bead is only trusted when the corresponding work bead is still
+// resolvable (via the normal routed rig-Beads client, since work beads live in
+// the rig DB while agent beads live in the town DB) and currently hooked to
+// this polecat. This guards ensureCanonicalSessionBranch from acting on stale
+// hook_bead values that survive past a re-dispatch (gastown-cet.10).
 func (m *SessionManager) readHookBead(polecat string) string {
 	agentID := m.agentBeadIDForSession(polecat)
-	bd := beads.New(m.rig.Path).ForAgentBead()
-	_, fields, err := bd.GetAgentBead(agentID)
+	_, fields, err := m.agentBeads().GetAgentBead(agentID)
 	if err != nil || fields == nil {
 		return ""
 	}
-	return strings.TrimSpace(fields.HookBead)
+	hookBead := strings.TrimSpace(fields.HookBead)
+	if hookBead == "" {
+		return ""
+	}
+	// Work beads live in the rig DB (prefix-routed), NOT in the noRoute
+	// town-DB wrapper that backs agent beads. Using the wrong wrapper here
+	// would silently drop every valid work bead and treat all hooks as
+	// stale — which is precisely the regression this function guards against.
+	issue, err := m.workBeads().Show(hookBead)
+	if err != nil || issue == nil {
+		return ""
+	}
+	assignee := fmt.Sprintf("%s/polecats/%s", m.rig.Name, polecat)
+	if !isCurrentHookedIssueForAssignee(issue, assignee) {
+		return ""
+	}
+	return hookBead
 }
 
 // Start creates and starts a new session for a polecat.
