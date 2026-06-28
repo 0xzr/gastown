@@ -214,6 +214,7 @@ test-makefile:
 	bash scripts/test-wrapper-topology.sh
 	bash scripts/cutover-pinned-1.2.0_test.sh
 	bash scripts/cutover-rollback_test.sh
+	bash scripts/guards/done-empty-hook-guard_test.sh
 	bash -n plugins/stuck-agent-dog/run.sh
 	bash -n plugins/stuck-agent-dog/run_test.sh
 	bash plugins/stuck-agent-dog/run_test.sh

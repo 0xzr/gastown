@@ -25,7 +25,8 @@ Available guards:
   dangerous-command  - Block rm -rf, force push, hard reset, git clean
 
 External guards (standalone scripts, not compiled into gt):
-  context-budget   - scripts/guards/context-budget-guard.sh
+  context-budget          - scripts/guards/context-budget-guard.sh
+  done-empty-hook-guard   - scripts/guards/done-empty-hook-guard.sh (gastown-dg1)
 
 Example hook configuration:
   {

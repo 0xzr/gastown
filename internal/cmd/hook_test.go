@@ -154,3 +154,50 @@ func TestNormalizeHookShowTarget(t *testing.T) {
 		})
 	}
 }
+
+// TestActualPolecatTargetFromEnv verifies that the canonical agent identity
+// is derived from GT_RIG/GT_POLECAT and matches what gt done uses to
+// reconstruct the polecat worktree. This is the gastown-dg1 recovery path
+// for the "rig/rig" misresolution that stranded polecats after deleted
+// molecules.
+func TestActualPolecatTargetFromEnv(t *testing.T) {
+	tests := []struct {
+		name     string
+		rig      string
+		polecat  string
+		expected string
+	}{
+		{"both set", "gastown", "jasper", "gastown/polecats/jasper"},
+		{"empty rig", "", "jasper", ""},
+		{"empty polecat", "gastown", "", ""},
+		{"both empty", "", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GT_RIG", tt.rig)
+			t.Setenv("GT_POLECAT", tt.polecat)
+			got := actualPolecatTargetFromEnv()
+			if got != tt.expected {
+				t.Fatalf("actualPolecatTargetFromEnv() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestResolveSourceBeadFromBranch_NoRepoOrNoBranch verifies that
+// resolveSourceBeadFromBranch is fail-closed when cwd is not a git repo or
+// the branch is unparseable. It must NEVER return a fabricated source bead
+// when durable evidence is absent.
+func TestResolveSourceBeadFromBranch_NoRepoOrNoBranch(t *testing.T) {
+	// Empty cwd → returns "". No branch parsing happens.
+	if got := resolveSourceBeadFromBranch("", "gastown/polecats/jasper", nil); got != "" {
+		t.Errorf("empty cwd returned %q, want \"\"", got)
+	}
+
+	// Non-git directory → returns "". We use t.TempDir() which has no .git.
+	tmp := t.TempDir()
+	if got := resolveSourceBeadFromBranch(tmp, "gastown/polecats/jasper", nil); got != "" {
+		t.Errorf("non-git dir returned %q, want \"\"", got)
+	}
+}
