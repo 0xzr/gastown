@@ -595,14 +595,16 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	if effectiveAgent != "" {
 		rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, effectiveAgent)
 		if err != nil {
-			// An invalid persisted agent must not wedge session start: fall back
-			// to the default role agent and warn so the operator can fix it.
+			// Fail-closed: an invalid persisted agent must NOT silently rotate
+			// the polecat to the rig default — that drift is exactly what the
+			// model-preservation commit (gastown-hkd) was meant to prevent.
+			// Surface the error so the operator fixes the persisted record or
+			// explicitly rotates via --agent. The session does not start until
+			// the assignment is consistent.
 			if opts.Agent != "" {
 				return fmt.Errorf("resolving agent config for %s: %w", effectiveAgent, err)
 			}
-			style.PrintWarning("persisted assigned_agent %q could not be resolved, falling back to default: %v", effectiveAgent, err)
-			effectiveAgent = ""
-			runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
+			return fmt.Errorf("persisted assigned_agent %q for %s/%s is not resolvable: %w\n  fix: rerun with an explicit --agent <name> to rotate, or clear the persisted record", effectiveAgent, m.rig.Name, polecat, err)
 		} else {
 			runtimeConfig = rc
 		}
