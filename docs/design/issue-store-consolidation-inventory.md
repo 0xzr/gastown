@@ -260,6 +260,52 @@ No Dolt data is deleted. To reverse the registration, remove the entries from
 `knownLegacyStoreDirs`) and re-run `gt doctor` to confirm expected warnings
 return.
 
+#### 4.3.1 Verification log (`gastown-cet.1.2.3`, 2026-06-28)
+
+Verification performed by `gastown/polecats/quartz` via the public `gt`/`bd`
+commands only (read-only, no raw Dolt edits).
+
+| Check | Command | Expected | Result |
+|---|---|---|---|
+| Protected label in Dolt status | `gt dolt status` | `bdglobal` shown as `(legacy empty bdglobal database (protected))` | ✓ Passed |
+| Not orphaned in database list | `gt dolt list` | `bdglobal` listed with protected label, not as orphaned | ✓ Passed |
+| Not flagged by doctor | `gt doctor` | `bdglobal/` NOT reported under `unregistered-beads-dirs` | ✓ Passed |
+| Cleanup dry-run ignores it | `gt dolt cleanup --dry-run` | Does NOT propose removing `bdglobal/` | ✓ Passed |
+
+Command output excerpts:
+
+```text
+$ gt dolt status
+  Databases:
+    - bdglobal             (legacy empty bdglobal database (protected))
+    - beads                (beads rig beads)
+    - beads_global         (legacy empty beads_global database (protected))
+    - gastown              (gastown rig beads)
+    ...
+
+$ gt dolt list
+  bdglobal (legacy empty bdglobal database (protected))
+    /home/ubuntu/gt-town/.dolt-data/bdglobal
+
+$ gt doctor
+  ...
+  ⚠  unregistered-beads-dirs 2 unregistered directory(ies) with beads metadata
+       └─ /home/ubuntu/gt-town/.claude/settings.json: wrong location (inside source repo)
+       └─ /home/ubuntu/gt-town/polybot/.claude/settings.json: wrong location (inside source repo)
+  ...
+  (bdglobal/ is not in the unregistered-beads-dirs list)
+
+$ gt dolt cleanup --dry-run
+  ✓ No orphaned databases found in .dolt-data/
+```
+
+**Findings:** All four checks passed. `bdglobal` is correctly registered as a
+protected legacy empty database. The `gt doctor` warnings about
+`.claude/settings.json` files are unrelated to `bdglobal` and are out of scope
+for this verification bead.
+
+Live status tracker: `gastown-cet.1.2.3` (this bead).
+
 ---
 
 ## 5. Rollback instructions
