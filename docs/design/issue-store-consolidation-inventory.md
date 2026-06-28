@@ -260,6 +260,21 @@ No Dolt data is deleted. To reverse the registration, remove the entries from
 `knownLegacyStoreDirs`) and re-run `gt doctor` to confirm expected warnings
 return.
 
+#### 4.3.1 Live verification log (`gastown-cet.1.2.4`, 2026-06-28)
+
+Verification performed by `gastown/polecats/onyx` via read-only `gt`
+commands only; no raw `.dolt/` or JSONL files were inspected or edited.
+
+| Check | Command | Expected result | Actual result (2026-06-28) |
+|---|---|---|---|
+| Protected label visible | `gt dolt status` | `beads_global` is listed with a purpose label, not as an unexplained empty store. | `beads_global (legacy empty beads_global database (protected))` ✓ |
+| Not orphaned | `gt dolt list` | `beads_global` appears as a known protected database, not flagged as orphaned. | Listed as `beads_global (legacy empty beads_global database (protected))`; no orphan flag. ✓ |
+| Not an unregistered beads directory | `gt doctor` | `unregistered-beads-dirs` warning does **not** include `beads_global/`. | `unregistered-beads-dirs` reports `beads/` and `gt-town/` only; `beads_global/` absent. ✓ |
+| Cleanup does not propose removal | `gt dolt cleanup --dry-run` | No proposal to remove `beads_global/`. | `✓ No orphaned databases found in .dolt-data/` ✓ |
+
+Live status tracker for this registration: `gastown-cet.1.2.4` — Document
+`beads_global` as protected legacy empty store.
+
 ---
 
 ## 5. Rollback instructions
@@ -303,6 +318,7 @@ changes and this document.
 - [x] Rollback instructions recorded.
 - [x] No raw `.dolt/`, `noms/`, `LOCK`, `manifest`, or JSONL files edited or removed.
 - [x] `bdglobal` and `beads_global` registered as protected legacy empty stores in `doltserver.go` and ignored by `unregistered-beads-dirs`.
+- [x] Live verification log for `beads_global` recorded in §4.3.1, cross-referencing tracker `gastown-cet.1.2.4`.
 - [x] **Remediation (`gastown-cet.1.2.1`, 2026-06-28):** All 28 open `hq-*` issues in the embedded `mayor/gastown/.beads` store closed via `bd` CLI as duplicates or preserved-for-provenance with cross-link notes pointing to canonical gastown/town trackers; `bd list --status=open` from `/home/ubuntu/gt-town/mayor/gastown` now returns zero issues. Disposition table recorded in §4.1.1. No raw Dolt files modified.
 
 ---
