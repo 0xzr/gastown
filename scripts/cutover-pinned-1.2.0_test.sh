@@ -269,6 +269,191 @@ else
   fail "cutover rollback does not use gt_install_rollback (no locked/canaried restore)"
 fi
 
+# --- Regression (gastown-cet.12.11): forward-only fail-fast on missing metadata ---
+# The forward-only guard previously printed "Warning: cannot determine installed
+# binary commit; skipping forward check" when `gt version --verbose` did not
+# emit an '@<commit>' token, and exited 0. That let a downgrade or wrong-version
+# cutover proceed with only a warning — the exact silent bypass this guard
+# exists to prevent. The fix is to FAIL FAST unless --skip-forward-check is
+# explicit. Lock in all three regimes with hermetic sub-tests.
+
+# A separate fake ELF that does NOT emit an '@<commit>' token in version output.
+# This is the binary that triggered the silent bypass in retro-gate shard D.
+FAKE_HOME_NO_COMMIT="${TMPDIR}/home-nocommit"
+FAKE_INSTALL_DIR_NO_COMMIT="${FAKE_HOME_NO_COMMIT}/.local/bin"
+FAKE_TOWN_ROOT_NO_COMMIT="${TMPDIR}/town-nocommit"
+mkdir -p "${FAKE_INSTALL_DIR_NO_COMMIT}" "${FAKE_TOWN_ROOT_NO_COMMIT}"
+
+cat > "${FAKE_INSTALL_DIR_NO_COMMIT}/gt" <<'WRAPPER_NC'
+#!/usr/bin/env bash
+# Fake wrapper without version metadata (mirrors a binary that lost its
+# ldflags -X Commit=... value — the failure mode the guard catches).
+REAL_BIN="${0%/*}/gt-real-bin"
+if [ "${1:-}" = "version" ]; then
+  echo "gt version 1.1.9 (no commit metadata)"
+  exit 0
+fi
+exec "${REAL_BIN}" "$@"
+WRAPPER_NC
+chmod 0755 "${FAKE_INSTALL_DIR_NO_COMMIT}/gt"
+
+cat > "${FAKE_INSTALL_DIR_NO_COMMIT}/gt-real-bin" <<'ELF_NC'
+#!/usr/bin/env bash
+if [ "${1:-}" = "version" ]; then
+  echo "gt version 1.1.9 (no commit metadata)"
+  exit 0
+fi
+if [ "${1:-}" = "version" ] && [ "${2:-}" = "--verbose" ]; then
+  echo "gt version 1.1.9 (no commit metadata)"
+  exit 0
+fi
+echo "Unknown command: $1" >&2
+exit 1
+ELF_NC
+chmod 0755 "${FAKE_INSTALL_DIR_NO_COMMIT}/gt-real-bin"
+
+# --- Regime 1: NO skip flag, NO commit metadata → must FAIL FAST ---
+set +e
+HOME="${FAKE_HOME_NO_COMMIT}" \
+  GT_TOWN_ROOT="${FAKE_TOWN_ROOT_NO_COMMIT}" \
+  PATH="${FAKE_INSTALL_DIR_NO_COMMIT}:${PATH}" \
+  bash "${CUTOVER_SCRIPT}" --dry-run \
+  > "${TMPDIR}/nocommit-strict.out" 2> "${TMPDIR}/nocommit-strict.err"
+NC_STRICT_RC=$?
+set -e
+if [ "${NC_STRICT_RC}" -ne 0 ]; then
+  pass "cutover fails fast (exit ${NC_STRICT_RC}) when binary has no commit metadata and --skip-forward-check is NOT set"
+else
+  fail "cutover exited 0 with no commit metadata and no --skip-forward-check (silent bypass regression — gastown-cet.12.11)"
+  echo "--- stdout ---"; cat "${TMPDIR}/nocommit-strict.out"
+  echo "--- stderr ---"; cat "${TMPDIR}/nocommit-strict.err"
+fi
+if grep -q "ERROR: cannot determine installed binary commit" "${TMPDIR}/nocommit-strict.err"; then
+  pass "fail-fast error message present on missing commit metadata (no silent warning)"
+else
+  fail "fail-fast error message missing on missing commit metadata"
+  cat "${TMPDIR}/nocommit-strict.err" >&2
+fi
+# The 'Warning' line must NOT appear WITHOUT the 'ERROR' line — that would
+# be the legacy silent-skip path returned. Use intermediate variables to
+# avoid fragile && chains inside `if`.
+WARN_HIT=0
+ERR_HIT=0
+grep -q "Warning: cannot determine installed binary commit" "${TMPDIR}/nocommit-strict.err" && WARN_HIT=1 || true
+grep -q "ERROR: cannot determine installed binary commit" "${TMPDIR}/nocommit-strict.err" && ERR_HIT=1 || true
+if [ "${WARN_HIT}" -eq 1 ] && [ "${ERR_HIT}" -eq 0 ]; then
+  fail "regression: only the legacy 'Warning' line is emitted (silent skip path returned)"
+fi
+# Also assert no cutover evidence was recorded: an unanchored cutover must not
+# proceed far enough to write its record file.
+if [ -f "${FAKE_TOWN_ROOT_NO_COMMIT}/.runtime/pinned-1.2.0-cutover.json" ]; then
+  fail "evidence record was written despite missing commit metadata (cutover did not fail fast)"
+else
+  pass "no evidence record written when forward-only check fails fast"
+fi
+
+# --- Regime 2: WITH --skip-forward-check, NO commit metadata → must SUCCEED ---
+set +e
+HOME="${FAKE_HOME_NO_COMMIT}" \
+  GT_TOWN_ROOT="${FAKE_TOWN_ROOT_NO_COMMIT}" \
+  PATH="${FAKE_INSTALL_DIR_NO_COMMIT}:${PATH}" \
+  bash "${CUTOVER_SCRIPT}" --dry-run --skip-forward-check \
+  > "${TMPDIR}/nocommit-skip.out" 2> "${TMPDIR}/nocommit-skip.err"
+NC_SKIP_RC=$?
+set -e
+if [ "${NC_SKIP_RC}" -eq 0 ]; then
+  pass "explicit --skip-forward-check overrides missing commit metadata (operator opt-in works)"
+else
+  fail "explicit --skip-forward-check did NOT override missing commit metadata (exit ${NC_SKIP_RC})"
+  echo "--- stdout ---"; cat "${TMPDIR}/nocommit-skip.out"
+  echo "--- stderr ---"; cat "${TMPDIR}/nocommit-skip.err"
+fi
+if grep -q "Skipping forward-only check (--skip-forward-check)" "${TMPDIR}/nocommit-skip.out"; then
+  pass "--skip-forward-check banner emitted on explicit opt-in"
+else
+  fail "--skip-forward-check banner missing on explicit opt-in"
+fi
+
+# --- Regime 3: baseline scenario with --skip-forward-check (already passes) ---
+# The original test scenario (lines 84-89) uses --skip-forward-check and
+# exercises the full dry-run flow. Assert the skip banner is present in its
+# output as a regression marker.
+if grep -q "Skipping forward-only check (--skip-forward-check)" "${TMPDIR}/cutover.out"; then
+  pass "baseline scenario emits --skip-forward-check banner (no regression)"
+else
+  fail "baseline scenario missing --skip-forward-check banner"
+  cat "${TMPDIR}/cutover.out" >&2
+fi
+
+# --- Regime 4: cutover script must NOT contain the legacy warning-only branch ---
+# Static check: the only place a "Warning: cannot determine installed binary
+# commit" message is acceptable is the deprecated-and-skipped branch. After
+# the fix the script should emit "ERROR: cannot determine installed binary
+# commit" instead. This guards against a future edit that re-introduces the
+# silent skip.
+if grep -q 'Warning: cannot determine installed binary commit' "${CUTOVER_SCRIPT}"; then
+  fail "cutover script still contains the legacy 'Warning' silent-skip message"
+else
+  pass "cutover script no longer contains the legacy 'Warning' silent-skip message"
+fi
+if grep -q 'ERROR: cannot determine installed binary commit' "${CUTOVER_SCRIPT}"; then
+  pass "cutover script emits fail-fast 'ERROR' on missing commit metadata"
+else
+  fail "cutover script does NOT emit fail-fast 'ERROR' on missing commit metadata"
+fi
+
+# --- Regime 5: Makefile check-forward-only must also fail fast on missing metadata ---
+# Static + dynamic: the Makefile target must contain the fail-fast branch
+# (error, exit 1) rather than the legacy warning-only skip.
+if grep -q 'WARNING.*cannot determine installed binary commit' Makefile; then
+  fail "Makefile check-forward-only still contains legacy 'Warning' silent-skip (gastown-cet.12.11)"
+fi
+if ! grep -q 'ERROR.*cannot determine installed binary commit' Makefile; then
+  fail "Makefile check-forward-only does NOT emit fail-fast 'ERROR' on missing commit metadata"
+fi
+# Dynamic check: invoke `make check-forward-only` against a fake install dir
+# holding a binary with no '@<commit>' token. The Makefile must exit non-zero.
+FAKE_HOME_MAKE="${TMPDIR}/home-make"
+FAKE_INSTALL_DIR_MAKE="${FAKE_HOME_MAKE}/.local/bin"
+mkdir -p "${FAKE_INSTALL_DIR_MAKE}"
+cat > "${FAKE_INSTALL_DIR_MAKE}/gt" <<'NOCOMMIT_GT'
+#!/usr/bin/env bash
+# Fake gt without '@<commit>' version metadata. Matches both `version`
+# and `version --verbose` since both are routed through $1 == "version".
+if [ "${1:-}" = "version" ]; then
+  echo "gt version 1.1.9 (no commit metadata)"
+  exit 0
+fi
+exit 1
+NOCOMMIT_GT
+chmod 0755 "${FAKE_INSTALL_DIR_MAKE}/gt"
+set +e
+HOME="${FAKE_HOME_MAKE}" \
+  make -C "${REPO_ROOT}" check-forward-only \
+  > "${TMPDIR}/make-strict.out" 2> "${TMPDIR}/make-strict.err"
+MAKE_STRICT_RC=$?
+set -e
+if [ "${MAKE_STRICT_RC}" -ne 0 ]; then
+  pass "make check-forward-only fails fast (exit ${MAKE_STRICT_RC}) when binary has no commit metadata"
+else
+  fail "make check-forward-only exited 0 with no commit metadata (silent bypass regression — gastown-cet.12.11)"
+  echo "--- stdout ---"; cat "${TMPDIR}/make-strict.out"
+  echo "--- stderr ---"; cat "${TMPDIR}/make-strict.err"
+fi
+# Explicit override must succeed (SKIP_FORWARD_CHECK=1 turns the guard off).
+set +e
+HOME="${FAKE_HOME_MAKE}" \
+  make -C "${REPO_ROOT}" check-forward-only SKIP_FORWARD_CHECK=1 \
+  > "${TMPDIR}/make-skip.out" 2> "${TMPDIR}/make-skip.err"
+MAKE_SKIP_RC=$?
+set -e
+if [ "${MAKE_SKIP_RC}" -eq 0 ]; then
+  pass "make SKIP_FORWARD_CHECK=1 overrides missing commit metadata (explicit opt-in)"
+else
+  fail "make SKIP_FORWARD_CHECK=1 did NOT override missing commit metadata (exit ${MAKE_SKIP_RC})"
+  cat "${TMPDIR}/make-skip.err" >&2
+fi
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 [ "${FAIL}" -eq 0 ]

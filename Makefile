@@ -82,25 +82,36 @@ endif
 # check-forward-only: Ensure HEAD is a descendant of the currently installed binary's commit.
 # Prevents rebuilding to an older or diverged commit, which caused a crash loop where
 # the replaced binary broke session startup hooks → witness respawned → loop every 1-2 min.
+#
+# When the installed binary does not advertise a commit token (no '@<commit>' in
+# `gt version --verbose`) the check has no anchor to validate against. Rather
+# than silently skip with a warning — which would let a downgrade or wrong-
+# version cutover proceed and re-trigger the crash loop — we FAIL FAST. The
+# operator must explicitly opt in with SKIP_FORWARD_CHECK=1 (gastown-cet.12.11).
 check-forward-only:
 ifndef SKIP_FORWARD_CHECK
 	@BINARY_COMMIT=$$($(INSTALL_DIR)/$(BINARY) version --verbose 2>/dev/null | grep -o '@[a-f0-9]*' | head -1 | tr -d '@'); \
-	if [ -n "$$BINARY_COMMIT" ] && [ "$$BINARY_COMMIT" != "unknown" ]; then \
-		HEAD_COMMIT=$$(git rev-parse HEAD 2>/dev/null); \
-		if [ "$$BINARY_COMMIT" = "$$HEAD_COMMIT" ] || [ "$$(git rev-parse --short HEAD)" = "$$BINARY_COMMIT" ]; then \
-			echo "Binary is already at HEAD, nothing to do"; \
-			exit 1; \
-		fi; \
-		if ! git merge-base --is-ancestor "$$BINARY_COMMIT" HEAD 2>/dev/null; then \
-			echo "ERROR: HEAD ($$(git rev-parse --short HEAD)) is NOT a descendant of installed binary ($$BINARY_COMMIT)"; \
-			echo "This would be a DOWNGRADE. Refusing to rebuild."; \
-			echo "Use SKIP_FORWARD_CHECK=1 to override (dangerous)."; \
-			exit 1; \
-		fi; \
-		echo "Forward-only check passed: $$BINARY_COMMIT → $$(git rev-parse --short HEAD)"; \
-	else \
-		echo "Warning: cannot determine installed binary commit, skipping forward check"; \
-	fi
+	if [ -z "$$BINARY_COMMIT" ] || [ "$$BINARY_COMMIT" = "unknown" ]; then \
+		echo "ERROR: cannot determine installed binary commit (no '@<commit>' token in $(INSTALL_DIR)/$(BINARY) version --verbose)" >&2; \
+		echo "  Refusing to silently skip the forward-only check — an unanchored" >&2; \
+		echo "  cutover to an older or diverged commit would re-trigger the crash" >&2; \
+		echo "  loop this guard exists to prevent (gastown-cet.12.11)." >&2; \
+		echo "  Build the new binary first so it carries a version commit, or" >&2; \
+		echo "  override explicitly with SKIP_FORWARD_CHECK=1 (dangerous)." >&2; \
+		exit 1; \
+	fi; \
+	HEAD_COMMIT=$$(git rev-parse HEAD 2>/dev/null); \
+	if [ "$$BINARY_COMMIT" = "$$HEAD_COMMIT" ] || [ "$$(git rev-parse --short HEAD)" = "$$BINARY_COMMIT" ]; then \
+		echo "Binary is already at HEAD, nothing to do"; \
+		exit 1; \
+	fi; \
+	if ! git merge-base --is-ancestor "$$BINARY_COMMIT" HEAD 2>/dev/null; then \
+		echo "ERROR: HEAD ($$(git rev-parse --short HEAD)) is NOT a descendant of installed binary ($$BINARY_COMMIT)" >&2; \
+		echo "This would be a DOWNGRADE. Refusing to rebuild." >&2; \
+		echo "Use SKIP_FORWARD_CHECK=1 to override (dangerous)." >&2; \
+		exit 1; \
+	fi; \
+	echo "Forward-only check passed: $$BINARY_COMMIT → $$(git rev-parse --short HEAD)"
 endif
 
 check-install-path:

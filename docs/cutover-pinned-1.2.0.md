@@ -50,6 +50,19 @@ commit is safe):
 scripts/cutover-pinned-1.2.0.sh --skip-forward-check
 ```
 
+### What happens when the installed binary carries no `@<commit>` token
+
+If the installed `gt` binary does not advertise a commit token in
+`gt version --verbose` (for example, a binary built without the `Commit=` ldflag,
+or any binary that lost its version metadata), the cutover script **fails
+fast** with a clear error rather than silently skipping the forward-only
+check (gastown-cet.12.11). The only way past the guard is the explicit
+`--skip-forward-check` flag — the prior "Warning: cannot determine installed
+binary commit; skipping forward check" path has been removed because it let a
+downgrade or wrong-version cutover proceed with only a warning. The same
+fail-fast behavior applies to `make safe-install` / `make check-forward-only`
+when `SKIP_FORWARD_CHECK=1` is not set.
+
 ## Rolling back
 
 The cutover script now copies the currently installed binary to

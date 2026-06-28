@@ -108,24 +108,35 @@ POST_VERBOSE=""
 # Verify the current source tree is on a descendant of the installed binary.
 # The forward-only check must read the version from the REAL ELF, not the
 # wrapper, because the wrapper does not carry version metadata.
+#
+# When the installed binary does not advertise a commit token (no '@<commit>'
+# in version --verbose) there is no anchor to validate against. Rather than
+# silently skip with a warning — which would let a downgrade or wrong-version
+# cutover proceed — we FAIL FAST. The operator must explicitly opt in with
+# --skip-forward-check (gastown-cet.12.11).
 if [ -z "${SKIP_FORWARD_CHECK:-}" ]; then
   PROBE="${REAL_BIN_PATH}"
   if [ ! -x "${PROBE}" ]; then
     PROBE="${WRAPPER_PATH}"
   fi
   INSTALLED_COMMIT="$(${PROBE} version --verbose 2>/dev/null | grep -o '@[a-f0-9]*' | head -1 | tr -d '@' || true)"
-  if [ -n "${INSTALLED_COMMIT}" ]; then
-    HEAD_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
-    if ! git -C "${REPO_ROOT}" merge-base --is-ancestor "${INSTALLED_COMMIT}" "${HEAD_COMMIT}" 2>/dev/null; then
-      echo "ERROR: HEAD ${HEAD_COMMIT} is not a descendant of installed binary ${INSTALLED_COMMIT}" >&2
-      echo "Refusing to cut over to an older or diverged commit." >&2
-      echo "Use --skip-forward-check to override (dangerous)." >&2
-      exit 1
-    fi
-    echo "Forward-only check passed: ${INSTALLED_COMMIT} -> ${HEAD_COMMIT}"
-  else
-    echo "Warning: cannot determine installed binary commit; skipping forward check"
+  if [ -z "${INSTALLED_COMMIT}" ]; then
+    echo "ERROR: cannot determine installed binary commit (no '@<commit>' token in ${PROBE} version --verbose)" >&2
+    echo "  Refusing to silently skip the forward-only check — an unanchored" >&2
+    echo "  cutover to an older or diverged commit would re-trigger the crash" >&2
+    echo "  loop this guard exists to prevent (gastown-cet.12.11)." >&2
+    echo "  Build the new binary first so it carries a version commit, or" >&2
+    echo "  override explicitly with --skip-forward-check (dangerous)." >&2
+    exit 1
   fi
+  HEAD_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+  if ! git -C "${REPO_ROOT}" merge-base --is-ancestor "${INSTALLED_COMMIT}" "${HEAD_COMMIT}" 2>/dev/null; then
+    echo "ERROR: HEAD ${HEAD_COMMIT} is not a descendant of installed binary ${INSTALLED_COMMIT}" >&2
+    echo "Refusing to cut over to an older or diverged commit." >&2
+    echo "Use --skip-forward-check to override (dangerous)." >&2
+    exit 1
+  fi
+  echo "Forward-only check passed: ${INSTALLED_COMMIT} -> ${HEAD_COMMIT}"
 else
   echo "Skipping forward-only check (--skip-forward-check)"
 fi
