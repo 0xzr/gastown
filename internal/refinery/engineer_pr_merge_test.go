@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -392,5 +393,189 @@ func TestDoMergePR_DegradedQuorum_ProceedsAndCreatesAudit(t *testing.T) {
 	}
 	if !mergeCalled {
 		t.Error("expected MergePR to be called")
+	}
+}
+
+// TestDoMergePR_DegradedQuorum_MergeFail_NoAuditBead guards gastown-cet.12.6.2:
+// when the provider merge fails, the reviewer audit bead must NOT be recorded.
+// Recording it before the merge succeeds orphaned an open audit task against a
+// failed MR with no merge to audit and no revoke path.
+func TestDoMergePR_DegradedQuorum_MergeFail_NoAuditBead(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = "pr"
+	e.config.RequireReview = boolPtr(true)
+	e.config.DegradedQuorumEnabled = boolPtr(true)
+	e.config.ReviewQuorumMin = 1
+
+	createFeatureBranch(t, workDir, "feat/degraded-fail", "test.txt", "hello")
+
+	auditCalled := false
+	e.recordReviewerAuditBeadFunc = func(mr *MRInfo, ev *ReviewEvaluation) (string, error) {
+		auditCalled = true
+		return "gt-audit-fake", nil
+	}
+
+	e.prProvider = &reviewerMockPRProvider{
+		findPRNumber: func(string) (int, error) { return 42, nil },
+		isPRApproved: func(int) (bool, error) { return true, nil },
+		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
+			return &ReviewEvaluation{
+				State: ReviewStateDegradedQuorum,
+				Results: []ReviewerResult{
+					{Reviewer: "alice", Verdict: ReviewerVerdictPass},
+					{Reviewer: "bob", Verdict: ReviewerVerdictUnavailable},
+				},
+				PassCount:        1,
+				UnavailableCount: 1,
+				AuditReviewers:   []string{"bob"},
+				Error:            "degraded quorum: 1 PASS, 1 audit",
+			}, nil
+		},
+		// Simulate the provider's PR merge API failing.
+		mergePR: func(int, string) (string, error) {
+			return "", fmt.Errorf("provider merge API: 409 conflict")
+		},
+	}
+
+	result := e.doMergePR(context.Background(), "feat/degraded-fail", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+
+	if result.Success {
+		t.Fatalf("expected merge failure, got success %+v", result)
+	}
+	if auditCalled {
+		t.Error("audit bead must NOT be recorded when the provider merge fails")
+	}
+	if result.AuditBead != "" {
+		t.Errorf("AuditBead must be empty on merge failure, got %q", result.AuditBead)
+	}
+}
+
+// TestDoMergePR_DegradedQuorum_PushVerifyFail_NoAuditBead guards the second
+// failure surface of gastown-cet.12.6.2: the provider merge lands but the
+// push-verification (VerifyPushedCommit) fails. The audit bead still must not
+// be recorded because the merge was not verified as published.
+func TestDoMergePR_DegradedQuorum_PushVerifyFail_NoAuditBead(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = "pr"
+	e.config.RequireReview = boolPtr(true)
+	e.config.DegradedQuorumEnabled = boolPtr(true)
+	e.config.ReviewQuorumMin = 1
+
+	createFeatureBranch(t, workDir, "feat/degraded-verify", "test.txt", "hello")
+
+	auditCalled := false
+	e.recordReviewerAuditBeadFunc = func(mr *MRInfo, ev *ReviewEvaluation) (string, error) {
+		auditCalled = true
+		return "gt-audit-fake", nil
+	}
+
+	e.prProvider = &reviewerMockPRProvider{
+		findPRNumber: func(string) (int, error) { return 42, nil },
+		isPRApproved: func(int) (bool, error) { return true, nil },
+		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
+			return &ReviewEvaluation{
+				State: ReviewStateDegradedQuorum,
+				Results: []ReviewerResult{
+					{Reviewer: "alice", Verdict: ReviewerVerdictPass},
+					{Reviewer: "bob", Verdict: ReviewerVerdictUnavailable},
+				},
+				PassCount:        1,
+				UnavailableCount: 1,
+				AuditReviewers:   []string{"bob"},
+				Error:            "degraded quorum: 1 PASS, 1 audit",
+			}, nil
+		},
+		// Provider merge "succeeds" (returns a commit SHA) but that SHA is not
+		// actually reachable on origin/main, so VerifyPushedCommit rejects it.
+		mergePR: func(int, string) (string, error) {
+			// Return a commit SHA that is not the origin/main tip.
+			return "0123456789abcdef0123456789abcdef01234567", nil
+		},
+	}
+
+	result := e.doMergePR(context.Background(), "feat/degraded-verify", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+
+	if result.Success {
+		t.Fatalf("expected push-verification failure, got success %+v", result)
+	}
+	if auditCalled {
+		t.Error("audit bead must NOT be recorded when push verification fails")
+	}
+	if result.AuditBead != "" {
+		t.Errorf("AuditBead must be empty on push-verify failure, got %q", result.AuditBead)
+	}
+}
+
+// TestDoMergePR_DegradedQuorum_Success_RecordsAuditBeadAfterMerge guards the
+// positive contract of gastown-cet.12.6.2: when the merge DOES succeed, the
+// audit bead is recorded AFTER the merge and threaded onto ProcessResult so the
+// source-issue closure stamps the audit bead reference.
+func TestDoMergePR_DegradedQuorum_Success_RecordsAuditBeadAfterMerge(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = "pr"
+	e.config.RequireReview = boolPtr(true)
+	e.config.DegradedQuorumEnabled = boolPtr(true)
+	e.config.ReviewQuorumMin = 1
+
+	createFeatureBranch(t, workDir, "feat/degraded-ok", "test.txt", "hello")
+
+	auditCalled := false
+	var auditMR *MRInfo
+	e.recordReviewerAuditBeadFunc = func(mr *MRInfo, ev *ReviewEvaluation) (string, error) {
+		auditCalled = true
+		auditMR = mr
+		return "gt-audit-success", nil
+	}
+
+	e.prProvider = &reviewerMockPRProvider{
+		findPRNumber: func(string) (int, error) { return 42, nil },
+		isPRApproved: func(int) (bool, error) { return true, nil },
+		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
+			return &ReviewEvaluation{
+				State: ReviewStateDegradedQuorum,
+				Results: []ReviewerResult{
+					{Reviewer: "alice", Verdict: ReviewerVerdictPass},
+					{Reviewer: "bob", Verdict: ReviewerVerdictUnavailable},
+				},
+				PassCount:        1,
+				UnavailableCount: 1,
+				AuditReviewers:   []string{"bob"},
+				Error:            "degraded quorum: 1 PASS, 1 audit",
+			}, nil
+		},
+		mergePR: func(int, string) (string, error) {
+			if err := g.Checkout("main"); err != nil {
+				return "", err
+			}
+			if err := g.MergeSquash("feat/degraded-ok", "feat: add test.txt"); err != nil {
+				return "", err
+			}
+			sha, err := g.Rev("HEAD")
+			if err != nil {
+				return "", err
+			}
+			if err := g.Push("origin", "main", false); err != nil {
+				return "", err
+			}
+			return sha, nil
+		},
+	}
+
+	result := e.doMergePR(context.Background(), "feat/degraded-ok", "main", &MRInfo{ID: "gt-test", SourceIssue: "gt-src"})
+
+	if !result.Success {
+		t.Fatalf("expected success under degraded quorum, got %+v", result)
+	}
+	if !auditCalled {
+		t.Error("audit bead must be recorded after a successful degraded-quorum merge")
+	}
+	if result.AuditBead != "gt-audit-success" {
+		t.Errorf("expected AuditBead=gt-audit-success, got %q", result.AuditBead)
+	}
+	if auditMR == nil || auditMR.ID != "gt-test" {
+		t.Errorf("audit bead should be recorded against the MR, got %+v", auditMR)
 	}
 }

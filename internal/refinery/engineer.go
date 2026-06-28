@@ -377,6 +377,14 @@ type Engineer struct {
 	// routing behavior without sending real nudges.
 	reviewerRejectionWorkerNudge func(target, msg string) error
 	reviewerRejectionMayorNudge  func(msg string) error
+
+	// recordReviewerAuditBeadFunc is a test seam for the degraded-quorum audit
+	// bead creation in doMergePR. When non-nil it replaces the real
+	// recordReviewerAuditBead call so tests can assert that the audit bead is
+	// recorded only after a successful merge (never on a failed merge — see
+	// gastown-cet.12.6.2). Production code leaves this nil and uses the real
+	// beads.Create path.
+	recordReviewerAuditBeadFunc func(mr *MRInfo, ev *ReviewEvaluation) (string, error)
 }
 
 // DefaultReworkRouterTimeout bounds the external `gt mq reject` call that
@@ -1117,16 +1125,28 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string, mr *MRI
 			}
 		case ReviewStateDegradedQuorum:
 			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d proceeding under degraded quorum: %s\n", prNumber, ev.Error)
-			var auditBead string
+			// The audit obligation only exists for a successful merge. Record the
+			// audit bead AFTER finishPRMerge succeeds: if the provider merge or
+			// push-verification fails, there is no merge to audit, and creating
+			// the bead now would orphan it against a failed MR (gastown-cet.12.6.2).
+			result := e.finishPRMerge(prNumber, branch, target, true)
+			if !result.Success {
+				return result
+			}
 			if mr != nil {
-				auditBead, err = e.recordReviewerAuditBead(mr, ev)
-				if err != nil {
-					_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to record reviewer audit bead: %v\n", err)
+				auditFn := e.recordReviewerAuditBead
+				if e.recordReviewerAuditBeadFunc != nil {
+					auditFn = e.recordReviewerAuditBeadFunc
+				}
+				auditBead, auditErr := auditFn(mr, ev)
+				if auditErr != nil {
+					_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to record reviewer audit bead: %v\n", auditErr)
 				} else {
 					_, _ = fmt.Fprintf(e.output, "[Engineer] Recorded reviewer audit bead: %s\n", auditBead)
+					result.AuditBead = auditBead
 				}
 			}
-			return e.finishPRMerge(prNumber, branch, target, true, auditBead)
+			return result
 		default:
 			// NO_VERDICT or UNAVAILABLE: keep MR in queue for retry rather than failing.
 			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d awaiting reviewer verdict (%s) — deferring merge\n", prNumber, ev.State)
@@ -1138,11 +1158,14 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string, mr *MRI
 		}
 	}
 
-	return e.finishPRMerge(prNumber, branch, target, false, "")
+	return e.finishPRMerge(prNumber, branch, target, false)
 }
 
 // finishPRMerge performs the actual PR merge and syncs local state.
-func (e *Engineer) finishPRMerge(prNumber int, branch, target string, degradedQuorum bool, auditBead string) ProcessResult {
+// It does not record the reviewer audit bead: the caller (doMergePR) records
+// the audit bead only after this returns success, so a failed merge or
+// push-verification cannot orphan an audit bead against a failed MR.
+func (e *Engineer) finishPRMerge(prNumber int, branch, target string, degradedQuorum bool) ProcessResult {
 	provider := e.config.VCSProvider
 	if provider == "" {
 		provider = "github"
@@ -1181,7 +1204,6 @@ func (e *Engineer) finishPRMerge(prNumber int, branch, target string, degradedQu
 		Success:         true,
 		MergeCommit:     mergeCommit,
 		DegradedQuorum:  degradedQuorum,
-		AuditBead:       auditBead,
 		PublishedCommit: mergeCommit,
 	}
 }
