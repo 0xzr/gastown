@@ -125,16 +125,24 @@ define gt_install_with_wrapper
 		gt_install_assert_wrapper_topology'
 endef
 
+# Reconcile well-known alternate install paths (e.g., $HOME/go/bin/gt,
+# $HOME/bin/gt) with the just-installed canonical ELF. Shadows that
+# verifiably match canonical are removed; non-matching shadows are backed
+# up to <path>.bak.<ts> instead of silently destroyed — see
+# gastown-cet.12.13. `|| true` so a shadow backup never aborts the
+# canonical install; operators that want fail-closed can set
+# GT_FAIL_ON_SHADOW_BACKUP=1 in the environment.
+define gt_install_nuke_shadows
+	@bash -c 'source "$(WRAPPER_PRESERVE_SH)"; \
+		gt_install_nuke_shadow_bins "$(INSTALL_DIR)/$(BINARY)" \
+			"$(HOME)/go/bin/$(BINARY)" "$(HOME)/bin/$(BINARY)" \
+		|| true'
+endef
+
 install: check-up-to-date build
 	@mkdir -p $(INSTALL_DIR)
 	$(gt_install_with_wrapper)
-	@# Nuke any stale go-install binaries that shadow the canonical location
-	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
-		if [ -f "$$bad" ]; then \
-			echo "Removing stale $$bad (use make install, not go install)"; \
-			rm -f "$$bad"; \
-		fi; \
-	done
+	$(gt_install_nuke_shadows)
 	@echo "Installed $(BINARY) to $(INSTALL_DIR) (wrapper topology preserved)"
 	@$(MAKE) --no-print-directory check-install-path
 	@# Restart daemon so it picks up the new binary.
@@ -162,13 +170,7 @@ install: check-up-to-date build
 safe-install: check-up-to-date check-forward-only build
 	@mkdir -p $(INSTALL_DIR)
 	$(gt_install_with_wrapper)
-	@# Nuke any stale go-install binaries that shadow the canonical location
-	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
-		if [ -f "$$bad" ]; then \
-			echo "Removing stale $$bad (use make install, not go install)"; \
-			rm -f "$$bad"; \
-		fi; \
-	done
+	$(gt_install_nuke_shadows)
 	@echo "Installed $(BINARY) to $(INSTALL_DIR) (wrapper topology preserved, daemon NOT restarted)"
 	@$(MAKE) --no-print-directory check-install-path
 	@echo "Sessions will pick up new binary on next cycle."
@@ -212,6 +214,7 @@ test: test-makefile
 test-makefile:
 	bash scripts/check-install-path_test.sh
 	bash scripts/test-wrapper-topology.sh
+	bash scripts/test-shadow-bins.sh
 	bash scripts/cutover-pinned-1.2.0_test.sh
 	bash scripts/cutover-rollback_test.sh
 	bash scripts/guards/done-empty-hook-guard_test.sh
