@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/refinery/mrtelemetry"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -305,6 +308,14 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 			style.PrintWarning("MR bead prefix mismatch: %v\nThe refinery may not find this MR — check 'gt mq list %s'", prefixErr, rigName)
 		}
 
+		// gastown-wjk: record an MR-attempt telemetry row at submit time so the
+		// per-writer-model report can attribute this submission correctly even
+		// if the refinery never reaches the validation phase. The submit-time
+		// writer attribution is what makes "kimi vs glm vs m3" comparisons
+		// reliable — the source bead may be reassigned between submit and
+		// merge, but the writer of THIS attempt is fixed at submit.
+		recordMRSubmitTelemetry(townRoot, rigName, issueID, mrIssue.ID, branch, worker, commitSHA)
+
 		// Nudge refinery to pick up the new MR
 		nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work")
 
@@ -539,6 +550,74 @@ Please verify state and execute lifecycle action.
 			return nil // Don't fail the MR submission just because cleanup timed out
 		}
 	}
+}
+
+// recordMRSubmitTelemetry writes one durable telemetry row for this MR
+// attempt (gastown-wjk). The writer attribution is resolved from the
+// polecat's agent bead at submit time, capturing the actual model that
+// authored this attempt even if the source bead is later reassigned for
+// rework. Failures are non-fatal — telemetry is best-effort and must not
+// block submission.
+func recordMRSubmitTelemetry(townRoot, rigName, sourceBead, mrID, branch, polecat, commitSHA string) {
+	store := mrtelemetry.NewStore(mrtelemetry.DefaultStorePath(filepath.Join(townRoot, rigName)))
+	writer, source := resolveSubmitWriter(townRoot, rigName, sourceBead)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := store.RecordMRAttempt(ctx, mrtelemetry.RecordMRAttemptInput{
+		Rig:               rigName,
+		SourceBead:        sourceBead,
+		MRID:              mrID,
+		Polecat:           polecat,
+		WriterModel:       writer,
+		WriterModelSource: source,
+		Branch:            branch,
+		CommitSHA:         commitSHA,
+		SubmittedAt:       time.Now().UTC(),
+	}); err != nil {
+		style.PrintWarning("could not record MR telemetry: %v", err)
+	}
+}
+
+// resolveSubmitWriter looks up the writer model for the source issue at
+// submit time using the durable model-assignment file written by
+// `gt sling` (path: <townRoot>/.runtime/model-assignments/<assignmentID>.json).
+// This is the same source the refinery uses in durableReviewWriter, so the
+// submit-time attribution matches the refinery's view.
+//
+// If no assignment file is present (e.g. legacy branch submitted outside
+// the sling path), returns ("unknown", "unknown") so the report still has
+// a row to attribute — empty writer_model would silently skew per-model
+// aggregations.
+func resolveSubmitWriter(townRoot, rigName, sourceIssue string) (string, string) {
+	if sourceIssue == "" || townRoot == "" {
+		return "unknown", "unknown"
+	}
+	// Same key derivation as refinery.durableReviewAssignmentID: drop any
+	// sub-issue suffix and use the bare bead ID as the assignment key.
+	assignmentID := sourceIssue
+	if at := strings.Index(assignmentID, "@"); at > 0 {
+		assignmentID = assignmentID[:at]
+	}
+	if dot := strings.Index(assignmentID, "."); dot > 0 {
+		assignmentID = assignmentID[:dot]
+	}
+	path := filepath.Join(townRoot, ".runtime", "model-assignments", assignmentID+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "unknown", "unknown"
+	}
+	// Parse just the agent field; ignore the rest of the schema to avoid
+	// pulling the durable-review package's struct into the submit path.
+	var raw struct {
+		Agent string `json:"agent"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return "unknown", "unknown"
+	}
+	if w := strings.TrimSpace(raw.Agent); w != "" {
+		return w, "model_assignment"
+	}
+	return "unknown", "unknown"
 }
 
 // checkStackedBranchForSubmit is the entry point used by gt mq submit (and,
