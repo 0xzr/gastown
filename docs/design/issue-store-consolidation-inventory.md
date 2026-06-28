@@ -260,6 +260,83 @@ No Dolt data is deleted. To reverse the registration, remove the entries from
 `knownLegacyStoreDirs`) and re-run `gt doctor` to confirm expected warnings
 return.
 
+#### 4.3.1 Verification status (`gastown-cet.1.2.4`, 2026-06-28)
+
+This verification bead (`gastown-cet.1.2.4`, polecat onyx, 2026-06-28) is the
+live status tracker for the `beads_global` registration. The implementation
+that precedes it is already in place; the bead's purpose is to confirm the four
+target state checks and keep the audit record current.
+
+**Target state 1 — `gt dolt status` labels `beads_global` as protected**
+
+```text
+● Dolt server is running (PID 4059825)
+  Port: 3307
+  Data dir: /home/ubuntu/gt-town/.dolt-data
+  Databases:
+    ...
+    - beads_global         (legacy empty beads_global database (protected))
+    ...
+```
+
+Result: **PASS**. `beads_global` appears with the protected-legacy purpose label,
+not as an unexplained empty store.
+
+**Target state 2 — `gt dolt list` does not flag `beads_global` as orphaned**
+
+```text
+Rig databases in /home/ubuntu/gt-town/.dolt-data:
+  ...
+  beads_global (legacy empty beads_global database (protected))
+    /home/ubuntu/gt-town/.dolt-data/beads_global
+  ...
+```
+
+Result: **PASS**. `beads_global` is listed as a protected legacy database, not
+as an orphan.
+
+**Target state 3 — `gt doctor` does not report `beads_global/` as unregistered**
+
+The `unregistered-beads-dirs` doctor check scans top-level directories with
+`.beads/metadata.json` and flags those that are neither registered rigs nor known
+system/legacy directories. After the implementation of
+`knownLegacyStoreDirs()` (backed by
+`doltserver.ProtectedSharedServerDatabaseNames()`), `beads_global/` is excluded
+from the check.
+
+On this run the check emitted:
+
+```text
+⚠  unregistered-beads-dirs 2 unregistered directory(ies) with beads metadata
+     └─ beads/ has .beads/metadata.json pointing to database "beads" (not a registered rig)
+     └─ gt-town/ has .beads/metadata.json pointing to database "gt-town" (not a registered rig)
+```
+
+Result: **PASS**. The two flagged directories are `beads/` and `gt-town/`;
+`beads_global/` is absent, so `gt doctor` does not report it as unregistered.
+
+**Target state 4 — `gt dolt cleanup --dry-run` does not propose removing
+`beads_global/`**
+
+```text
+✓ No orphaned databases found in .dolt-data/
+```
+
+Result: **PASS**. Cleanup dry-run proposes no removal.
+
+**Verification summary**
+
+| Check | Command | Result |
+|---|---|---|
+| Protected purpose label visible | `gt dolt status` | PASS |
+| Not flagged as orphaned | `gt dolt list` | PASS |
+| Not reported as unregistered | `gt doctor` | PASS |
+| Cleanup dry-run ignores it | `gt dolt cleanup --dry-run` | PASS |
+
+All target states from the §4.3 decision are satisfied. Future regressions in
+`beads_global` protection should be filed as new bug beads and cross-linked to
+`gastown-cet.1.2.4`.
+
 ---
 
 ## 5. Rollback instructions
@@ -302,7 +379,7 @@ changes and this document.
 - [x] Stale export clobber case (`hq-k6lt`) explicitly tied to canonical `gastown-stale-export-clobber` fix.
 - [x] Rollback instructions recorded.
 - [x] No raw `.dolt/`, `noms/`, `LOCK`, `manifest`, or JSONL files edited or removed.
-- [x] `bdglobal` and `beads_global` registered as protected legacy empty stores in `doltserver.go` and ignored by `unregistered-beads-dirs`.
+- [x] `bdglobal` and `beads_global` registered as protected legacy empty stores in `doltserver.go` and ignored by `unregistered-beads-dirs`; `beads_global` specifically verified in §4.3.1 via `gastown-cet.1.2.4`.
 - [x] **Remediation (`gastown-cet.1.2.1`, 2026-06-28):** All 28 open `hq-*` issues in the embedded `mayor/gastown/.beads` store closed via `bd` CLI as duplicates or preserved-for-provenance with cross-link notes pointing to canonical gastown/town trackers; `bd list --status=open` from `/home/ubuntu/gt-town/mayor/gastown` now returns zero issues. Disposition table recorded in §4.1.1. No raw Dolt files modified.
 
 ---
