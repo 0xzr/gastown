@@ -226,6 +226,78 @@ func TestPatrolScanZombieItemSerialization(t *testing.T) {
 	}
 }
 
+// TestPatrolScanStallOutput_ActiveMRGates_SeparateFromStalls is the regression
+// guard for gastown-72v. The mayor observed that fleet reporting could treat a
+// Gastown lane with a live session plus an open MR gate as fleet-empty. After
+// the fix, post-submit lanes must surface as `active_mr_gates` in the JSON,
+// not as stalls, and definitely not as a missing-fleet outcome.
+func TestPatrolScanStallOutput_ActiveMRGates_SeparateFromStalls(t *testing.T) {
+	stallResult := &witness.DetectStalledPolecatsResult{
+		Checked: 1,
+		Stalled: nil, // post-submit MUST NOT appear in Stalled
+		ActiveMRGates: []witness.ActiveMRGate{
+			{Polecat: "quartz", MRID: "gastown-wisp-e3a"},
+		},
+	}
+	// Re-run the JSON shaping used by `gt patrol scan --json` so a downstream
+	// consumer reading `output.Stalls.ActiveMRGates` cannot confuse the gate
+	// for a stall.
+	output := PatrolScanOutput{
+		Rig:       "gastown",
+		Timestamp: "2026-06-27T15:00:00Z",
+	}
+	if stallResult != nil {
+		so := &PatrolScanStallOutput{
+			Checked: stallResult.Checked,
+			Found:   len(stallResult.Stalled),
+		}
+		for _, s := range stallResult.Stalled {
+			so.Stalls = append(so.Stalls, PatrolScanStallItem{Polecat: s.PolecatName, StallType: s.StallType, Action: s.Action})
+		}
+		for _, g := range stallResult.ActiveMRGates {
+			so.ActiveMRGates = append(so.ActiveMRGates, PatrolScanActiveMRGate{Polecat: g.Polecat, MRID: g.MRID})
+		}
+		output.Stalls = so
+	}
+
+	data, err := json.Marshal(output)
+	if err != nil {
+		t.Fatalf("marshal PatrolScanOutput: %v", err)
+	}
+	// JSON shape must use snake_case `active_mr_gates` (Go field tag) and must
+	// NOT omit the section when a gate is present.
+	if !strings.Contains(string(data), `"active_mr_gates":`) {
+		t.Errorf("JSON output missing `active_mr_gates` section for live MR gate (gastown-72v): %s", data)
+	}
+	if !strings.Contains(string(data), `"mr_id":"gastown-wisp-e3a"`) {
+		t.Errorf("JSON output did not include the open MR ID for the active gate: %s", data)
+	}
+	// Stalled must remain empty — the gate lane must not double-count as a stall.
+	if strings.Contains(string(data), `"stalls":[`) {
+		t.Errorf("post-submit gate must not also appear in `stalls` (gastown-72v): %s", data)
+	}
+
+	var parsed PatrolScanOutput
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("unmarshal PatrolScanOutput: %v", err)
+	}
+	if parsed.Stalls == nil {
+		t.Fatal("Stalls output missing from JSON")
+	}
+	if len(parsed.Stalls.Stalls) != 0 {
+		t.Errorf("Stalls.Stalls = %d, want 0 (post-submit gate must not be reported as a stall, gastown-72v)", len(parsed.Stalls.Stalls))
+	}
+	if len(parsed.Stalls.ActiveMRGates) != 1 {
+		t.Fatalf("Stalls.ActiveMRGates = %d, want 1", len(parsed.Stalls.ActiveMRGates))
+	}
+	if parsed.Stalls.ActiveMRGates[0].Polecat != "quartz" {
+		t.Errorf("ActiveMRGates[0].Polecat = %q, want quartz", parsed.Stalls.ActiveMRGates[0].Polecat)
+	}
+	if parsed.Stalls.ActiveMRGates[0].MRID != "gastown-wisp-e3a" {
+		t.Errorf("ActiveMRGates[0].MRID = %q, want gastown-wisp-e3a", parsed.Stalls.ActiveMRGates[0].MRID)
+	}
+}
+
 // alertFakeBeadsClient is a minimal in-memory alerts.BeadsClient for testing
 // sendZombieNotification without touching a real Dolt database.
 type alertFakeBeadsClient struct {
