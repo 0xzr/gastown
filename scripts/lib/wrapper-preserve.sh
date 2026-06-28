@@ -37,6 +37,16 @@
 #                                          gt-real-bin.bak.<ts> snapshot
 #                                          (MUTATING — replaces the live ELF).
 #                                          (see gastown-cet.12.9)
+#   gt_install_nuke_shadow_bins         -> reconcile shadow binaries at well-known
+#                                          alternate install paths (e.g.,
+#                                          $HOME/go/bin/gt, $HOME/bin/gt) with the
+#                                          freshly installed canonical ELF. Removes
+#                                          shadows verifiably equal to the
+#                                          canonical (symlinks to it, or byte-
+#                                          identical duplicates); backs up
+#                                          non-matching shadows to <path>.bak.<ts>
+#                                          instead of silently destroying user data
+#                                          (MUTATING on disk; see gastown-cet.12.13).
 #
 # Environment:
 #   INSTALL_DIR  (default: $HOME/.local/bin)
@@ -50,6 +60,12 @@
 #       as a hang. Set to 0 to skip the canary entirely (NOT recommended).
 #       The probe is fail-closed on the bound: if GNU `timeout` is missing
 #       the candidate is refused rather than run unbounded (codex finding #2).
+#   GT_FAIL_ON_SHADOW_BACKUP=1 — make gt_install_nuke_shadow_bins exit 1 if
+#       any shadow had to be backed up instead of cleanly removed. The
+#       default is "informational exit 1, install proceeds" so an interactive
+#       `make install` always lands the canonical ELF even when a user-
+#       installed shadow exists. CI / fleet deployments that want a hard
+#       signal can opt into fail-closed.
 #
 # Side effects of gt_install_preserve_wrapper:
 #   - Snapshots any existing wrapper to $INSTALL_DIR/gt.wrapper.bak.<ts>
@@ -630,4 +646,164 @@ gt_install_check_forward_only() {
     echo "ERROR: HEAD $head_commit is not a descendant of installed binary $installed_commit" >&2
     echo "Refusing to install an older or diverged build." >&2
     return 1
+}
+
+# gt_install_nuke_shadow_bins <canonical> <shadow>...
+#
+# Reconcile shadow binaries at well-known alternate install paths
+# (e.g., $HOME/go/bin/gt, $HOME/bin/gt) with the just-installed
+# <canonical> ELF. Targets the exact silent-deletion bug found by
+# retro-gate shard D and reported as gastown-cet.12.13:
+#
+#   Previous behavior: every `make install` / `make safe-install`
+#   unconditionally `rm -f`'d $HOME/go/bin/gt and $HOME/bin/gt. If a
+#   user intentionally installed gt there (a fork, an older version
+#   they kept for rollback, a wrapper they curated), it was silently
+#   destroyed with no record and no recovery path.
+#
+# New behavior: a shadow is REMOVED only when it is verifiably the same
+# as the canonical install — i.e., a forwarding symlink that resolves
+# to <canonical>, or a byte-identical duplicate (cmp -s). Anything else
+# is PRESERVED by renaming to <shadow>.bak.<ts> so the operator can
+# inspect/restore it; the canonical install always lands regardless.
+#
+# Non-file paths (directories, sockets, devices) and dangling symlinks
+# are left untouched — they are almost certainly user data, not a
+# shadow binary.
+#
+# Arguments:
+#   $1     — canonical ELF path (e.g., $INSTALL_DIR/gt). Must be a
+#            regular file; the function refuses to start otherwise.
+#   $2..N  — one or more shadow paths to reconcile.
+#
+# Environment:
+#   GT_FAIL_ON_SHADOW_BACKUP=1 — exit 1 if any shadow had to be backed
+#       up instead of cleanly removed. Without this env var the function
+#       still exits 1 on a backup (informational; the Makefile target
+#       discards that exit code with `|| true` so the install lands),
+#       but operators / CI can opt into fail-closed. The canonical
+#       install always proceeds regardless.
+#
+# Exit codes:
+#   0  all shadows handled cleanly (every shadow removed OR no shadows)
+#   1  at least one shadow was preserved as <shadow>.bak.<ts> instead
+#      of removed. Informational; GT_FAIL_ON_SHADOW_BACKUP=1 makes this
+#      fail-closed at the call site.
+#   2  internal error (canonical missing, bad argument count)
+#
+# Side effects (intentional, MUTATING on disk):
+#   - rm -f on forwarding symlinks and byte-identical duplicates
+#   - mv <shadow> <shadow>.bak.<ts> on non-matching shadows
+#   - Leaves canonical and untouched paths completely alone
+gt_install_nuke_shadow_bins() {
+    if [ "$#" -lt 2 ]; then
+        echo "gt_install_nuke_shadow_bins: requires <canonical> and at least one <shadow>" >&2
+        return 2
+    fi
+    local canonical="${1}"
+    shift
+    if [ ! -f "$canonical" ]; then
+        echo "gt_install_nuke_shadow_bins: canonical $canonical not found or not a regular file" >&2
+        return 2
+    fi
+
+    local backed_up=0
+    local removed=0
+    local ts
+    ts="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%s)"
+
+    local shadow
+    for shadow in "$@"; do
+        # Nothing to do if the path doesn't exist.
+        if [ ! -e "$shadow" ]; then
+            continue
+        fi
+
+        # Defensive: skip if the caller accidentally passed the canonical.
+        if [ "$shadow" = "$canonical" ]; then
+            continue
+        fi
+
+        # Skip directories, sockets, devices, etc. — only operate on
+        # regular files, hardlinks, or symlinks. A directory named "gt"
+        # is almost certainly user data, not a shadow binary.
+        if [ ! -f "$shadow" ] && [ ! -L "$shadow" ]; then
+            echo "gt_install_nuke_shadow_bins: $shadow exists but is not a regular file or symlink; leaving alone" >&2
+            continue
+        fi
+
+        # Dangling symlinks: leave them — they point at nothing,
+        # removing them destroys user intent without saving anything.
+        if [ -L "$shadow" ] && [ ! -e "$shadow" ]; then
+            echo "gt_install_nuke_shadow_bins: $shadow is a dangling symlink; leaving alone" >&2
+            continue
+        fi
+
+        # Forwarding symlink (target resolves to canonical): safe to
+        # remove — it was just a duplicate entry on PATH that delegates
+        # to canonical. The operator loses nothing; canonical is
+        # untouched.
+        local target
+        target="$(readlink -f "$shadow" 2>/dev/null || true)"
+        if [ -n "$target" ] && [ "$target" = "$canonical" ]; then
+            if rm -f "$shadow" 2>/dev/null; then
+                echo "gt_install_nuke_shadow_bins: removed forwarding symlink $shadow → $canonical"
+                removed=$((removed + 1))
+            else
+                echo "gt_install_nuke_shadow_bins: WARNING could not remove forwarding symlink $shadow" >&2
+            fi
+            continue
+        fi
+
+        # Byte-identical to canonical: a stale duplicate (probably
+        # left over from `go install`). Safe to remove; canonical is
+        # untouched and the operator can recreate the duplicate any
+        # time with `cp`.
+        if cmp -s "$shadow" "$canonical" 2>/dev/null; then
+            if rm -f "$shadow" 2>/dev/null; then
+                echo "gt_install_nuke_shadow_bins: removed stale duplicate $shadow (matches canonical)"
+                removed=$((removed + 1))
+            else
+                echo "gt_install_nuke_shadow_bins: WARNING could not remove stale duplicate $shadow" >&2
+            fi
+            continue
+        fi
+
+        # Different bytes (and not a forwarding symlink to canonical).
+        # PRESERVE by renaming to <shadow>.bak.<ts>; never silently
+        # delete user data — that is the exact bug this function exists
+        # to fix. A second backup in the same second gets a ".<pid>"
+        # suffix so it cannot clobber an earlier one.
+        local bak="${shadow}.bak.${ts}"
+        if [ -e "$bak" ]; then
+            bak="${shadow}.bak.${ts}.$$"
+        fi
+        if mv "$shadow" "$bak" 2>/dev/null; then
+            echo "gt_install_nuke_shadow_bins: refused to delete $shadow (does not match canonical); backed up to $bak" >&2
+            echo "  inspect/remove manually if no longer needed"
+            backed_up=$((backed_up + 1))
+        else
+            # mv failed — could be a permissions problem, read-only
+            # filesystem, cross-device move, etc. Do NOT fall back to
+            # `rm`: silent data loss is the bug we are fixing. Warn
+            # loudly and count it as a backup so GT_FAIL_ON_SHADOW_BACKUP
+            # still fires if set.
+            echo "gt_install_nuke_shadow_bins: WARNING refused to delete $shadow AND could not back it up" >&2
+            echo "  (does not match canonical $canonical; manual intervention required)"
+            backed_up=$((backed_up + 1))
+        fi
+    done
+
+    if [ "$removed" -gt 0 ]; then
+        echo "gt_install_nuke_shadow_bins: removed $removed stale shadow(s)"
+    fi
+    if [ "$backed_up" -gt 0 ]; then
+        echo "gt_install_nuke_shadow_bins: backed up $backed_up shadow(s) — review .bak.<ts> files" >&2
+        # Informational exit 1; the Makefile target uses `|| true` so
+        # the canonical install still lands. Operators / CI that want
+        # fail-closed can set GT_FAIL_ON_SHADOW_BACKUP=1 and remove the
+        # `|| true` from the Makefile (or wrap their own gate).
+        return 1
+    fi
+    return 0
 }
