@@ -587,25 +587,25 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// default. Without this, gt session restart reverts a codex/gemini polecat
 	// to the rig default (claude), silently changing the assigned model.
 	effectiveAgent := opts.Agent
+	agentSource := "override"
 	if effectiveAgent == "" {
 		if persisted := m.ReadPersistedAssignedAgent(polecat); persisted != "" {
 			effectiveAgent = persisted
+			agentSource = "persisted"
 		}
 	}
 	if effectiveAgent != "" {
 		rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, effectiveAgent)
 		if err != nil {
-			// An invalid persisted agent must not wedge session start: fall back
-			// to the default role agent and warn so the operator can fix it.
-			if opts.Agent != "" {
-				return fmt.Errorf("resolving agent config for %s: %w", effectiveAgent, err)
-			}
-			style.PrintWarning("persisted assigned_agent %q could not be resolved, falling back to default: %v", effectiveAgent, err)
-			effectiveAgent = ""
-			runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
-		} else {
-			runtimeConfig = rc
+			// Fail-closed on invalid agent (gastown-hkd): whether the agent came from
+			// an explicit --agent override or from the persisted assignment, an
+			// unresolvable agent MUST NOT silently rotate to the rig default. That
+			// drift is exactly what model preservation is meant to prevent. Refuse
+			// to start so the operator can fix the override or clear the stale
+			// assigned_agent before retrying.
+			return fmt.Errorf("resolving agent config for %s (source=%s): %w", effectiveAgent, agentSource, err)
 		}
+		runtimeConfig = rc
 	} else {
 		runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
 	}

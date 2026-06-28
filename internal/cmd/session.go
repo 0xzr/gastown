@@ -34,6 +34,11 @@ var (
 	sessionStatusJSON          bool
 	sessionHealthJSON          bool
 	sessionHealthMaxInactivity time.Duration
+	// sessionAgent is the explicit runtime-agent override for session start/restart.
+	// Precedence on session start: --agent override > persisted assigned_agent > role default.
+	// Without --agent, Start() restores the previously persisted assignment so a restart
+	// does not silently rotate the polecat to a different model (gastown-hkd).
+	sessionAgent string
 )
 
 var sessionCmd = &cobra.Command{
@@ -59,9 +64,14 @@ var sessionStartCmd = &cobra.Command{
 Creates a tmux session, navigates to the polecat's working directory,
 and launches claude. Optionally inject an initial issue to work on.
 
+The --agent flag overrides the runtime agent for this session (e.g., "codex",
+"gemini"). Without it, Start() restores the previously persisted assigned_agent
+or falls back to the role default. Precedence: --agent > persisted > default.
+
 Examples:
   gt session start wyvern/Toast
-  gt session start wyvern/Toast --issue gt-123`,
+  gt session start wyvern/Toast --issue gt-123
+  gt session start wyvern/Toast --agent codex`,
 	Args: cobra.ExactArgs(1),
 	RunE: runSessionStart,
 }
@@ -137,7 +147,12 @@ var sessionRestartCmd = &cobra.Command{
 	Long: `Restart a polecat session (stop + start).
 
 Gracefully stops the current session and starts a fresh one.
-Use --force to skip graceful shutdown.`,
+Use --force to skip graceful shutdown.
+
+The --agent flag overrides the runtime agent for the restarted session
+(e.g., "codex", "gemini"). Without it, Start() restores the previously
+persisted assigned_agent so a restart does not silently rotate the polecat
+to a different model (gastown-hkd). Precedence: --agent > persisted > default.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runSessionRestart,
 }
@@ -192,6 +207,7 @@ Examples:
 func init() {
 	// Start flags
 	sessionStartCmd.Flags().StringVar(&sessionIssue, "issue", "", "Issue ID to work on")
+	sessionStartCmd.Flags().StringVar(&sessionAgent, "agent", "", "Override the runtime agent for this session (e.g., \"codex\", \"gemini\"); empty uses persisted/default")
 
 	// Stop flags
 	sessionStopCmd.Flags().BoolVarP(&sessionForce, "force", "f", false, "Force immediate shutdown")
@@ -209,6 +225,7 @@ func init() {
 
 	// Restart flags
 	sessionRestartCmd.Flags().BoolVarP(&sessionForce, "force", "f", false, "Force immediate shutdown")
+	sessionRestartCmd.Flags().StringVar(&sessionAgent, "agent", "", "Override the runtime agent for the restarted session (e.g., \"codex\", \"gemini\"); empty restores the persisted model")
 
 	// Status flags
 	sessionStatusCmd.Flags().BoolVar(&sessionStatusJSON, "json", false, "Output as JSON")
@@ -312,6 +329,7 @@ func runSessionStart(cmd *cobra.Command, args []string) error {
 
 	opts := polecat.SessionStartOptions{
 		Issue: sessionIssue,
+		Agent: sessionAgent,
 	}
 
 	fmt.Printf("Starting session for %s/%s...\n", rigName, polecatName)
@@ -593,18 +611,26 @@ func runSessionRestart(cmd *cobra.Command, args []string) error {
 	// record in the wrapper's model-assignments/<bead>.json. ReadPersistedAssignedAgent
 	// checks both sources; when nothing can be recovered we emit an explicit reason
 	// instead of silently falling back to the town default (gastown-hkd).
-	restartAgent := polecatMgr.ReadPersistedAssignedAgent(polecatName)
-	if restartAgent == "" {
-		townRoot := filepath.Dir(r.Path)
-		defaultCfg := config.ResolveRoleAgentConfig("polecat", townRoot, r.Path)
-		style.PrintWarning("gt session restart %s/%s: no model assignment recovered; using default role agent %q (assigned_agent empty and model-assignments fallback missing or unreadable)",
-			rigName, polecatName, defaultCfg.ResolvedAgent)
+	//
+	// Only run this probe when the operator did NOT pass --agent: a CLI override
+	// wins regardless of what was persisted, and reporting on it would be noise.
+	if sessionAgent == "" {
+		persistedAgent := polecatMgr.ReadPersistedAssignedAgent(polecatName)
+		if persistedAgent == "" {
+			townRoot := filepath.Dir(r.Path)
+			defaultCfg := config.ResolveRoleAgentConfig("polecat", townRoot, r.Path)
+			style.PrintWarning("gt session restart %s/%s: no model assignment recovered; using default role agent %q (assigned_agent empty and model-assignments fallback missing or unreadable)",
+				rigName, polecatName, defaultCfg.ResolvedAgent)
+		}
 	}
 
-	// Start fresh session
+	// Start fresh session. Pass only the explicit --agent override here; Start()
+	// resolves the full --agent > persisted > default precedence itself so we don't
+	// duplicate the ReadPersistedAssignedAgent call (and risk divergent results if
+	// bead state changes between the probe and Start) (gastown-hkd).
 	fmt.Printf("Starting session for %s/%s...\n", rigName, polecatName)
 	opts := polecat.SessionStartOptions{
-		Agent: restartAgent,
+		Agent: sessionAgent,
 	}
 	if err := polecatMgr.Start(polecatName, opts); err != nil {
 		return fmt.Errorf("starting session: %w", err)
