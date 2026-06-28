@@ -8,12 +8,32 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 )
 
+// githubGitOps is the subset of *git.Git the GitHub PR provider needs. It is
+// extracted into an interface so unit tests can drive GetReviewEvaluation
+// without shelling to gh (gastown-cet.12.6.3).
+type githubGitOps interface {
+	GetPRReviews(prNumber int) ([]git.PRReview, error)
+	GetPRReviewDecision(prNumber int) (string, error)
+	RemoteBranchTip(remote, branch string) (string, error)
+	Rev(ref string) (string, error)
+	FindPRNumber(branch string) (int, error)
+	IsPRApproved(prNumber int) (bool, error)
+	GhPrMerge(prNumber int, method string) (string, error)
+}
+
 // githubPRProvider implements PRProvider using the gh CLI via git.Git.
 type githubPRProvider struct {
-	git *git.Git
+	git githubGitOps
 }
 
 func newGitHubPRProvider(g *git.Git) PRProvider {
+	return &githubPRProvider{git: g}
+}
+
+// newGitHubPRProviderWithOps is the test-only constructor that accepts any
+// githubGitOps implementation, so unit tests can drive GetReviewEvaluation
+// without shelling to gh (gastown-cet.12.6.3).
+func newGitHubPRProviderWithOps(g githubGitOps) PRProvider {
 	return &githubPRProvider{git: g}
 }
 

@@ -7,9 +7,22 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 )
 
+// bitbucketGitOps is the subset of *git.Git the Bitbucket PR provider needs.
+// Extracted so unit tests can drive GetReviewEvaluation without HTTP calls
+// (gastown-cet.12.6.3).
+type bitbucketGitOps interface {
+	GetBitbucketPRParticipants(workspace, repoSlug string, prID int) ([]git.BitbucketParticipant, error)
+	RemoteBranchTip(remote, branch string) (string, error)
+	Rev(ref string) (string, error)
+	FindBitbucketPRNumber(workspace, repoSlug, branch string) (int, error)
+	IsBitbucketPRApproved(workspace, repoSlug string, prID int) (bool, error)
+	BitbucketPRMerge(workspace, repoSlug string, prID int, strategy string) (string, error)
+	RemoteURL(remote string) (string, error)
+}
+
 // bitbucketPRProvider implements PRProvider using the Bitbucket Cloud REST API.
 type bitbucketPRProvider struct {
-	git       *git.Git
+	git       bitbucketGitOps
 	workspace string
 	repoSlug  string
 }
@@ -28,6 +41,17 @@ func newBitbucketPRProvider(g *git.Git) (PRProvider, error) {
 		workspace: workspace,
 		repoSlug:  repoSlug,
 	}, nil
+}
+
+// newBitbucketPRProviderWithOps is the test-only constructor that accepts
+// any bitbucketGitOps implementation, so unit tests can drive
+// GetReviewEvaluation without HTTP calls (gastown-cet.12.6.3).
+func newBitbucketPRProviderWithOps(g bitbucketGitOps, workspace, repoSlug string) PRProvider {
+	return &bitbucketPRProvider{
+		git:       g,
+		workspace: workspace,
+		repoSlug:  repoSlug,
+	}
 }
 
 func (p *bitbucketPRProvider) FindPRNumber(branch string) (int, error) {
