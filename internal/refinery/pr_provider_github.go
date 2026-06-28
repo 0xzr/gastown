@@ -8,13 +8,23 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 )
 
+// prBaseRefResolver returns the PR's target/base branch name (gastown-cet.12.6.6).
+// It is the seam used by mergeCandidateBasis to look up the actual merge
+// target — not a hardcoded "main" — so the basis is testable against
+// non-main targets without shelling to gh. Production wiring resolves this
+// from *git.Git.GetPRBaseBranch; tests substitute a stub.
+type prBaseRefResolver func(prNumber int) (string, error)
+
 // githubPRProvider implements PRProvider using the gh CLI via git.Git.
 type githubPRProvider struct {
 	git *git.Git
+	// resolveTarget returns the PR's actual target branch name. Defaults to
+	// g.GetPRBaseBranch; tests override via the unexported field.
+	resolveTarget prBaseRefResolver
 }
 
 func newGitHubPRProvider(g *git.Git) PRProvider {
-	return &githubPRProvider{git: g}
+	return &githubPRProvider{git: g, resolveTarget: g.GetPRBaseBranch}
 }
 
 func (p *githubPRProvider) FindPRNumber(branch string) (int, error) {
@@ -31,7 +41,7 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 	// makes the review packet identify the exact diff reviewed (gastown-cet.8),
 	// so a verdict against intermediate commit history can be distinguished
 	// from a verdict against the final merge candidate.
-	basis := p.mergeCandidateBasis()
+	basis := p.mergeCandidateBasis(prNumber)
 
 	reviews, err := p.git.GetPRReviews(prNumber)
 	if err != nil {
@@ -189,11 +199,28 @@ func collapseReviews(reviews []git.PRReview) []git.PRReview {
 
 // mergeCandidateBasis returns the merge-candidate diff basis for the PR under
 // review. Base is the merge target tip (origin/<target>); head is the branch
-// tip. Both are resolved on a best-effort basis — an empty component means
-// "unknown", which EvaluateReviews treats as a merge-candidate basis (the safe
-// default) rather than a commit-history basis.
-func (p *githubPRProvider) mergeCandidateBasis() DiffBasis {
-	base, _ := p.git.RemoteBranchTip("origin", "main")
+// tip. The base branch is the PR's actual target — not hardcoded to main —
+// so PRs targeting release/ or other non-default branches diff against the
+// correct range (gastown-cet.12.6.6). Both components are resolved on a
+// best-effort basis — an empty component means "unknown", which
+// EvaluateReviews treats as a merge-candidate basis (the safe default) rather
+// than a commit-history basis.
+//
+// Fallback order for the base branch:
+//  1. Resolve the PR's baseRefName via gh. If non-empty, use origin/<branch>.
+//  2. On provider error (gh unavailable, auth failure, timeout), fall back to
+//     origin/main so existing single-target deployments keep working. The bug
+//     the fix addresses (hardcoded origin/main when target differs) only
+//     manifests when gh succeeds; degraded failures were already latent and
+//     remain so by design.
+func (p *githubPRProvider) mergeCandidateBasis(prNumber int) DiffBasis {
+	target := "main"
+	if p.resolveTarget != nil {
+		if name, err := p.resolveTarget(prNumber); err == nil && name != "" {
+			target = name
+		}
+	}
+	base, _ := p.git.RemoteBranchTip("origin", target)
 	head, _ := p.git.Rev("HEAD")
 	return MergeCandidateBasis(base, head)
 }

@@ -1496,6 +1496,32 @@ type PRReview struct {
 	SubmittedAt string `json:"submitted_at,omitempty"`
 }
 
+// GetPRBaseBranch returns the target/base branch name (e.g. "main",
+// "release/2026-07") for the given GitHub PR number. Used by the refinery
+// merge-candidate diff basis so PRs targeting non-default branches are
+// diffed against their actual merge target rather than the hardcoded
+// origin/main (gastown-cet.12.6.6). Returns an empty string if the provider
+// call fails or the field is missing; callers treat that as "unknown" and
+// fall back to the safe-default merge-candidate basis.
+func (g *Git) GetPRBaseBranch(prNumber int) (string, error) {
+	// Bounded via runProviderCommand; on timeout the caller (PR provider)
+	// records the failure and falls back to a best-effort base. We do NOT
+	// fail closed here because the merge-candidate basis is a traceability
+	// field, not a gate; EvaluateReviews already treats an empty Base as
+	// the safe "unknown → merge-candidate" default.
+	result, err := runProviderCommand("gh", []string{"pr", "view", fmt.Sprintf("%d", prNumber), "--json", "baseRefName"}, g.workDir, "github pr-base")
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		BaseRefName string `json:"baseRefName"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &parsed); err != nil {
+		return "", fmt.Errorf("failed to parse gh pr baseRefName output: %w", err)
+	}
+	return parsed.BaseRefName, nil
+}
+
 // IsPRApproved checks whether a GitHub PR has at least one approving review.
 // Returns true if approved, false if not (or on error).
 func (g *Git) IsPRApproved(prNumber int) (bool, error) {
@@ -1697,6 +1723,40 @@ func (g *Git) GetBitbucketPRParticipants(workspace, repoSlug string, prID int) (
 		})
 	}
 	return participants, nil
+}
+
+// GetBitbucketPRBaseBranch returns the destination branch name (e.g. "main",
+// "release/2026-07") for the given Bitbucket PR. Used by the refinery
+// merge-candidate diff basis so PRs targeting non-default branches are
+// diffed against their actual merge target rather than the hardcoded
+// origin/main (gastown-cet.12.6.6). Returns an empty string if the API call
+// fails or the field is missing; callers treat that as "unknown" and fall
+// back to the safe-default merge-candidate basis.
+func (g *Git) GetBitbucketPRBaseBranch(workspace, repoSlug string, prID int) (string, error) {
+	token := os.Getenv("BITBUCKET_TOKEN")
+	if token == "" {
+		return "", fmt.Errorf("BITBUCKET_TOKEN is required for Bitbucket PR operations")
+	}
+	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d",
+		workspace, repoSlug, prID)
+	// runProviderCommand enforces the bounded timeout and scrubs BITBUCKET_TOKEN
+	// from any returned error/output. See GetBitbucketPRParticipants for the
+	// same pattern.
+	result, err := runProviderCommand("curl", []string{"-s", "-H", "Authorization: Bearer " + token, url}, g.workDir, "bitbucket get-base", token)
+	if err != nil {
+		return "", err
+	}
+	var pr struct {
+		Destination struct {
+			Branch struct {
+				Name string `json:"name"`
+			} `json:"branch"`
+		} `json:"destination"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &pr); err != nil {
+		return "", fmt.Errorf("failed to parse Bitbucket destination branch: %w", err)
+	}
+	return pr.Destination.Branch.Name, nil
 }
 
 // BitbucketPRMerge merges a Bitbucket PR via the REST API.

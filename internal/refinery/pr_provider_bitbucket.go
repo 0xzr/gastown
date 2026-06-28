@@ -7,11 +7,20 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 )
 
+// bitbucketBaseResolver returns a PR's destination branch name
+// (gastown-cet.12.6.6). It is the seam used by mergeCandidateBasis to look
+// up the actual merge target — not a hardcoded "main" — so the basis is
+// testable against non-main targets without shelling to the Bitbucket REST
+// API. Production wiring resolves this from
+// *git.Git.GetBitbucketPRBaseBranch; tests substitute a stub.
+type bitbucketBaseResolver func(workspace, repoSlug string, prID int) (string, error)
+
 // bitbucketPRProvider implements PRProvider using the Bitbucket Cloud REST API.
 type bitbucketPRProvider struct {
-	git       *git.Git
-	workspace string
-	repoSlug  string
+	git           *git.Git
+	workspace     string
+	repoSlug      string
+	resolveTarget bitbucketBaseResolver
 }
 
 func newBitbucketPRProvider(g *git.Git) (PRProvider, error) {
@@ -24,9 +33,10 @@ func newBitbucketPRProvider(g *git.Git) (PRProvider, error) {
 		return nil, fmt.Errorf("bitbucket provider: %w", err)
 	}
 	return &bitbucketPRProvider{
-		git:       g,
-		workspace: workspace,
-		repoSlug:  repoSlug,
+		git:           g,
+		workspace:     workspace,
+		repoSlug:      repoSlug,
+		resolveTarget: g.GetBitbucketPRBaseBranch,
 	}, nil
 }
 
@@ -42,7 +52,7 @@ func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluati
 	// Record the merge-candidate diff basis so the review packet identifies the
 	// exact diff reviewed (gastown-cet.8). A verdict against intermediate
 	// commit history is distinguished from one against the final candidate.
-	basis := p.mergeCandidateBasis()
+	basis := p.mergeCandidateBasis(prNumber)
 
 	participants, err := p.git.GetBitbucketPRParticipants(p.workspace, p.repoSlug, prNumber)
 	if err != nil {
@@ -98,10 +108,28 @@ func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluati
 }
 
 // mergeCandidateBasis returns the merge-candidate diff basis for the PR under
-// review. Best-effort resolution; an empty component means "unknown" (treated
-// as a merge-candidate basis, the safe default).
-func (p *bitbucketPRProvider) mergeCandidateBasis() DiffBasis {
-	base, _ := p.git.RemoteBranchTip("origin", "main")
+// review. The base branch is the PR's actual destination — not hardcoded to
+// main — so PRs targeting release/ or other non-default branches diff against
+// the correct range (gastown-cet.12.6.6). Best-effort resolution; an empty
+// component means "unknown" (treated as a merge-candidate basis, the safe
+// default).
+//
+// Fallback order for the base branch:
+//  1. Resolve the PR's destination branch via the Bitbucket REST API. If
+//     non-empty, use origin/<branch>.
+//  2. On provider error (no token, network failure, timeout), fall back to
+//     origin/main so existing single-target deployments keep working. The
+//     bug the fix addresses (hardcoded origin/main when target differs) only
+//     manifests when the API succeeds; degraded failures were already latent
+//     and remain so by design.
+func (p *bitbucketPRProvider) mergeCandidateBasis(prNumber int) DiffBasis {
+	target := "main"
+	if p.resolveTarget != nil {
+		if name, err := p.resolveTarget(p.workspace, p.repoSlug, prNumber); err == nil && name != "" {
+			target = name
+		}
+	}
+	base, _ := p.git.RemoteBranchTip("origin", target)
 	head, _ := p.git.Rev("HEAD")
 	return MergeCandidateBasis(base, head)
 }
