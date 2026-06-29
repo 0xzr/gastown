@@ -1930,14 +1930,26 @@ func (e *Engineer) durableReviewWriter(mr *MRInfo) string {
 	return "unknown"
 }
 
+// legacyDurableReviewFallbackGateName is the gate name whose command is reused
+// when durable_review_gate is required but no explicit command is configured.
+// Gastown's production config defines the durable review as a post-squash gate
+// with this exact name; targeting by name (rather than scanning for any
+// post-squash gate containing "refinery-gate.sh") keeps the fallback
+// deterministic and prevents unrelated post-squash gates from silently
+// becoming the durable reviewer. (gastown-jzq)
+const legacyDurableReviewFallbackGateName = "four-model-refinery-review"
+
 // durableReviewGateCmd returns the configured review gate command, or an empty
 // string if none is configured.
 //
 // Legacy-config fallback: if durable_review_gate is required but the command is
-// empty, reuse an existing post-squash gate whose command invokes
-// refinery-gate.sh. Gastown's production config defines the durable review as
-// a post-squash gate named "four-model-refinery-review"; this fallback lets
-// that config enforce durable attestation without duplicating the command.
+// empty, reuse the post-squash gate named
+// legacyDurableReviewFallbackGateName (whose command invokes refinery-gate.sh).
+// Gastown's production config defines the durable review as a post-squash gate
+// with that exact name; this fallback lets that config enforce durable
+// attestation without duplicating the command. If no gate with that exact
+// name exists as a post-squash gate, the fallback returns empty so the
+// durable gate fails closed downstream.
 func (e *Engineer) durableReviewGateCmd() string {
 	if e.config.DurableReviewGate == nil {
 		return ""
@@ -1946,16 +1958,11 @@ func (e *Engineer) durableReviewGateCmd() string {
 	if cmd != "" {
 		return cmd
 	}
-	for _, gate := range e.config.Gates {
-		if gate == nil || gate.Phase != GatePhasePostSquash {
-			continue
-		}
-		candidate := strings.TrimSpace(gate.Cmd)
-		if strings.Contains(candidate, "refinery-gate.sh") {
-			return candidate
-		}
+	gate, ok := e.config.Gates[legacyDurableReviewFallbackGateName]
+	if !ok || gate == nil || gate.Phase != GatePhasePostSquash {
+		return ""
 	}
-	return ""
+	return strings.TrimSpace(gate.Cmd)
 }
 
 func (e *Engineer) durableReviewGateTimeout() time.Duration {
