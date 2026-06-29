@@ -66,6 +66,9 @@ func SubprocessModeForArgs(args []string) SubprocessEnvMode {
 	return MutationRouting
 }
 
+// bdBoolGlobalFlags are recognized boolean global flags that do not select a
+// different database or working directory. They can appear before any bd
+// subcommand and do not consume a following argument.
 var bdBoolGlobalFlags = map[string]bool{
 	"--allow-stale": true,
 	"--help":        true,
@@ -80,12 +83,40 @@ var bdBoolGlobalFlags = map[string]bool{
 	"-v":            true,
 }
 
-var bdTargetSelectorFlags = map[string]bool{
+// bdBoolTargetSelectorFlags are global flags that select a different database
+// or working directory but do not take a value. They are treated as boolean
+// flags when scanning leading arguments, but HasBDTargetSelectorFlag still
+// rejects them because they override Gas Town's target selection.
+var bdBoolTargetSelectorFlags = map[string]bool{
+	"--global":  true,
+	"--sandbox": true,
+}
+
+// bdValueTargetSelectorFlags are global flags that take a following value and
+// also select a different database or working directory. stripLeadingFlags
+// must skip the value argument for these.
+var bdValueTargetSelectorFlags = map[string]bool{
 	"--db":        true,
 	"--directory": true,
-	"--global":    true,
-	"--sandbox":   true,
 	"-C":          true,
+}
+
+func isBDTargetSelectorFlag(name string) bool {
+	return bdBoolTargetSelectorFlags[name] || bdValueTargetSelectorFlags[name]
+}
+
+// bdGlobalBoolFlags is the union of ordinary boolean global flags and boolean
+// target selectors. It is used when scanning the leading arguments of a bd
+// command so that flags like --global are stripped without consuming the next
+// positional argument.
+var bdGlobalBoolFlags = make(map[string]bool)
+
+func init() {
+	for _, m := range []map[string]bool{bdBoolGlobalFlags, bdBoolTargetSelectorFlags} {
+		for k := range m {
+			bdGlobalBoolFlags[k] = true
+		}
+	}
 }
 
 // BDSubcommandIndex returns the argv index of bd's subcommand after recognized
@@ -130,7 +161,7 @@ func HasBDTargetSelectorFlag(argv []string) bool {
 		if cut, _, ok := strings.Cut(arg, "="); ok {
 			name = cut
 		}
-		if bdTargetSelectorFlags[name] {
+		if isBDTargetSelectorFlag(name) {
 			return true
 		}
 	}

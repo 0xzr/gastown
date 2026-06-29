@@ -392,6 +392,14 @@ func TestArgsAreReadOnlyFailsClosedForMutations(t *testing.T) {
 		{"mol", "wisp", "formula"},
 		{"sql", "UPDATE issues SET status='open'"},
 		{"config", "set", "issue_prefix", "gt"},
+		// Boolean target selectors must not consume the following positional.
+		{"--global", "create", "show"},
+		{"--sandbox", "create", "foo"},
+		// Value-taking target selectors must skip their value.
+		{"--db", "/tmp/bd", "create", "foo"},
+		{"-C", "/tmp", "create", "foo"},
+		// Consuming all remaining args leaves no subcommand → fail closed.
+		{"--db", "ready"},
 	}
 	for _, args := range cases {
 		if ArgsAreReadOnly(args) {
@@ -400,6 +408,77 @@ func TestArgsAreReadOnlyFailsClosedForMutations(t *testing.T) {
 		if got := SubprocessModeForArgs(args); got != MutationRouting {
 			t.Fatalf("SubprocessModeForArgs(%v) = %v, want MutationRouting", args, got)
 		}
+	}
+}
+
+// TestArgsAreReadOnlyStripsShortGlobalFlags verifies the retro-bug fix for
+// stripBDGlobalFlags only dropping '--' prefixed tokens. Short flags like -q,
+// -v, and value-taking selectors like -C <dir> must be stripped so the actual
+// subcommand is used for read-only classification. Boolean target selectors
+// such as --global must not consume the next positional argument.
+func TestArgsAreReadOnlyStripsShortGlobalFlags(t *testing.T) {
+	cases := [][]string{
+		{"-q", "show", "gt-123"},
+		{"-v", "list"},
+		{"-h", "version"},
+		{"-C", "/tmp", "show", "gt-123"},
+		{"--db", "/tmp/bd", "ready"},
+		{"--quiet", "--json", "query", "SELECT * FROM issues"},
+		{"--allow-stale", "-C", "/tmp", "blocked"},
+		{"--global", "show", "gt-123"},
+		{"--sandbox", "stale"},
+		{"--json", "sql", "SELECT 1"},
+	}
+	for _, args := range cases {
+		if !ArgsAreReadOnly(args) {
+			t.Fatalf("ArgsAreReadOnly(%v) = false, want true", args)
+		}
+	}
+}
+
+// TestArgsAreReadOnlyFailClosedOnUnknownLeadingFlag verifies that an
+// unrecognized leading flag leaves the args in place so the command is
+// classified as a mutation (the safe default).
+func TestArgsAreReadOnlyFailClosedOnUnknownLeadingFlag(t *testing.T) {
+	cases := [][]string{
+		{"--unknown", "show", "gt-123"},
+		{"-x", "show", "gt-123"},
+		{"--repo", "gastown", "show", "gt-123"},
+	}
+	for _, args := range cases {
+		if ArgsAreReadOnly(args) {
+			t.Fatalf("ArgsAreReadOnly(%v) = true, want false", args)
+		}
+	}
+}
+
+// TestStripBDCommandFlagsDropsSqlBools verifies sql-specific flags like --csv,
+// --json, --help, and -h are stripped so the query is inspected for the
+// SELECT prefix.
+func TestStripBDCommandFlagsDropsSqlBools(t *testing.T) {
+	for _, flags := range [][]string{
+		{"--csv"},
+		{"-h"},
+		{"--json"},
+		{"--help"},
+	} {
+		args := append(flags, "SELECT", "1")
+		got := stripBDCommandFlags(args, bdSqlBoolFlags)
+		want := []string{"SELECT", "1"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("stripBDCommandFlags(%v) = %v, want %v", args, got, want)
+		}
+	}
+}
+
+// TestStripBDCommandFlagsShortFlagValueStopsScan verifies that a flag-like
+// token that is not a known sql bool is left in place (fail-closed for the
+// sql command classifier).
+func TestStripBDCommandFlagsStopsOnUnknownFlag(t *testing.T) {
+	got := stripBDCommandFlags([]string{"--schema", "SELECT", "1"}, bdSqlBoolFlags)
+	want := []string{"--schema", "SELECT", "1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stripBDCommandFlags(schema) = %v, want %v", got, want)
 	}
 }
 
