@@ -222,6 +222,7 @@ test: test-makefile
 
 test-makefile:
 	bash scripts/check-install-path_test.sh
+	bash scripts/run-all-gates_test.sh
 	bash scripts/test-wrapper-topology.sh
 	bash scripts/cutover-pinned-1.2.0_test.sh
 	bash scripts/cutover-rollback_test.sh
