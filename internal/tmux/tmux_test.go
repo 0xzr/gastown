@@ -3,6 +3,7 @@ package tmux
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,18 +18,39 @@ func hasTmux() bool {
 	return err == nil
 }
 
-// newTestTmux returns a Tmux instance connected to the package-level test
-// socket (set by TestMain in testmain_test.go). All tests in this package
-// share one tmux server, which is torn down after all tests complete.
+// testSocketName returns a unique tmux socket name for this test. Isolating
+// sockets per-test prevents parallel tests from killing each other's tmux
+// servers and avoids the "no tmux server running" race that flaked when the
+// whole package shared a single TestMain server.
+func testSocketName(t *testing.T) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(t.Name()))
+	return fmt.Sprintf("gt-test-%d-%016x", os.Getpid(), h.Sum64())
+}
+
+// newTestTmux returns a Tmux instance connected to an isolated tmux socket
+// unique to this test. A sentinel session is created so the server stays alive
+// even if the test kills all of its own named sessions, and the server is
+// torn down when the test ends.
 //
-// This isolates tests from the user's interactive tmux and from other
-// packages' tests that run in parallel during `go test ./...`.
+// Isolation is per test name, so parallel top-level tests and parallel
+// t.Run subtests cannot interfere with each other's servers.
 func newTestTmux(t *testing.T) *Tmux {
 	t.Helper()
 	if !hasTmux() {
 		t.Skip("tmux not installed")
 	}
-	return NewTmux()
+	tm := NewTmuxWithSocket(testSocketName(t))
+
+	// bootstrapSession ensures the isolated server is running and keeps it
+	// alive when tests kill their own sessions. We ignore errors because the
+	// server may already be running from an earlier call in the same test.
+	_ = tm.NewSession("gt-test-sentinel", "")
+
+	t.Cleanup(func() {
+		_ = tm.KillServer()
+	})
+	return tm
 }
 
 func TestListSessionsNoServer(t *testing.T) {
@@ -296,11 +318,7 @@ func TestEnsureSessionFresh_IdempotentOnZombie(t *testing.T) {
 }
 
 func TestEnsureSessionFreshWithCommand_NoExisting(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-fwc-new-" + t.Name()
 
 	// Clean up any existing session
@@ -333,11 +351,7 @@ func TestEnsureSessionFreshWithCommand_NoExisting(t *testing.T) {
 }
 
 func TestEnsureSessionFreshWithCommand_KillsZombie(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-fwc-zombie-" + t.Name()
 
 	// Clean up any existing session
