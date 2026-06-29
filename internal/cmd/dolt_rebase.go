@@ -180,6 +180,35 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("  Created %s from main, checked out\n", workBranch)
 
+	// Step 2.5: Acquire dolt_branch_control-based global writer interlock
+	// BEFORE recording preHead. Closes the TOCTOU window in the destructive
+	// main swap (gastown-d88 / gastown-5nz retro-bug P0). The interlock
+	// revokes write on main for everyone except this session, so any
+	// concurrent writer that slips past the drain still fails at the next
+	// DOLT_COMMIT/CHECK_ACCESS call.
+	interlockSnapshot, releaseInterlock, err := acquireRebaseInterlock(ctx, db, dbName)
+	if err != nil {
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("acquire rebase interlock: %w", err)
+	}
+	defer func() {
+		if rerr := releaseInterlock(); rerr != nil {
+			fmt.Printf("  %s WARNING: failed to release rebase interlock: %v\n",
+				style.Bold.Render("!"), rerr)
+		}
+	}()
+	fmt.Printf("  Writer interlock acquired (dolt_branch_control: main=read except this session=admin)\n")
+
+	// Re-record preHead NOW (post-acquire) so the comparison below is against
+	// state at the moment the interlock went into effect.
+	preHead, err = flattenGetHead(db, dbName)
+	if err != nil {
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("re-record HEAD after interlock: %w", err)
+	}
+	fmt.Printf("  HEAD (post-interlock): %s\n", preHead[:12])
+	_ = interlockSnapshot // currently used only for logging; snapshot is restored by releaseInterlock
+
 	// Step 3: Start interactive rebase — populates dolt_rebase system table.
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_REBASE('--interactive', '%s')", baseBranch)); err != nil {
 		rebaseCleanupAll(db, baseBranch, workBranch)
@@ -287,6 +316,9 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  %s Rebase executed successfully\n", style.Bold.Render("✓"))
 
 	// Step 7: Concurrency check — verify main hasn't moved.
+	// First defense: working-set-CAS-style re-verify. With the interlock
+	// in place, this is the authoritative gate for any in-flight writer
+	// that completed during the rebase execution.
 	currentHead, err := flattenGetHead(db, dbName)
 	if err != nil {
 		rebaseCleanupAll(db, baseBranch, workBranch)
@@ -295,6 +327,15 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	if currentHead != preHead {
 		rebaseCleanupAll(db, baseBranch, workBranch)
 		return fmt.Errorf("ABORT: main HEAD moved during rebase (%s → %s)", shortHash(preHead), shortHash(currentHead))
+	}
+
+	// Second defense: verify against the preHead we re-recorded AFTER the
+	// interlock acquisition. Belt-and-suspenders so any drift during the
+	// rebase execution is caught even if the original preHead capture was
+	// stale by the time we got here.
+	if err := verifyMainHeadUnchanged(ctx, db, dbName, preHead); err != nil {
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("post-rebase HEAD verify: %w", err)
 	}
 
 	// Step 8: Swap branches — make compact-work the new main.
