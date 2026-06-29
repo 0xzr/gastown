@@ -1,15 +1,18 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/util"
+	"github.com/steveyegge/gastown/internal/wisp"
 )
 
 func TestMainBranchTestInterval(t *testing.T) {
