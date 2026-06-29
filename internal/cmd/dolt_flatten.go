@@ -235,14 +235,23 @@ func findNewestFile(dir string) time.Time {
 	return newest
 }
 
-// flattenGetHead returns the HEAD commit hash via dolt_log.
+// flattenGetHead returns the current HEAD commit hash of the main branch.
+// It uses DOLT_HASHOF('main') so the result is independent of the session's
+// currently checked-out branch (e.g. compact-work during a surgical rebase).
 func flattenGetHead(db *sql.DB, dbName string) (string, error) {
+	return flattenGetBranchHead(db, dbName, "main")
+}
+
+// flattenGetBranchHead returns the current HEAD commit hash of the named
+// branch using DOLT_HASHOF. The result is independent of the session's
+// currently checked-out branch.
+func flattenGetBranchHead(db *sql.DB, dbName, branch string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var hash string
-	query := fmt.Sprintf("SELECT commit_hash FROM `%s`.dolt_log ORDER BY date DESC LIMIT 1", dbName)
+	query := fmt.Sprintf("SELECT DOLT_HASHOF('%s') FROM `%s`.dual", branch, dbName)
 	if err := db.QueryRowContext(ctx, query).Scan(&hash); err != nil {
-		return "", err
+		return "", fmt.Errorf("DOLT_HASHOF %s: %w", branch, err)
 	}
 	return hash, nil
 }

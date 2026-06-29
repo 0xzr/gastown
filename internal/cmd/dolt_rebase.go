@@ -157,6 +157,22 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 
 	const baseBranch = "compact-base"
 	const workBranch = "compact-work"
+	const rebaseLockTimeout = 60 * time.Second
+
+	// Serialize with the daemon compactor and other manual rebases via a
+	// per-database MySQL advisory lock. The lock must be held from before we
+	// touch the shared compact-base/compact-work/rebase state until after the
+	// branch swap (or dry-run cleanup) to close the TOCTOU window where a
+	// concurrent dry-run could delete/abort in-progress state.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	lockRelease, err := doltserver.AcquireRebaseLock(ctx, db, dbName, rebaseLockTimeout)
+	if err != nil {
+		return fmt.Errorf("advisory lock for %s: %w", dbName, err)
+	}
+	defer lockRelease(ctx)
+	fmt.Printf("  Advisory lock acquired for %s\n", dbName)
 
 	// Clean up any leftover branches from a previous failed run.
 	rebaseCleanup(db, baseBranch, workBranch)
@@ -297,15 +313,58 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ABORT: main HEAD moved during rebase (%s → %s)", shortHash(preHead), shortHash(currentHead))
 	}
 
-	// Step 8: Swap branches — make compact-work the new main.
-	// We're already on compact-work from the rebase.
+	// Step 7.5: Record the expected new main HEAD (compact-work HEAD after the
+	// rebase), perform a final concurrency check, and execute the destructive
+	// branch swap inside a single SQL transaction so the read of main HEAD is as
+	// close as possible to the deletion/rename. This minimizes the residual TOCTOU
+	// window where a concurrent writer could move main after our last check.
+	expectedMainHead, err := flattenGetBranchHead(db, dbName, workBranch)
+	if err != nil {
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("getting compact-work HEAD before swap: %w", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "BEGIN"); err != nil {
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("begin pre-swap transaction: %w", err)
+	}
+
+	preSwapHead, err := flattenGetHead(db, dbName)
+	if err != nil {
+		_, _ = db.ExecContext(ctx, "ROLLBACK")
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("pre-swap concurrency check: %w", err)
+	}
+	if preSwapHead != preHead {
+		_, _ = db.ExecContext(ctx, "ROLLBACK")
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("ABORT: main HEAD moved after concurrency check (%s → %s)", shortHash(preHead), shortHash(preSwapHead))
+	}
+
 	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', 'main')"); err != nil {
+		_, _ = db.ExecContext(ctx, "ROLLBACK")
 		// Can't delete main — leave compact-work in place for manual recovery.
 		return fmt.Errorf("delete old main: %w (compact-work branch preserved for manual recovery)", err)
 	}
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-m', '%s', 'main')", workBranch)); err != nil {
+		_, _ = db.ExecContext(ctx, "ROLLBACK")
 		return fmt.Errorf("rename work branch to main: %w", err)
 	}
+	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit branch swap: %w", err)
+	}
+
+	// Step 8: Post-swap verification. Ensure the new main HEAD matches the
+	// compact-work HEAD we expected to swap to. If it differs, the swap itself
+	// was inconsistent and we leave compact-work as a recovery handle.
+	postSwapHead, err := flattenGetHead(db, dbName)
+	if err != nil {
+		return fmt.Errorf("post-swap verification: %w (compact-work branch preserved for manual recovery)", err)
+	}
+	if postSwapHead != expectedMainHead {
+		return fmt.Errorf("post-swap verification failed: new main HEAD is %s, expected %s (compact-work branch preserved for manual recovery)", shortHash(postSwapHead), shortHash(expectedMainHead))
+	}
+
 	// Delete the base branch.
 	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
 	// Checkout main.

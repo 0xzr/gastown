@@ -11,6 +11,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/reaper"
 )
 
@@ -401,6 +402,25 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 	}
 	defer db.Close()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	// Serialize with manual `gt dolt rebase` invocations and other compactor
+	// workers via a per-database MySQL advisory lock. The lock must be held
+	// from before we touch the shared compact-base/compact-work/rebase state
+	// until after the branch swap to close the TOCTOU window where a concurrent
+	// dry-run could delete/abort in-progress state.
+	const surgicalRebaseLockTimeout = 60 * time.Second
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	lockRelease, err := doltserver.AcquireRebaseLock(ctx, db, dbName, surgicalRebaseLockTimeout)
+	if err != nil {
+		return fmt.Errorf("advisory lock: %w", err)
+	}
+	defer lockRelease(context.Background())
+	d.logger.Printf("compactor_dog: %s: advisory lock acquired", dbName)
+
 	// Pre-flight: record state.
 	preHead, err := d.compactorGetHead(db, dbName)
 	if err != nil {
@@ -417,9 +437,6 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 	if err != nil {
 		return fmt.Errorf("find root commit: %w", err)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
 
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("USE `%s`", dbName)); err != nil {
 		return fmt.Errorf("use database: %w", err)
@@ -526,13 +543,55 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 		return fmt.Errorf("concurrency abort: main HEAD moved from %s to %s", shortHash(preHead), shortHash(currentHead))
 	}
 
-	// Step 8: Swap branches — make compact-work the new main.
+	// Step 7.5: Record the expected new main HEAD (compact-work HEAD after the
+	// rebase), perform a final concurrency check, and execute the destructive
+	// branch swap inside a single SQL transaction so the read of main HEAD is as
+	// close as possible to the deletion/rename.
+	expectedMainHead, err := d.compactorGetBranchHead(db, dbName, workBranch)
+	if err != nil {
+		d.surgicalCleanup(db, baseBranch, workBranch)
+		return fmt.Errorf("getting compact-work HEAD before swap: %w", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "BEGIN"); err != nil {
+		d.surgicalCleanup(db, baseBranch, workBranch)
+		return fmt.Errorf("begin pre-swap transaction: %w", err)
+	}
+
+	preSwapHead, err := d.compactorGetHead(db, dbName)
+	if err != nil {
+		_, _ = db.ExecContext(ctx, "ROLLBACK")
+		d.surgicalCleanup(db, baseBranch, workBranch)
+		return fmt.Errorf("pre-swap concurrency check: %w", err)
+	}
+	if preSwapHead != preHead {
+		_, _ = db.ExecContext(ctx, "ROLLBACK")
+		d.surgicalCleanup(db, baseBranch, workBranch)
+		return fmt.Errorf("concurrency abort: main HEAD moved from %s to %s after check", shortHash(preHead), shortHash(preSwapHead))
+	}
+
 	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', 'main')"); err != nil {
+		_, _ = db.ExecContext(ctx, "ROLLBACK")
 		return fmt.Errorf("delete old main: %w (compact-work preserved for recovery)", err)
 	}
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-m', '%s', 'main')", workBranch)); err != nil {
+		_, _ = db.ExecContext(ctx, "ROLLBACK")
 		return fmt.Errorf("rename work to main: %w", err)
 	}
+	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit branch swap: %w", err)
+	}
+
+	// Step 8: Post-swap verification. The new main HEAD must match the
+	// compact-work HEAD we intended to swap to.
+	postSwapHead, err := d.compactorGetHead(db, dbName)
+	if err != nil {
+		return fmt.Errorf("post-swap verification: %w (compact-work preserved for recovery)", err)
+	}
+	if postSwapHead != expectedMainHead {
+		return fmt.Errorf("post-swap verification failed: new main HEAD is %s, expected %s (compact-work preserved for recovery)", shortHash(postSwapHead), shortHash(expectedMainHead))
+	}
+
 	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
 	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')"); err != nil {
 		return fmt.Errorf("checkout new main: %w", err)
@@ -609,17 +668,20 @@ func (d *Daemon) compactorOpenDB(dbName string) (*sql.DB, error) {
 
 // compactorGetHead returns the current HEAD commit hash of the main branch.
 func (d *Daemon) compactorGetHead(db *sql.DB, dbName string) (string, error) {
+	return d.compactorGetBranchHead(db, dbName, "main")
+}
+
+// compactorGetBranchHead returns the current HEAD commit hash of the named
+// branch. The result is independent of the session's currently checked-out
+// branch.
+func (d *Daemon) compactorGetBranchHead(db *sql.DB, dbName, branch string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), compactorQueryTimeout)
 	defer cancel()
 
 	var hash string
-	query := fmt.Sprintf("SELECT DOLT_HASHOF('main') FROM `%s`.dual", dbName)
+	query := fmt.Sprintf("SELECT DOLT_HASHOF('%s') FROM `%s`.dual", branch, dbName)
 	if err := db.QueryRowContext(ctx, query).Scan(&hash); err != nil {
-		// Fallback: try without dual table.
-		query = fmt.Sprintf("SELECT commit_hash FROM `%s`.dolt_log ORDER BY date DESC LIMIT 1", dbName)
-		if err := db.QueryRowContext(ctx, query).Scan(&hash); err != nil {
-			return "", err
-		}
+		return "", fmt.Errorf("DOLT_HASHOF %s: %w", branch, err)
 	}
 	return hash, nil
 }
