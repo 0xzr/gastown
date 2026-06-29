@@ -631,3 +631,102 @@ gt_install_check_forward_only() {
     echo "Refusing to install an older or diverged build." >&2
     return 1
 }
+
+# gt_install_nuke_shadow_bins <source-elf>
+#
+# Reconciles legacy/alternate gt installs at $HOME/go/bin/<binary> and
+# $HOME/bin/<binary> so that `make install` / `make safe-install` no longer
+# silently clobbers user-installed forks or custom wrappers
+# (gastown-cet.12.13).
+#
+# For each known shadow path:
+#   - Missing                               -> skip
+#   - Symlink resolving to canonical path   -> remove
+#   - Regular file byte-identical to <elf>  -> remove
+#   - Anything else (different ELF, script, directory, dangling symlink, etc.)
+#                                            -> rename to <path>.bak.<ts>
+#
+# Arguments:
+#   $1 — source ELF to compare against (e.g., ./gt)
+# Environment:
+#   INSTALL_DIR, BINARY, HOME — as described above
+#   GT_FAIL_ON_SHADOW_BACKUP=1 — if any shadow is backed up, return 2
+#                                  instead of 1 (CI fail-closed).
+# Returns:
+#   0 — no shadow needed a backup
+#   1 — one or more shadows were backed up (informational unless fail-closed)
+#   2 — error (missing source, backup failure, etc.)
+gt_install_nuke_shadow_bins() {
+    local src="${1:?gt_install_nuke_shadow_bins requires <source-elf>}"
+    local binary="${BINARY:-gt}"
+    local home="${HOME:-$HOME}"
+    local shadow_paths=("$home/go/bin/$binary" "$home/bin/$binary")
+    local canonical
+    canonical="$(gt_install_wrapper_path)"
+    local ts
+    ts="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%s)"
+
+    if [ ! -f "$src" ]; then
+        echo "gt_install_nuke_shadow_bins: source ELF $src not found" >&2
+        return 2
+    fi
+
+    local backed_up=0
+    local shadow
+    for shadow in "${shadow_paths[@]}"; do
+        # The canonical install path is not a shadow; skip it to avoid
+        # self-harm if the caller happens to list it.
+        if [ "$shadow" = "$canonical" ]; then
+            continue
+        fi
+
+        # Not there at all (and not a dangling symlink we can see via -L).
+        if [ ! -e "$shadow" ] && [ ! -L "$shadow" ]; then
+            continue
+        fi
+
+        # Forwarding symlink: points at the canonical public path. Resolve
+        # both sides to absolute paths so relative links are handled.
+        if [ -L "$shadow" ]; then
+            local resolved
+            resolved="$(readlink -f "$shadow" 2>/dev/null || true)"
+            if [ -n "$resolved" ] && [ "$resolved" = "$(readlink -f "$canonical" 2>/dev/null || true)" ]; then
+                if rm -f "$shadow"; then
+                    echo "gt_install_nuke_shadow_bins: removed forwarding symlink $shadow -> $canonical"
+                else
+                    echo "gt_install_nuke_shadow_bins: failed to remove forwarding symlink $shadow" >&2
+                    return 2
+                fi
+                continue
+            fi
+        fi
+
+        # Byte-identical duplicate of the source ELF: safe to remove.
+        if [ -f "$shadow" ] && [ ! -L "$shadow" ] && cmp -s "$shadow" "$src"; then
+            if rm -f "$shadow"; then
+                echo "gt_install_nuke_shadow_bins: removed byte-identical shadow $shadow"
+            else
+                echo "gt_install_nuke_shadow_bins: failed to remove byte-identical shadow $shadow" >&2
+                return 2
+            fi
+            continue
+        fi
+
+        # Anything else (different ELF, user script, directory, dangling
+        # symlink, etc.): back up instead of destroying.
+        local bak="$shadow.bak.$ts"
+        if mv "$shadow" "$bak"; then
+            echo "gt_install_nuke_shadow_bins: backed up non-canonical shadow $shadow -> $bak"
+            backed_up=1
+        else
+            echo "gt_install_nuke_shadow_bins: failed to back up shadow $shadow" >&2
+            return 2
+        fi
+    done
+
+    if [ "$backed_up" -eq 1 ] && [ "${GT_FAIL_ON_SHADOW_BACKUP:-0}" = "1" ]; then
+        echo "gt_install_nuke_shadow_bins: shadow backups occurred and GT_FAIL_ON_SHADOW_BACKUP=1" >&2
+        return 2
+    fi
+    return "$backed_up"
+}

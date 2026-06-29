@@ -136,16 +136,26 @@ define gt_install_with_wrapper
 		gt_install_assert_wrapper_topology'
 endef
 
+# Reconcile legacy $(HOME)/go/bin/$(BINARY) and $(HOME)/bin/$(BINARY)
+# shadows instead of blindly removing them (gastown-cet.12.13).
+# Symlinks to the canonical path and byte-identical duplicates are
+# removed; anything else is backed up to <path>.bak.<ts>. Exit code 1
+# means a backup happened (informational); exit code 2+ is a real error.
+define gt_nuke_shadow_bins
+	@bash -c 'set -e; \
+		INSTALL_DIR="$(INSTALL_DIR)" BINARY="$(BINARY)" HOME="$(HOME)" \
+		source "$(WRAPPER_PRESERVE_SH)"; \
+		gt_install_nuke_shadow_bins "$(BUILD_DIR)/$(BINARY)" || _ec=$$?; \
+		case "$${_ec:-0}" in \
+			0|1) : ;; \
+			*) echo "gt_install_nuke_shadow_bins failed (exit $$_ec)" >&2; exit $$_ec ;; \
+		esac'
+endef
+
 install: check-up-to-date build
 	@mkdir -p $(INSTALL_DIR)
 	$(gt_install_with_wrapper)
-	@# Nuke any stale go-install binaries that shadow the canonical location
-	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
-		if [ -f "$$bad" ]; then \
-			echo "Removing stale $$bad (use make install, not go install)"; \
-			rm -f "$$bad"; \
-		fi; \
-	done
+	$(gt_nuke_shadow_bins)
 	@echo "Installed $(BINARY) to $(INSTALL_DIR) (wrapper topology preserved)"
 	@$(MAKE) --no-print-directory check-install-path
 	@# Restart daemon so it picks up the new binary.
@@ -173,13 +183,7 @@ install: check-up-to-date build
 safe-install: check-up-to-date check-forward-only build
 	@mkdir -p $(INSTALL_DIR)
 	$(gt_install_with_wrapper)
-	@# Nuke any stale go-install binaries that shadow the canonical location
-	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
-		if [ -f "$$bad" ]; then \
-			echo "Removing stale $$bad (use make install, not go install)"; \
-			rm -f "$$bad"; \
-		fi; \
-	done
+	$(gt_nuke_shadow_bins)
 	@echo "Installed $(BINARY) to $(INSTALL_DIR) (wrapper topology preserved, daemon NOT restarted)"
 	@$(MAKE) --no-print-directory check-install-path
 	@echo "Sessions will pick up new binary on next cycle."
