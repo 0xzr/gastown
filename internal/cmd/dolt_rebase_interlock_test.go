@@ -476,9 +476,9 @@ func TestAcquireRebaseInterlock_RefusesSharedRoot(t *testing.T) {
 	msg := err.Error()
 	for _, want := range []string{
 		"shared",
-		"root@%",         // user@host visible in the message
-		"gastown-d88",    // references the design bead
-		"gtrebase",       // names the recommended dedicated user
+		"root@%",      // user@host visible in the message
+		"gastown-d88", // references the design bead
+		"gtrebase",    // names the recommended dedicated user
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error message missing %q: %v", want, err)
