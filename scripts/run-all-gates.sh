@@ -33,17 +33,7 @@ if ! command -v go >/dev/null 2>&1; then
   exit 1
 fi
 
-gofmt_input="$(mktemp)"
-trap 'rm -f "$gofmt_input"' EXIT
-if git rev-parse --verify -q HEAD~1 >/dev/null 2>&1; then
-  git diff -z --name-only --diff-filter=ACMR HEAD~1 HEAD -- '*.go' >>"$gofmt_input"
-else
-  git ls-files -z '*.go' >>"$gofmt_input"
-fi
-git diff -z --name-only --diff-filter=ACMR HEAD -- '*.go' >>"$gofmt_input"
-mapfile -d '' go_files < <(sort -zu "$gofmt_input" | while IFS= read -r -d '' file; do
-  [ -f "$file" ] && printf '%s\0' "$file"
-done)
+mapfile -d '' go_files < <("$repo_root/scripts/lib/changed-go-files.sh")
 if [ "${#go_files[@]}" -gt 0 ]; then
   echo "[gastown gates] gofmt check (changed Go files)"
   unformatted="$(gofmt -l "${go_files[@]}")"
