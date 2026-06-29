@@ -315,7 +315,7 @@ func TestManager_Get_notFound(t *testing.T) {
 	m, _ := testManager(t)
 
 	_, err := m.Get("nonexistent")
-	if err != ErrDogNotFound {
+	if !errors.Is(err, ErrDogNotFound) {
 		t.Errorf("Get() error = %v, want ErrDogNotFound", err)
 	}
 }
@@ -330,7 +330,7 @@ func TestManager_Get_dirExistsButNoStateFile(t *testing.T) {
 	}
 
 	_, err := m.Get("boot")
-	if err != ErrDogNotFound {
+	if !errors.Is(err, ErrDogNotFound) {
 		t.Errorf("Get() error = %v, want ErrDogNotFound for dir without state file", err)
 	}
 }
@@ -458,7 +458,7 @@ func TestManager_SetState_notFound(t *testing.T) {
 	m, _ := testManager(t)
 
 	err := m.SetState("nonexistent", StateWorking)
-	if err != ErrDogNotFound {
+	if !errors.Is(err, ErrDogNotFound) {
 		t.Errorf("SetState() error = %v, want ErrDogNotFound", err)
 	}
 }
@@ -529,7 +529,7 @@ func TestManager_AssignWork_notFound(t *testing.T) {
 	m, _ := testManager(t)
 
 	err := m.AssignWork("nonexistent", "some-work")
-	if err != ErrDogNotFound {
+	if !errors.Is(err, ErrDogNotFound) {
 		t.Errorf("AssignWork() error = %v, want ErrDogNotFound", err)
 	}
 }
@@ -577,7 +577,7 @@ func TestManager_AssignWorkIfIdle_workingDog(t *testing.T) {
 	setupDogWithState(t, m, "alpha", state)
 
 	assigned, err := m.AssignWorkIfIdle("alpha", "mol-dog-reaper")
-	if err != ErrDogWorking {
+	if !errors.Is(err, ErrDogWorking) {
 		t.Fatalf("AssignWorkIfIdle() error = %v, want ErrDogWorking", err)
 	}
 	if assigned != nil {
@@ -634,7 +634,7 @@ func TestManager_ClearWork_notFound(t *testing.T) {
 	m, _ := testManager(t)
 
 	err := m.ClearWork("nonexistent")
-	if err != ErrDogNotFound {
+	if !errors.Is(err, ErrDogNotFound) {
 		t.Errorf("ClearWork() error = %v, want ErrDogNotFound", err)
 	}
 }
@@ -762,7 +762,7 @@ func TestManager_ClearWorkIfMatches_notFound(t *testing.T) {
 	m, root := testManager(t)
 
 	cleared, err := m.ClearWorkIfMatches("nonexistent", "mol-dog-reaper", time.Now())
-	if err != ErrDogNotFound {
+	if !errors.Is(err, ErrDogNotFound) {
 		t.Fatalf("ClearWorkIfMatches() error = %v, want ErrDogNotFound", err)
 	}
 	if cleared {
@@ -919,7 +919,7 @@ func TestManager_Add_noRigsReturnsError(t *testing.T) {
 	m, _ := testManagerNoRigs(t)
 
 	_, err := m.Add("alpha")
-	if err != ErrNoRigs {
+	if !errors.Is(err, ErrNoRigs) {
 		t.Errorf("Add() error = %v, want ErrNoRigs", err)
 	}
 }
@@ -938,7 +938,7 @@ func TestManager_Add_duplicateReturnsError(t *testing.T) {
 	setupDogWithState(t, m, "existing", state)
 
 	_, err := m.Add("existing")
-	if err != ErrDogExists {
+	if !errors.Is(err, ErrDogExists) {
 		t.Errorf("Add() error = %v, want ErrDogExists", err)
 	}
 }
@@ -954,7 +954,7 @@ func TestManager_Remove_notFound(t *testing.T) {
 	m, _ := testManager(t)
 
 	err := m.Remove("nonexistent")
-	if err != ErrDogNotFound {
+	if !errors.Is(err, ErrDogNotFound) {
 		t.Errorf("Remove() error = %v, want ErrDogNotFound", err)
 	}
 }
@@ -1019,7 +1019,7 @@ func TestManager_Refresh_notFound(t *testing.T) {
 	m, _ := testManager(t)
 
 	err := m.Refresh("nonexistent")
-	if err != ErrDogNotFound {
+	if !errors.Is(err, ErrDogNotFound) {
 		t.Errorf("Refresh() error = %v, want ErrDogNotFound", err)
 	}
 }
@@ -1028,7 +1028,7 @@ func TestManager_RefreshRig_notFound(t *testing.T) {
 	m, _ := testManager(t)
 
 	err := m.RefreshRig("nonexistent", "gastown")
-	if err != ErrDogNotFound {
+	if !errors.Is(err, ErrDogNotFound) {
 		t.Errorf("RefreshRig() error = %v, want ErrDogNotFound", err)
 	}
 }
@@ -1048,7 +1048,7 @@ func TestManager_Refresh_rejectsWorkingDog(t *testing.T) {
 	setupDogWithState(t, m, "busy", state)
 
 	err := m.Refresh("busy")
-	if err != ErrDogWorking {
+	if !errors.Is(err, ErrDogWorking) {
 		t.Errorf("Refresh() error = %v, want ErrDogWorking", err)
 	}
 
@@ -1077,7 +1077,7 @@ func TestManager_RefreshRig_rejectsWorkingDog(t *testing.T) {
 	setupDogWithState(t, m, "busy", state)
 
 	err := m.RefreshRig("busy", "gastown")
-	if err != ErrDogWorking {
+	if !errors.Is(err, ErrDogWorking) {
 		t.Errorf("RefreshRig() error = %v, want ErrDogWorking", err)
 	}
 

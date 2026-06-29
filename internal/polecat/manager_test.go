@@ -260,7 +260,7 @@ func TestGetNotFound(t *testing.T) {
 	m := NewManager(r, git.NewGit(root), nil)
 
 	_, err := m.Get("nonexistent")
-	if err != ErrPolecatNotFound {
+	if !errors.Is(err, ErrPolecatNotFound) {
 		t.Errorf("Get = %v, want ErrPolecatNotFound", err)
 	}
 }
@@ -274,7 +274,7 @@ func TestRemoveNotFound(t *testing.T) {
 	m := NewManager(r, git.NewGit(root), nil)
 
 	err := m.Remove("nonexistent", false)
-	if err != ErrPolecatNotFound {
+	if !errors.Is(err, ErrPolecatNotFound) {
 		t.Errorf("Remove = %v, want ErrPolecatNotFound", err)
 	}
 }

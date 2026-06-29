@@ -81,7 +81,7 @@ func TestLock_AcquireAndRelease(t *testing.T) {
 
 	// Verify lock file is gone
 	_, err = l.Read()
-	if err != ErrNotLocked {
+	if !errors.Is(err, ErrNotLocked) {
 		t.Errorf("Read() after release: error = %v, want ErrNotLocked", err)
 	}
 }
@@ -171,7 +171,7 @@ func TestLock_Read(t *testing.T) {
 
 	// Test reading non-existent lock
 	_, err := l.Read()
-	if err != ErrNotLocked {
+	if !errors.Is(err, ErrNotLocked) {
 		t.Errorf("Read() non-existent: error = %v, want ErrNotLocked", err)
 	}
 
@@ -325,7 +325,7 @@ func TestLock_ForceRelease(t *testing.T) {
 	}
 
 	_, err := l.Read()
-	if err != ErrNotLocked {
+	if !errors.Is(err, ErrNotLocked) {
 		t.Errorf("Read() after ForceRelease: error = %v, want ErrNotLocked", err)
 	}
 }

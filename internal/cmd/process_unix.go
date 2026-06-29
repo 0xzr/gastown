@@ -16,5 +16,5 @@ func isProcessRunning(pid int) bool {
 	}
 
 	// EPERM means process exists but we don't have permission to signal it.
-	return err == syscall.EPERM
+	return errors.Is(err, syscall.EPERM)
 }

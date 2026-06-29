@@ -64,7 +64,7 @@ func runMqStatus(cmd *cobra.Command, args []string) error {
 	// Fetch the issue
 	issue, err := bd.Show(mrID)
 	if err != nil {
-		if err == beads.ErrNotFound {
+		if errors.Is(err, beads.ErrNotFound) {
 			return fmt.Errorf("merge request '%s' not found", mrID)
 		}
 		return fmt.Errorf("fetching merge request: %w", err)

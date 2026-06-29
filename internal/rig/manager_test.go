@@ -198,7 +198,7 @@ func TestGetRigNotFound(t *testing.T) {
 	manager := NewManager(root, rigsConfig, git.NewGit(root))
 
 	_, err := manager.GetRig("nonexistent")
-	if err != ErrRigNotFound {
+	if !errors.Is(err, ErrRigNotFound) {
 		t.Errorf("GetRig = %v, want ErrRigNotFound", err)
 	}
 }
@@ -237,7 +237,7 @@ func TestRemoveRigNotFound(t *testing.T) {
 	manager := NewManager(root, rigsConfig, git.NewGit(root))
 
 	err := manager.RemoveRig("nonexistent")
-	if err != ErrRigNotFound {
+	if !errors.Is(err, ErrRigNotFound) {
 		t.Errorf("RemoveRig = %v, want ErrRigNotFound", err)
 	}
 }
@@ -254,7 +254,7 @@ func TestRemoveRigNotFoundWithOrphanDir(t *testing.T) {
 
 	// Manager should still return ErrRigNotFound (UX is handled in cmd layer)
 	err := manager.RemoveRig("orphan-rig")
-	if err != ErrRigNotFound {
+	if !errors.Is(err, ErrRigNotFound) {
 		t.Errorf("RemoveRig orphan dir = %v, want ErrRigNotFound", err)
 	}
 }

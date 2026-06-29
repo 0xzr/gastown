@@ -314,7 +314,7 @@ func runRefineryStart(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Starting refinery for %s...\n", rigName)
 
 	if err := mgr.Start(refineryForeground, refineryAgentOverride); err != nil {
-		if err == refinery.ErrAlreadyRunning {
+		if errors.Is(err, refinery.ErrAlreadyRunning) {
 			fmt.Printf("%s Refinery is already running\n", style.Dim.Render("⚠"))
 			return nil
 		}
@@ -338,7 +338,7 @@ func runRefineryStop(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := mgr.Stop(); err != nil {
-		if err == refinery.ErrNotRunning {
+		if errors.Is(err, refinery.ErrNotRunning) {
 			fmt.Printf("%s Refinery is not running\n", style.Dim.Render("⚠"))
 			return nil
 		}
@@ -541,7 +541,7 @@ func runRefineryRestart(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Restarting refinery for %s...\n", rigName)
 
 	// Stop if running (ignore ErrNotRunning)
-	if err := mgr.Stop(); err != nil && err != refinery.ErrNotRunning {
+	if err := mgr.Stop(); err != nil && !errors.Is(err, refinery.ErrNotRunning) {
 		return fmt.Errorf("stopping refinery: %w", err)
 	}
 

@@ -347,7 +347,7 @@ func TestBaseCheck(t *testing.T) {
 	if b.CanFix() {
 		t.Error("BaseCheck.CanFix() should return false")
 	}
-	if err := b.Fix(nil); err != ErrCannotFix {
+	if err := b.Fix(nil); !errors.Is(err, ErrCannotFix) {
 		t.Errorf("BaseCheck.Fix() should return ErrCannotFix, got %v", err)
 	}
 }

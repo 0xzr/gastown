@@ -248,7 +248,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		defer startupWg.Done()
 		deaconMgr := deacon.NewManager(townRoot)
 		if err := deaconMgr.Start(""); err != nil {
-			if err == deacon.ErrAlreadyRunning {
+			if errors.Is(err, deacon.ErrAlreadyRunning) {
 				deaconResult = agentStartResult{name: "Deacon", ok: true, detail: deaconMgr.SessionName()}
 			} else {
 				deaconResult = agentStartResult{name: "Deacon", ok: false, detail: err.Error()}
@@ -729,7 +729,7 @@ func upStartWitness(rigName string, r *rig.Rig) agentStartResult {
 
 	mgr := witness.NewManager(r)
 	if err := mgr.Start(false, "", nil); err != nil {
-		if err == witness.ErrAlreadyRunning {
+		if errors.Is(err, witness.ErrAlreadyRunning) {
 			return agentStartResult{name: name, ok: true, detail: mgr.SessionName()}
 		}
 		return agentStartResult{name: name, ok: false, detail: err.Error()}
@@ -755,7 +755,7 @@ func upStartRefinery(rigName string, r *rig.Rig) agentStartResult {
 
 	mgr := refinery.NewManager(r)
 	if err := mgr.Start(false, ""); err != nil {
-		if err == refinery.ErrAlreadyRunning {
+		if errors.Is(err, refinery.ErrAlreadyRunning) {
 			return agentStartResult{name: name, ok: true, detail: mgr.SessionName()}
 		}
 		return agentStartResult{name: name, ok: false, detail: err.Error()}
@@ -861,7 +861,7 @@ func startCrewFromSettings(townRoot, rigName string) ([]string, map[string]error
 	// Start each crew member using Manager
 	for _, crewName := range toStart {
 		if err := crewMgr.Start(crewName, crew.StartOptions{}); err != nil {
-			if err == crew.ErrSessionRunning {
+			if errors.Is(err, crew.ErrSessionRunning) {
 				started = append(started, crewName)
 			} else {
 				errors[crewName] = err
@@ -987,7 +987,7 @@ func startPolecatsWithWork(townRoot, rigName string) ([]string, map[string]error
 
 		// This polecat has work - start it using SessionManager
 		if err := polecatMgr.Start(polecatName, polecat.SessionStartOptions{}); err != nil {
-			if err == polecat.ErrSessionRunning {
+			if errors.Is(err, polecat.ErrSessionRunning) {
 				started = append(started, polecatName)
 			} else {
 				errors[polecatName] = err

@@ -2,6 +2,7 @@ package mail
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -132,7 +133,7 @@ func TestMailboxLegacyGet(t *testing.T) {
 
 	// Get non-existent message
 	_, err = m.Get("msg-nonexistent")
-	if err != ErrMessageNotFound {
+	if !errors.Is(err, ErrMessageNotFound) {
 		t.Errorf("Get non-existent = %v, want ErrMessageNotFound", err)
 	}
 }
@@ -165,7 +166,7 @@ func TestMailboxLegacyMarkRead(t *testing.T) {
 
 	// Mark non-existent
 	err = m.MarkRead("msg-nonexistent")
-	if err != ErrMessageNotFound {
+	if !errors.Is(err, ErrMessageNotFound) {
 		t.Errorf("MarkRead non-existent = %v, want ErrMessageNotFound", err)
 	}
 }
@@ -203,7 +204,7 @@ func TestMailboxLegacyDelete(t *testing.T) {
 
 	// Delete non-existent
 	err = m.Delete("msg-nonexistent")
-	if err != ErrMessageNotFound {
+	if !errors.Is(err, ErrMessageNotFound) {
 		t.Errorf("Delete non-existent = %v, want ErrMessageNotFound", err)
 	}
 }

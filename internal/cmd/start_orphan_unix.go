@@ -34,7 +34,7 @@ func cleanupOrphanedClaude(graceSecs int) {
 	var termPIDs []int
 	for _, orphan := range orphans {
 		if err := syscall.Kill(orphan.PID, syscall.SIGTERM); err != nil {
-			if err != syscall.ESRCH {
+			if !errors.Is(err, syscall.ESRCH) {
 				fmt.Printf("  %s PID %d: failed to send SIGTERM: %v\n",
 					style.Bold.Render("⚠"), orphan.PID, err)
 			}
@@ -66,7 +66,7 @@ func cleanupOrphanedClaude(graceSecs int) {
 
 		// Process still alive - send SIGKILL
 		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
-			if err != syscall.ESRCH {
+			if !errors.Is(err, syscall.ESRCH) {
 				fmt.Printf("  %s PID %d: failed to send SIGKILL: %v\n",
 					style.Bold.Render("⚠"), pid, err)
 			}

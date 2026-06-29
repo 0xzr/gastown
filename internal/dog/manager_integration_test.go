@@ -351,7 +351,7 @@ func TestManager_Integration_FullLifecycle(t *testing.T) {
 		t.Fatalf("Remove() error = %v", err)
 	}
 	_, err = m.Get("lifecycle")
-	if err != ErrDogNotFound {
+	if !errors.Is(err, ErrDogNotFound) {
 		t.Errorf("After Remove: Get() error = %v, want ErrDogNotFound", err)
 	}
 }

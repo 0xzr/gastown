@@ -314,7 +314,7 @@ func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
 		fmt.Println("Deacon session missing - starting Deacon")
 		if townRoot != "" {
 			mgr := deacon.NewManager(townRoot)
-			if err := mgr.Start(""); err != nil && err != deacon.ErrAlreadyRunning {
+			if err := mgr.Start(""); err != nil && !errors.Is(err, deacon.ErrAlreadyRunning) {
 				fmt.Printf("Failed to start Deacon: %v\n", err)
 				return "error", "deacon-start-failed", fmt.Errorf("starting deacon: %w", err)
 			}

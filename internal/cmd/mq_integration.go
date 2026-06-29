@@ -352,7 +352,7 @@ func runMqIntegrationCreate(cmd *cobra.Command, args []string) error {
 	// 1. Verify epic exists
 	epic, err := bd.Show(epicID)
 	if err != nil {
-		if err == beads.ErrNotFound {
+		if errors.Is(err, beads.ErrNotFound) {
 			return fmt.Errorf("epic '%s' not found", epicID)
 		}
 		return fmt.Errorf("fetching epic: %w", err)
@@ -487,7 +487,7 @@ func runMqIntegrationLand(cmd *cobra.Command, args []string) error {
 	// 1. Verify epic exists
 	epic, err := bd.Show(epicID)
 	if err != nil {
-		if err == beads.ErrNotFound {
+		if errors.Is(err, beads.ErrNotFound) {
 			return fmt.Errorf("epic '%s' not found", epicID)
 		}
 		return fmt.Errorf("fetching epic: %w", err)
@@ -892,7 +892,7 @@ func runMqIntegrationStatus(cmd *cobra.Command, args []string) error {
 	// Fetch epic to get stored branch name
 	epic, err := bd.Show(epicID)
 	if err != nil {
-		if err == beads.ErrNotFound {
+		if errors.Is(err, beads.ErrNotFound) {
 			return fmt.Errorf("epic '%s' not found", epicID)
 		}
 		return fmt.Errorf("fetching epic: %w", err)

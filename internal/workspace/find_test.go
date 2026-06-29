@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -84,7 +85,7 @@ func TestFindOrErrorNotFound(t *testing.T) {
 	dir := t.TempDir()
 
 	_, err := FindOrError(dir)
-	if err != ErrNotFound {
+	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("FindOrError = %v, want ErrNotFound", err)
 	}
 }

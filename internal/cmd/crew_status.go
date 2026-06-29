@@ -80,7 +80,7 @@ func runCrewStatus(cmd *cobra.Command, args []string) error {
 			// Specific worker
 			worker, err := crewMgr.Get(targetName)
 			if err != nil {
-				if err == crew.ErrCrewNotFound {
+				if errors.Is(err, crew.ErrCrewNotFound) {
 					return fmt.Errorf("crew workspace '%s' not found", targetName)
 				}
 				return fmt.Errorf("getting crew worker: %w", err)

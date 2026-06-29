@@ -90,13 +90,13 @@ func TestManagerAddAndGet(t *testing.T) {
 
 	// Test duplicate Add
 	_, err = mgr.Add("dave", false)
-	if err != ErrCrewExists {
+	if !errors.Is(err, ErrCrewExists) {
 		t.Errorf("expected ErrCrewExists, got %v", err)
 	}
 
 	// Test Get non-existent
 	_, err = mgr.Get("nonexistent")
-	if err != ErrCrewNotFound {
+	if !errors.Is(err, ErrCrewNotFound) {
 		t.Errorf("expected ErrCrewNotFound, got %v", err)
 	}
 }
@@ -347,13 +347,13 @@ func TestManagerRemove(t *testing.T) {
 
 	// Verify it's gone
 	_, err = mgr.Get("charlie")
-	if err != ErrCrewNotFound {
+	if !errors.Is(err, ErrCrewNotFound) {
 		t.Errorf("expected ErrCrewNotFound, got %v", err)
 	}
 
 	// Remove non-existent
 	err = mgr.Remove("nonexistent", false)
-	if err != ErrCrewNotFound {
+	if !errors.Is(err, ErrCrewNotFound) {
 		t.Errorf("expected ErrCrewNotFound, got %v", err)
 	}
 }
@@ -540,7 +540,7 @@ func TestManagerRenameValidatesNewName(t *testing.T) {
 
 	// Verify alice no longer exists and bob does
 	_, err = mgr.Get("alice")
-	if err != ErrCrewNotFound {
+	if !errors.Is(err, ErrCrewNotFound) {
 		t.Errorf("expected ErrCrewNotFound for alice, got %v", err)
 	}
 	worker, err := mgr.Get("bob")

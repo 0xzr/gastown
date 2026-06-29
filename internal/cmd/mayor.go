@@ -246,7 +246,7 @@ func runMayorStart(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("Starting Mayor session...")
 	if err := mgr.Start(mayorAgentOverride); err != nil {
-		if err == mayor.ErrAlreadyRunning {
+		if errors.Is(err, mayor.ErrAlreadyRunning) {
 			return fmt.Errorf("Mayor session already running. Attach with: gt mayor attach")
 		}
 		return err
@@ -267,7 +267,7 @@ func runMayorStop(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("Stopping Mayor session...")
 	if err := mgr.Stop(); err != nil {
-		if err == mayor.ErrNotRunning {
+		if errors.Is(err, mayor.ErrNotRunning) {
 			return fmt.Errorf("Mayor session is not running")
 		}
 		return err
@@ -481,7 +481,7 @@ func runMayorRestart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Stop if running (ignore not-running error)
-	if err := mgr.Stop(); err != nil && err != mayor.ErrNotRunning {
+	if err := mgr.Stop(); err != nil && !errors.Is(err, mayor.ErrNotRunning) {
 		return fmt.Errorf("stopping session: %w", err)
 	}
 

@@ -274,7 +274,7 @@ func (s *Server) Start(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
 		s.log.Info("gt-proxy-server: listening", "addr", ln.Addr(), "tls", "mTLS")
-		if err := srv.ServeTLS(ln, "", ""); err != nil && err != http.ErrServerClosed {
+		if err := srv.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
@@ -307,7 +307,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 		s.log.Info("gt-proxy-server: admin listening", "addr", adminLn.Addr())
 		go func() {
-			if err := adminSrv.Serve(adminLn); err != nil && err != http.ErrServerClosed {
+			if err := adminSrv.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				s.log.Error("admin server error", "err", err)
 			}
 		}()

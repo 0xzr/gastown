@@ -3,6 +3,7 @@
 package lock
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
@@ -49,7 +50,7 @@ func FlockTryAcquire(path string) (func(), bool, error) {
 
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
-		if err == syscall.EWOULDBLOCK {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
 			return nil, false, nil
 		}
 		return nil, false, fmt.Errorf("acquiring flock: %w", err)

@@ -171,7 +171,7 @@ func runWitnessStart(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Starting witness for %s...\n", rigName)
 
 	if err := mgr.Start(witnessForeground, witnessAgentOverride, witnessEnvOverrides); err != nil {
-		if err == witness.ErrAlreadyRunning {
+		if errors.Is(err, witness.ErrAlreadyRunning) {
 			fmt.Printf("%s Witness is already running\n", style.Dim.Render("⚠"))
 			fmt.Printf("  %s\n", style.Dim.Render("Use 'gt witness attach' to connect"))
 			return nil
@@ -206,7 +206,7 @@ func runWitnessStop(cmd *cobra.Command, args []string) error {
 
 	// Update state file
 	if err := mgr.Stop(); err != nil {
-		if err == witness.ErrNotRunning && !running {
+		if errors.Is(err, witness.ErrNotRunning) && !running {
 			fmt.Printf("%s Witness is not running\n", style.Dim.Render("⚠"))
 			return nil
 		}
@@ -318,7 +318,7 @@ func runWitnessAttach(cmd *cobra.Command, args []string) error {
 	sessionName := witnessSessionName(rigName)
 
 	// Ensure session exists (creates if needed)
-	if err := mgr.Start(false, "", nil); err != nil && err != witness.ErrAlreadyRunning {
+	if err := mgr.Start(false, "", nil); err != nil && !errors.Is(err, witness.ErrAlreadyRunning) {
 		return err
 	} else if err == nil {
 		fmt.Printf("Started witness session for %s\n", rigName)

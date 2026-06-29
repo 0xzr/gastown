@@ -125,7 +125,7 @@ func TestActiveDecision_ResumeOverridesBlock(t *testing.T) {
 		t.Fatalf("LoadDecisions: %v", err)
 	}
 	d, err := state.ActiveDecision("gt-y")
-	if err != ErrDecisionNotFound {
+	if !errors.Is(err, ErrDecisionNotFound) {
 		t.Fatalf("expected ErrDecisionNotFound after resume, got %v (%+v)", err, d)
 	}
 }
@@ -133,7 +133,7 @@ func TestActiveDecision_ResumeOverridesBlock(t *testing.T) {
 func TestActiveDecision_NoDecision(t *testing.T) {
 	t.Parallel()
 	state, _ := LoadDecisions(t.TempDir())
-	if _, err := state.ActiveDecision("gt-none"); err != ErrDecisionNotFound {
+	if _, err := state.ActiveDecision("gt-none"); !errors.Is(err, ErrDecisionNotFound) {
 		t.Errorf("expected ErrDecisionNotFound, got %v", err)
 	}
 }
@@ -141,7 +141,7 @@ func TestActiveDecision_NoDecision(t *testing.T) {
 func TestActiveDecision_EmptyBeadID(t *testing.T) {
 	t.Parallel()
 	state, _ := LoadDecisions(t.TempDir())
-	if _, err := state.ActiveDecision("   "); err != ErrDecisionNotFound {
+	if _, err := state.ActiveDecision("   "); !errors.Is(err, ErrDecisionNotFound) {
 		t.Errorf("expected ErrDecisionNotFound for empty bead, got %v", err)
 	}
 }
@@ -163,7 +163,7 @@ func TestPriorBlockingDecision(t *testing.T) {
 	}
 
 	// Active is resume (no block), but a prior block exists.
-	if _, err := state.ActiveDecision("gt-z"); err != ErrDecisionNotFound {
+	if _, err := state.ActiveDecision("gt-z"); !errors.Is(err, ErrDecisionNotFound) {
 		t.Fatalf("expected resume to clear active block, got %v", err)
 	}
 	prior, err := state.PriorBlockingDecision("gt-z")
@@ -175,7 +175,7 @@ func TestPriorBlockingDecision(t *testing.T) {
 	}
 
 	// Bead with no blocking history.
-	if _, err := state.PriorBlockingDecision("gt-other"); err != ErrDecisionNotFound {
+	if _, err := state.PriorBlockingDecision("gt-other"); !errors.Is(err, ErrDecisionNotFound) {
 		t.Errorf("expected ErrDecisionNotFound, got %v", err)
 	}
 }

@@ -102,9 +102,9 @@ func runCrewRemove(cmd *cobra.Command, args []string) error {
 		} else {
 			// For regular clones, use the crew manager
 			if err := crewMgr.Remove(name, forceRemove); err != nil {
-				if err == crew.ErrCrewNotFound {
+				if errors.Is(err, crew.ErrCrewNotFound) {
 					fmt.Printf("Error removing %s: crew workspace not found\n", arg)
-				} else if err == crew.ErrHasChanges {
+				} else if errors.Is(err, crew.ErrHasChanges) {
 					fmt.Printf("Error removing %s: uncommitted changes (use --force)\n", arg)
 				} else {
 					fmt.Printf("Error removing %s: %v\n", arg, err)
@@ -205,7 +205,7 @@ func runCrewRefresh(cmd *cobra.Command, args []string) error {
 	// Get the crew worker (must exist for refresh)
 	worker, err := crewMgr.Get(name)
 	if err != nil {
-		if err == crew.ErrCrewNotFound {
+		if errors.Is(err, crew.ErrCrewNotFound) {
 			return fmt.Errorf("crew workspace '%s' not found", name)
 		}
 		return fmt.Errorf("getting crew worker: %w", err)
