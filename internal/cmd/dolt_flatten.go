@@ -188,31 +188,52 @@ func runDoltFlatten(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// flattenGetRowCounts returns table -> row count for all user tables.
-func flattenGetRowCounts(db *sql.DB, dbName string) (map[string]int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+// flattenNewQueryContext returns a fresh context with the standard per-query
+// budget. Each SQL operation in flattenGetRowCounts calls this independently,
+// so one slow query cannot starve subsequent queries of the remaining window.
+// (gastown-xi8)
+func flattenNewQueryContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), maintainQueryTimeout)
+}
 
-	query := fmt.Sprintf("SELECT table_name FROM information_schema.tables WHERE table_schema = '%s' AND table_name NOT LIKE 'dolt_%%'", dbName)
-	rows, err := db.QueryContext(ctx, query)
+// flattenGetRowCounts returns table -> row count for all user tables.
+// It creates a fresh query context for the table-list scan AND for each
+// per-table COUNT, so the whole table list does not share a single 30s budget
+// with every individual COUNT (gastown-xi8).
+func flattenGetRowCounts(db *sql.DB, dbName string) (map[string]int, error) {
+	// List user tables with its own timeout budget.
+	ctx, cancel := flattenNewQueryContext()
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT table_name FROM information_schema.tables WHERE table_schema = '%s' AND table_name NOT LIKE 'dolt_%%'", dbName))
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	defer rows.Close()
 
 	var tables []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			cancel()
 			return nil, err
 		}
 		tables = append(tables, name)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		cancel()
+		return nil, err
+	}
+	rows.Close()
+	cancel()
 
 	counts := make(map[string]int, len(tables))
 	for _, table := range tables {
+		ctx, cancel := flattenNewQueryContext()
 		var count int
-		if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", dbName, table)).Scan(&count); err != nil {
+		err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", dbName, table)).Scan(&count)
+		cancel()
+		if err != nil {
 			return nil, fmt.Errorf("count %s: %w", table, err)
 		}
 		counts[table] = count
