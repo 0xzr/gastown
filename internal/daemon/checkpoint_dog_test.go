@@ -257,6 +257,43 @@ func checkpointHeadMessage(t *testing.T, workDir string) string {
 	return runCheckpointCmd(t, workDir, "git", "log", "-1", "--format=%s")
 }
 
+func TestIsProtectedCheckpointBranch_DefaultUnreachable_FailClosed(t *testing.T) {
+	workDir, _ := checkpointTestRepo(t)
+
+	// Remove the remote so refs/remotes/origin/HEAD and origin/main/master
+	// cannot be resolved.
+	runCheckpointCmd(t, workDir, "git", "remote", "remove", "origin")
+
+	// Without remote resolution, the current branch must be treated as
+	// protected. Returning true here drives ensureCheckpointBranch to error
+	// rather than committing a WIP checkpoint to main.
+	if !isProtectedCheckpointBranch(workDir, "main") {
+		t.Error("expected main to be treated as protected when default branch resolution fails")
+	}
+}
+
+func TestIsProtectedCheckpointBranch_EmptyBranch(t *testing.T) {
+	workDir, _ := checkpointTestRepo(t)
+
+	// An empty branch name is never protected.
+	if isProtectedCheckpointBranch(workDir, "") {
+		t.Error("expected empty branch to be unprotected")
+	}
+}
+
+func TestEnsureCheckpointBranch_DefaultUnreachable_ReturnsError(t *testing.T) {
+	workDir, polecatName := checkpointTestRepo(t)
+
+	// Remove the remote so the default branch cannot be resolved.
+	runCheckpointCmd(t, workDir, "git", "remote", "remove", "origin")
+
+	d := &Daemon{logger: log.New(os.Stdout, "", 0)}
+
+	if _, err := d.ensureCheckpointBranch(workDir, polecatName); err == nil {
+		t.Fatal("expected error when default branch cannot be resolved")
+	}
+}
+
 func TestCheckpointWorktree_OnDefaultBranch_LandsOnWIPBranch(t *testing.T) {
 	workDir, polecatName := checkpointTestRepo(t)
 

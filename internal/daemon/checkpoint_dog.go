@@ -174,12 +174,20 @@ func checkpointWIPBranchName(polecatName string) string {
 
 // isProtectedCheckpointBranch reports whether branch is the repository default
 // branch on which WIP checkpoints are forbidden.
+//
+// If the default branch cannot be resolved (e.g. the remote is unreachable or
+// missing), the function fails closed and treats the branch as protected.
+// This prevents checkpoint_dog from committing WIP directly to what is
+// likely main/master simply because it could not prove otherwise.
 func isProtectedCheckpointBranch(workDir, branch string) bool {
 	if branch == "" {
 		return false
 	}
 	defaultBranch := checkpointDefaultBranch(workDir)
-	return defaultBranch != "" && branch == defaultBranch
+	if defaultBranch == "" {
+		return true
+	}
+	return branch == defaultBranch
 }
 
 // ensureCheckpointBranch returns the branch that should receive the WIP
