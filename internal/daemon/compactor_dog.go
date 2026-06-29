@@ -38,10 +38,23 @@ const (
 	// compactorBranchName is the temporary branch used during compaction.
 	compactorBranchName = "gt-compaction"
 	// surgicalMaxRetries is the number of times to retry surgical rebase after
-	// a concurrent write error. DOLT_REBASE is NOT safe with concurrent writes —
-	// Dolt detects that the commit graph changed and returns an error. One retry
-	// is usually sufficient since the window for concurrent writes is small.
+	// a concurrent write error. DOLT_REBASE fail-closes if a concurrent writer
+	// advances main mid-rebase ("rebase aborted due to changes in branch main")
+	// — no data is lost. One retry is usually sufficient since the collision
+	// window is small.
 	surgicalMaxRetries = 1
+	// compactBaseBranch / compactWorkBranch are the legacy temporary branch
+	// names from the destructive-swap surgical rebase. The in-place rebase
+	// (gastown-5nz) no longer creates them, but cleanup still deletes them
+	// so a failed prior run on the old code doesn't leave residue.
+	compactBaseBranch = "compact-base"
+	compactWorkBranch = "compact-work"
+	// doltRebaseMainBranch is the internal branch Dolt creates when an
+	// interactive rebase is started on `main`. Auto-deleted on a successful
+	// --continue, but NOT on an abort — so failed runs leave it behind and
+	// block the next rebase with "A branch named 'dolt_rebase_main' already
+	// exists".
+	doltRebaseMainBranch = "dolt_rebase_main"
 )
 
 // CompactorDogConfig holds configuration for the compactor_dog patrol.
@@ -349,12 +362,13 @@ func (d *Daemon) compactDatabase(dbName string) error {
 // squashes old commits while keeping the most recent N as individual picks.
 // This is an alternative to the flatten algorithm that preserves recent history.
 //
-// CONCURRENT WRITE HAZARD: Unlike flatten mode (which uses DOLT_RESET --soft
-// and is safe with concurrent writes), surgical mode uses DOLT_REBASE which is
-// NOT safe with concurrent writes. If an agent commits to the database while a
-// rebase is in progress, Dolt detects the graph change and returns an error.
-// This function retries once on such errors, which is usually sufficient since
-// the collision window is small. If retries are exhausted, the error is returned
+// CONCURRENT WRITE SAFETY (gastown-5nz): The rebase runs in-place on `main` —
+// DOLT_REBASE('--continue') atomically updates refs/heads/main, so there is no
+// destructive branch-swap and no TOCTOU window. If a concurrent writer commits
+// to main mid-rebase, Dolt fail-closes with "rebase aborted due to changes in
+// branch main" (no data lost; the concurrent commit remains on main). This
+// function retries once on that error, which is usually sufficient since the
+// collision window is small. If retries are exhausted, the error is returned
 // to the caller for escalation.
 // Ref: Tim Sehn (2026-02-28) confirmed DOLT_REBASE fails on concurrent writes.
 func (d *Daemon) surgicalRebase(dbName string, keepRecent int) error {
@@ -380,14 +394,20 @@ func (d *Daemon) surgicalRebase(dbName string, keepRecent int) error {
 
 // isConcurrentWriteError returns true if the error indicates Dolt detected a
 // concurrent write during rebase (commit graph changed underneath the operation).
+//
+// With the in-place rebase (gastown-5nz), DOLT_REBASE('--continue') fail-closes
+// with "rebase aborted due to changes in branch main" when a concurrent writer
+// advanced main mid-rebase — the canonical concurrent-write signal.
 func isConcurrentWriteError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
 	// Dolt reports graph-change errors during rebase when concurrent writes occur.
-	// Also catch our own concurrency abort from HEAD movement detection.
-	return strings.Contains(msg, "rebase execution failed") ||
+	// "changes in branch main" is the in-place rebase's fail-closed message.
+	// "rebase execution failed"/"concurrency abort" are our own wrappers.
+	return strings.Contains(msg, "changes in branch main") ||
+		strings.Contains(msg, "rebase execution failed") ||
 		strings.Contains(msg, "concurrency abort") ||
 		strings.Contains(msg, "graph") ||
 		strings.Contains(msg, "cannot rebase")
@@ -401,7 +421,8 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 	}
 	defer db.Close()
 
-	// Pre-flight: record state.
+	// Pre-flight: record state. preHead is informational only — the
+	// authoritative concurrent-write gate is Dolt itself (see continue below).
 	preHead, err := d.compactorGetHead(db, dbName)
 	if err != nil {
 		return fmt.Errorf("pre-flight HEAD: %w", err)
@@ -418,6 +439,23 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 		return fmt.Errorf("find root commit: %w", err)
 	}
 
+	// Pin the pool to a single connection. The interactive rebase plan
+	// lives in the session-scoped `dolt_rebase` system table, so every plan
+	// mutation (start, UPDATE action='squash', --continue) MUST run on the
+	// SAME connection. SetMaxOpenConns(1) guarantees one underlying conn for
+	// every ExecContext/QueryRowContext below.
+	//
+	// This also closes the TOCTOU window (gastown-5nz retro-bug P0): there
+	// is no destructive `DOLT_BRANCH -D main` + `-m compact-work → main`
+	// swap in this flow. DOLT_REBASE('--continue') atomically updates
+	// refs/heads/main and fail-closes ("rebase aborted due to changes in
+	// branch main") if a concurrent writer advances main mid-rebase. No
+	// application-level interlock or per-user Dolt provisioning required.
+	// (Empirically verified against Dolt 2.1.8.)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
@@ -425,52 +463,46 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 		return fmt.Errorf("use database: %w", err)
 	}
 
-	const baseBranch = "compact-base"
-	const workBranch = "compact-work"
+	// Clean up leftover branches from a previous failed run: the legacy
+	// compact-base/compact-work names AND Dolt's internal dolt_rebase_main
+	// branch (left behind when a prior rebase aborted — not auto-cleaned).
+	d.surgicalCleanup(db, compactBaseBranch, compactWorkBranch)
 
-	// Clean up leftover branches.
-	d.surgicalCleanup(db, baseBranch, workBranch)
-
-	// Step 1: Create anchor branch at root commit.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('%s', '%s')", baseBranch, rootHash)); err != nil {
-		return fmt.Errorf("create base branch: %w", err)
+	// Ensure we are on main. Running the interactive rebase on main is what
+	// makes DOLT_REBASE('--continue') atomically update refs/heads/main
+	// (eliminating the destructive-swap TOCTOU window).
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')"); err != nil {
+		return fmt.Errorf("checkout main before rebase: %w", err)
 	}
 
-	// Step 2: Create work branch from main.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('%s', 'main')", workBranch)); err != nil {
-		d.surgicalCleanupBase(db, baseBranch)
-		return fmt.Errorf("create work branch: %w", err)
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_CHECKOUT('%s')", workBranch)); err != nil {
-		d.surgicalCleanup(db, baseBranch, workBranch)
-		return fmt.Errorf("checkout work branch: %w", err)
-	}
-
-	// Step 3: Start interactive rebase.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_REBASE('--interactive', '%s')", baseBranch)); err != nil {
-		d.surgicalCleanup(db, baseBranch, workBranch)
+	// Step 1: Start interactive rebase directly on main against the root
+	// commit. Dolt creates an internal `dolt_rebase_main` branch, switches
+	// onto it, and populates the session-scoped `dolt_rebase` plan table.
+	// No compact-base/compact-work fork, no destructive swap.
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_REBASE('--interactive', '%s')", rootHash)); err != nil {
+		d.surgicalAbortAndCleanup(db, compactBaseBranch, compactWorkBranch)
 		return fmt.Errorf("start interactive rebase: %w", err)
 	}
-	d.logger.Printf("compactor_dog: %s: interactive rebase started", dbName)
+	d.logger.Printf("compactor_dog: %s: interactive rebase started on main", dbName)
 
-	// Step 4: Read rebase plan bounds and mark old commits as squash.
+	// Step 2: Read rebase plan bounds and mark old commits as squash.
 	// Dolt returns rebase_order as DECIMAL — the MySQL driver delivers it as
 	// []uint8 (e.g. "1.00") which cannot be scanned directly into int.
 	var minOrderStr, maxOrderStr string
 	if err := db.QueryRowContext(ctx, "SELECT MIN(rebase_order), MAX(rebase_order) FROM dolt_rebase").Scan(&minOrderStr, &maxOrderStr); err != nil {
-		d.surgicalAbortAndCleanup(db, baseBranch, workBranch)
+		d.surgicalAbortAndCleanup(db, compactBaseBranch, compactWorkBranch)
 		return fmt.Errorf("read rebase bounds: %w", err)
 	}
 	minOrder, maxOrder, err := parseRebaseOrder2(minOrderStr, maxOrderStr)
 	if err != nil {
-		d.surgicalAbortAndCleanup(db, baseBranch, workBranch)
+		d.surgicalAbortAndCleanup(db, compactBaseBranch, compactWorkBranch)
 		return fmt.Errorf("parse rebase bounds: %w", err)
 	}
 
 	squashThreshold := maxOrder - keepRecent
 	if squashThreshold <= minOrder {
 		d.logger.Printf("compactor_dog: %s: nothing to squash (all commits recent), aborting rebase", dbName)
-		d.surgicalAbortAndCleanup(db, baseBranch, workBranch)
+		d.surgicalAbortAndCleanup(db, compactBaseBranch, compactWorkBranch)
 		return nil
 	}
 
@@ -478,21 +510,29 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 		"UPDATE dolt_rebase SET action = 'squash' WHERE rebase_order > %d AND rebase_order <= %d",
 		minOrder, squashThreshold))
 	if err != nil {
-		d.surgicalAbortAndCleanup(db, baseBranch, workBranch)
+		d.surgicalAbortAndCleanup(db, compactBaseBranch, compactWorkBranch)
 		return fmt.Errorf("update rebase plan: %w", err)
 	}
 	affected, _ := result.RowsAffected()
 	d.logger.Printf("compactor_dog: %s: marked %d commits as squash", dbName, affected)
 
-	// Step 5: Execute the rebase.
+	// Step 3: Execute the rebase. DOLT_REBASE('--continue') atomically
+	// updates refs/heads/main, switches back to main, and deletes the
+	// internal dolt_rebase_main branch. If a concurrent writer advanced
+	// main between the rebase start and here, Dolt fail-closes with
+	// "rebase aborted due to changes in branch main" — no data is lost and
+	// the concurrent commit remains on main. The caller retries on that
+	// error (isConcurrentWriteError).
 	if _, err := db.ExecContext(ctx, "CALL DOLT_REBASE('--continue')"); err != nil {
-		d.surgicalCleanup(db, baseBranch, workBranch)
+		d.surgicalAbortAndCleanup(db, compactBaseBranch, compactWorkBranch)
 		return fmt.Errorf("rebase execution failed: %w", err)
 	}
-	d.logger.Printf("compactor_dog: %s: rebase executed successfully", dbName)
+	d.logger.Printf("compactor_dog: %s: rebase executed successfully — refs/heads/main updated atomically", dbName)
 
-	// Step 6: Verify integrity — row counts must not decrease (data loss).
-	// Concurrent writes may increase counts during rebase — this is safe.
+	// Step 4: Verify integrity — row counts must not decrease (data loss).
+	// main already holds the rebased history (no separate swap), so this
+	// reads the final state directly. Concurrent writes that landed during
+	// the rebase are rejected by Dolt, so counts should match pre-flight.
 	postCounts, err := d.compactorGetRowCounts(db, dbName)
 	if err != nil {
 		d.logger.Printf("compactor_dog: %s: WARNING: could not verify row counts after rebase: %v", dbName, err)
@@ -500,42 +540,13 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 		for table, preCount := range preCounts {
 			postCount, ok := postCounts[table]
 			if !ok {
-				d.surgicalCleanup(db, baseBranch, workBranch)
 				return fmt.Errorf("integrity: table %q missing after rebase", table)
 			}
 			if postCount < preCount {
-				d.surgicalCleanup(db, baseBranch, workBranch)
 				return fmt.Errorf("integrity: table %q lost rows: pre=%d post=%d", table, preCount, postCount)
-			}
-			if postCount > preCount {
-				d.logger.Printf("compactor_dog: %s: table %q gained %d rows during rebase (concurrent write, safe)",
-					dbName, table, postCount-preCount)
 			}
 		}
 		d.logger.Printf("compactor_dog: %s: integrity verified (%d tables)", dbName, len(preCounts))
-	}
-
-	// Step 7: Concurrency check.
-	currentHead, err := d.compactorGetHead(db, dbName)
-	if err != nil {
-		d.surgicalCleanup(db, baseBranch, workBranch)
-		return fmt.Errorf("concurrency check: %w", err)
-	}
-	if currentHead != preHead {
-		d.surgicalCleanup(db, baseBranch, workBranch)
-		return fmt.Errorf("concurrency abort: main HEAD moved from %s to %s", shortHash(preHead), shortHash(currentHead))
-	}
-
-	// Step 8: Swap branches — make compact-work the new main.
-	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', 'main')"); err != nil {
-		return fmt.Errorf("delete old main: %w (compact-work preserved for recovery)", err)
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-m', '%s', 'main')", workBranch)); err != nil {
-		return fmt.Errorf("rename work to main: %w", err)
-	}
-	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
-	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')"); err != nil {
-		return fmt.Errorf("checkout new main: %w", err)
 	}
 
 	finalCount, _ := d.compactorCountCommits(dbName)
@@ -552,6 +563,8 @@ func (d *Daemon) surgicalCleanup(db *sql.DB, baseBranch, workBranch string) {
 	_, _ = db.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')")
 	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", workBranch))
 	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
+	// Clean Dolt's internal rebase branch (left behind on abort).
+	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", doltRebaseMainBranch))
 }
 
 // surgicalAbortAndCleanup aborts an in-progress rebase, then cleans up.
@@ -562,6 +575,8 @@ func (d *Daemon) surgicalAbortAndCleanup(db *sql.DB, baseBranch, workBranch stri
 	_, _ = db.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')")
 	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", workBranch))
 	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
+	// Clean Dolt's internal rebase branch (left behind on abort).
+	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", doltRebaseMainBranch))
 }
 
 // parseRebaseOrder2 parses min/max rebase_order DECIMAL strings to ints.
@@ -577,13 +592,6 @@ func parseRebaseOrder2(minStr, maxStr string) (int, int, error) {
 		return 0, 0, fmt.Errorf("invalid max rebase_order %q: %w", maxStr, err)
 	}
 	return int(math.Round(minF)), int(math.Round(maxF)), nil
-}
-
-// surgicalCleanupBase removes only the base branch (work branch not yet created).
-func (d *Daemon) surgicalCleanupBase(db *sql.DB, baseBranch string) {
-	ctx, cancel := context.WithTimeout(context.Background(), compactorQueryTimeout)
-	defer cancel()
-	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
 }
 
 // compactorCleanup attempts to switch back to main and delete the temp branch.

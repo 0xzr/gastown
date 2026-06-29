@@ -30,20 +30,19 @@ Unlike 'gt dolt flatten' (which destroys ALL history), surgical rebase
 keeps recent commits individual while squashing old history into one.
 
 Algorithm (based on Dolt's DOLT_REBASE):
-  1. Creates anchor branch at root commit
-  2. Creates work branch from main
-  3. Starts interactive rebase — populates dolt_rebase table
-  4. Marks old commits as 'squash', keeps recent N as 'pick'
-  5. Executes the rebase plan
-  6. Swaps branches: work becomes the new main
-  7. Cleans up temporary branches
-  8. Runs GC to reclaim space
+  1. Starts interactive rebase directly on main — populates dolt_rebase table
+  2. Marks old commits as 'squash', keeps recent N as 'pick'
+  3. Executes the rebase plan (atomically updates refs/heads/main)
+  4. Verifies row-count integrity
+  5. Cleans up temporary branches
 
-WARNING: DOLT_REBASE is NOT safe with concurrent writes. If agents are
-actively committing to this database, the rebase may fail with a graph-change
-error. The Compactor Dog (daemon) has automatic retry logic for this case.
-For manual use, re-run the command if it fails due to concurrent writes.
-Flatten mode (gt dolt flatten) is safe with concurrent writes.
+CONCURRENT-WRITE SAFETY: the rebase runs in place on main — there is no
+destructive branch swap, so there is no TOCTOU window. DOLT_REBASE('--continue')
+atomically updates refs/heads/main and fail-closes ("rebase aborted due to
+changes in branch main") if an agent commits to this database mid-rebase; the
+concurrent commit is preserved, not lost. Re-run the command if it fails due
+to concurrent writes. Flatten mode (gt dolt flatten) is also safe with
+concurrent writes.
 
 Use --keep-recent to control how many recent commits to preserve.
 Use --dry-run to see the plan without executing it.
@@ -99,6 +98,25 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
+	// Pin the pool to a single connection. The interactive rebase plan lives
+	// in the session-scoped `dolt_rebase` system table, so every plan mutation
+	// (start, UPDATE action='squash', --continue) MUST run on the SAME
+	// connection. SetMaxOpenConns(1) guarantees the sql.DB hands out one
+	// underlying conn for every ExecContext/QueryRowContext below — without
+	// it, the driver may round-robin to a fresh conn and `dolt_rebase` looks
+	// empty, causing the rebase to no-op or fail.
+	//
+	// This also closes the TOCTOU window: there is no destructive
+	// `DOLT_BRANCH -D main` + `-m compact-work → main` swap in this flow.
+	// DOLT_REBASE('--continue') atomically updates refs/heads/main and
+	// fail-closes ("rebase aborted due to changes in branch main") if a
+	// concurrent writer advances main mid-rebase — no application-level
+	// interlock or per-user Dolt provisioning required.
+	// (gastown-5nz retro-bug P0; empirically verified against Dolt 2.1.8.)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
@@ -136,13 +154,16 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 		fmt.Printf("    %s: %d rows\n", table, count)
 	}
 
-	// Get HEAD hash for concurrency check (informational — authoritative
-	// preHead is re-recorded AFTER interlock acquisition below).
+	// Record pre-flight HEAD for the log. The authoritative concurrent-write
+	// gate is now Dolt itself: DOLT_REBASE('--continue') fail-closes with
+	// "rebase aborted due to changes in branch main" if main advanced during
+	// the rebase. preHead is informational only (no destructive swap to guard).
 	preHead, err := flattenGetHead(db, dbName)
 	if err != nil {
 		return fmt.Errorf("getting HEAD: %w", err)
 	}
 	fmt.Printf("  HEAD: %s\n", preHead[:12])
+	_ = preHead
 
 	// Get root commit.
 	var rootHash string
@@ -156,91 +177,41 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("use database: %w", err)
 	}
 
-	const baseBranch = "compact-base"
-	const workBranch = "compact-work"
-
-	// Clean up any leftover branches from a previous failed run.
-	// Runs BEFORE the interlock — the rebase session must already have
-	// permission on main for DOLT_CHECKOUT('main') to succeed. The
-	// interlock only tightens the per-DB grants below; the deployment's
-	// pre-existing gtrebase admin grant on main covers this cleanup.
-	rebaseCleanup(db, baseBranch, workBranch)
+	// Clean up any leftover branches from a previous failed run. This
+	// covers both the legacy compact-base/compact-work names AND the
+	// internal dolt_rebase_main branch Dolt creates during an interactive
+	// rebase. dolt_rebase_main is auto-deleted on a SUCCESSFUL --continue
+	// but is NOT auto-cleaned when the rebase aborts (e.g. concurrent-write
+	// abort), so a failed prior run can leave it behind and block the next
+	// `DOLT_REBASE('--interactive')` with "A branch named 'dolt_rebase_main'
+	// already exists".
+	rebaseCleanup(db, "compact-base", "compact-work")
 
 	fmt.Printf("\n%s Starting surgical rebase...\n", style.Bold.Render("●"))
 
-	// Step 2.5: Acquire dolt_branch_control-based global writer interlock
-	// BEFORE creating compact-work. Closes the TOCTOU window in the
-	// destructive main swap (gastown-d88 / gastown-5nz retro-bug P0).
-	//
-	// ORDER MATTERS: the previous revision acquired the interlock AFTER
-	// compact-work was forked from main. A concurrent writer that advanced
-	// main between the fork and the interlock acquisition would cause
-	// compact-work to miss the intervening commits, which the swap would
-	// then discard. By acquiring the interlock first and forking
-	// compact-work from main AFTER, we guarantee main is frozen at the
-	// fork moment — no commit can be added behind our back.
-	interlockSnapshot, releaseInterlock, err := acquireRebaseInterlock(ctx, db, dbName)
-	if err != nil {
-		rebaseCleanupAll(db, baseBranch, workBranch)
-		return fmt.Errorf("acquire rebase interlock: %w", err)
+	// Ensure we are on main before starting the rebase. The interactive
+	// rebase rebases the CURRENT branch onto the given base; running it on
+	// main is what makes Dolt atomically update refs/heads/main on
+	// --continue (the in-place primitive that eliminates the TOCTOU window).
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')"); err != nil {
+		return fmt.Errorf("checkout main before rebase: %w", err)
 	}
-	defer func() {
-		if rerr := releaseInterlock(); rerr != nil {
-			fmt.Printf("  %s WARNING: failed to release rebase interlock: %v\n",
-				style.Bold.Render("!"), rerr)
-		}
-	}()
-	fmt.Printf("  Writer interlock acquired (dolt_branch_control: main=read except this session=admin)\n")
 
-	// Re-record preHead NOW (post-acquire, authoritative). This is the hash
-	// that compact-work is about to be forked from and that we will compare
-	// against immediately before the destructive swap.
-	preHead, err = flattenGetHead(db, dbName)
-	if err != nil {
-		rebaseCleanupAll(db, baseBranch, workBranch)
-		return fmt.Errorf("re-record HEAD after interlock: %w", err)
-	}
-	fmt.Printf("  HEAD (post-interlock, authoritative): %s\n", preHead[:12])
-	_ = interlockSnapshot // currently used only for logging; snapshot is restored by releaseInterlock
-
-	// Step 1: Create anchor branch at root commit. Safe under interlock —
-	// we have admin on main and the destination branch is a brand-new ref.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('%s', '%s')", baseBranch, rootHash)); err != nil {
-		return fmt.Errorf("create base branch at root: %w", err)
-	}
-	fmt.Printf("  Created %s at root %s\n", baseBranch, rootHash[:12])
-
-	// Step 2: Create work branch from main. SAFE: main is locked to our
-	// session-only admin grant — no other writer can advance it between
-	// here and the swap. Belt-and-suspenders: verify the fork base matches
-	// preHead (it MUST, since we just acquired admin and re-recorded
-	// preHead, but the explicit check documents the invariant and surfaces
-	// any Dolt internal caching weirdness).
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('%s', 'main')", workBranch)); err != nil {
-		rebaseCleanupBase(db, baseBranch)
-		return fmt.Errorf("create work branch from main: %w", err)
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_CHECKOUT('%s')", workBranch)); err != nil {
-		rebaseCleanupAll(db, baseBranch, workBranch)
-		return fmt.Errorf("checkout work branch: %w", err)
-	}
-	if err := verifyMainHeadUnchanged(ctx, db, dbName, preHead); err != nil {
-		rebaseCleanupAll(db, baseBranch, workBranch)
-		return fmt.Errorf("post-fork HEAD verify: %w", err)
-	}
-	fmt.Printf("  Created %s from main, checked out (post-fork HEAD verify OK)\n", workBranch)
-
-	// Step 3: Start interactive rebase — populates dolt_rebase system table.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_REBASE('--interactive', '%s')", baseBranch)); err != nil {
-		rebaseCleanupAll(db, baseBranch, workBranch)
+	// Step 1: Start interactive rebase directly on main against the root
+	// commit. Dolt creates an internal `dolt_rebase_main` branch, switches
+	// onto it, and populates the session-scoped `dolt_rebase` plan table.
+	// No compact-base / compact-work fork is created — there is no
+	// destructive branch swap to race against a concurrent writer.
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_REBASE('--interactive', '%s')", rootHash)); err != nil {
+		rebaseAbortAndCleanup(db, "compact-base", "compact-work")
 		return fmt.Errorf("start interactive rebase: %w", err)
 	}
-	fmt.Printf("  Interactive rebase started (dolt_rebase table populated)\n")
+	fmt.Printf("  Interactive rebase started on main (dolt_rebase table populated)\n")
 
-	// Step 4: Inspect the rebase plan.
+	// Step 2: Inspect the rebase plan.
 	var totalPlan int
 	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_rebase").Scan(&totalPlan); err != nil {
-		rebaseAbortAndCleanup(db, baseBranch, workBranch)
+		rebaseAbortAndCleanup(db, "compact-base", "compact-work")
 		return fmt.Errorf("counting rebase entries: %w", err)
 	}
 	fmt.Printf("  Rebase plan: %d commits\n", totalPlan)
@@ -251,12 +222,12 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	// Scan as string, parse to float, then truncate to int.
 	var minOrderStr, maxOrderStr string
 	if err := db.QueryRowContext(ctx, "SELECT MIN(rebase_order), MAX(rebase_order) FROM dolt_rebase").Scan(&minOrderStr, &maxOrderStr); err != nil {
-		rebaseAbortAndCleanup(db, baseBranch, workBranch)
+		rebaseAbortAndCleanup(db, "compact-base", "compact-work")
 		return fmt.Errorf("getting rebase order range: %w", err)
 	}
 	minOrder, maxOrder, err := parseRebaseOrderRange(minOrderStr, maxOrderStr)
 	if err != nil {
-		rebaseAbortAndCleanup(db, baseBranch, workBranch)
+		rebaseAbortAndCleanup(db, "compact-base", "compact-work")
 		return fmt.Errorf("parsing rebase order range: %w", err)
 	}
 
@@ -271,7 +242,7 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 
 	if toSquash == 0 {
 		fmt.Printf("  %s Nothing to squash — all commits are recent\n", style.Bold.Render("✓"))
-		rebaseAbortAndCleanup(db, baseBranch, workBranch)
+		rebaseAbortAndCleanup(db, "compact-base", "compact-work")
 		return nil
 	}
 
@@ -280,7 +251,7 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 		fmt.Printf("\n%s Dry-run rebase plan:\n", style.Bold.Render("●"))
 		rows, err := db.QueryContext(ctx, "SELECT rebase_order, action, commit_hash, commit_message FROM dolt_rebase ORDER BY rebase_order")
 		if err != nil {
-			rebaseAbortAndCleanup(db, baseBranch, workBranch)
+			rebaseAbortAndCleanup(db, "compact-base", "compact-work")
 			return fmt.Errorf("reading rebase plan: %w", err)
 		}
 		defer rows.Close()
@@ -310,80 +281,46 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 
 		fmt.Printf("\n  Would squash %d commits, keep %d recent + 1 root pick\n",
 			toSquash, doltRebaseKeepRecent)
-		rebaseAbortAndCleanup(db, baseBranch, workBranch)
+		rebaseAbortAndCleanup(db, "compact-base", "compact-work")
 		return nil
 	}
 
-	// Step 5: Modify the plan — mark old commits as squash.
+	// Step 3: Modify the plan — mark old commits as squash.
 	// First commit (minOrder) MUST stay 'pick' — squash needs a parent to fold into.
 	// Keep last N commits as 'pick'.
 	result, err := db.ExecContext(ctx, fmt.Sprintf(
 		"UPDATE dolt_rebase SET action = 'squash' WHERE rebase_order > %d AND rebase_order <= %d",
 		minOrder, squashThreshold))
 	if err != nil {
-		rebaseAbortAndCleanup(db, baseBranch, workBranch)
+		rebaseAbortAndCleanup(db, "compact-base", "compact-work")
 		return fmt.Errorf("updating rebase plan: %w", err)
 	}
 	affected, _ := result.RowsAffected()
 	fmt.Printf("  Marked %d commits as squash\n", affected)
 
-	// Step 6: Execute the rebase plan.
+	// Step 4: Execute the rebase plan. DOLT_REBASE('--continue') atomically
+	// updates refs/heads/main, switches back to main, and deletes the
+	// internal dolt_rebase_main branch. If a concurrent writer advanced
+	// main between the rebase start and here, Dolt fail-closes with
+	// "rebase aborted due to changes in branch main" — no data is lost and
+	// the concurrent commit remains on main. No swap, no TOCTOU window.
 	fmt.Printf("  Executing rebase (this may take a while)...\n")
 	if _, err := db.ExecContext(ctx, "CALL DOLT_REBASE('--continue')"); err != nil {
-		// Rebase failed — conflicts cause automatic abort.
-		rebaseCleanupAll(db, baseBranch, workBranch)
-		return fmt.Errorf("rebase execution failed (possible conflicts — automatic abort): %w", err)
+		// Rebase aborted (concurrent-write abort or conflicts). Dolt has
+		// already rolled back to main; clean up any residual branch.
+		rebaseAbortAndCleanup(db, "compact-base", "compact-work")
+		return fmt.Errorf("rebase execution failed (possible concurrent write or conflicts — automatic abort): %w", err)
 	}
-	fmt.Printf("  %s Rebase executed successfully\n", style.Bold.Render("✓"))
+	fmt.Printf("  %s Rebase executed successfully — refs/heads/main updated atomically\n", style.Bold.Render("✓"))
 
-	// Step 7: Concurrency check — verify main hasn't moved.
-	// First defense: working-set-CAS-style re-verify. With the interlock
-	// in place, this is the authoritative gate for any in-flight writer
-	// that completed during the rebase execution.
-	currentHead, err := flattenGetHead(db, dbName)
-	if err != nil {
-		rebaseCleanupAll(db, baseBranch, workBranch)
-		return fmt.Errorf("concurrency check: %w", err)
-	}
-	if currentHead != preHead {
-		rebaseCleanupAll(db, baseBranch, workBranch)
-		return fmt.Errorf("ABORT: main HEAD moved during rebase (%s → %s)", shortHash(preHead), shortHash(currentHead))
-	}
-
-	// Second defense: verify against the preHead we re-recorded AFTER the
-	// interlock acquisition. Belt-and-suspenders so any drift during the
-	// rebase execution is caught even if the original preHead capture was
-	// stale by the time we got here.
-	if err := verifyMainHeadUnchanged(ctx, db, dbName, preHead); err != nil {
-		rebaseCleanupAll(db, baseBranch, workBranch)
-		return fmt.Errorf("post-rebase HEAD verify: %w", err)
-	}
-
-	// Step 8: Swap branches — make compact-work the new main.
-	// We're already on compact-work from the rebase.
-	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', 'main')"); err != nil {
-		// Can't delete main — leave compact-work in place for manual recovery.
-		return fmt.Errorf("delete old main: %w (compact-work branch preserved for manual recovery)", err)
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-m', '%s', 'main')", workBranch)); err != nil {
-		return fmt.Errorf("rename work branch to main: %w", err)
-	}
-	// Delete the base branch.
-	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
-	// Checkout main.
-	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')"); err != nil {
-		return fmt.Errorf("checkout new main: %w", err)
-	}
-	fmt.Printf("  Branch swap complete — compact-work is now main\n")
-
-	// Step 9: Verify integrity — row counts must match pre-flight.
-	// This runs AFTER the branch swap so we're reading from the new main,
-	// not from compact-work (which may have different table visibility during rebase).
+	// Step 5: Verify integrity — row counts must match pre-flight. main is
+	// already the rebased history (no separate swap), so this reads the
+	// final state directly.
 	postCounts, err := flattenGetRowCounts(db, dbName)
 	if err != nil {
 		fmt.Printf("  %s WARNING: could not verify row counts after rebase: %v\n",
 			style.Bold.Render("!"), err)
-		fmt.Printf("  Branch swap already complete — verify manually with 'gt dolt status'\n")
+		fmt.Printf("  Verify manually with 'gt dolt status'\n")
 	} else {
 		integrityOK := true
 		for table, preCount := range preCounts {
@@ -416,6 +353,13 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// doltRebaseMainBranch is the internal branch Dolt creates when an
+// interactive rebase is started on `main`. It is auto-deleted on a
+// successful `DOLT_REBASE('--continue')` but NOT on an abort, so failed
+// runs leave it behind and block the next rebase with
+// "A branch named 'dolt_rebase_main' already exists".
+const doltRebaseMainBranch = "dolt_rebase_main"
+
 // rebaseCleanup removes leftover branches from a previous failed rebase.
 func rebaseCleanup(db *sql.DB, baseBranch, workBranch string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -424,6 +368,8 @@ func rebaseCleanup(db *sql.DB, baseBranch, workBranch string) {
 	_, _ = db.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')")
 	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", workBranch))
 	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
+	// Clean Dolt's internal rebase branch (left behind on abort).
+	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", doltRebaseMainBranch))
 }
 
 // rebaseAbortAndCleanup aborts an in-progress rebase then cleans up branches.
@@ -436,13 +382,8 @@ func rebaseAbortAndCleanup(db *sql.DB, baseBranch, workBranch string) {
 	_, _ = db.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')")
 	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", workBranch))
 	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
-}
-
-// rebaseCleanupAll cleans up both branches after a failed rebase.
-//
-//nolint:unparam // baseBranch always "compact-base" — API kept flexible for future callers
-func rebaseCleanupAll(db *sql.DB, baseBranch, workBranch string) {
-	rebaseCleanup(db, baseBranch, workBranch)
+	// Clean Dolt's internal rebase branch (left behind on abort).
+	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", doltRebaseMainBranch))
 }
 
 // parseRebaseOrder converts a rebase_order value (returned by Dolt as DECIMAL
@@ -466,11 +407,4 @@ func parseRebaseOrderRange(minStr, maxStr string) (int, int, error) {
 		return 0, 0, err
 	}
 	return minVal, maxVal, nil
-}
-
-// rebaseCleanupBase cleans up only the base branch (work branch not yet created).
-func rebaseCleanupBase(db *sql.DB, baseBranch string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
 }
