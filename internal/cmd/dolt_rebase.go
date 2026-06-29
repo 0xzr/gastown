@@ -136,7 +136,8 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 		fmt.Printf("    %s: %d rows\n", table, count)
 	}
 
-	// Get HEAD hash for concurrency check.
+	// Get HEAD hash for concurrency check (informational — authoritative
+	// preHead is re-recorded AFTER interlock acquisition below).
 	preHead, err := flattenGetHead(db, dbName)
 	if err != nil {
 		return fmt.Errorf("getting HEAD: %w", err)
@@ -159,17 +160,62 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	const workBranch = "compact-work"
 
 	// Clean up any leftover branches from a previous failed run.
+	// Runs BEFORE the interlock — the rebase session must already have
+	// permission on main for DOLT_CHECKOUT('main') to succeed. The
+	// interlock only tightens the per-DB grants below; the deployment's
+	// pre-existing gtrebase admin grant on main covers this cleanup.
 	rebaseCleanup(db, baseBranch, workBranch)
 
 	fmt.Printf("\n%s Starting surgical rebase...\n", style.Bold.Render("●"))
 
-	// Step 1: Create anchor branch at root commit.
+	// Step 2.5: Acquire dolt_branch_control-based global writer interlock
+	// BEFORE creating compact-work. Closes the TOCTOU window in the
+	// destructive main swap (gastown-d88 / gastown-5nz retro-bug P0).
+	//
+	// ORDER MATTERS: the previous revision acquired the interlock AFTER
+	// compact-work was forked from main. A concurrent writer that advanced
+	// main between the fork and the interlock acquisition would cause
+	// compact-work to miss the intervening commits, which the swap would
+	// then discard. By acquiring the interlock first and forking
+	// compact-work from main AFTER, we guarantee main is frozen at the
+	// fork moment — no commit can be added behind our back.
+	interlockSnapshot, releaseInterlock, err := acquireRebaseInterlock(ctx, db, dbName)
+	if err != nil {
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("acquire rebase interlock: %w", err)
+	}
+	defer func() {
+		if rerr := releaseInterlock(); rerr != nil {
+			fmt.Printf("  %s WARNING: failed to release rebase interlock: %v\n",
+				style.Bold.Render("!"), rerr)
+		}
+	}()
+	fmt.Printf("  Writer interlock acquired (dolt_branch_control: main=read except this session=admin)\n")
+
+	// Re-record preHead NOW (post-acquire, authoritative). This is the hash
+	// that compact-work is about to be forked from and that we will compare
+	// against immediately before the destructive swap.
+	preHead, err = flattenGetHead(db, dbName)
+	if err != nil {
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("re-record HEAD after interlock: %w", err)
+	}
+	fmt.Printf("  HEAD (post-interlock, authoritative): %s\n", preHead[:12])
+	_ = interlockSnapshot // currently used only for logging; snapshot is restored by releaseInterlock
+
+	// Step 1: Create anchor branch at root commit. Safe under interlock —
+	// we have admin on main and the destination branch is a brand-new ref.
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('%s', '%s')", baseBranch, rootHash)); err != nil {
 		return fmt.Errorf("create base branch at root: %w", err)
 	}
 	fmt.Printf("  Created %s at root %s\n", baseBranch, rootHash[:12])
 
-	// Step 2: Create work branch from main.
+	// Step 2: Create work branch from main. SAFE: main is locked to our
+	// session-only admin grant — no other writer can advance it between
+	// here and the swap. Belt-and-suspenders: verify the fork base matches
+	// preHead (it MUST, since we just acquired admin and re-recorded
+	// preHead, but the explicit check documents the invariant and surfaces
+	// any Dolt internal caching weirdness).
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('%s', 'main')", workBranch)); err != nil {
 		rebaseCleanupBase(db, baseBranch)
 		return fmt.Errorf("create work branch from main: %w", err)
@@ -178,7 +224,11 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 		rebaseCleanupAll(db, baseBranch, workBranch)
 		return fmt.Errorf("checkout work branch: %w", err)
 	}
-	fmt.Printf("  Created %s from main, checked out\n", workBranch)
+	if err := verifyMainHeadUnchanged(ctx, db, dbName, preHead); err != nil {
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("post-fork HEAD verify: %w", err)
+	}
+	fmt.Printf("  Created %s from main, checked out (post-fork HEAD verify OK)\n", workBranch)
 
 	// Step 3: Start interactive rebase — populates dolt_rebase system table.
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_REBASE('--interactive', '%s')", baseBranch)); err != nil {
@@ -287,6 +337,9 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  %s Rebase executed successfully\n", style.Bold.Render("✓"))
 
 	// Step 7: Concurrency check — verify main hasn't moved.
+	// First defense: working-set-CAS-style re-verify. With the interlock
+	// in place, this is the authoritative gate for any in-flight writer
+	// that completed during the rebase execution.
 	currentHead, err := flattenGetHead(db, dbName)
 	if err != nil {
 		rebaseCleanupAll(db, baseBranch, workBranch)
@@ -295,6 +348,15 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	if currentHead != preHead {
 		rebaseCleanupAll(db, baseBranch, workBranch)
 		return fmt.Errorf("ABORT: main HEAD moved during rebase (%s → %s)", shortHash(preHead), shortHash(currentHead))
+	}
+
+	// Second defense: verify against the preHead we re-recorded AFTER the
+	// interlock acquisition. Belt-and-suspenders so any drift during the
+	// rebase execution is caught even if the original preHead capture was
+	// stale by the time we got here.
+	if err := verifyMainHeadUnchanged(ctx, db, dbName, preHead); err != nil {
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("post-rebase HEAD verify: %w", err)
 	}
 
 	// Step 8: Swap branches — make compact-work the new main.
