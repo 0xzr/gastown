@@ -11,6 +11,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/doltserver"
+	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -65,6 +66,13 @@ func init() {
 
 func runDoltRebase(cmd *cobra.Command, args []string) error {
 	dbName := args[0]
+
+	// Trust boundary: dbName comes straight from a CLI arg and is interpolated
+	// unescaped into backtick-quoted identifiers (`%s`) throughout rebase.
+	// Reject before touching the DSN (gastown-wes).
+	if err := reaper.ValidateDBName(dbName); err != nil {
+		return err
+	}
 
 	if !doltRebaseConfirm && !doltRebaseDryRun {
 		return fmt.Errorf("this command rewrites commit history. Pass --yes-i-am-sure to proceed (or --dry-run to preview)")

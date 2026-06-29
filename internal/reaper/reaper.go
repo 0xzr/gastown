@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -163,10 +164,24 @@ const (
 	DefaultAlertThreshold = 800
 )
 
-// ValidateDBName returns an error if the database name is unsafe.
+// ErrInvalidDBName is returned by ValidateDBName when a database name contains
+// characters outside the safe [a-zA-Z0-9_-] set. It is a typed error so callers
+// (and tests) at trust boundaries can distinguish a rejected name from other
+// failures. Database names originate from untrusted sources (CLI args, server
+// SHOW DATABASES, daemon config) and are interpolated into SQL identifiers
+// (`%s`) and string literals ('%s'); a name carrying ` -- ; or ' breaks out of
+// the surrounding quotes and permits SQL injection (gastown-wes).
+var ErrInvalidDBName = errors.New("invalid database name")
+
+// ValidateDBName returns ErrInvalidDBName (wrapping a descriptive message) if
+// the database name is unsafe — i.e. contains anything outside [a-zA-Z0-9_-].
+// It is the single canonical trust-boundary guard for database names that are
+// later interpolated into SQL. Call it once at the boundary where an untrusted
+// name enters the system (CLI arg parse, server-discovered list, config load),
+// NOT at each fmt.Sprintf — a missed callsite is a vulnerability.
 func ValidateDBName(dbName string) error {
 	if !validDBName.MatchString(dbName) {
-		return fmt.Errorf("invalid database name: %q", dbName)
+		return fmt.Errorf("%w: %q", ErrInvalidDBName, dbName)
 	}
 	return nil
 }

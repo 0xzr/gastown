@@ -129,7 +129,7 @@ func runWLStamps(cmd *cobra.Command, args []string) error {
 			Severity:    wlStampsSeverity,
 			Limit:       wlStampsLimit,
 		})
-		serverQuery := fmt.Sprintf("USE %s; %s", dbName, query)
+		serverQuery := fmt.Sprintf("USE `%s`; %s", dbName, query)
 
 		if wlStampsJSON {
 			output, err := doltserver.QueryJSON(townRoot, serverQuery)

@@ -14,6 +14,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/doltserver"
+	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -289,6 +290,13 @@ func maintainBackupSync(dataDir, dbName, backupName string) error {
 
 // maintainOpenDB opens a connection to the Dolt server for a database.
 func maintainOpenDB(config *doltserver.Config, dbName string) (*sql.DB, error) {
+	// Defense in depth: dbName is server-discovered (SHOW DATABASES) and then
+	// interpolated unescaped into backtick-quoted identifiers (`%s`) and string
+	// literals ('%s') by maintainCountCommits/maintainFlattenDB. Validate at this
+	// chokepoint so every maintain caller is covered (gastown-wes).
+	if err := reaper.ValidateDBName(dbName); err != nil {
+		return nil, err
+	}
 	// wa-d6f: socket-first DSN (TCP fallback) to avoid TIME_WAIT churn from
 	// short-lived gt maintain invocations.
 	dsn := buildDoltDSNFromConfig(config, dbName, dsnOpts{

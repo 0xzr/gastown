@@ -70,7 +70,7 @@ func runWLBrowse(cmd *cobra.Command, args []string) error {
 			Priority: wlBrowsePriority,
 			Limit:    wlBrowseLimit,
 		})
-		serverQuery := fmt.Sprintf("USE %s; %s", dbName, query)
+		serverQuery := fmt.Sprintf("USE `%s`; %s", dbName, query)
 
 		if wlBrowseJSON {
 			output, err := doltserver.QueryJSON(townRoot, serverQuery)

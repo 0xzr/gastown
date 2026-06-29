@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -44,8 +45,8 @@ var testPollutionPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`-wisp-`),                               // id: wisp-pattern IDs leaked into issues table
 }
 
-// validDBName matches safe database names (alphanumeric, underscore, hyphen).
-var validDBName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+// validDBName has been removed in favor of the canonical reaper.ValidateDBName
+// to avoid a second source of truth for the database-name allowlist (gastown-wes).
 
 // scrubQuery is the WHERE clause for filtering ephemeral data.
 // Kept separate from Sprintf to avoid %% confusion.
@@ -228,8 +229,12 @@ var supplementalTables = []string{
 //
 // Returns the total number of records exported across all tables.
 func (d *Daemon) exportDatabaseToJsonl(db, gitRepo, dataDir string, scrub bool) (int, error) {
-	if !validDBName.MatchString(db) {
-		return 0, fmt.Errorf("invalid database name: %q", db)
+	// db is interpolated unescaped into backtick-quoted SQL identifiers (`db`.issues)
+	// and used as a filesystem path component. Use the canonical reaper validator
+	// (rejects path traversal and SQL metacharacters alike) instead of the local
+	// duplicate (gastown-wes).
+	if err := reaper.ValidateDBName(db); err != nil {
+		return 0, err
 	}
 
 	// Create per-database subdirectory.
