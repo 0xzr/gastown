@@ -28,6 +28,14 @@ func newTestTmux(t *testing.T) *Tmux {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
 	}
+	// If TestMain could not bring the shared server up (after retries), skip
+	// with a clear reason rather than letting the first tmux operation fail
+	// with a spurious "no server running" that rejects unrelated MRs in the
+	// gate (gastown-e6n). On the green path testServerErr is nil and this is a
+	// no-op.
+	if testServerErr != nil {
+		t.Skipf("shared tmux server unavailable: %v", testServerErr)
+	}
 	return NewTmux()
 }
 
