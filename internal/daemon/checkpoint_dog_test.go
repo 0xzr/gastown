@@ -257,6 +257,66 @@ func checkpointHeadMessage(t *testing.T, workDir string) string {
 	return runCheckpointCmd(t, workDir, "git", "log", "-1", "--format=%s")
 }
 
+func TestIsProtectedCheckpointBranch_FailClosedOnUnreachableDefault(t *testing.T) {
+	// When the remote default branch cannot be resolved (no origin or the
+	// remote HEAD ref is missing), isProtectedCheckpointBranch must treat the
+	// current branch as protected so a WIP checkpoint cannot land on what
+	// might be the default branch.
+	tmp := t.TempDir()
+	runCheckpointCmd(t, tmp, "git", "init", "--initial-branch=main", "repo")
+	workDir := filepath.Join(tmp, "repo")
+	runCheckpointCmd(t, workDir, "git", "config", "user.email", "test@test.com")
+	runCheckpointCmd(t, workDir, "git", "config", "user.name", "Test")
+	checkpointWriteFile(t, workDir, "README.md", "# Test\n")
+	runCheckpointCmd(t, workDir, "git", "add", ".")
+	runCheckpointCmd(t, workDir, "git", "commit", "-m", "initial commit")
+
+	if !isProtectedCheckpointBranch(workDir, "main") {
+		t.Error("expected main to be protected when default branch is unreachable")
+	}
+}
+
+func TestIsProtectedCheckpointBranch_ResolvesRemoteDefault(t *testing.T) {
+	// With a properly configured remote, only the resolved default branch is
+	// protected; feature branches remain unprotected.
+	workDir, _ := checkpointTestRepo(t)
+
+	if !isProtectedCheckpointBranch(workDir, "main") {
+		t.Error("expected main to be protected")
+	}
+
+	runCheckpointCmd(t, workDir, "git", "checkout", "-b", "feature/test")
+	if isProtectedCheckpointBranch(workDir, "feature/test") {
+		t.Error("expected feature branch to be unprotected")
+	}
+}
+
+func TestCheckpointWorktree_UnreachableDefaultBranch_RefusesCommit(t *testing.T) {
+	// If the default branch cannot be resolved, checkpointWorktree must refuse
+	// to commit even when the worktree is on a branch named "main".
+	tmp := t.TempDir()
+	runCheckpointCmd(t, tmp, "git", "init", "--initial-branch=main", "repo")
+	workDir := filepath.Join(tmp, "repo")
+	runCheckpointCmd(t, workDir, "git", "config", "user.email", "test@test.com")
+	runCheckpointCmd(t, workDir, "git", "config", "user.name", "Test")
+	checkpointWriteFile(t, workDir, "README.md", "# Test\n")
+	runCheckpointCmd(t, workDir, "git", "add", ".")
+	runCheckpointCmd(t, workDir, "git", "commit", "-m", "initial commit")
+
+	// Dirty the worktree while there is no remote/default branch to resolve.
+	checkpointWriteFile(t, workDir, "feature.go", "package main\n")
+
+	d := &Daemon{logger: log.New(os.Stdout, "", 0)}
+	if d.checkpointWorktree(workDir, "gastown", "opal") {
+		t.Error("expected checkpointWorktree to refuse commit when default branch is unreachable")
+	}
+
+	// The local main branch must not have received the WIP commit.
+	if msg := checkpointHeadMessage(t, workDir); msg != "initial commit" {
+		t.Errorf("main was polluted by WIP commit; got message %q", msg)
+	}
+}
+
 func TestCheckpointWorktree_OnDefaultBranch_LandsOnWIPBranch(t *testing.T) {
 	workDir, polecatName := checkpointTestRepo(t)
 
