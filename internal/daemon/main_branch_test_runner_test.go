@@ -105,6 +105,37 @@ func TestIsPatrolEnabledMainBranchTest(t *testing.T) {
 	}
 }
 
+// TestMainBranchTestRunnableGate locks in the phase-filter contract for the
+// main-branch test runner. The retro-audit of tree a652f49c… flagged the
+// missing phase-field parsing as a P0; this test is the direct regression
+// guard for mainBranchTestRunnableGate so future refactors cannot silently
+// drop the filter or weaken its handling of pre-merge / post-squash /
+// unknown / whitespace / case variants.
+func TestMainBranchTestRunnableGate(t *testing.T) {
+	cases := []struct {
+		name  string
+		phase string
+		want  bool
+	}{
+		{"empty defaults to runnable (pre-merge)", "", true},
+		{"explicit pre-merge is runnable", "pre-merge", true},
+		{"post-squash is filtered out", "post-squash", false},
+		{"uppercase post-squash is filtered", "POST-SQUASH", false},
+		{"mixed-case Post-Squash is filtered", "Post-Squash", false},
+		{"whitespace around post-squash is filtered", "  post-squash  ", false},
+		{"whitespace + uppercase post-squash is filtered", "\tPOST-SQUASH\n", false},
+		{"unknown phase is left runnable (no false reject)", "mid-cycle", true},
+		{"single space is runnable", " ", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mainBranchTestRunnableGate(tc.phase); got != tc.want {
+				t.Errorf("mainBranchTestRunnableGate(%q) = %v, want %v", tc.phase, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadRigGateConfig(t *testing.T) {
 	t.Run("no config file", func(t *testing.T) {
 		cfg, err := loadRigGateConfig("/nonexistent/path")
@@ -280,6 +311,102 @@ func TestLoadRigGateConfig(t *testing.T) {
 		}
 		if cfg != nil {
 			t.Errorf("expected nil for no test commands, got %+v", cfg)
+		}
+	})
+
+	// Retro-bug P0 regression: loadRigGateConfig must parse the `phase` field
+	// out of each gate entry. If parsing is dropped (the audit finding for
+	// tree a652f49c…), every gate with a non-pre-merge phase ends up in the
+	// main-branch test set, re-entering the refinery review gate and
+	// producing false alerts. Lock in: a gate without a phase field is
+	// treated as pre-merge (runnable), and the JSON tag is wired to `Phase`.
+	t.Run("gate without phase field is runnable (default pre-merge)", func(t *testing.T) {
+		dir := t.TempDir()
+		data := map[string]interface{}{
+			"merge_queue": map[string]interface{}{
+				"gates": map[string]interface{}{
+					"build": map[string]interface{}{"cmd": "go build ./..."},
+				},
+			},
+		}
+		raw, _ := json.Marshal(data)
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadRigGateConfig(dir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("expected non-nil config")
+		}
+		if cfg.Gates["build"] != "go build ./..." {
+			t.Errorf("expected build gate retained when phase omitted, got %+v", cfg.Gates)
+		}
+	})
+
+	// The JSON tag for Phase is `phase` (lowercase). Verify the wire format
+	// is honored — if it were ever renamed/typo'd, this test catches it.
+	t.Run("phase field is parsed from JSON tag", func(t *testing.T) {
+		dir := t.TempDir()
+		data := map[string]interface{}{
+			"merge_queue": map[string]interface{}{
+				"gates": map[string]interface{}{
+					"build": map[string]interface{}{"cmd": "go build ./..."},
+					"review": map[string]interface{}{
+						"cmd":   "/tmp/refinery-gate.sh",
+						"phase": "post-squash",
+					},
+				},
+			},
+		}
+		raw, _ := json.Marshal(data)
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadRigGateConfig(dir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("expected non-nil config")
+		}
+		if _, hasReview := cfg.Gates["review"]; hasReview {
+			t.Errorf("post-squash review gate must be filtered, got %+v", cfg.Gates)
+		}
+		if cfg.Gates["build"] != "go build ./..." {
+			t.Errorf("expected build gate retained, got %+v", cfg.Gates)
+		}
+	})
+
+	// Phase is case- and whitespace-normalized via mainBranchTestRunnableGate.
+	// Lock in the normalization at the loadRigGateConfig layer too.
+	t.Run("phase is case- and whitespace-normalized", func(t *testing.T) {
+		dir := t.TempDir()
+		data := map[string]interface{}{
+			"merge_queue": map[string]interface{}{
+				"gates": map[string]interface{}{
+					"build": map[string]interface{}{"cmd": "go build ./..."},
+					"review": map[string]interface{}{
+						"cmd":   "/tmp/refinery-gate.sh",
+						"phase": "  POST-SQUASH  ",
+					},
+				},
+			},
+		}
+		raw, _ := json.Marshal(data)
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadRigGateConfig(dir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("expected non-nil config")
+		}
+		if _, hasReview := cfg.Gates["review"]; hasReview {
+			t.Errorf("normalized POST-SQUASH must be filtered, got %+v", cfg.Gates)
 		}
 	})
 }
