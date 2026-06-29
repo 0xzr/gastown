@@ -1070,3 +1070,83 @@ func containsString(items []string, want string) bool {
 	}
 	return false
 }
+
+type fakeActiveMRClearer struct {
+	err      error
+	id       string
+	activeMR string
+	calls    int
+}
+
+func (f *fakeActiveMRClearer) UpdateAgentActiveMR(id string, activeMR string) error {
+	f.calls++
+	f.id = id
+	f.activeMR = activeMR
+	return f.err
+}
+
+// TestReconcileRecoveryStatusIfReconciled verifies gastown-1gd: after cleanup
+// and active_mr reconciliation, the output disposition is re-derived from the
+// updated input so the final verdict, blockers, and active_mr field reflect the
+// reconciled state rather than the stale pre-reconcile state.
+func TestReconcileRecoveryStatusIfReconciled(t *testing.T) {
+	status := &RecoveryStatus{
+		Verdict:       "SAFE_TO_NUKE",
+		Branch:        "polecat/nitro",
+		MQStatus:      "not_required",
+		CleanupStatus: polecat.CleanupUnpushed,
+		ActiveMR:      "gt-mr",
+		activeMRAssessment: polecat.ActiveMRAssessment{
+			ActiveMR:     "gt-mr",
+			Stale:        true,
+			Reconcilable: true,
+			Pending:      false,
+		},
+	}
+	input := polecat.WorkstateInput{
+		State:              polecat.StateIdle,
+		CleanupStatus:      polecat.CleanupUnpushed,
+		Branch:             "polecat/nitro",
+		ActiveMR:           "gt-mr",
+		MQCheckRequired:    true,
+		HasSubmittableWork: false,
+	}
+
+	cleanupUpdater := &fakeCleanupUpdater{}
+	activeMRClearer := &fakeActiveMRClearer{}
+	fields := &beads.AgentFields{
+		AgentState:    string(beads.AgentStateIdle),
+		CleanupStatus: string(polecat.CleanupUnpushed),
+		ActiveMR:      "gt-mr",
+	}
+
+	reconcileRecoveryStatusIfReconciled(status, &input, cleanupUpdater, activeMRClearer, "gt-gastown-polecat-nitro", &polecat.Polecat{State: polecat.StateIdle}, fields)
+
+	if cleanupUpdater.calls != 1 {
+		t.Fatalf("UpdateAgentCleanupStatus calls = %d, want 1", cleanupUpdater.calls)
+	}
+	if activeMRClearer.calls != 1 {
+		t.Fatalf("UpdateAgentActiveMR calls = %d, want 1", activeMRClearer.calls)
+	}
+	if status.CleanupStatus != polecat.CleanupClean {
+		t.Fatalf("status.CleanupStatus = %q, want clean", status.CleanupStatus)
+	}
+	if status.ActiveMR != "" {
+		t.Fatalf("status.ActiveMR = %q, want empty", status.ActiveMR)
+	}
+	if !status.Reconciled {
+		t.Fatal("status.Reconciled = false, want true")
+	}
+	if status.Verdict != "SAFE_TO_NUKE" {
+		t.Fatalf("status.Verdict = %q, want SAFE_TO_NUKE", status.Verdict)
+	}
+	if len(status.Blockers) != 0 {
+		t.Fatalf("status.Blockers = %v, want empty", status.Blockers)
+	}
+	if input.CleanupStatus != polecat.CleanupClean {
+		t.Fatalf("input.CleanupStatus = %q, want clean", input.CleanupStatus)
+	}
+	if input.ActiveMR != "" {
+		t.Fatalf("input.ActiveMR = %q, want empty", input.ActiveMR)
+	}
+}

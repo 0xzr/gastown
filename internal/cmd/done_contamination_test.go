@@ -69,6 +69,41 @@ func TestCanonicalMergeTarget(t *testing.T) {
 	}
 }
 
+// TestValidateDefaultMergeTarget covers gastown-1gd: when the resolved target
+// is invalid and falls back to the configured default branch, the default
+// branch itself must be validated. An unsafe default (empty or equal to the
+// rig name) must surface a clear error rather than silently submitting an MR
+// to a bogus target.
+func TestValidateDefaultMergeTarget(t *testing.T) {
+	tests := []struct {
+		name          string
+		defaultBranch string
+		rigName       string
+		wantErr       bool
+	}{
+		{name: "normal default branch", defaultBranch: "main", rigName: "gastown"},
+		{name: "integration default branch", defaultBranch: "integration/gt-epic", rigName: "gastown"},
+		{name: "default equals rig name", defaultBranch: "gastown", rigName: "gastown", wantErr: true},
+		{name: "empty default branch", defaultBranch: "", rigName: "gastown", wantErr: true},
+		{name: "origin-prefixed rig name", defaultBranch: "origin/gastown", rigName: "gastown", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDefaultMergeTarget(tt.defaultBranch, tt.rigName)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("validateDefaultMergeTarget() = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateDefaultMergeTarget() = %v, want nil", err)
+			}
+		})
+	}
+}
+
 // TestIsValidMergeTarget covers hq-faz: gt done must never resolve the MR
 // target as the rig name itself (which would advertise an "<rig>/<rig>" MR).
 func TestIsValidMergeTarget(t *testing.T) {

@@ -3333,3 +3333,20 @@ func TestBranchPreservationStatus_RemoteSourceBranchMissing(t *testing.T) {
 		t.Error("UnpreservedPatchCount = 0, want > 0 (feature work not on main)")
 	}
 }
+
+// TestBranchPreservationStatus_NetworkErrorNotMissing verifies gastown-1gd:
+// a genuine lookup failure (e.g. unreachable remote) must not be conflated
+// with a missing source branch. The error is propagated and
+// RemoteSourceBranchMissing stays false.
+func TestBranchPreservationStatus_NetworkErrorNotMissing(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	pres, err := g.BranchPreservationStatus("polecat/feature", "nonexistent-remote", []string{mainBranch})
+	if err == nil {
+		t.Fatalf("BranchPreservationStatus: expected error for nonexistent remote, got nil (pres=%+v)", pres)
+	}
+	if pres.RemoteSourceBranchMissing {
+		t.Fatal("RemoteSourceBranchMissing = true, want false on lookup error")
+	}
+}

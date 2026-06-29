@@ -2832,6 +2832,7 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 	var result BranchPreservationStatus
 	var candidates []string
 	hasEvidence := len(nonEmptyUnique(targets)) > 0
+	var lastErr error
 
 	if includeExactBranch && localBranch != "" && localBranch != "HEAD" {
 		remoteSHA, err := g.PushRemoteBranchTip(remote, localBranch)
@@ -2846,14 +2847,17 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 				return result, nil
 			}
 			candidates = append(candidates, remoteSHA)
-		default:
-			// Remote source branch is gone. Common after post-merge cleanup
-			// deletes the merged branch: PushRemoteBranchTip returns either a
-			// lookup error or an empty SHA with a nil error. Both mean the
-			// exact pushed source branch no longer exists on the remote, so
-			// flag it for callers to warn instead of hard-blocking capacity
-			// (hq-4do).
+		case err == nil && remoteSHA == "":
+			// Remote source branch is gone: PushRemoteBranchTip returned an empty
+			// SHA with a nil error. The exact pushed source branch no longer exists
+			// on the remote, so flag it for callers to warn instead of hard-blocking
+			// capacity (hq-4do).
 			result.RemoteSourceBranchMissing = true
+		default:
+			// A genuine lookup error (network, auth, timeout) is not the same as a
+			// missing branch; preserve it so callers see the failure instead of a
+			// misleading missing-branch warning (gastown-1gd).
+			lastErr = err
 		}
 	}
 
@@ -2881,13 +2885,15 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 
 	candidates = nonEmptyUnique(candidates)
 	if len(candidates) == 0 {
+		if lastErr != nil {
+			return result, lastErr
+		}
 		if hasEvidence {
 			return result, fmt.Errorf("no target/custody refs resolved")
 		}
 		return result, errNoComparisonRefs
 	}
 
-	var lastErr error
 	for _, ref := range candidates {
 		candidate, err := g.preservationAgainstRef(ref)
 		if err != nil {

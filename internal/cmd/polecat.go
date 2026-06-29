@@ -1219,8 +1219,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	if polecatCheckRecoveryReconcileCleanup {
-		reconcileCleanupStatusIfSafe(&status, bd, agentBeadID, p, fields)
-		reconcileActiveMRIfSafe(&status, bd, agentBeadID, fields)
+		reconcileRecoveryStatusIfReconciled(&status, &input, bd, bd, agentBeadID, p, fields)
 	}
 
 	// JSON output
@@ -1509,6 +1508,26 @@ func reconcileActiveMRIfSafe(status *RecoveryStatus, clearer activeMRClearer, ag
 	status.ActiveMR = ""
 	status.Reconciled = true
 	status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("reconciled_active_mr=cleared previous=%s mr_status=%s close_reason=%s source_issue=%s", assessment.ActiveMR, assessment.MRStatus, assessment.CloseReason, assessment.SourceIssue))
+}
+
+// reconcileRecoveryStatusIfReconciled runs cleanup and active_mr reconciliation
+// and, if either mutated status, re-derives the workstate disposition from the
+// updated input. Without this second pass the output carries a stale verdict
+// (e.g. a dead active_mr still shown as PENDING_MR, or reason keyed to the old
+// cleanup status) even though Reconciled=true (gastown-1gd).
+func reconcileRecoveryStatusIfReconciled(status *RecoveryStatus, input *polecat.WorkstateInput, updater cleanupStatusUpdater, clearer activeMRClearer, agentBeadID string, p *polecat.Polecat, fields *beads.AgentFields) {
+	reconcileCleanupStatusIfSafe(status, updater, agentBeadID, p, fields)
+	reconcileActiveMRIfSafe(status, clearer, agentBeadID, fields)
+	if !status.Reconciled {
+		return
+	}
+	input.CleanupStatus = status.CleanupStatus
+	input.ActiveMR = status.ActiveMR
+	if status.ActiveMR == "" {
+		input.ActiveMRBlocker = ""
+	}
+	disposition := polecat.DecideWorkstate(*input)
+	applyWorkstateDispositionToRecoveryStatus(status, disposition)
 }
 
 func agentSourceIssueHint(currentIssue string, fields *beads.AgentFields) string {

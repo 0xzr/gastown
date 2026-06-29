@@ -131,6 +131,16 @@ func isValidMergeTarget(target, rigName string) bool {
 	return true
 }
 
+// validateDefaultMergeTarget returns an error when the configured default branch
+// is itself unsafe to submit. This prevents a malformed rig.DefaultBranch from
+// silently producing an MR that advertises "<rig>/<rig>" (gastown-1gd).
+func validateDefaultMergeTarget(defaultBranch, rigName string) error {
+	if !isValidMergeTarget(defaultBranch, rigName) {
+		return fmt.Errorf("configured default branch %q is not a valid merge target for rig %q; verify rig.DefaultBranch in settings/config", defaultBranch, rigName)
+	}
+	return nil
+}
+
 func shouldSyncIdlePolecatWorktree(exitType, mergeStrategy string, pushFailed, mrFailed, syncSafe bool) bool {
 	if exitType != ExitCompleted || pushFailed || mrFailed || !syncSafe {
 		return false
@@ -1242,6 +1252,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 			target = defaultBranch
 			explicitTarget = false
+		}
+		if err := validateDefaultMergeTarget(defaultBranch, rigName); err != nil {
+			return err
 		}
 
 		// Get source issue for priority inheritance
