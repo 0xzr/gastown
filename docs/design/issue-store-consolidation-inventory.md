@@ -408,6 +408,87 @@ All target states from the §4.3 decision are satisfied. Future regressions in
 `beads_global` protection should be filed as new bug beads and cross-linked to
 `gastown-cet.1.2.4`.
 
+#### 4.3.2 Verification status (`gastown-cet.1.2.3`, 2026-06-28)
+
+This verification bead (`gastown-cet.1.2.3`, polecat jasper, 2026-06-28) is the
+live status tracker for the `bdglobal` registration. The implementation that
+precedes it is already in place (see `internal/doltserver/doltserver.go:3019` and
+`internal/doctor/unregistered_beads_check.go:88`); the bead's purpose is to
+confirm the four target state checks and keep the audit record current. It
+mirrors the `beads_global` verification recorded in §4.3.1 (`gastown-cet.1.2.4`).
+
+**Target state 1 — `gt dolt status` labels `bdglobal` as protected**
+
+```text
+● Dolt server is running (PID 4059825)
+  Port: 3307
+  Data dir: /home/ubuntu/gt-town/.dolt-data
+  Databases:
+    - bdglobal             (legacy empty bdglobal database (protected))
+    ...
+```
+
+Result: **PASS**. `bdglobal` appears with the protected-legacy purpose label,
+not as an unexplained empty store.
+
+**Target state 2 — `gt dolt list` does not flag `bdglobal` as orphaned**
+
+```text
+Rig databases in /home/ubuntu/gt-town/.dolt-data:
+
+  bdglobal (legacy empty bdglobal database (protected))
+    /home/ubuntu/gt-town/.dolt-data/bdglobal
+  ...
+```
+
+Result: **PASS**. `bdglobal` is listed as a protected legacy database, not as
+an orphan.
+
+**Target state 3 — `gt doctor` does not report `bdglobal/` as unregistered**
+
+The `unregistered-beads-dirs` doctor check scans top-level directories with
+`.beads/metadata.json` and flags those that are neither registered rigs nor known
+system/legacy directories. After the implementation of `knownLegacyStoreDirs()`
+(backed by `doltserver.ProtectedSharedServerDatabaseNames()`), `bdglobal/` is
+excluded from the check (see `internal/doctor/unregistered_beads_check.go:88`,
+where `legacyDirs[name]` short-circuits before the metadata probe).
+
+On this run the check emitted:
+
+```text
+⚠  unregistered-beads-dirs 2 unregistered directory(ies) with beads metadata
+     └─ beads/ has .beads/metadata.json pointing to database "beads" (not a registered rig)
+     └─ gt-town/ has .beads/metadata.json pointing to database "gt-town" (not a registered rig)
+```
+
+Result: **PASS**. The two flagged directories are `beads/` and `gt-town/`;
+`bdglobal/` is absent, so `gt doctor` does not report it as unregistered. The
+registered rigs (per `mayor/rigs.json`) are `gastown`, `gtviz`, and `polybot`;
+`bdglobal` is correctly treated as a legacy store rather than an unregistered
+rig.
+
+**Target state 4 — `gt dolt cleanup --dry-run` does not propose removing
+`bdglobal/`**
+
+```text
+✓ No orphaned databases found in .dolt-data/
+```
+
+Result: **PASS**. Cleanup dry-run proposes no removal.
+
+**Verification summary**
+
+| Check | Command | Result |
+|---|---|---|
+| Protected purpose label visible | `gt dolt status` | PASS |
+| Not flagged as orphaned | `gt dolt list` | PASS |
+| Not reported as unregistered | `gt doctor` | PASS |
+| Cleanup dry-run ignores it | `gt dolt cleanup --dry-run` | PASS |
+
+All target states from the §4.3 decision are satisfied. Future regressions in
+`bdglobal` protection should be filed as new bug beads and cross-linked to
+`gastown-cet.1.2.3`.
+
 ---
 
 ## 5. Rollback instructions
@@ -450,7 +531,7 @@ changes and this document.
 - [x] Stale export clobber case (`hq-k6lt`) explicitly tied to canonical `gastown-stale-export-clobber` fix.
 - [x] Rollback instructions recorded.
 - [x] No raw `.dolt/`, `noms/`, `LOCK`, `manifest`, or JSONL files edited or removed.
-- [x] `bdglobal` and `beads_global` registered as protected legacy empty stores in `doltserver.go` and ignored by `unregistered-beads-dirs`; `beads_global` specifically verified in §4.3.1 via `gastown-cet.1.2.4`.
+- [x] `bdglobal` and `beads_global` registered as protected legacy empty stores in `doltserver.go` and ignored by `unregistered-beads-dirs`; `beads_global` specifically verified in §4.3.1 via `gastown-cet.1.2.4`, and `bdglobal` specifically verified in §4.3.2 via `gastown-cet.1.2.3`.
 - [x] **Remediation (`gastown-cet.1.2.1`, 2026-06-28):** All 28 open `hq-*` issues in the embedded `mayor/gastown/.beads` store closed via `bd` CLI as duplicates or preserved-for-provenance with cross-link notes pointing to canonical gastown/town trackers; `bd list --status=open` from `/home/ubuntu/gt-town/mayor/gastown` now returns zero issues. Disposition table recorded in §4.1.1. No raw Dolt files modified.
 
 ---
