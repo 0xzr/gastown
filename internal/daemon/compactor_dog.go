@@ -11,6 +11,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/reaper"
 )
 
@@ -515,28 +516,34 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 		d.logger.Printf("compactor_dog: %s: integrity verified (%d tables)", dbName, len(preCounts))
 	}
 
-	// Step 7: Concurrency check.
-	currentHead, err := d.compactorGetHead(db, dbName)
+	// Step 7: Atomic branch swap.
+	//
+	// The classic TOCTOU hazard here is: verify main is still at preHead, then
+	// delete main and rename compact-work to main. If another writer commits to
+	// main between the verify and the delete, that commit is silently lost.
+	//
+	// We close the window by updating dolt_branches in a single conditional SQL
+	// statement (hash = newHash WHERE name = 'main' AND hash = preHead). If the
+	// WHERE clause matches, the swap is atomic; if main moved, RowsAffected is zero
+	// and we return a concurrency abort so the outer retry loop can start over.
+	workHead, err := doltserver.BranchHead(ctx, db, dbName, workBranch)
 	if err != nil {
 		d.surgicalCleanup(db, baseBranch, workBranch)
-		return fmt.Errorf("concurrency check: %w", err)
+		return fmt.Errorf("get work branch head: %w", err)
 	}
-	if currentHead != preHead {
+	swapped, err := doltserver.TrySwapBranch(ctx, db, dbName, "main", preHead, workHead)
+	if err != nil {
 		d.surgicalCleanup(db, baseBranch, workBranch)
-		return fmt.Errorf("concurrency abort: main HEAD moved from %s to %s", shortHash(preHead), shortHash(currentHead))
+		return fmt.Errorf("atomic branch swap: %w", err)
 	}
+	if !swapped {
+		d.surgicalCleanup(db, baseBranch, workBranch)
+		return fmt.Errorf("concurrency abort: main HEAD moved during atomic branch swap (expected %s)", shortHash(preHead))
+	}
+	d.logger.Printf("compactor_dog: %s: atomic branch swap complete — main now points to %s", dbName, shortHash(workHead))
 
-	// Step 8: Swap branches — make compact-work the new main.
-	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', 'main')"); err != nil {
-		return fmt.Errorf("delete old main: %w (compact-work preserved for recovery)", err)
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-m', '%s', 'main')", workBranch)); err != nil {
-		return fmt.Errorf("rename work to main: %w", err)
-	}
-	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
-	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')"); err != nil {
-		return fmt.Errorf("checkout new main: %w", err)
-	}
+	// Step 8: Switch session to the new main and clean up temp branches.
+	d.surgicalCleanup(db, baseBranch, workBranch)
 
 	finalCount, _ := d.compactorCountCommits(dbName)
 	d.logger.Printf("compactor_dog: %s: surgical rebase complete — %d commits remain", dbName, finalCount)

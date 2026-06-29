@@ -136,10 +136,12 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 		fmt.Printf("    %s: %d rows\n", table, count)
 	}
 
-	// Get HEAD hash for concurrency check.
-	preHead, err := flattenGetHead(db, dbName)
+	// Get main HEAD for the concurrency check.
+	// Use DOLT_HASHOF('main') rather than dolt_log so the check targets main
+	// regardless of the session's active branch after the rebase checkout.
+	preHead, err := doltserver.BranchHead(ctx, db, dbName, "main")
 	if err != nil {
-		return fmt.Errorf("getting HEAD: %w", err)
+		return fmt.Errorf("getting main HEAD: %w", err)
 	}
 	fmt.Printf("  HEAD: %s\n", preHead[:12])
 
@@ -286,33 +288,35 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("  %s Rebase executed successfully\n", style.Bold.Render("✓"))
 
-	// Step 7: Concurrency check — verify main hasn't moved.
-	currentHead, err := flattenGetHead(db, dbName)
+	// Step 7: Atomic branch swap.
+	//
+	// Close the classic TOCTOU window between the concurrency check and branch
+	// swap by doing the swap as a single conditional SQL UPDATE on dolt_branches.
+	// The update only succeeds if main is still at preHead; otherwise RowsAffected
+	// is zero and we abort without losing any concurrent commit.
+	workHead, err := doltserver.BranchHead(ctx, db, dbName, workBranch)
 	if err != nil {
 		rebaseCleanupAll(db, baseBranch, workBranch)
-		return fmt.Errorf("concurrency check: %w", err)
+		return fmt.Errorf("get work branch head: %w", err)
 	}
-	if currentHead != preHead {
+	swapped, err := doltserver.TrySwapBranch(ctx, db, dbName, "main", preHead, workHead)
+	if err != nil {
 		rebaseCleanupAll(db, baseBranch, workBranch)
-		return fmt.Errorf("ABORT: main HEAD moved during rebase (%s → %s)", shortHash(preHead), shortHash(currentHead))
+		return fmt.Errorf("atomic branch swap: %w", err)
 	}
+	if !swapped {
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("ABORT: main HEAD moved during atomic branch swap (expected %s)", shortHash(preHead))
+	}
+	fmt.Printf("  Atomic branch swap complete — compact-work is now main\n")
 
-	// Step 8: Swap branches — make compact-work the new main.
-	// We're already on compact-work from the rebase.
-	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', 'main')"); err != nil {
-		// Can't delete main — leave compact-work in place for manual recovery.
-		return fmt.Errorf("delete old main: %w (compact-work branch preserved for manual recovery)", err)
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-m', '%s', 'main')", workBranch)); err != nil {
-		return fmt.Errorf("rename work branch to main: %w", err)
-	}
-	// Delete the base branch.
-	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
-	// Checkout main.
+	// Step 8: Switch session to the new main and clean up temp branches.
+	// We're still on compact-work from the rebase; checkout main before deleting it.
 	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')"); err != nil {
 		return fmt.Errorf("checkout new main: %w", err)
 	}
-	fmt.Printf("  Branch swap complete — compact-work is now main\n")
+	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", workBranch))
+	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", baseBranch))
 
 	// Step 9: Verify integrity — row counts must match pre-flight.
 	// This runs AFTER the branch swap so we're reading from the new main,
