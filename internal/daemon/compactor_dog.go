@@ -11,6 +11,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/reaper"
 )
 
@@ -401,6 +402,25 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 	}
 	defer db.Close()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	// Serialize with manual `gt dolt rebase` invocations and other compactor
+	// workers via a per-database MySQL advisory lock. The lock must be held
+	// from before we touch the shared compact-base/compact-work/rebase state
+	// until after the branch swap to close the TOCTOU window where a concurrent
+	// dry-run could delete/abort in-progress state.
+	const surgicalRebaseLockTimeout = 60 * time.Second
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	lockRelease, err := doltserver.AcquireRebaseLock(ctx, db, dbName, surgicalRebaseLockTimeout)
+	if err != nil {
+		return fmt.Errorf("advisory lock: %w", err)
+	}
+	defer lockRelease(context.Background())
+	d.logger.Printf("compactor_dog: %s: advisory lock acquired", dbName)
+
 	// Pre-flight: record state.
 	preHead, err := d.compactorGetHead(db, dbName)
 	if err != nil {
@@ -417,9 +437,6 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 	if err != nil {
 		return fmt.Errorf("find root commit: %w", err)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
 
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("USE `%s`", dbName)); err != nil {
 		return fmt.Errorf("use database: %w", err)

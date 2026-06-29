@@ -157,6 +157,22 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 
 	const baseBranch = "compact-base"
 	const workBranch = "compact-work"
+	const rebaseLockTimeout = 60 * time.Second
+
+	// Serialize with the daemon compactor and other manual rebases via a
+	// per-database MySQL advisory lock. The lock must be held from before we
+	// touch the shared compact-base/compact-work/rebase state until after the
+	// branch swap (or dry-run cleanup) to close the TOCTOU window where a
+	// concurrent dry-run could delete/abort in-progress state.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	lockRelease, err := doltserver.AcquireRebaseLock(ctx, db, dbName, rebaseLockTimeout)
+	if err != nil {
+		return fmt.Errorf("advisory lock for %s: %w", dbName, err)
+	}
+	defer lockRelease(ctx)
+	fmt.Printf("  Advisory lock acquired for %s\n", dbName)
 
 	// Clean up any leftover branches from a previous failed run.
 	rebaseCleanup(db, baseBranch, workBranch)
