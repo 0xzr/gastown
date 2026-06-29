@@ -765,6 +765,95 @@ func TestDoMerge_DurableReviewGate_LegacyFallback_ReusesPostSquashGate(t *testin
 	}
 }
 
+// TestDoMerge_DurableReviewGate_LegacyFallback_IgnoresWrongGateName pins
+// (gastown-jzq) the legacy fallback's name-based selection: a post-squash gate
+// that invokes refinery-gate.sh but is NOT named "four-model-refinery-review"
+// must not be picked up as the durable reviewer. The previous implementation
+// scanned e.config.Gates by phase + substring and could pick the wrong gate
+// non-deterministically. The fix requires an exact name match so unrelated
+// post-squash gates cannot silently become the durable reviewer (which would
+// be a catastrophic regression if a future post-squash gate happened to invoke
+// refinery-gate.sh for an unrelated purpose).
+func TestDoMerge_DurableReviewGate_LegacyFallback_IgnoresWrongGateName(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+
+	attestDir := filepath.Join(workDir, "attestations")
+	keyPath := writeTestHMACKey(t, workDir)
+	// Intentionally name the gate something OTHER than
+	// "four-model-refinery-review" — even though its command invokes
+	// refinery-gate.sh and is post-squash, the fallback must not pick it up.
+	e.config.Gates = map[string]*GateConfig{
+		"unrelated-post-squash-gate": {
+			Cmd:     "echo 'invoking refinery-gate.sh' && exit 0",
+			Timeout: 5 * time.Minute,
+			Phase:   GatePhasePostSquash,
+		},
+	}
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		AttestDir:   attestDir,
+		HMACKeyPath: keyPath,
+	}
+
+	createFeatureBranch(t, workDir, "feat/wrong-name", "feature.txt", "feature content")
+
+	result := e.doMerge(context.Background(), "feat/wrong-name", "main", "gt-test", nil, true)
+	if result.Success {
+		t.Fatal("expected merge to fail: fallback must not reuse an unrelated post-squash gate")
+	}
+	if !result.TestsFailed {
+		t.Errorf("expected TestsFailed=true when fallback finds no matching gate, got %+v", result)
+	}
+	if !strings.Contains(result.Error, "no command configured") {
+		t.Errorf("expected missing command error, got: %s", result.Error)
+	}
+}
+
+// TestDoMerge_DurableReviewGate_LegacyFallback_IgnoresWrongPhase pins the
+// fallback's phase requirement: a gate named "four-model-refinery-review"
+// that exists but is NOT in the post-squash phase must not be picked up as
+// the durable reviewer. Only the post-squash phase matches the production
+// intent; picking a pre-merge or other-phase gate would either run the
+// reviewer at the wrong point in the flow or silently bind the HMAC
+// attestation to an unreviewed tree.
+func TestDoMerge_DurableReviewGate_LegacyFallback_IgnoresWrongPhase(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+
+	attestDir := filepath.Join(workDir, "attestations")
+	keyPath := writeTestHMACKey(t, workDir)
+	attestCmd := hmacAttestationShellCmd(t)
+	// Named correctly but in the pre-merge phase — must NOT be picked up
+	// by the legacy fallback.
+	e.config.Gates = map[string]*GateConfig{
+		"four-model-refinery-review": {
+			Cmd:     "echo 'invoking refinery-gate.sh' && " + attestCmd,
+			Timeout: 5 * time.Minute,
+			Phase:   GatePhasePreMerge,
+		},
+	}
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		AttestDir:   attestDir,
+		HMACKeyPath: keyPath,
+	}
+
+	createFeatureBranch(t, workDir, "feat/wrong-phase", "feature.txt", "feature content")
+
+	result := e.doMerge(context.Background(), "feat/wrong-phase", "main", "gt-test", nil, true)
+	if result.Success {
+		t.Fatal("expected merge to fail: fallback must not reuse a non-post-squash gate")
+	}
+	if !strings.Contains(result.Error, "no command configured") {
+		t.Errorf("expected missing command error, got: %s", result.Error)
+	}
+}
+
 // TestRunDurableReviewGate_EmptyDiff_BlocksMerge proves the empty-diff guard
 // (gastown-cet.12.4): when the merge-candidate diff between the branch and
 // the target is empty, the durable review gate fails closed regardless of
