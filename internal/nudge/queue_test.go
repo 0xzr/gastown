@@ -652,17 +652,19 @@ func TestRemoveKindByThread(t *testing.T) {
 	}
 }
 
-// TestDeferredNudgeDeliveredAfterDelay uses a very short DeliverAfter to confirm
-// that the same nudge is skipped on first Drain and delivered on a second Drain
-// after the deadline elapses.
+// TestDeferredNudgeDeliveredAfterDelay confirms that the same nudge is skipped
+// on first Drain and delivered on a second Drain after the deadline elapses.
+// The delay/sleep margins are intentionally generous to stay well ahead of
+// scheduler jitter in parallel CI runs.
 func TestDeferredNudgeDeliveredAfterDelay(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-test-deferred-sequence"
 
+	deferBy := 200 * time.Millisecond
 	shortDelay := QueuedNudge{
 		Sender:       "system",
 		Message:      "reply via mail",
-		DeliverAfter: time.Now().Add(50 * time.Millisecond),
+		DeliverAfter: time.Now().Add(deferBy),
 	}
 	if err := Enqueue(townRoot, session, shortDelay); err != nil {
 		t.Fatalf("Enqueue: %v", err)
@@ -677,8 +679,8 @@ func TestDeferredNudgeDeliveredAfterDelay(t *testing.T) {
 		t.Fatalf("first Drain: got %d nudges, want 0 (deferred not ready)", len(nudges))
 	}
 
-	// Wait for deadline.
-	time.Sleep(60 * time.Millisecond)
+	// Wait for the deadline to pass.
+	time.Sleep(deferBy + 50*time.Millisecond)
 
 	// Second Drain: ready now.
 	nudges, err = Drain(townRoot, session)
