@@ -26,7 +26,7 @@ func processExists(pid int) bool {
 
 	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
-		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		if err == windows.ERROR_ACCESS_DENIED {
 			return true
 		}
 		return false

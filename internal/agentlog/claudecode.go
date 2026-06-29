@@ -207,7 +207,7 @@ func tailJSONL(ctx context.Context, path, projectDir string, since time.Time, se
 		if len(line) > 0 {
 			partial.WriteString(line)
 		}
-		if err == nil || (errors.Is(err, io.EOF) && strings.HasSuffix(partial.String(), "\n")) {
+		if err == nil || (err == io.EOF && strings.HasSuffix(partial.String(), "\n")) {
 			fullLine := strings.TrimRight(partial.String(), "\r\n")
 			partial.Reset()
 			if fullLine != "" {
@@ -220,7 +220,7 @@ func tailJSONL(ctx context.Context, path, projectDir string, since time.Time, se
 				}
 			}
 		}
-		if errors.Is(err, io.EOF) {
+		if err == io.EOF {
 			// At EOF: check every poll whether a newer file has appeared.
 			// This detects new Claude sessions within one poll interval (500ms).
 			if newer, ok := newestJSONLIn(projectDir, since); ok && newer != path {

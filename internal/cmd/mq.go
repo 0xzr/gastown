@@ -425,7 +425,7 @@ func runMQRetry(cmd *cobra.Command, args []string) error {
 	// Get the MR first to show info
 	mr, err := mgr.GetMR(mrID)
 	if err != nil {
-		if errors.Is(err, refinery.ErrMRNotFound) {
+		if err == refinery.ErrMRNotFound {
 			return fmt.Errorf("merge request '%s' not found in rig '%s'", mrID, rigName)
 		}
 		return fmt.Errorf("getting merge request: %w", err)
@@ -441,7 +441,7 @@ func runMQRetry(cmd *cobra.Command, args []string) error {
 
 	// Perform the retry
 	if err := mgr.Retry(mrID, mqRetryNow); err != nil {
-		if errors.Is(err, refinery.ErrMRNotFailed) {
+		if err == refinery.ErrMRNotFailed {
 			return fmt.Errorf("merge request '%s' has not failed (status: %s)", mrID, mr.Status)
 		}
 		return fmt.Errorf("retrying merge request: %w", err)

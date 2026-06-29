@@ -170,7 +170,7 @@ func TestMayorDecision_ResumeOverridesDefer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadDecisions: %v", err)
 	}
-	if _, err := state.ActiveDecision("gt-resume-cli"); !errors.Is(err, mayor.ErrDecisionNotFound) {
+	if _, err := state.ActiveDecision("gt-resume-cli"); err != mayor.ErrDecisionNotFound {
 		t.Errorf("expected resume to clear active block, got %v", err)
 	}
 	// Prior blocking decision still recorded for audit.

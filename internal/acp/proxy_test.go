@@ -675,7 +675,7 @@ func (m *MockAgent) Run(ctx context.Context) error {
 		default:
 			err := m.Step()
 			if err != nil {
-				if errors.Is(err, io.EOF) {
+				if err == io.EOF {
 					return nil
 				}
 				return err

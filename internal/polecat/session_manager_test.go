@@ -204,7 +204,7 @@ func TestStopNotFound(t *testing.T) {
 	m := NewSessionManager(tmux.NewTmux(), r)
 
 	err := m.Stop("Toast", false)
-	if !errors.Is(err, ErrSessionNotFound) {
+	if err != ErrSessionNotFound {
 		t.Errorf("Stop = %v, want ErrSessionNotFound", err)
 	}
 }
@@ -219,7 +219,7 @@ func TestCaptureNotFound(t *testing.T) {
 	m := NewSessionManager(tmux.NewTmux(), r)
 
 	_, err := m.Capture("Toast", 50)
-	if !errors.Is(err, ErrSessionNotFound) {
+	if err != ErrSessionNotFound {
 		t.Errorf("Capture = %v, want ErrSessionNotFound", err)
 	}
 }
@@ -234,7 +234,7 @@ func TestInjectNotFound(t *testing.T) {
 	m := NewSessionManager(tmux.NewTmux(), r)
 
 	err := m.Inject("Toast", "hello")
-	if !errors.Is(err, ErrSessionNotFound) {
+	if err != ErrSessionNotFound {
 		t.Errorf("Inject = %v, want ErrSessionNotFound", err)
 	}
 }

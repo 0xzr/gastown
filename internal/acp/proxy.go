@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -384,7 +383,7 @@ func (p *Proxy) forwardToAgent() {
 
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			if err == io.EOF {
 				if !receivedInput && p.handshakeState == handshakeInit {
 					logEvent(p.townRoot, "acp_error", "stdin closed before handshake - no ACP client connected")
 					debugLog(p.townRoot, "[Proxy] stdin closed before handshake - no ACP client connected?")
@@ -451,7 +450,7 @@ func (p *Proxy) forwardFromAgent() {
 
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			if err == io.EOF {
 				debugLog(p.townRoot, "[Proxy] forwardFromAgent: agent stdout EOF (agent terminated)")
 				p.logCrashDiagnostics("agent stdout EOF")
 				logEvent(p.townRoot, "acp_shutdown", "agent stdout EOF - agent terminated gracefully")
@@ -578,7 +577,7 @@ func (p *Proxy) forwardAgentStderr() {
 
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
+			if err != io.EOF {
 				debugLog(p.townRoot, "[Agent stderr] read error: %v", err)
 			}
 			return

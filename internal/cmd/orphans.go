@@ -675,7 +675,7 @@ func runOrphansKill(cmd *cobra.Command, args []string) error {
 			}
 
 			if err := proc.Signal(signal); err != nil {
-				if errors.Is(err, os.ErrProcessDone) {
+				if err == os.ErrProcessDone {
 					fmt.Printf("  %s PID %d: already terminated\n", style.Dim.Render("○"), o.PID)
 					continue
 				}
@@ -927,7 +927,7 @@ func runOrphansKillProcesses(cmd *cobra.Command, args []string) error {
 
 		if err := proc.Signal(signal); err != nil {
 			// Process may have already exited
-			if errors.Is(err, os.ErrProcessDone) {
+			if err == os.ErrProcessDone {
 				fmt.Printf("  %s PID %d: already terminated\n", style.Dim.Render("○"), o.PID)
 				continue
 			}
@@ -1004,7 +1004,7 @@ func runOrphansKillProcessesAggressive() error {
 
 		if err := proc.Signal(signal); err != nil {
 			// Process may have already exited
-			if errors.Is(err, os.ErrProcessDone) {
+			if err == os.ErrProcessDone {
 				fmt.Printf("  %s PID %d: already terminated\n", style.Dim.Render("○"), z.PID)
 				continue
 			}

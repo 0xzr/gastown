@@ -3,7 +3,6 @@
 package mayor
 
 import (
-	"errors"
 	"math"
 
 	"golang.org/x/sys/windows"
@@ -22,7 +21,7 @@ func acpProcessAlive(pid int) bool {
 
 	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
-		return errors.Is(err, windows.ERROR_ACCESS_DENIED)
+		return err == windows.ERROR_ACCESS_DENIED
 	}
 	_ = windows.CloseHandle(handle)
 	return true

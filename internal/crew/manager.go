@@ -693,7 +693,7 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 
 	// Get or create the crew worker (using locked variants to avoid lock re-entry)
 	worker, err := m.getLocked(name)
-	if errors.Is(err, ErrCrewNotFound) {
+	if err == ErrCrewNotFound {
 		worker, err = m.addLocked(name, false) // No feature branch for crew
 		if err != nil {
 			return fmt.Errorf("creating crew workspace: %w", err)

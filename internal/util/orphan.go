@@ -4,7 +4,6 @@ package util
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -208,7 +207,7 @@ func loadSignalState(filename string) map[int]signalState {
 		}
 
 		// Only keep if process still exists
-		if err := syscall.Kill(pid, 0); err == nil || errors.Is(err, syscall.EPERM) {
+		if err := syscall.Kill(pid, 0); err == nil || err == syscall.EPERM {
 			state[pid] = signalState{Signal: sig, Timestamp: time.Unix(ts, 0)}
 		}
 	}
@@ -256,7 +255,7 @@ func saveOrphanState(state map[int]signalState) error {
 // processExists checks if a process is still running.
 func processExists(pid int) bool {
 	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	return err == nil || err == syscall.EPERM
 }
 
 // getProcessCwd returns the current working directory of a process.
@@ -715,7 +714,7 @@ func CleanupZombieClaudeProcesses() ([]ZombieCleanupResult, error) {
 
 		if s.Signal == "SIGTERM" && elapsed >= float64(sigkillGracePeriod) {
 			if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
-				if !errors.Is(err, syscall.ESRCH) {
+				if err != syscall.ESRCH {
 					lastErr = fmt.Errorf("SIGKILL PID %d: %w", pid, err)
 				}
 				delete(state, pid)
@@ -748,7 +747,7 @@ func CleanupZombieClaudeProcesses() ([]ZombieCleanupResult, error) {
 		}
 
 		if err := syscall.Kill(zombie.PID, syscall.SIGTERM); err != nil {
-			if !errors.Is(err, syscall.ESRCH) {
+			if err != syscall.ESRCH {
 				lastErr = fmt.Errorf("SIGTERM PID %d: %w", zombie.PID, err)
 			}
 			continue
@@ -822,7 +821,7 @@ func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {
 		if s.Signal == "SIGTERM" && elapsed >= float64(sigkillGracePeriod) {
 			// Sent SIGTERM but still alive after grace period - escalate to SIGKILL
 			if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
-				if !errors.Is(err, syscall.ESRCH) {
+				if err != syscall.ESRCH {
 					lastErr = fmt.Errorf("SIGKILL PID %d: %w", pid, err)
 				}
 				delete(state, pid)
@@ -857,7 +856,7 @@ func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {
 
 		// New orphan - send SIGTERM
 		if err := syscall.Kill(orphan.PID, syscall.SIGTERM); err != nil {
-			if !errors.Is(err, syscall.ESRCH) {
+			if err != syscall.ESRCH {
 				lastErr = fmt.Errorf("SIGTERM PID %d: %w", orphan.PID, err)
 			}
 			continue

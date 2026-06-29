@@ -129,7 +129,7 @@ func TestChooseAgent_NoEligibleWhenAllFull(t *testing.T) {
 		"umans-kimi": true,
 		"m3":         true,
 	}
-	if _, err := ChooseAgent(caps, live, healthy, 0); !errors.Is(err, ErrNoEligibleAgent) {
+	if _, err := ChooseAgent(caps, live, healthy, 0); err != ErrNoEligibleAgent {
 		t.Fatalf("got err=%v, want ErrNoEligibleAgent", err)
 	}
 }
@@ -221,7 +221,7 @@ func TestChooseAgent_ReconcilesAgainstLegacyLanes(t *testing.T) {
 			t.Fatalf("model %s at live=%d, want 2 (caps were %v)", m, live[m], caps)
 		}
 	}
-	if _, err := ChooseAgent(caps, live, healthy, idx); !errors.Is(err, ErrNoEligibleAgent) {
+	if _, err := ChooseAgent(caps, live, healthy, idx); err != ErrNoEligibleAgent {
 		t.Fatalf("expected ErrNoEligibleAgent after caps reached, got err=%v picks=%v", err, picks)
 	}
 }
@@ -308,7 +308,7 @@ func TestChooseAndReserveAgent_SequentialRotation(t *testing.T) {
 	}
 
 	// Cap exhausted: next pick must error.
-	if _, err := ChooseAndReserveAgent(caps, counter, healthy, idx); !errors.Is(err, ErrNoEligibleAgent) {
+	if _, err := ChooseAndReserveAgent(caps, counter, healthy, idx); err != ErrNoEligibleAgent {
 		t.Fatalf("after cap exhaustion: got err=%v, want ErrNoEligibleAgent", err)
 	}
 }
@@ -341,7 +341,7 @@ func TestChooseAndReserveAgent_NoOverReservation(t *testing.T) {
 				if r.Agent == "" {
 					t.Errorf("success reservation had empty Agent")
 				}
-			} else if errors.Is(err, ErrNoEligibleAgent) {
+			} else if err == ErrNoEligibleAgent {
 				atomic.AddInt64(&fail, 1)
 			} else {
 				t.Errorf("unexpected error: %v", err)
@@ -395,7 +395,7 @@ func TestChooseAndReserveAgent_RespectsCaps(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
-			if _, err := ChooseAndReserveAgent(caps, counter, healthy, 0); errors.Is(err, ErrNoEligibleAgent) {
+			if _, err := ChooseAndReserveAgent(caps, counter, healthy, 0); err == ErrNoEligibleAgent {
 				atomic.AddInt64(&fail, 1)
 			} else {
 				t.Errorf("non-ErrNoEligibleAgent under cap=1 saturated: %v", err)
@@ -429,7 +429,7 @@ func TestReservation_ReleaseFreesSlot(t *testing.T) {
 	}
 
 	// While the reservation is held, a second pick must fail.
-	if _, err := ChooseAndReserveAgent(caps, counter, healthy, 0); !errors.Is(err, ErrNoEligibleAgent) {
+	if _, err := ChooseAndReserveAgent(caps, counter, healthy, 0); err != ErrNoEligibleAgent {
 		t.Fatalf("second pick during held reservation: got %v, want ErrNoEligibleAgent", err)
 	}
 
@@ -506,7 +506,7 @@ func TestChooseAndReserveAgent_RespectsHealthyFilter(t *testing.T) {
 // conditionally initialize the counter).
 func TestChooseAndReserveAgent_NilCounterDefensive(t *testing.T) {
 	caps := MixCaps{"m3": 1}
-	if _, err := ChooseAndReserveAgent(caps, nil, HealthyAgents{"m3": true}, 0); !errors.Is(err, ErrNoEligibleAgent) {
+	if _, err := ChooseAndReserveAgent(caps, nil, HealthyAgents{"m3": true}, 0); err != ErrNoEligibleAgent {
 		t.Fatalf("nil counter: got %v, want ErrNoEligibleAgent", err)
 	}
 }
@@ -621,7 +621,7 @@ func TestChooseAndReserveAgent_LegacyLanesCount(t *testing.T) {
 			t.Fatalf("model %s at count=%d, want 2 (legacy lanes not honored)", m, counter.Counts()[m])
 		}
 	}
-	if _, err := ChooseAndReserveAgent(caps, counter, healthy, idx); !errors.Is(err, ErrNoEligibleAgent) {
+	if _, err := ChooseAndReserveAgent(caps, counter, healthy, idx); err != ErrNoEligibleAgent {
 		t.Fatalf("after caps reached: got %v, want ErrNoEligibleAgent (picks=%v)", err, picks)
 	}
 }

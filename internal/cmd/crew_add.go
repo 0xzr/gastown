@@ -121,7 +121,7 @@ func runCrewAdd(cmd *cobra.Command, args []string) error {
 
 		worker, err := crewMgr.Add(name, crewBranch)
 		if err != nil {
-			if errors.Is(err, crew.ErrCrewExists) {
+			if err == crew.ErrCrewExists {
 				style.PrintWarning("crew workspace '%s' already exists, skipping", name)
 				failed = append(failed, name+" (exists)")
 				continue
