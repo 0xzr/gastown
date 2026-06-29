@@ -304,11 +304,7 @@ func TestEnsureSessionFresh_IdempotentOnZombie(t *testing.T) {
 }
 
 func TestEnsureSessionFreshWithCommand_NoExisting(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-fwc-new-" + t.Name()
 
 	// Clean up any existing session
@@ -341,11 +337,7 @@ func TestEnsureSessionFreshWithCommand_NoExisting(t *testing.T) {
 }
 
 func TestEnsureSessionFreshWithCommand_KillsZombie(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-fwc-zombie-" + t.Name()
 
 	// Clean up any existing session
