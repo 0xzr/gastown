@@ -35,8 +35,8 @@ func TestValidateDBName(t *testing.T) {
 		// a P0 SQLi in callers unescaped dbName into both backtick identifiers
 		// and single-quote string literals. Anything below that could escape the
 		// surrounding quote/identifier and inject arbitrary SQL must be rejected.
-		{"my-rig", false},      // hyphen OK
-		{"wl_commons", false},  // underscore OK
+		{"my-rig", false},     // hyphen OK
+		{"wl_commons", false}, // underscore OK
 		{"db;DROP DATABASE foo", true},
 		{"db'--", true},
 		{"`x` -- ; DROP DATABASE foo", true},
