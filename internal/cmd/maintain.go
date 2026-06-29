@@ -300,10 +300,22 @@ func maintainOpenDB(config *doltserver.Config, dbName string) (*sql.DB, error) {
 	return sql.Open("mysql", dsn)
 }
 
+// maintainFreshQueryContext returns a fresh context with maintainQueryTimeout.
+// Each SQL operation in maintainFlattenDB calls this to get its own 30s budget,
+// so one slow query cannot starve subsequent queries of the remaining window.
+// (gastown-xi8)
+func maintainFreshQueryContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), maintainQueryTimeout)
+}
+
 // maintainFlattenDB flattens a database's commit history to a single commit.
 // Uses direct SQL on the running server — no branches, no downtime.
 // Per Tim Sehn (2026-02-28): DOLT_RESET --soft + DOLT_COMMIT is safe on a
 // running server. Concurrent writes during flatten are safe.
+//
+// maintainQueryTimeout is the per-query budget. Each SQL operation below gets
+// its own fresh context (via maintainFreshQueryContext) so a slow query cannot
+// starve subsequent queries of the 30s window (gastown-xi8).
 func maintainFlattenDB(config *doltserver.Config, dbName string) error {
 	db, err := maintainOpenDB(config, dbName)
 	if err != nil {
@@ -311,13 +323,15 @@ func maintainFlattenDB(config *doltserver.Config, dbName string) error {
 	}
 	defer db.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), maintainQueryTimeout)
-	defer cancel()
-
 	// Verify connection.
-	var dummy int
-	if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&dummy); err != nil {
-		return fmt.Errorf("connection check: %w", err)
+	{
+		ctx, cancel := maintainFreshQueryContext()
+		var dummy int
+		err := db.QueryRowContext(ctx, "SELECT 1").Scan(&dummy)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("connection check: %w", err)
+		}
 	}
 
 	// Pre-flight: record row counts for integrity verification.
@@ -328,26 +342,46 @@ func maintainFlattenDB(config *doltserver.Config, dbName string) error {
 
 	// Find root commit.
 	var rootHash string
-	if err := db.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT commit_hash FROM `%s`.dolt_log ORDER BY date ASC LIMIT 1", dbName),
-	).Scan(&rootHash); err != nil {
-		return fmt.Errorf("find root commit: %w", err)
+	{
+		ctx, cancel := maintainFreshQueryContext()
+		err := db.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT commit_hash FROM `%s`.dolt_log ORDER BY date ASC LIMIT 1", dbName),
+		).Scan(&rootHash)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("find root commit: %w", err)
+		}
 	}
 
 	// USE database for session-scoped operations.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("USE `%s`", dbName)); err != nil {
-		return fmt.Errorf("use database: %w", err)
+	{
+		ctx, cancel := maintainFreshQueryContext()
+		_, err := db.ExecContext(ctx, fmt.Sprintf("USE `%s`", dbName))
+		cancel()
+		if err != nil {
+			return fmt.Errorf("use database: %w", err)
+		}
 	}
 
 	// Soft-reset to root on main — all data remains staged.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_RESET('--soft', '%s')", rootHash)); err != nil {
-		return fmt.Errorf("soft reset: %w", err)
+	{
+		ctx, cancel := maintainFreshQueryContext()
+		_, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_RESET('--soft', '%s')", rootHash))
+		cancel()
+		if err != nil {
+			return fmt.Errorf("soft reset: %w", err)
+		}
 	}
 
 	// Commit flattened data.
-	commitMsg := fmt.Sprintf("maintain: flatten %s history", dbName)
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil {
-		return fmt.Errorf("commit: %w", err)
+	{
+		ctx, cancel := maintainFreshQueryContext()
+		commitMsg := fmt.Sprintf("maintain: flatten %s history", dbName)
+		_, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg))
+		cancel()
+		if err != nil {
+			return fmt.Errorf("commit: %w", err)
+		}
 	}
 
 	// Verify integrity: row counts must match pre-flight.

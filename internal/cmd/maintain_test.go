@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"testing"
+	"time"
 )
 
 func TestMaintainCommand_Registered(t *testing.T) {
@@ -78,5 +79,65 @@ func TestMaintainDBInfo(t *testing.T) {
 func TestMaintainConstants(t *testing.T) {
 	if defaultMaintainThreshold != 100 {
 		t.Errorf("expected default threshold 100, got %d", defaultMaintainThreshold)
+	}
+}
+
+// TestMaintainFreshQueryContext_IndependentDeadlines guards against the
+// regression fixed in gastown-xi8: maintainFlattenDB previously created ONE
+// shared 30s context and reused it across 4+ distinct SQL operations, so a
+// slow first query would starve subsequent queries of the remaining budget.
+//
+// Each call to maintainFreshQueryContext MUST return an independent context
+// with its own deadline. Verifying this directly prevents re-introduction of
+// the shared-context anti-pattern.
+func TestMaintainFreshQueryContext_IndependentDeadlines(t *testing.T) {
+	ctx1, cancel1 := maintainFreshQueryContext()
+	defer cancel1()
+
+	deadline1, ok := ctx1.Deadline()
+	if !ok {
+		t.Fatal("expected maintainFreshQueryContext to return a context with a deadline")
+	}
+
+	cancel1() // exhaust first context's budget immediately.
+
+	// Second call must produce a fresh context with its own deadline that is
+	// AFTER the (now-cancelled) first deadline — not the same shared deadline.
+	ctx2, cancel2 := maintainFreshQueryContext()
+	defer cancel2()
+
+	deadline2, ok := ctx2.Deadline()
+	if !ok {
+		t.Fatal("expected second maintainFreshQueryContext call to return a context with a deadline")
+	}
+
+	if !deadline2.After(deadline1) {
+		t.Errorf("expected independent deadlines: deadline1=%v, deadline2=%v", deadline1, deadline2)
+	}
+
+	// And ctx2 must NOT already be expired (the regression would have left
+	// only a few hundred ms on the shared budget).
+	if err := ctx2.Err(); err != nil {
+		t.Errorf("fresh context unexpectedly already done: %v", err)
+	}
+}
+
+// TestMaintainFreshQueryContext_BudgetMatchesConstant ensures the per-query
+// budget matches the documented maintainQueryTimeout (gastown-xi8).
+func TestMaintainFreshQueryContext_BudgetMatchesConstant(t *testing.T) {
+	ctx, cancel := maintainFreshQueryContext()
+	defer cancel()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("expected deadline")
+	}
+	remaining := time.Until(deadline)
+	// Allow generous slack for scheduler delay; budget must be ~maintainQueryTimeout.
+	if remaining < maintainQueryTimeout-100*time.Millisecond {
+		t.Errorf("deadline too soon: remaining=%v, want ~%v", remaining, maintainQueryTimeout)
+	}
+	if remaining > maintainQueryTimeout+time.Second {
+		t.Errorf("deadline too far: remaining=%v, want ~%v", remaining, maintainQueryTimeout)
 	}
 }

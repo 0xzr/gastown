@@ -80,11 +80,18 @@ func runDoltFlatten(cmd *cobra.Command, args []string) error {
 	defer db.Close()
 
 	// Verify database exists by querying it.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	var dummy int
-	if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&dummy); err != nil {
-		return fmt.Errorf("database %q not reachable: %w", dbName, err)
+	// Use a dedicated connection-check context (10s) — NOT the same context reused
+	// for the rest of the flatten work. Each subsequent query gets its own
+	// maintainQueryTimeout budget so a slow early op cannot starve later ops
+	// (gastown-xi8).
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		var dummy int
+		err := db.QueryRowContext(ctx, "SELECT 1").Scan(&dummy)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("database %q not reachable: %w", dbName, err)
+		}
 	}
 
 	// Pre-flight: check backup freshness.
@@ -108,8 +115,13 @@ func runDoltFlatten(cmd *cobra.Command, args []string) error {
 
 	// Count commits.
 	var commitCount int
-	if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM `%s`.dolt_log", dbName)).Scan(&commitCount); err != nil {
-		return fmt.Errorf("counting commits: %w", err)
+	{
+		ctx, cancel := flattenNewQueryContext()
+		err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM `%s`.dolt_log", dbName)).Scan(&commitCount)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("counting commits: %w", err)
+		}
 	}
 	fmt.Printf("  Commits: %d\n", commitCount)
 
@@ -130,29 +142,49 @@ func runDoltFlatten(cmd *cobra.Command, args []string) error {
 
 	// Get root commit.
 	var rootHash string
-	if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT commit_hash FROM `%s`.dolt_log ORDER BY date ASC LIMIT 1", dbName)).Scan(&rootHash); err != nil {
-		return fmt.Errorf("finding root commit: %w", err)
+	{
+		ctx, cancel := flattenNewQueryContext()
+		err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT commit_hash FROM `%s`.dolt_log ORDER BY date ASC LIMIT 1", dbName)).Scan(&rootHash)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("finding root commit: %w", err)
+		}
 	}
 	fmt.Printf("  Root: %s\n", rootHash[:12])
 
 	fmt.Printf("\n%s Flattening %s (direct SQL — no downtime)...\n", style.Bold.Render("●"), dbName)
 
 	// USE database for session-scoped operations.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("USE `%s`", dbName)); err != nil {
-		return fmt.Errorf("use database: %w", err)
+	{
+		ctx, cancel := flattenNewQueryContext()
+		_, err := db.ExecContext(ctx, fmt.Sprintf("USE `%s`", dbName))
+		cancel()
+		if err != nil {
+			return fmt.Errorf("use database: %w", err)
+		}
 	}
 
 	// Soft-reset to root on main — all data remains staged.
 	// This is trivially cheap: just moves the parent pointer (Tim Sehn).
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_RESET('--soft', '%s')", rootHash)); err != nil {
-		return fmt.Errorf("soft reset: %w", err)
+	{
+		ctx, cancel := flattenNewQueryContext()
+		_, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_RESET('--soft', '%s')", rootHash))
+		cancel()
+		if err != nil {
+			return fmt.Errorf("soft reset: %w", err)
+		}
 	}
 	fmt.Printf("  Soft-reset to root %s\n", rootHash[:12])
 
 	// Commit flattened data.
-	commitMsg := fmt.Sprintf("flatten: compact %s history to single commit", dbName)
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil {
-		return fmt.Errorf("commit: %w", err)
+	{
+		ctx, cancel := flattenNewQueryContext()
+		commitMsg := fmt.Sprintf("flatten: compact %s history to single commit", dbName)
+		_, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg))
+		cancel()
+		if err != nil {
+			return fmt.Errorf("commit: %w", err)
+		}
 	}
 	fmt.Printf("  Committed flattened data\n")
 
@@ -179,8 +211,13 @@ func runDoltFlatten(cmd *cobra.Command, args []string) error {
 
 	// Verify final state.
 	var finalCount int
-	if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM `%s`.dolt_log", dbName)).Scan(&finalCount); err == nil {
-		fmt.Printf("  Final commit count: %d\n", finalCount)
+	{
+		ctx, cancel := flattenNewQueryContext()
+		err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM `%s`.dolt_log", dbName)).Scan(&finalCount)
+		cancel()
+		if err == nil {
+			fmt.Printf("  Final commit count: %d\n", finalCount)
+		}
 	}
 
 	fmt.Printf("\n%s Flatten complete: %d → %d commits\n",
@@ -188,31 +225,52 @@ func runDoltFlatten(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// flattenGetRowCounts returns table -> row count for all user tables.
-func flattenGetRowCounts(db *sql.DB, dbName string) (map[string]int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+// flattenNewQueryContext returns a fresh context with the standard per-query
+// budget. Each SQL operation in flattenGetRowCounts calls this independently,
+// so one slow query cannot starve subsequent queries of the remaining window.
+// (gastown-xi8)
+func flattenNewQueryContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), maintainQueryTimeout)
+}
 
-	query := fmt.Sprintf("SELECT table_name FROM information_schema.tables WHERE table_schema = '%s' AND table_name NOT LIKE 'dolt_%%'", dbName)
-	rows, err := db.QueryContext(ctx, query)
+// flattenGetRowCounts returns table -> row count for all user tables.
+// It creates a fresh query context for the table-list scan AND for each
+// per-table COUNT, so the whole table list does not share a single 30s budget
+// with every individual COUNT (gastown-xi8).
+func flattenGetRowCounts(db *sql.DB, dbName string) (map[string]int, error) {
+	// List user tables with its own timeout budget.
+	ctx, cancel := flattenNewQueryContext()
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT table_name FROM information_schema.tables WHERE table_schema = '%s' AND table_name NOT LIKE 'dolt_%%'", dbName))
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	defer rows.Close()
 
 	var tables []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			cancel()
 			return nil, err
 		}
 		tables = append(tables, name)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		cancel()
+		return nil, err
+	}
+	rows.Close()
+	cancel()
 
 	counts := make(map[string]int, len(tables))
 	for _, table := range tables {
+		ctx, cancel := flattenNewQueryContext()
 		var count int
-		if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", dbName, table)).Scan(&count); err != nil {
+		err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", dbName, table)).Scan(&count)
+		cancel()
+		if err != nil {
 			return nil, fmt.Errorf("count %s: %w", table, err)
 		}
 		counts[table] = count
