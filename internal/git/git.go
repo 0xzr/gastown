@@ -154,7 +154,7 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 
 	err := cmd.Run()
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return "", fmt.Errorf("git %s timed out after %v (remote may be unreachable)", args[0], timeout)
 		}
 		return "", g.wrapError(err, stdout.String(), stderr.String(), args)
@@ -3515,7 +3515,7 @@ func (g *Git) PushSubmoduleCommit(submodulePath, sha, remote string) error {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("pushing submodule %s timed out after %v (remote may be unreachable)", submodulePath, pushTimeout)
 		}
 		abbrev := sha

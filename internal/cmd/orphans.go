@@ -3,6 +3,7 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -675,7 +676,7 @@ func runOrphansKill(cmd *cobra.Command, args []string) error {
 			}
 
 			if err := proc.Signal(signal); err != nil {
-				if err == os.ErrProcessDone {
+				if errors.Is(err, os.ErrProcessDone) {
 					fmt.Printf("  %s PID %d: already terminated\n", style.Dim.Render("○"), o.PID)
 					continue
 				}
@@ -927,7 +928,7 @@ func runOrphansKillProcesses(cmd *cobra.Command, args []string) error {
 
 		if err := proc.Signal(signal); err != nil {
 			// Process may have already exited
-			if err == os.ErrProcessDone {
+			if errors.Is(err, os.ErrProcessDone) {
 				fmt.Printf("  %s PID %d: already terminated\n", style.Dim.Render("○"), o.PID)
 				continue
 			}
@@ -1004,7 +1005,7 @@ func runOrphansKillProcessesAggressive() error {
 
 		if err := proc.Signal(signal); err != nil {
 			// Process may have already exited
-			if err == os.ErrProcessDone {
+			if errors.Is(err, os.ErrProcessDone) {
 				fmt.Printf("  %s PID %d: already terminated\n", style.Dim.Render("○"), z.PID)
 				continue
 			}

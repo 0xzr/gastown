@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
@@ -246,7 +247,7 @@ func runMayorStart(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("Starting Mayor session...")
 	if err := mgr.Start(mayorAgentOverride); err != nil {
-		if err == mayor.ErrAlreadyRunning {
+		if errors.Is(err, mayor.ErrAlreadyRunning) {
 			return fmt.Errorf("Mayor session already running. Attach with: gt mayor attach")
 		}
 		return err

@@ -3,6 +3,7 @@ package rig
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -121,7 +122,7 @@ func runHook(hookPath, worktreePath string) error {
 	)
 
 	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("timed out after %s", hookTimeout)
 		}
 		return err

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -76,7 +77,7 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 	// Get the crew worker
 	worker, err := crewMgr.Get(name)
 	if err != nil {
-		if err == crew.ErrCrewNotFound {
+		if errors.Is(err, crew.ErrCrewNotFound) {
 			return fmt.Errorf("crew workspace '%s' not found", name)
 		}
 		return fmt.Errorf("getting crew worker: %w", err)
@@ -330,7 +331,7 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 						return fmt.Errorf("stale session persists after cleanup: %w", err)
 					}
 					fmt.Printf("Stale session detected, recreating...\n")
-					if killErr := t.KillSession(sessionID); killErr != nil && killErr != tmux.ErrSessionNotFound {
+					if killErr := t.KillSession(sessionID); killErr != nil && !errors.Is(killErr, tmux.ErrSessionNotFound) {
 						return fmt.Errorf("failed to kill stale session: %w", killErr)
 					}
 					crewAtRetried = true

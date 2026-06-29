@@ -248,7 +248,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		defer startupWg.Done()
 		deaconMgr := deacon.NewManager(townRoot)
 		if err := deaconMgr.Start(""); err != nil {
-			if err == deacon.ErrAlreadyRunning {
+			if errors.Is(err, deacon.ErrAlreadyRunning) {
 				deaconResult = agentStartResult{name: "Deacon", ok: true, detail: deaconMgr.SessionName()}
 			} else {
 				deaconResult = agentStartResult{name: "Deacon", ok: false, detail: err.Error()}
@@ -729,7 +729,7 @@ func upStartWitness(rigName string, r *rig.Rig) agentStartResult {
 
 	mgr := witness.NewManager(r)
 	if err := mgr.Start(false, "", nil); err != nil {
-		if err == witness.ErrAlreadyRunning {
+		if errors.Is(err, witness.ErrAlreadyRunning) {
 			return agentStartResult{name: name, ok: true, detail: mgr.SessionName()}
 		}
 		return agentStartResult{name: name, ok: false, detail: err.Error()}
@@ -755,7 +755,7 @@ func upStartRefinery(rigName string, r *rig.Rig) agentStartResult {
 
 	mgr := refinery.NewManager(r)
 	if err := mgr.Start(false, ""); err != nil {
-		if err == refinery.ErrAlreadyRunning {
+		if errors.Is(err, refinery.ErrAlreadyRunning) {
 			return agentStartResult{name: name, ok: true, detail: mgr.SessionName()}
 		}
 		return agentStartResult{name: name, ok: false, detail: err.Error()}

@@ -3,6 +3,7 @@ package beads
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1029,7 +1030,7 @@ func TestBDListSlowListDoesNotBlockUnrelatedList(t *testing.T) {
 	started := time.Now()
 	fastOut, fastErr := fastCmd.CombinedOutput()
 	fastElapsed := time.Since(started)
-	if fastCtx.Err() == context.DeadlineExceeded {
+	if errors.Is(fastCtx.Err(), context.DeadlineExceeded) {
 		t.Fatalf("fast unrelated bd list blocked behind slow list; output:\n%s", fastOut)
 	}
 	if fastErr != nil {

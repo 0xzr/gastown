@@ -1495,7 +1495,7 @@ func (d *Daemon) ensureDeaconRunning() {
 	mgr := deacon.NewManager(d.config.TownRoot)
 
 	if err := mgr.Start(""); err != nil {
-		if err == deacon.ErrAlreadyRunning {
+		if errors.Is(err, deacon.ErrAlreadyRunning) {
 			// Deacon is running - record success to reset backoff
 			if d.restartTracker != nil {
 				d.restartTracker.RecordSuccess(agentID)
@@ -1799,7 +1799,7 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 	// See: daemon.log "is hung (no activity for 30m0s), killing for restart"
 
 	if err := mgr.Start(false, "", nil); err != nil {
-		if err == witness.ErrAlreadyRunning {
+		if errors.Is(err, witness.ErrAlreadyRunning) {
 			// Already running - this is the expected case. Run the
 			// self-recovery supervisor (gastown-o9d): if the existing
 			// Witness has reported a saturated+stalled heartbeat for
@@ -1999,7 +1999,7 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	// See: daemon.log "is hung (no activity for 30m0s), killing for restart"
 
 	if err := mgr.Start(false, ""); err != nil {
-		if err == refinery.ErrAlreadyRunning {
+		if errors.Is(err, refinery.ErrAlreadyRunning) {
 			// Already running - this is the expected case when fix is working
 			d.logger.Printf("Refinery for %s already running, skipping spawn", rigName)
 			return
@@ -2024,12 +2024,12 @@ func (d *Daemon) ensureMayorRunning() {
 	townRoot := d.config.TownRoot
 
 	if err := mgr.Start(""); err != nil {
-		if err == mayor.ErrACPActive {
+		if errors.Is(err, mayor.ErrACPActive) {
 			// ACP mode is not supervised by the tmux-based health check.
 			_ = mayor.Touch(townRoot, "acp-active", tmux.SessionHealthy.String())
 			return
 		}
-		if err == mayor.ErrAlreadyRunning {
+		if errors.Is(err, mayor.ErrAlreadyRunning) {
 			// Primary liveness: session exists and the agent process is alive.
 			// Pass 0 to skip tmux activity checking — a Mayor sitting idle at the
 			// prompt waiting for work is still healthy.
@@ -3414,7 +3414,7 @@ func (d *Daemon) dispatchQueuedWork() {
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = append(beads.BuildMutationRoutingBDEnv(os.Environ(), filepath.Join(d.config.TownRoot, ".beads")), "GT_DAEMON=1")
 	out, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		d.logger.Printf("Scheduler dispatch timed out after 5m")
 	} else if err != nil {
 		d.logger.Printf("Scheduler dispatch failed: %v (output: %s)", err, string(out))

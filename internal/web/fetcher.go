@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -37,7 +38,7 @@ func runCmd(timeout time.Duration, name string, args ...string) (*bytes.Buffer, 
 	cmd.Stdout = &stdout
 
 	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%s timed out after %v", name, timeout)
 		}
 		return nil, err
@@ -80,7 +81,7 @@ func (f *LiveConvoyFetcher) runBdCmd(beadsDir string, args ...string) (*bytes.Bu
 
 	err := cmd.Run()
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return nil, fmt.Errorf("bd timed out after %v", f.cmdTimeout)
 		}
 		// If we got some output, return it anyway (bd may exit non-zero with warnings)

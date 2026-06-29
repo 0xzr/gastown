@@ -868,7 +868,7 @@ func runGTForSlotOpen(townRoot string, args ...string) (string, error) {
 	cmd.Env = append(beads.BuildMutationRoutingBDEnv(os.Environ(), filepath.Join(townRoot, ".beads")), "GT_DAEMON=1")
 	out, err := cmd.CombinedOutput()
 	output := string(out)
-	if ctx.Err() == context.DeadlineExceeded {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return output, fmt.Errorf("gt %s timed out after 5m", strings.Join(args, " "))
 	}
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -263,7 +264,7 @@ func (h *APIHandler) runGtCommand(ctx context.Context, timeout time.Duration, ar
 		output += stderr.String()
 	}
 
-	if ctx.Err() == context.DeadlineExceeded {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return output, fmt.Errorf("command timed out after %v", timeout)
 	}
 
@@ -1407,7 +1408,7 @@ func (h *APIHandler) runBdCommand(ctx context.Context, timeout time.Duration, ar
 		output += stderr.String()
 	}
 
-	if ctx.Err() == context.DeadlineExceeded {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return output, fmt.Errorf("command timed out after %v", timeout)
 	}
 
@@ -1685,7 +1686,7 @@ func (h *APIHandler) runGhCommand(ctx context.Context, timeout time.Duration, ar
 		output += stderr.String()
 	}
 
-	if ctx.Err() == context.DeadlineExceeded {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return output, fmt.Errorf("command timed out after %v", timeout)
 	}
 
@@ -2125,7 +2126,7 @@ func (h *APIHandler) handleSessionPreview(w http.ResponseWriter, r *http.Request
 
 	err := cmd.Run()
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			h.sendError(w, "tmux capture-pane timed out", http.StatusGatewayTimeout)
 			return
 		}

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -689,7 +690,7 @@ func (d *Daemon) compactorRunGC(dbName string) error {
 	start := time.Now()
 	if _, err := db.ExecContext(ctx, "CALL dolt_gc()"); err != nil {
 		elapsed := time.Since(start)
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			d.logger.Printf("compactor_dog: gc: %s: TIMEOUT after %v", dbName, elapsed)
 			return fmt.Errorf("gc timeout after %v", elapsed)
 		}

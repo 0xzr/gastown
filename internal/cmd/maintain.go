@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -381,7 +382,7 @@ func maintainGCDatabase(config *doltserver.Config, dbName string) error {
 	defer cancel()
 
 	if _, err := db.ExecContext(ctx, "CALL dolt_gc()"); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("timeout after %v", maintainGCTimeout)
 		}
 		return fmt.Errorf("dolt_gc: %w", err)

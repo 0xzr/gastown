@@ -1633,7 +1633,7 @@ func runRigBoot(cmd *cobra.Command, args []string) error {
 	// sessions whose tmux pane remains after the agent exits.
 	witMgr := witness.NewManager(r)
 	if err := witMgr.Start(false, "", nil); err != nil {
-		if err == witness.ErrAlreadyRunning {
+		if errors.Is(err, witness.ErrAlreadyRunning) {
 			skipped = append(skipped, "witness (already running)")
 		} else {
 			return fmt.Errorf("starting witness: %w", err)
@@ -1645,7 +1645,7 @@ func runRigBoot(cmd *cobra.Command, args []string) error {
 	// 2. Start the refinery
 	refMgr := refinery.NewManager(r)
 	if err := refMgr.Start(false, ""); err != nil { // false = background mode
-		if err == refinery.ErrAlreadyRunning {
+		if errors.Is(err, refinery.ErrAlreadyRunning) {
 			skipped = append(skipped, "refinery (already running)")
 		} else {
 			return fmt.Errorf("starting refinery: %w", err)
@@ -1711,7 +1711,7 @@ func runRigStart(cmd *cobra.Command, args []string) error {
 		// sessions whose tmux pane remains after the agent exits.
 		witMgr := witness.NewManager(r)
 		if err := witMgr.Start(false, "", nil); err != nil {
-			if err == witness.ErrAlreadyRunning {
+			if errors.Is(err, witness.ErrAlreadyRunning) {
 				skipped = append(skipped, "witness")
 			} else {
 				fmt.Printf("  %s Failed to start witness: %v\n", style.Warning.Render("⚠"), err)
@@ -1724,7 +1724,7 @@ func runRigStart(cmd *cobra.Command, args []string) error {
 		// 2. Start the refinery
 		refMgr := refinery.NewManager(r)
 		if err := refMgr.Start(false, ""); err != nil {
-			if err == refinery.ErrAlreadyRunning {
+			if errors.Is(err, refinery.ErrAlreadyRunning) {
 				skipped = append(skipped, "refinery")
 			} else {
 				fmt.Printf("  %s Failed to start refinery: %v\n", style.Warning.Render("⚠"), err)
@@ -2280,7 +2280,7 @@ func runRigRestart(cmd *cobra.Command, args []string) error {
 		// Start() treats healthy sessions as already running and recreates zombie
 		// sessions whose tmux pane remains after the agent exits.
 		if err := witMgr.Start(false, "", nil); err != nil {
-			if err == witness.ErrAlreadyRunning {
+			if errors.Is(err, witness.ErrAlreadyRunning) {
 				skipped = append(skipped, "witness")
 			} else {
 				fmt.Printf("    %s Failed to start witness: %v\n", style.Warning.Render("⚠"), err)
@@ -2292,7 +2292,7 @@ func runRigRestart(cmd *cobra.Command, args []string) error {
 
 		// 2. Start the refinery
 		if err := refMgr.Start(false, ""); err != nil {
-			if err == refinery.ErrAlreadyRunning {
+			if errors.Is(err, refinery.ErrAlreadyRunning) {
 				skipped = append(skipped, "refinery")
 			} else {
 				fmt.Printf("    %s Failed to start refinery: %v\n", style.Warning.Render("⚠"), err)

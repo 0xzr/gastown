@@ -2678,7 +2678,7 @@ func (e *Engineer) routeRejectionToReworkBounce(mr *MRInfo, cause, errMsg string
 		runExec = e.routeRejectionExec
 	}
 	if err := runExec(ctx, args...); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: rework-bounce router call for %s timed out after %s (process group killed)\n", mr.ID, timeout)
 		} else {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: rework-bounce router call failed for %s: %v\n", mr.ID, err)

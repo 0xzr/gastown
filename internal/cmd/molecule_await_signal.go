@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -407,7 +408,7 @@ func waitForEventsFile(ctx context.Context, eventsPath string) (*AwaitSignalResu
 				}, nil
 			}
 			// io.EOF means no new data yet — keep polling
-			if err != nil && err != io.EOF {
+			if err != nil && !errors.Is(err, io.EOF) {
 				return nil, fmt.Errorf("reading events file: %w", err)
 			}
 		}

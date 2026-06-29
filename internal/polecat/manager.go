@@ -2929,7 +2929,7 @@ func (m *Manager) runSetupCommand(worktreePath string) error {
 
 	fmt.Println("Running setup_command...")
 	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("setup_command timed out after %s", setupCmdTimeout)
 		}
 		return fmt.Errorf("setup_command failed: %w", err)
