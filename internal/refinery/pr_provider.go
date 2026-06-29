@@ -6,9 +6,6 @@ type PRProvider interface {
 	// FindPRNumber returns the PR number/ID for the given branch, or 0 if none exists.
 	FindPRNumber(branch string) (int, error)
 
-	// IsPRApproved checks whether a PR has at least one approving review.
-	IsPRApproved(prNumber int) (bool, error)
-
 	// GetReviewEvaluation returns classified per-reviewer results for the PR.
 	// Implementations should distinguish explicit approval, explicit rejection
 	// with blockers, no-verdict/no-output, and provider/reviewer unavailability.
