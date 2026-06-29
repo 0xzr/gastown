@@ -30,6 +30,12 @@ func TestValidateDBName(t *testing.T) {
 		{"db;--", true},
 		{"db`name", true},
 		{"../etc/passwd", true},
+		// Injection payloads (gastown-wes).
+		{"x`; DROP DATABASE foo; --", true},
+		{"x'; DROP DATABASE foo; --", true},
+		{`x"; DROP DATABASE foo; --`, true},
+		{"x -- comment", true},
+		{"x UNION SELECT password FROM mysql.user", true},
 	}
 	for _, tt := range tests {
 		err := ValidateDBName(tt.name)

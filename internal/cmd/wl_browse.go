@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/doltserver"
+	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/wasteland"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -62,6 +63,9 @@ func runWLBrowse(cmd *cobra.Command, args []string) error {
 
 	// Fast path: query through the Dolt server if the database is registered.
 	dbName := wasteland.ResolveDBName(townRoot)
+	if err := reaper.ValidateDBName(dbName); err != nil {
+		return err
+	}
 	if doltserver.DatabaseExists(townRoot, dbName) {
 		query := buildBrowseQuery(BrowseFilter{
 			Status:   wlBrowseStatus,
@@ -70,7 +74,7 @@ func runWLBrowse(cmd *cobra.Command, args []string) error {
 			Priority: wlBrowsePriority,
 			Limit:    wlBrowseLimit,
 		})
-		serverQuery := fmt.Sprintf("USE %s; %s", dbName, query)
+		serverQuery := fmt.Sprintf("USE `%s`; %s", dbName, query)
 
 		if wlBrowseJSON {
 			output, err := doltserver.QueryJSON(townRoot, serverQuery)
