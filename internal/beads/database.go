@@ -146,7 +146,7 @@ func ArgsAreReadOnly(args []string) bool {
 	case "mol":
 		return len(args) > 2 && args[1] == "wisp" && args[2] == "list"
 	case "sql":
-		query := strings.ToLower(strings.Join(stripBDCommandFlags(args[1:]), " "))
+		query := strings.ToLower(strings.Join(stripBDCommandFlags(args[1:], bdSqlBoolFlags), " "))
 		return strings.HasPrefix(strings.TrimSpace(query), "select")
 	case "config":
 		return len(args) > 1 && args[1] == "get"
@@ -155,18 +155,45 @@ func ArgsAreReadOnly(args []string) bool {
 	}
 }
 
-func stripBDGlobalFlags(args []string) []string {
-	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
-		args = args[1:]
-	}
-	return args
+var bdSqlBoolFlags = map[string]bool{
+	"--csv": true,
+	"-h":    true,
 }
 
-func stripBDCommandFlags(args []string) []string {
-	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
-		args = args[1:]
+func stripBDGlobalFlags(args []string) []string {
+	return stripLeadingFlags(args, bdBoolGlobalFlags, bdTargetSelectorFlags)
+}
+
+func stripBDCommandFlags(args []string, bools map[string]bool) []string {
+	return stripLeadingFlags(args, bools, nil)
+}
+
+// stripLeadingFlags removes recognized leading flags from args and returns the
+// remaining positional slice. It fails closed: an unknown leading flag, a
+// "--" terminator, or a flag=value form stops the scan at that position so
+// the caller treats it as an unrecognized/mutation command.
+func stripLeadingFlags(args []string, bools, selectorFlags map[string]bool) []string {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" || !strings.HasPrefix(arg, "-") {
+			return args[i:]
+		}
+		if _, _, ok := strings.Cut(arg, "="); ok {
+			return args[i:]
+		}
+		if bools[arg] {
+			continue
+		}
+		if selectorFlags[arg] {
+			if i+1 >= len(args) {
+				return args[i:]
+			}
+			i++ // skip the selector's value argument
+			continue
+		}
+		return args[i:]
 	}
-	return args
+	return nil
 }
 
 // SuppressBDSideEffects disables Beads JSONL export/backup/push side effects for
