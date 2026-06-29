@@ -30,6 +30,31 @@ func TestValidateDBName(t *testing.T) {
 		{"db;--", true},
 		{"db`name", true},
 		{"../etc/passwd", true},
+
+		// Extended injection coverage (gastown-wes retro-bug P0):
+		// a P0 SQLi in callers unescaped dbName into both backtick identifiers
+		// and single-quote string literals. Anything below that could escape the
+		// surrounding quote/identifier and inject arbitrary SQL must be rejected.
+		{"my-rig", false},     // hyphen OK
+		{"wl_commons", false}, // underscore OK
+		{"db;DROP DATABASE foo", true},
+		{"db'--", true},
+		{"`x` -- ; DROP DATABASE foo", true},
+		{"x'; DROP TABLE issues; --", true},
+		{"x' OR '1'='1", true},
+		{"x' UNION SELECT 1--", true},
+		{"..\\windows", true},
+		{"db name", true},
+		{"db\tname", true},
+		{"db\nname", true},
+		{"db|name", true},
+		{"db&name", true},
+		{"db$name", true},
+		{"db*name", true},
+		{"db?name", true},
+		{"db<name>", true},
+		{"db(name)", true},
+		{"db\x00name", true},
 	}
 	for _, tt := range tests {
 		err := ValidateDBName(tt.name)

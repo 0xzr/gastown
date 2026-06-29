@@ -14,6 +14,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/doltserver"
+	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -105,6 +106,14 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 
 	dbInfos := make([]maintainDBInfo, 0, len(databases))
 	for _, dbName := range databases {
+		// Defense in depth: dbNames come from server SHOW DATABASES (trusted),
+		// but reject anything that wouldn't pass the canonical regex so a stale
+		// or misconfigured server can't drive injection downstream.
+		if err := reaper.ValidateDBName(dbName); err != nil {
+			fmt.Printf("  %s %s: skipping (invalid name: %v)\n",
+				style.Warning.Render("!"), dbName, err)
+			continue
+		}
 		info := maintainDBInfo{name: dbName}
 		if count, err := maintainCountCommits(config, dbName); err == nil {
 			info.commitCount = count
@@ -289,6 +298,12 @@ func maintainBackupSync(dataDir, dbName, backupName string) error {
 
 // maintainOpenDB opens a connection to the Dolt server for a database.
 func maintainOpenDB(config *doltserver.Config, dbName string) (*sql.DB, error) {
+	// Defense in depth: dbName is interpolated into the DSN path. Even though
+	// runMaintain iterates over server-trusted names, reject malformed input here
+	// so this chokepoint is safe regardless of future callers.
+	if err := reaper.ValidateDBName(dbName); err != nil {
+		return nil, err
+	}
 	// wa-d6f: socket-first DSN (TCP fallback) to avoid TIME_WAIT churn from
 	// short-lived gt maintain invocations.
 	dsn := buildDoltDSNFromConfig(config, dbName, dsnOpts{

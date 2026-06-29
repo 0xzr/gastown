@@ -11,6 +11,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/doltserver"
+	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -48,6 +49,12 @@ func init() {
 
 func runDoltFlatten(cmd *cobra.Command, args []string) error {
 	dbName := args[0]
+
+	// Trust-boundary guard: dbName is interpolated unescaped into multiple SQL
+	// statements below. Validate against injection before opening any connection.
+	if err := reaper.ValidateDBName(dbName); err != nil {
+		return fmt.Errorf("dolt flatten: %w", err)
+	}
 
 	if !doltFlattenConfirm {
 		return fmt.Errorf("this command destroys all commit history. Pass --yes-i-am-sure to proceed")
