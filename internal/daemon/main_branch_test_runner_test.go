@@ -1,15 +1,18 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/util"
+	"github.com/steveyegge/gastown/internal/wisp"
 )
 
 func TestMainBranchTestInterval(t *testing.T) {
@@ -516,5 +519,75 @@ func TestEnsureLifecycleDefaultsFillsMainBranchTest(t *testing.T) {
 	}
 	if !config.Patrols.MainBranchTest.Enabled {
 		t.Error("expected MainBranchTest.Enabled=true after defaults")
+	}
+}
+
+// TestRunMainBranchTests_UsesPatrolRigsFilter drives runMainBranchTests
+// end-to-end and locks in the retro-bug P0 fix from gastown-3kc: the runner
+// must route through d.getPatrolRigs("main_branch_test") so operational
+// filters (parked/docked) apply, instead of iterating d.getKnownRigs().
+//
+// The previous regression attempt (49a883f2) tested getPatrolRigs directly
+// and was rejected; this test exercises the full runner to prove the log
+// exclusions are emitted for non-operational rigs.
+func TestRunMainBranchTests_UsesPatrolRigsFilter(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Seed three registered rigs.
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
+		t.Fatalf("mkdir mayor dir: %v", err)
+	}
+	rigsJSON := `{"rigs":{"alpha":{},"beta":{},"gamma":{}}}`
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0o644); err != nil {
+		t.Fatalf("write rigs.json: %v", err)
+	}
+
+	// Mark beta parked and gamma docked via wisp. Alpha is also parked so
+	// the test remains deterministic regardless of whether Dolt is available.
+	for _, rigName := range []string{"alpha", "beta", "gamma"} {
+		status := "parked"
+		if rigName == "gamma" {
+			status = "docked"
+		}
+		if err := wisp.NewConfig(townRoot, rigName).Set("status", status); err != nil {
+			t.Fatalf("set %s %s: %v", rigName, status, err)
+		}
+	}
+
+	var logBuf bytes.Buffer
+	d := &Daemon{
+		config: &Config{TownRoot: townRoot},
+		patrolConfig: &DaemonPatrolConfig{
+			Type:    "daemon-patrol-config",
+			Version: 1,
+			Patrols: &PatrolsConfig{
+				MainBranchTest: &MainBranchTestConfig{Enabled: true},
+			},
+		},
+		disabledPatrols: map[string]bool{},
+		ctx:             context.Background(),
+		logger:          log.New(&logBuf, "", 0),
+	}
+
+	d.runMainBranchTests()
+
+	output := logBuf.String()
+
+	if !strings.Contains(output, "main_branch_test: starting patrol cycle") {
+		t.Errorf("expected patrol start log, got:\n%s", output)
+	}
+	if !strings.Contains(output, "main_branch_test: no operational rigs found") {
+		t.Errorf("expected 'no operational rigs found' log, got:\n%s", output)
+	}
+
+	// The core regression assertion: beta and gamma must be excluded with
+	// the wisp-driven operational reasons, proving the runner consulted the
+	// patrol filter rather than blindly using getKnownRigs().
+	if !strings.Contains(output, "Excluding beta from main_branch_test patrol: rig is parked") {
+		t.Errorf("expected beta parked exclusion log, got:\n%s", output)
+	}
+	if !strings.Contains(output, "Excluding gamma from main_branch_test patrol: rig is docked") {
+		t.Errorf("expected gamma docked exclusion log, got:\n%s", output)
 	}
 }
