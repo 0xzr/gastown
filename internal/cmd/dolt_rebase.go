@@ -5,12 +5,16 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/doltserver"
+	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -63,6 +67,26 @@ func init() {
 	doltCmd.AddCommand(doltRebaseCmd)
 }
 
+// acquireDoltRebaseLock acquires the same per-database advisory flock used
+// by the daemon's compactor_dog surgical mode. Keeping the critical section
+// locked from pre-flight checks through the branch swap closes the TOCTOU
+// window between the HEAD verification and the branch swap.
+// The lock path must stay in sync with internal/daemon/compactor_dog.go.
+func acquireDoltRebaseLock(townRoot, dbName string) (func(), error) {
+	lockDir := filepath.Join(townRoot, ".runtime", "locks", "compactor-surgical")
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating dolt rebase lock dir: %w", err)
+	}
+
+	safeDBName := strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(dbName)
+	lockPath := filepath.Join(lockDir, safeDBName+".flock")
+	release, err := lock.FlockAcquire(lockPath)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring dolt rebase lock for %s: %w", dbName, err)
+	}
+	return release, nil
+}
+
 func runDoltRebase(cmd *cobra.Command, args []string) error {
 	dbName := args[0]
 
@@ -82,6 +106,16 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	running, _, err := doltserver.IsRunning(townRoot)
 	if err != nil || !running {
 		return fmt.Errorf("Dolt server is not running — start with 'gt dolt start'")
+	}
+
+	// Serialize with the daemon compactor (and other manual invocations) for the
+	// same database. Dry-run only reads, so it doesn't need the lock.
+	if !doltRebaseDryRun {
+		releaseLock, lockErr := acquireDoltRebaseLock(townRoot, dbName)
+		if lockErr != nil {
+			return lockErr
+		}
+		defer releaseLock()
 	}
 
 	config := doltserver.DefaultConfig(townRoot)
@@ -295,6 +329,19 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	if currentHead != preHead {
 		rebaseCleanupAll(db, baseBranch, workBranch)
 		return fmt.Errorf("ABORT: main HEAD moved during rebase (%s → %s)", shortHash(preHead), shortHash(currentHead))
+	}
+
+	// Step 7.5: Final pre-swap concurrency check. The advisory lock serializes
+	// against other surgical rebase operations; re-read HEAD one last time to
+	// minimize the TOCTOU window before the destructive branch swap.
+	preSwapHead, err := flattenGetHead(db, dbName)
+	if err != nil {
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("pre-swap concurrency check: %w", err)
+	}
+	if preSwapHead != preHead {
+		rebaseCleanupAll(db, baseBranch, workBranch)
+		return fmt.Errorf("ABORT: main HEAD moved after concurrency check (%s → %s)", shortHash(preHead), shortHash(preSwapHead))
 	}
 
 	// Step 8: Swap branches — make compact-work the new main.
