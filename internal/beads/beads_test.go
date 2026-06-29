@@ -403,6 +403,70 @@ func TestArgsAreReadOnlyFailsClosedForMutations(t *testing.T) {
 	}
 }
 
+// TestArgsAreReadOnlyStripsShortGlobalFlags verifies the retro-bug fix for
+// stripBDGlobalFlags only dropping '--' prefixed tokens. Short flags like -q,
+// -v, and value-taking selectors like -C <dir> must be stripped so the actual
+// subcommand is used for read-only classification.
+func TestArgsAreReadOnlyStripsShortGlobalFlags(t *testing.T) {
+	cases := [][]string{
+		{"-q", "show", "gt-123"},
+		{"-v", "list"},
+		{"-h", "version"},
+		{"-C", "/tmp", "show", "gt-123"},
+		{"--db", "/tmp/bd", "ready"},
+		{"--quiet", "--json", "query", "SELECT * FROM issues"},
+		{"--allow-stale", "-C", "/tmp", "blocked"},
+		{"--sandbox", "foo", "--json", "stale"},
+	}
+	for _, args := range cases {
+		if !ArgsAreReadOnly(args) {
+			t.Fatalf("ArgsAreReadOnly(%v) = false, want true", args)
+		}
+	}
+}
+
+// TestArgsAreReadOnlyFailClosedOnUnknownLeadingFlag verifies that an
+// unrecognized leading flag leaves the args misaligned so the command is
+// classified as a mutation (the safe default).
+func TestArgsAreReadOnlyFailClosedOnUnknownLeadingFlag(t *testing.T) {
+	cases := [][]string{
+		{"--unknown", "show", "gt-123"},
+		{"-x", "show", "gt-123"},
+		{"--repo", "gastown", "show", "gt-123"},
+	}
+	for _, args := range cases {
+		if ArgsAreReadOnly(args) {
+			t.Fatalf("ArgsAreReadOnly(%v) = true, want false", args)
+		}
+	}
+}
+
+// TestStripBDCommandFlagsDropsSqlBools verifies sql-specific flags like --csv
+// and -h are stripped so the query is inspected for the SELECT prefix.
+func TestStripBDCommandFlagsDropsSqlBools(t *testing.T) {
+	got := stripBDCommandFlags([]string{"--csv", "SELECT", "1"}, bdSqlBoolFlags)
+	want := []string{"SELECT", "1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stripBDCommandFlags(csv) = %v, want %v", got, want)
+	}
+
+	got = stripBDCommandFlags([]string{"-h", "SELECT", "1"}, bdSqlBoolFlags)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stripBDCommandFlags(h) = %v, want %v", got, want)
+	}
+}
+
+// TestStripBDCommandFlagsShortFlagValueStopsScan verifies that a flag-like
+// token that is not a known sql bool is left in place (fail-closed for the
+// sql command classifier).
+func TestStripBDCommandFlagsStopsOnUnknownFlag(t *testing.T) {
+	got := stripBDCommandFlags([]string{"--schema", "SELECT", "1"}, bdSqlBoolFlags)
+	want := []string{"--schema", "SELECT", "1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stripBDCommandFlags(schema) = %v, want %v", got, want)
+	}
+}
+
 func envMap(env []string) map[string]string {
 	out := make(map[string]string)
 	for _, entry := range env {
