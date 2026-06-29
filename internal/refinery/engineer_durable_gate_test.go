@@ -12,7 +12,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/util"
 )
+
+// testHMACAttestationTimeout bounds the shell-out to the HMAC helper used by
+// setup tests. Production gate commands carry their own deadline (via the
+// durable review gate timeout); tests must fail closed rather than block the
+// parent test run when the helper hangs or its descendants orphan pipes.
+const testHMACAttestationTimeout = time.Minute
 
 // TestDoMerge_DurableReviewGate_MissingCommand_BlocksMerge proves that a
 // required durable review gate with no configured command fails closed: even
@@ -500,16 +508,8 @@ func TestDoMerge_DurableReviewGate_SymlinkAttestation_BlocksMerge(t *testing.T) 
 	if err != nil {
 		t.Fatalf("resolve merge-candidate tree: %v", err)
 	}
-	realToken := filepath.Join(t.TempDir(), "real-token")
-	key, err := os.ReadFile(keyPath)
-	if err != nil {
-		t.Fatalf("read HMAC key: %v", err)
-	}
-	key = bytes.TrimRight(key, "\r\n")
-	token := hex.EncodeToString(expectedDurableReviewAttestationWithKey(key, tree, "unknown"))
-	if err := os.WriteFile(realToken, []byte(token+"\n"), 0644); err != nil {
-		t.Fatalf("write real token: %v", err)
-	}
+	realToken := filepath.Join(t.TempDir(), tree)
+	writeHMACTokenTo(t, realToken, keyPath, tree, "unknown")
 	if err := os.Symlink(realToken, filepath.Join(attestDir, tree)); err != nil {
 		t.Fatalf("create attestation symlink: %v", err)
 	}
@@ -1005,14 +1005,42 @@ func writeTownMarker(t *testing.T, townRoot string) {
 
 func writeHMACToken(t *testing.T, attestDir, keyPath, tree, writer string) {
 	t.Helper()
-	key, err := os.ReadFile(keyPath)
+	writeHMACTokenTo(t, filepath.Join(attestDir, tree), keyPath, tree, writer)
+}
+
+// writeHMACTokenTo writes a durable-review HMAC attestation for tree by
+// shelling out through hmacAttestationShellCmd, the same command shape
+// production gate commands use. This ensures setup tests exercise the real
+// reviewer code path instead of short-circuiting with the production signing
+// function directly. The shell-out is wrapped in process-group cancellation
+// (util.SetProcessGroup) so that when the deadline expires the entire process
+// tree — including the helper child re-invoked via os.Args[0] — is killed.
+// cmd.WaitDelay provides a second-line guarantee: after the deadline, the
+// OS-level I/O pipes are closed even if a descendant refuses to exit, so
+// CombinedOutput cannot block forever (gastown-zcl).
+func writeHMACTokenTo(t *testing.T, outPath, keyPath, tree, writer string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), testHMACAttestationTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", hmacAttestationShellCmd(t)) //nolint:gosec // G204: test helper only
+	util.SetProcessGroup(cmd)
+	cmd.WaitDelay = testHMACAttestationTimeout
+	cmd.Env = append(os.Environ(),
+		"GT_GATE_ATTEST_DIR="+filepath.Dir(outPath),
+		"GT_GATE_HMAC_KEY="+keyPath,
+		"GT_REVIEW_GATE_WRITER="+writer,
+		"GT_HMAC_ATTESTATION_TREE="+tree,
+	)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("read HMAC key: %v", err)
-	}
-	key = bytes.TrimRight(key, "\r\n")
-	token := hex.EncodeToString(expectedDurableReviewAttestationWithKey(key, tree, writer))
-	if err := os.WriteFile(filepath.Join(attestDir, tree), []byte(token+"\n"), 0644); err != nil {
-		t.Fatalf("write HMAC attestation: %v", err)
+		msg := fmt.Sprintf("write HMAC attestation via gate helper: %v", err)
+		if ctx.Err() == context.DeadlineExceeded {
+			msg = fmt.Sprintf("write HMAC attestation via gate helper timed out after %v (process group killed)", testHMACAttestationTimeout)
+		}
+		if len(out) > 0 {
+			msg += fmt.Sprintf("\nhelper output:\n%s", out)
+		}
+		t.Fatal(msg)
 	}
 }
 
@@ -1022,21 +1050,24 @@ func shellQuote(s string) string {
 
 func hmacAttestationShellCmd(t *testing.T) string {
 	t.Helper()
-	return fmt.Sprintf(`mkdir -p "$GT_GATE_ATTEST_DIR" && tree="$(git rev-parse HEAD^{tree})" && GT_HMAC_ATTESTATION_HELPER=1 %s -test.run=TestHMACAttestationHelper -- "$tree" > "$GT_GATE_ATTEST_DIR/$tree"`, shellQuote(os.Args[0]))
+	return fmt.Sprintf(`mkdir -p "$GT_GATE_ATTEST_DIR" && tree="${GT_HMAC_ATTESTATION_TREE:-$(git rev-parse HEAD^{tree})}" && GT_HMAC_ATTESTATION_HELPER=1 %s -test.run=TestHMACAttestationHelper -- "$tree" > "$GT_GATE_ATTEST_DIR/$tree"`, shellQuote(os.Args[0]))
 }
 
 func TestHMACAttestationHelper(t *testing.T) {
 	if os.Getenv("GT_HMAC_ATTESTATION_HELPER") != "1" {
 		return
 	}
-	if len(os.Args) == 0 {
-		fmt.Fprintln(os.Stderr, "missing argv")
-		os.Exit(2)
-	}
-	tree := os.Args[len(os.Args)-1]
-	if tree == "" || strings.HasPrefix(tree, "-") {
-		fmt.Fprintln(os.Stderr, "usage: TestHMACAttestationHelper -- <tree>")
-		os.Exit(2)
+	tree := os.Getenv("GT_HMAC_ATTESTATION_TREE")
+	if tree == "" {
+		if len(os.Args) == 0 {
+			fmt.Fprintln(os.Stderr, "missing argv")
+			os.Exit(2)
+		}
+		tree = os.Args[len(os.Args)-1]
+		if tree == "" || strings.HasPrefix(tree, "-") {
+			fmt.Fprintln(os.Stderr, "usage: TestHMACAttestationHelper -- <tree>")
+			os.Exit(2)
+		}
 	}
 	keyPath := os.Getenv("GT_GATE_HMAC_KEY")
 	if keyPath == "" {
