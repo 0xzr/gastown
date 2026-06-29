@@ -153,6 +153,15 @@ func (d *Daemon) runCompactorDog() {
 	errors := 0
 
 	for _, dbName := range databases {
+		// Trust-boundary guard: dbNames here are config-derived (or fall back to
+		// reaper.DefaultDatabases / auto-discovery) but never CLI-supplied. Validate
+		// anyway, matching the policy used by wisp_reaper, so an attacker who can
+		// poison config can't escalate to SQLi.
+		if err := reaper.ValidateDBName(dbName); err != nil {
+			d.logger.Printf("compactor_dog: %s: skipping (invalid name: %v)", dbName, err)
+			skipped++
+			continue
+		}
 		commitCount, err := d.compactorCountCommits(dbName)
 		if err != nil {
 			d.logger.Printf("compactor_dog: %s: error counting commits: %v", dbName, err)
@@ -602,6 +611,13 @@ func (d *Daemon) compactorCleanup(db *sql.DB, dbName string) {
 
 // compactorOpenDB opens a connection to the Dolt server for the given database.
 func (d *Daemon) compactorOpenDB(dbName string) (*sql.DB, error) {
+	// Defense in depth: dbName is interpolated into both the DSN path and many
+	// SQL statements below. Reject malformed input here so this chokepoint is
+	// safe regardless of caller. runCompactorDog validates at the loop entry
+	// too, so this is belt-and-suspenders.
+	if err := reaper.ValidateDBName(dbName); err != nil {
+		return nil, err
+	}
 	dsn := fmt.Sprintf("root@tcp(%s:%d)/%s?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s",
 		"127.0.0.1", d.doltServerPort(), dbName)
 	return sql.Open("mysql", dsn)

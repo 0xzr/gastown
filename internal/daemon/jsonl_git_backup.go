@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -45,7 +46,8 @@ var testPollutionPatterns = []*regexp.Regexp{
 }
 
 // validDBName matches safe database names (alphanumeric, underscore, hyphen).
-var validDBName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+// Removed: duplicated the reaper's canonical regex (gastown-wes); use
+// reaper.ValidateDBName instead so all dbName checks share one definition.
 
 // scrubQuery is the WHERE clause for filtering ephemeral data.
 // Kept separate from Sprintf to avoid %% confusion.
@@ -228,7 +230,7 @@ var supplementalTables = []string{
 //
 // Returns the total number of records exported across all tables.
 func (d *Daemon) exportDatabaseToJsonl(db, gitRepo, dataDir string, scrub bool) (int, error) {
-	if !validDBName.MatchString(db) {
+	if err := reaper.ValidateDBName(db); err != nil {
 		return 0, fmt.Errorf("invalid database name: %q", db)
 	}
 
