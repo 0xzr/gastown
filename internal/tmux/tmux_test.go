@@ -28,7 +28,16 @@ func newTestTmux(t *testing.T) *Tmux {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
 	}
-	return NewTmux()
+
+	// Use a unique socket per test so parallel tests cannot interfere with each
+	// other. The previous shared-server model was flaky: one test killing the
+	// server left a stale socket and broke subsequent NewSession calls.
+	socket := fmt.Sprintf("gt-test-%d-%s", os.Getpid(), strings.ReplaceAll(t.Name(), "/", "-"))
+	tm := NewTmuxWithSocket(socket)
+	t.Cleanup(func() {
+		_ = tm.KillServer()
+	})
+	return tm
 }
 
 func TestListSessionsNoServer(t *testing.T) {
@@ -296,11 +305,7 @@ func TestEnsureSessionFresh_IdempotentOnZombie(t *testing.T) {
 }
 
 func TestEnsureSessionFreshWithCommand_NoExisting(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-fwc-new-" + t.Name()
 
 	// Clean up any existing session
@@ -333,11 +338,7 @@ func TestEnsureSessionFreshWithCommand_NoExisting(t *testing.T) {
 }
 
 func TestEnsureSessionFreshWithCommand_KillsZombie(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-fwc-zombie-" + t.Name()
 
 	// Clean up any existing session
