@@ -5,12 +5,15 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/reaper"
 )
 
@@ -42,7 +45,32 @@ const (
 	// Dolt detects that the commit graph changed and returns an error. One retry
 	// is usually sufficient since the window for concurrent writes is small.
 	surgicalMaxRetries = 1
+	// surgicalRebaseLockDir is the subdirectory under <townRoot>/.runtime/locks
+	// where per-database advisory flock files for surgical rebase live. It is
+	// shared with the manual `gt dolt rebase` command so the daemon and CLI
+	// cannot race through each other's check-and-swap windows.
+	surgicalRebaseLockDir = "compactor-surgical"
 )
+
+// acquireSurgicalRebaseLock acquires an exclusive advisory flock for surgical
+// rebase on the named database. The returned release function must be called
+// when the operation completes. This serializes the entire critical section
+// (pre-flight HEAD read → branch swap) across processes, closing the TOCTOU
+// window between the concurrency check and the branch swap.
+func acquireSurgicalRebaseLock(townRoot, dbName string) (func(), error) {
+	lockDir := filepath.Join(townRoot, ".runtime", "locks", surgicalRebaseLockDir)
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating surgical rebase lock dir: %w", err)
+	}
+
+	safeDBName := strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(dbName)
+	lockPath := filepath.Join(lockDir, safeDBName+".flock")
+	release, err := lock.FlockAcquire(lockPath)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring surgical rebase lock for %s: %w", dbName, err)
+	}
+	return release, nil
+}
 
 // CompactorDogConfig holds configuration for the compactor_dog patrol.
 type CompactorDogConfig struct {
@@ -401,6 +429,19 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 	}
 	defer db.Close()
 
+	// Acquire the per-database surgical rebase lock before reading pre-flight
+	// state. Holding this lock until the branch swap completes makes the
+	// concurrency check + branch swap atomic relative to any other surgical
+	// rebase (compactor dog or manual `gt dolt rebase`).
+	if d.config != nil && d.config.TownRoot != "" {
+		releaseLock, lockErr := acquireSurgicalRebaseLock(d.config.TownRoot, dbName)
+		if lockErr != nil {
+			return fmt.Errorf("acquiring surgical rebase lock: %w", lockErr)
+		}
+		defer releaseLock()
+		d.logger.Printf("compactor_dog: %s: acquired surgical rebase lock", dbName)
+	}
+
 	// Pre-flight: record state.
 	preHead, err := d.compactorGetHead(db, dbName)
 	if err != nil {
@@ -524,6 +565,20 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 	if currentHead != preHead {
 		d.surgicalCleanup(db, baseBranch, workBranch)
 		return fmt.Errorf("concurrency abort: main HEAD moved from %s to %s", shortHash(preHead), shortHash(currentHead))
+	}
+
+	// Step 7.5: Final pre-swap concurrency check. While the lock serializes
+	// against other surgical rebase operations, normal Dolt commits can still
+	// move main in a separate connection. Re-read HEAD immediately before the
+	// destructive branch swap to keep the TOCTOU window as small as possible.
+	preSwapHead, err := d.compactorGetHead(db, dbName)
+	if err != nil {
+		d.surgicalCleanup(db, baseBranch, workBranch)
+		return fmt.Errorf("pre-swap concurrency check: %w", err)
+	}
+	if preSwapHead != preHead {
+		d.surgicalCleanup(db, baseBranch, workBranch)
+		return fmt.Errorf("concurrency abort: main HEAD moved from %s to %s after check", shortHash(preHead), shortHash(preSwapHead))
 	}
 
 	// Step 8: Swap branches — make compact-work the new main.
