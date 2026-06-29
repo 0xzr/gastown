@@ -735,33 +735,52 @@ func sameMainRows(a, b []branchControlRow) bool {
 // (the fork) and asserts the acquire call appears first in the function
 // body. If someone reorders these calls in a future refactor, the test
 // fails loudly with a pointer to the design bead.
-func TestRebaseOrder_InterlockBeforeFork(t *testing.T) {
+// TestRebaseOrder_InPlaceNoDestructiveSwap guards the gastown-5nz invariant:
+// the surgical rebase must rebase directly on `main` in place, with NO
+// destructive `DOLT_BRANCH -D main` + `-m compact-work → main` swap and NO
+// compact-work fork from main. The swap was the source of the TOCTOU window
+// (gastown-d88); 5nz eliminates it by relying on DOLT_REBASE('--continue')
+// to atomically update refs/heads/main and fail-close on concurrent writes.
+//
+// This supersedes the gastown-d88 TestRebaseOrder_InterlockBeforeFork guard,
+// which asserted the now-removed interlock-acquired-before-fork ordering.
+func TestRebaseOrder_InPlaceNoDestructiveSwap(t *testing.T) {
 	src, err := os.ReadFile("dolt_rebase.go")
 	if err != nil {
 		t.Fatalf("read dolt_rebase.go: %v", err)
 	}
 	text := string(src)
 
-	acquireIdx := strings.Index(text, "acquireRebaseInterlock(")
-	if acquireIdx < 0 {
-		t.Fatal("acquireRebaseInterlock call site not found in dolt_rebase.go")
+	// MUST NOT contain the destructive swap: deleting main and renaming
+	// compact-work onto it. Either half re-introduces the TOCTOU window.
+	if strings.Contains(text, "CALL DOLT_BRANCH('-D', 'main')") {
+		t.Fatal("TOCTOU REGRESSION (gastown-5nz): destructive `DOLT_BRANCH -D main` present in dolt_rebase.go — " +
+			"the in-place rebase must update refs/heads/main via DOLT_REBASE('--continue'), not a branch delete+rename swap")
 	}
-	// The fork from main: "CALL DOLT_BRANCH('%s', 'main')" — the work branch
-	// creation. (compact-base uses rootHash, not main, so it is not the
-	// fork we are guarding.)
-	forkIdx := strings.Index(text, "CALL DOLT_BRANCH('%s', 'main')")
-	if forkIdx < 0 {
-		t.Fatal(`compact-work fork ("CALL DOLT_BRANCH('<base>', 'main')") not found in dolt_rebase.go`)
+	if strings.Contains(text, "CALL DOLT_BRANCH('-m', '%s', 'main')") {
+		t.Fatal("TOCTOU REGRESSION (gastown-5nz): destructive compact-work→main rename present in dolt_rebase.go — " +
+			"the in-place rebase must not swap branches")
 	}
-
-	if acquireIdx > forkIdx {
-		t.Fatalf(
-			"TOCTOU REGRESSION (gastown-d88 finding #1): acquireRebaseInterlock at offset %d "+
-				"appears AFTER the compact-work fork at offset %d. The interlock MUST be acquired "+
-				"BEFORE the fork so a concurrent writer cannot advance main between fork and "+
-				"interlock acquisition and silently lose the intervening commit.",
-			acquireIdx, forkIdx)
+	// MUST NOT fork a compact-work branch from main (the swap target).
+	if strings.Contains(text, "CALL DOLT_BRANCH('%s', 'main')") {
+		t.Fatal("TOCTOU REGRESSION (gastown-5nz): compact-work fork from main present in dolt_rebase.go — " +
+			"the in-place rebase runs directly on main, no work branch")
 	}
-	t.Logf("acquireRebaseInterlock (offset %d) precedes compact-work fork (offset %d) — TOCTOU guard OK",
-		acquireIdx, forkIdx)
+	// MUST pin a single connection so the session-scoped dolt_rebase plan
+	// survives across the start/UPDATE/continue calls.
+	if !strings.Contains(text, "SetMaxOpenConns(1)") {
+		t.Fatal("gastown-5nz: SetMaxOpenConns(1) missing in dolt_rebase.go — the session-scoped dolt_rebase plan " +
+			"requires a pinned single connection or the driver may round-robin and lose the plan")
+	}
+	// MUST start the interactive rebase directly on main (no checkout of a
+	// work branch before it).
+	continueIdx := strings.Index(text, "CALL DOLT_REBASE('--continue')")
+	startIdx := strings.Index(text, "CALL DOLT_REBASE('--interactive'")
+	if startIdx < 0 || continueIdx < 0 {
+		t.Fatal("gastown-5nz: in-place rebase start/continue calls missing in dolt_rebase.go")
+	}
+	if startIdx > continueIdx {
+		t.Fatalf("gastown-5nz: DOLT_REBASE('--interactive') (offset %d) after --continue (offset %d)", startIdx, continueIdx)
+	}
+	t.Logf("in-place rebase invariant OK: no destructive swap, no compact-work fork, single-conn pinned")
 }
