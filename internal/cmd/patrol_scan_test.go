@@ -46,6 +46,14 @@ func TestPatrolScanOutputJSON(t *testing.T) {
 				},
 			},
 		},
+		Fleet: &witness.FleetState{
+			Rig:                  "gastown",
+			ActiveImplementation: []string{"alpha"},
+			PostSubmitGate:       []string{"beta"},
+			RecoveryHeld:         nil,
+			Idle:                 []string{"gamma"},
+			IsEmpty:              false,
+		},
 		Receipts: []witness.PatrolReceipt{
 			{
 				Rig:               "gastown",
@@ -99,6 +107,81 @@ func TestPatrolScanOutputJSON(t *testing.T) {
 	if parsed.Receipts[0].Verdict != witness.PatrolVerdictStale {
 		t.Errorf("receipt Verdict = %q, want %q", parsed.Receipts[0].Verdict, witness.PatrolVerdictStale)
 	}
+
+	// Fleet must round-trip with the bucket separation gastown-72v requires.
+	if parsed.Fleet == nil {
+		t.Fatal("Fleet = nil; want populated. Witness patrol output must present MQ gates separately from active impl")
+	}
+	if got, want := parsed.Fleet.PostSubmitGate, []string{"beta"}; !equalStrings(got, want) {
+		t.Errorf("Fleet.PostSubmitGate = %v, want %v", got, want)
+	}
+	if got, want := parsed.Fleet.ActiveImplementation, []string{"alpha"}; !equalStrings(got, want) {
+		t.Errorf("Fleet.ActiveImplementation = %v, want %v", got, want)
+	}
+	if parsed.Fleet.IsEmpty {
+		t.Error("Fleet.IsEmpty = true; want false (gates + impl present)")
+	}
+}
+
+// TestOutputPatrolScanJSON_CapturesBuffer verifies the io.Writer seam
+// (introduced for gastown-72v) keeps the JSON serialization testable
+// without ever touching os.Stdout. Parallel capture from os.Stdout races
+// with the test runner's output, which is exactly the failure mode the
+// rejection called out. We capture into a bytes.Buffer instead — no
+// t.Parallel, no os.Stdout. (gastown-72v)
+func TestOutputPatrolScanJSON_CapturesBuffer(t *testing.T) {
+	var buf bytes.Buffer
+	zombie := &witness.DetectZombiePolecatsResult{
+		Checked: 1,
+		Zombies: []witness.ZombieResult{
+			{PolecatName: "alpha", WasActive: true, Classification: witness.ZombieSessionDeadActive, Action: "restarted"},
+		},
+	}
+	fleet := &witness.FleetState{
+		Rig:            "gastown",
+		PostSubmitGate: []string{"alpha"},
+		IsEmpty:        false,
+	}
+	if err := outputPatrolScanJSON(&buf, "gastown", "2026-06-29T00:00:00Z", zombie, nil, nil, fleet, nil); err != nil {
+		t.Fatalf("outputPatrolScanJSON: %v", err)
+	}
+	got := buf.String()
+	for _, want := range []string{
+		`"rig": "gastown"`,
+		`"fleet"`,
+		`"PostSubmitGate"`,
+		`"alpha"`,
+		`"IsEmpty": false`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output %q missing %s", got, want)
+		}
+	}
+}
+
+// TestOutputPatrolScanJSON_NilFleetIsOmitted covers the ops failure mode
+// where DetectFleetState failed (Dolt down, missing polecats dir); the
+// patrol must still emit valid JSON without a fleet field.
+func TestOutputPatrolScanJSON_NilFleetIsOmitted(t *testing.T) {
+	var buf bytes.Buffer
+	if err := outputPatrolScanJSON(&buf, "gastown", "2026-06-29T00:00:00Z", nil, nil, nil, nil, nil); err != nil {
+		t.Fatalf("outputPatrolScanJSON: %v", err)
+	}
+	if strings.Contains(buf.String(), `"Fleet"`) {
+		t.Errorf("expected no Fleet field when fleet is nil; got %s", buf.String())
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestCountActiveWorkZombies(t *testing.T) {

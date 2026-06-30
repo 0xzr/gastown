@@ -74,7 +74,12 @@ type PatrolScanOutput struct {
 	Zombies     *PatrolScanZombieOutput   `json:"zombies"`
 	Stalls      *PatrolScanStallOutput    `json:"stalls,omitempty"`
 	Completions *PatrolScanCompleteOutput `json:"completions,omitempty"`
-	Receipts    []witness.PatrolReceipt   `json:"receipts,omitempty"`
+	// Fleet is the per-bucket polecat composition: implementation,
+	// post-submit gate, recovery-held, idle. Patrol consumers (witness,
+	// mayor) read this to answer "is anything actually in flight?" without
+	// collapsing MQ gates into "no active polecats". (gastown-72v)
+	Fleet    *witness.FleetState     `json:"fleet,omitempty"`
+	Receipts []witness.PatrolReceipt `json:"receipts,omitempty"`
 }
 
 // PatrolScanZombieOutput holds zombie detection results.
@@ -171,6 +176,19 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 		return witness.DiscoverCompletions(bd, workDir, rigName, router)
 	})
 
+	// Best-effort fleet composition summary (gastown-72v): we want the witness
+	// patrol output to present active MQ gates separately from implementation
+	// polecats and recovery-held slots, so consumers don't summarize the fleet
+	// as "no active polecats" while a refinery gate is draining. The summary
+	// requires a working bead store and the rig's polecats directory; if either
+	// is unavailable we omit the bucket rather than fail the patrol.
+	var fleet *witness.FleetState
+	if fstate, ferr := witness.DetectFleetState(&witness.BdCliPolecatBeadSource{Cli: bd, WorkDir: townRoot}, townRoot, rigName); ferr == nil {
+		fleet = fstate
+	} else {
+		fmt.Fprintf(diagnostics, "gt patrol scan: fleet composition unavailable: %v\n", ferr)
+	}
+
 	// Build patrol receipts for zombies
 	receipts := witness.BuildPatrolReceipts(rigName, zombieResult)
 
@@ -191,7 +209,7 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	}
 
 	if patrolScanJSON {
-		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, receipts)
+		return outputPatrolScanJSON(os.Stdout, rigName, timestamp, zombieResult, stallResult, completionResult, fleet, receipts)
 	}
 
 	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, receipts)
@@ -347,10 +365,11 @@ func alertResIssueID(res *alerts.RecordResult) string {
 	return res.IssueID
 }
 
-func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, receipts []witness.PatrolReceipt) error {
+func outputPatrolScanJSON(w io.Writer, rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, fleet *witness.FleetState, receipts []witness.PatrolReceipt) error {
 	output := PatrolScanOutput{
 		Rig:       rigName,
 		Timestamp: timestamp,
+		Fleet:     fleet,
 		Receipts:  receipts,
 	}
 
@@ -423,7 +442,7 @@ func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.Detec
 		output.Completions = co
 	}
 
-	enc := json.NewEncoder(os.Stdout)
+	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(output)
 }
