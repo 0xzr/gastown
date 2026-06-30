@@ -216,6 +216,150 @@ func TestTownCLAUDEmdCheck_Fix_Idempotent(t *testing.T) {
 	}
 }
 
+// TestTownCLAUDEmdCheck_Fix_NoH2Duplication exercises the retro-bug P0 case:
+// when both an H2 section ("## Dolt Server") and an H3 subsection it contains
+// ("### Communication hygiene") are missing, Fix must append the H2 section
+// exactly once — not once for the H2 and a second time for the H3 (the
+// pre-fix behavior). The check matches the canonical "## Dolt Server —
+// Operational Awareness (All Agents)" heading as the H2 to append.
+func TestTownCLAUDEmdCheck_Fix_NoH2Duplication(t *testing.T) {
+	tmpDir := t.TempDir()
+	ctx := &CheckContext{TownRoot: tmpDir}
+
+	// Start from a minimal file that has neither required section.
+	original := `# Gas Town
+
+This is a Gas Town workspace.
+`
+	claudePath := filepath.Join(tmpDir, "CLAUDE.md")
+	if err := os.WriteFile(claudePath, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := NewTownCLAUDEmdCheck()
+	result := check.Run(ctx)
+	if result.Status != StatusWarning {
+		t.Fatalf("expected StatusWarning, got %v", result.Status)
+	}
+	if len(check.missingSections) != 2 {
+		t.Fatalf("expected 2 missing sections (H2 + H3), got %d", len(check.missingSections))
+	}
+
+	if err := check.Fix(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(claudePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+
+	// The H2 header line must appear exactly once.
+	const h2 = "## Dolt Server — Operational Awareness (All Agents)"
+	if c := strings.Count(content, h2); c != 1 {
+		t.Errorf("expected H2 %q to appear exactly once, got %d occurrences", h2, c)
+	}
+
+	// And the H3 subsection must appear exactly once (inside the appended H2).
+	const h3 = "### Communication hygiene"
+	if c := strings.Count(content, h3); c != 1 {
+		t.Errorf("expected H3 %q to appear exactly once, got %d occurrences", h3, c)
+	}
+}
+
+// TestTownCLAUDEmdCheck_Fix_H3OnlyAppendsSubsection covers the case where the
+// user already has the "## Dolt Server" H2 but is missing the "###
+// Communication hygiene" H3 subsection. Fix must append ONLY the missing H3
+// subsection — not the entire enclosing H2 (which would duplicate the header
+// and re-add every other H3 subsection).
+func TestTownCLAUDEmdCheck_Fix_H3OnlyAppendsSubsection(t *testing.T) {
+	tmpDir := t.TempDir()
+	ctx := &CheckContext{TownRoot: tmpDir}
+
+	// User has the H2 but no H3 subsection — use a unique heading so Run only
+	// flags the H3 as missing.
+	original := `# Gas Town
+
+This is a Gas Town workspace.
+
+## Dolt Server — Operational Awareness (All Agents)
+
+User-maintained Dolt content here.
+`
+	claudePath := filepath.Join(tmpDir, "CLAUDE.md")
+	if err := os.WriteFile(claudePath, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := NewTownCLAUDEmdCheck()
+	result := check.Run(ctx)
+	if result.Status != StatusWarning {
+		t.Fatalf("expected StatusWarning, got %v", result.Status)
+	}
+	if len(check.missingSections) != 1 || check.missingSections[0].Name != "Communication hygiene" {
+		t.Fatalf("expected only 'Communication hygiene' missing, got %v", check.missingSections)
+	}
+
+	if err := check.Fix(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(claudePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+
+	// H3 was appended.
+	if !strings.Contains(content, "### Communication hygiene") {
+		t.Error("expected H3 'Communication hygiene' to be appended")
+	}
+
+	// H2 header must still appear exactly once — must not be duplicated.
+	const h2 = "## Dolt Server — Operational Awareness (All Agents)"
+	if c := strings.Count(content, h2); c != 1 {
+		t.Errorf("expected H2 %q to appear exactly once, got %d occurrences", h2, c)
+	}
+
+	// User content must be preserved.
+	if !strings.Contains(content, "User-maintained Dolt content here.") {
+		t.Error("user content was not preserved")
+	}
+}
+
+// TestExtractH3FromH2 verifies the H3 extractor returns only the matched
+// subsection (heading + body up to the next H2/H3), not the entire H2 body.
+func TestExtractH3FromH2(t *testing.T) {
+	body := `## Dolt Server
+
+Intro paragraph that should not appear in extraction.
+
+### Subsection A
+
+Content A.
+
+### Subsection B
+
+Content B line 1.
+Content B line 2.
+
+## Next Section
+
+Should not appear.
+`
+
+	got := extractH3FromH2(body, "### Subsection B")
+	want := "### Subsection B\n\nContent B line 1.\nContent B line 2.\n\n"
+	if got != want {
+		t.Errorf("extractH3FromH2 mismatch\n got: %q\nwant: %q", got, want)
+	}
+
+	if got := extractH3FromH2(body, "### Does Not Exist"); got != "" {
+		t.Errorf("expected empty string for missing H3, got %q", got)
+	}
+}
+
 func TestParseH2Sections(t *testing.T) {
 	content := `# Header
 
