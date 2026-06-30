@@ -34,10 +34,6 @@ func (p *bitbucketPRProvider) FindPRNumber(branch string) (int, error) {
 	return p.git.FindBitbucketPRNumber(p.workspace, p.repoSlug, branch)
 }
 
-func (p *bitbucketPRProvider) IsPRApproved(prNumber int) (bool, error) {
-	return p.git.IsBitbucketPRApproved(p.workspace, p.repoSlug, prNumber)
-}
-
 func (p *bitbucketPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation, error) {
 	// Record the merge-candidate diff basis so the review packet identifies the
 	// exact diff reviewed (gastown-cet.8). A verdict against intermediate

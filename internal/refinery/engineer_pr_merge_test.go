@@ -196,17 +196,12 @@ func TestHandleMRInfoFailure_NeedsApproval_StaysInQueue(t *testing.T) {
 
 type reviewerMockPRProvider struct {
 	findPRNumber        func(branch string) (int, error)
-	isPRApproved        func(prNumber int) (bool, error)
 	getReviewEvaluation func(prNumber int) (*ReviewEvaluation, error)
 	mergePR             func(prNumber int, method string) (string, error)
 }
 
 func (m *reviewerMockPRProvider) FindPRNumber(branch string) (int, error) {
 	return m.findPRNumber(branch)
-}
-
-func (m *reviewerMockPRProvider) IsPRApproved(prNumber int) (bool, error) {
-	return m.isPRApproved(prNumber)
 }
 
 func (m *reviewerMockPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation, error) {
@@ -227,7 +222,6 @@ func TestDoMergePR_NoVerdict_NotTreatedAsFail(t *testing.T) {
 
 	e.prProvider = &reviewerMockPRProvider{
 		findPRNumber: func(string) (int, error) { return 42, nil },
-		isPRApproved: func(int) (bool, error) { return false, nil },
 		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
 			return &ReviewEvaluation{
 				State:          ReviewStateNoVerdict,
@@ -266,7 +260,6 @@ func TestDoMergePR_ParsedFail_RoutesToNeedsRework(t *testing.T) {
 
 	e.prProvider = &reviewerMockPRProvider{
 		findPRNumber: func(string) (int, error) { return 42, nil },
-		isPRApproved: func(int) (bool, error) { return false, nil },
 		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
 			return &ReviewEvaluation{
 				State:     ReviewStateFail,
@@ -311,7 +304,6 @@ func TestDoMergePR_ParsedFail_DefaultCauseWhenNoneSupplied(t *testing.T) {
 
 	e.prProvider = &reviewerMockPRProvider{
 		findPRNumber: func(string) (int, error) { return 42, nil },
-		isPRApproved: func(int) (bool, error) { return false, nil },
 		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
 			return &ReviewEvaluation{
 				State:     ReviewStateFail,
@@ -349,7 +341,6 @@ func TestDoMergePR_DegradedQuorum_ProceedsAndCreatesAudit(t *testing.T) {
 	mergeCalled := false
 	e.prProvider = &reviewerMockPRProvider{
 		findPRNumber: func(string) (int, error) { return 42, nil },
-		isPRApproved: func(int) (bool, error) { return true, nil },
 		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
 			return &ReviewEvaluation{
 				State: ReviewStateDegradedQuorum,
@@ -418,7 +409,6 @@ func TestDoMergePR_DegradedQuorum_MergeFail_NoAuditBead(t *testing.T) {
 
 	e.prProvider = &reviewerMockPRProvider{
 		findPRNumber: func(string) (int, error) { return 42, nil },
-		isPRApproved: func(int) (bool, error) { return true, nil },
 		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
 			return &ReviewEvaluation{
 				State: ReviewStateDegradedQuorum,
@@ -473,7 +463,6 @@ func TestDoMergePR_DegradedQuorum_PushVerifyFail_NoAuditBead(t *testing.T) {
 
 	e.prProvider = &reviewerMockPRProvider{
 		findPRNumber: func(string) (int, error) { return 42, nil },
-		isPRApproved: func(int) (bool, error) { return true, nil },
 		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
 			return &ReviewEvaluation{
 				State: ReviewStateDegradedQuorum,
@@ -532,7 +521,6 @@ func TestDoMergePR_DegradedQuorum_Success_RecordsAuditBeadAfterMerge(t *testing.
 
 	e.prProvider = &reviewerMockPRProvider{
 		findPRNumber: func(string) (int, error) { return 42, nil },
-		isPRApproved: func(int) (bool, error) { return true, nil },
 		getReviewEvaluation: func(int) (*ReviewEvaluation, error) {
 			return &ReviewEvaluation{
 				State: ReviewStateDegradedQuorum,

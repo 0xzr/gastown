@@ -38,10 +38,6 @@ func (m *mockPRProvider) FindPRNumber(branch string) (int, error) {
 	return m.findNumber, nil
 }
 
-func (m *mockPRProvider) IsPRApproved(prNumber int) (bool, error) {
-	return m.approved, nil
-}
-
 func (m *mockPRProvider) MergePR(prNumber int, method string) (string, error) {
 	return "", m.mergeErr
 }

@@ -1540,27 +1540,6 @@ type PRReview struct {
 	SubmittedAt string `json:"submitted_at,omitempty"`
 }
 
-// IsPRApproved checks whether a GitHub PR has at least one approving review.
-// Returns true if approved, false if not (or on error).
-func (g *Git) IsPRApproved(prNumber int) (bool, error) {
-	// Use gh pr view which includes review decision. Bounded via
-	// runProviderCommand so a hung gh cannot keep the gate waiting; on
-	// timeout the caller maps to a fail-closed verdict (UNAVAILABLE) rather
-	// than passing on an unconfirmed state.
-	result, err := runProviderCommand("gh", []string{"pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision"}, g.workDir, "github pr-decision")
-	if err != nil {
-		return false, err
-	}
-	var parsed struct {
-		ReviewDecision string `json:"reviewDecision"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &parsed); err != nil {
-		return false, fmt.Errorf("failed to parse gh pr view output: %w", err)
-	}
-	// APPROVED is the GitHub review decision when at least one approving review exists
-	return parsed.ReviewDecision == "APPROVED", nil
-}
-
 // GetPRReviews returns per-reviewer GitHub review states for a PR.
 // Requires the gh CLI. Returns an empty slice if there are no reviews.
 func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
@@ -1679,20 +1658,6 @@ type BitbucketParticipant struct {
 	User     string `json:"user"`
 	Role     string `json:"role"`
 	Approved bool   `json:"approved"`
-}
-
-// IsBitbucketPRApproved checks whether a Bitbucket PR has at least one approving reviewer.
-func (g *Git) IsBitbucketPRApproved(workspace, repoSlug string, prID int) (bool, error) {
-	participants, err := g.GetBitbucketPRParticipants(workspace, repoSlug, prID)
-	if err != nil {
-		return false, err
-	}
-	for _, p := range participants {
-		if p.Role == "REVIEWER" && p.Approved {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 // GetBitbucketPRParticipants returns all participants for a Bitbucket PR.
