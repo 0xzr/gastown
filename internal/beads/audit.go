@@ -49,7 +49,17 @@ func (b *Beads) DetachMoleculeWithAudit(pinnedBeadID string, opts DetachOptions)
 		return issue, nil // Nothing to detach
 	}
 
-	// Log the detach operation
+	// Clear attachment fields by passing nil
+	newDesc := SetAttachmentFields(issue, nil)
+
+	// Update the issue FIRST. The audit log must reflect actual state: if the
+	// Update fails (db error, conflict, disk full, ...), the detach did NOT
+	// happen and writing a "detached" audit entry would corrupt the trail.
+	if err := b.Update(pinnedBeadID, UpdateOptions{Description: &newDesc}); err != nil {
+		return nil, fmt.Errorf("updating pinned bead: %w", err)
+	}
+
+	// Update succeeded - now write the audit entry so it reflects the new state.
 	operation := opts.Operation
 	if operation == "" {
 		operation = "detach"
@@ -64,16 +74,8 @@ func (b *Beads) DetachMoleculeWithAudit(pinnedBeadID string, opts DetachOptions)
 		PreviousState:    issue.Status,
 	}
 	if err := b.LogDetachAudit(entry); err != nil {
-		// Log error but don't fail the detach operation
+		// Log error but don't fail the detach operation - the bead IS detached.
 		fmt.Fprintf(os.Stderr, "Warning: failed to write audit log: %v\n", err)
-	}
-
-	// Clear attachment fields by passing nil
-	newDesc := SetAttachmentFields(issue, nil)
-
-	// Update the issue
-	if err := b.Update(pinnedBeadID, UpdateOptions{Description: &newDesc}); err != nil {
-		return nil, fmt.Errorf("updating pinned bead: %w", err)
 	}
 
 	// Re-fetch to return updated state
