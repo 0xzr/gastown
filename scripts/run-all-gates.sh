@@ -54,5 +54,19 @@ if [ "${#go_files[@]}" -gt 0 ]; then
   fi
 fi
 
-echo "[gastown gates] go test ./..."
-go test ./...
+# Cap Go test parallelism so concurrent gate runs (Refinery bisect of stacked
+# MR batches, sibling rigs sharing the host, ad-hoc polecat runs) keep memory
+# headroom. `go test ./...` was OOM-killed at default parallelism under
+# concurrent load — swap exhausted, many packages already passed, no assertion
+# failure. See gastown-b6my.
+#
+# Default: half the logical CPUs (min 2) for both GOMAXPROCS and `go test -p`.
+# Override per-run with positive integers: GT_GATE_GOMAXPROCS, GT_GATE_TEST_PARALLEL.
+# shellcheck source=lib/gate-parallelism.sh
+source "${repo_root}/scripts/lib/gate-parallelism.sh"
+cpu_count="$(nproc 2>/dev/null || echo 4)"
+read -r gate_gomaxprocs gate_test_parallel < <(gt_gate_compute_parallelism "$cpu_count")
+export GOMAXPROCS="$gate_gomaxprocs"
+
+echo "[gastown gates] go test ./... (GOMAXPROCS=${gate_gomaxprocs}, -p=${gate_test_parallel})"
+go test -p "$gate_test_parallel" ./...
