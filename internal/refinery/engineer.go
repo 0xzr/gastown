@@ -26,6 +26,7 @@ import (
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/refinery/mrtelemetry"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -385,6 +386,14 @@ type Engineer struct {
 	// gastown-cet.12.6.2). Production code leaves this nil and uses the real
 	// beads.Create path.
 	recordReviewerAuditBeadFunc func(mr *MRInfo, ev *ReviewEvaluation) (string, error)
+
+	// telemetry records durable per-MR-attempt and per-review-attempt
+	// outcomes (writer model, Codex verdict, validation verdict, timestamps,
+	// failure class) to a JSONL log under the town runtime root. It is
+	// best-effort and nil-safe: a nil recorder makes every telemetry call a
+	// no-op so telemetry can never break the merge path.
+	// (gastown-wjk: per-model implementation outcomes + time-to-verdict.)
+	telemetry *mrtelemetry.Recorder
 }
 
 // DefaultReworkRouterTimeout bounds the external `gt mq reject` call that
@@ -452,6 +461,215 @@ func NewEngineer(r *rig.Rig) *Engineer {
 func (e *Engineer) SetOutput(w io.Writer) {
 	e.output = w
 }
+
+// TelemetryRecorder returns the engineer's durable telemetry recorder, or nil.
+func (e *Engineer) TelemetryRecorder() *mrtelemetry.Recorder {
+	if e == nil {
+		return nil
+	}
+	return e.telemetry
+}
+
+// SetTelemetry sets the durable telemetry recorder. Passing nil disables
+// telemetry (all calls become no-ops). This is used by the refinery daemon
+// after constructing the engineer, and by tests to inject an in-memory or
+// temp-dir recorder.
+func (e *Engineer) SetTelemetry(r *mrtelemetry.Recorder) {
+	e.telemetry = r
+}
+
+// telemetryDir returns the town runtime directory holding refinery telemetry.
+// It mirrors durableReviewTownRoot's walk to the town root, then resolves
+// .runtime/refinery-telemetry. Returns ("", false) when the town root or
+// runtime dir cannot be resolved (telemetry stays disabled in that case).
+func (e *Engineer) telemetryDir() (string, bool) {
+	townRoot, ok := e.durableReviewTownRoot()
+	if !ok {
+		return "", false
+	}
+	dir := filepath.Join(townRoot, ".runtime", mrtelemetry.DefaultTelemetryDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", false
+	}
+	return dir, true
+}
+
+// EnsureTelemetry lazily constructs the telemetry recorder from the town
+// runtime root if one is not already set. Safe to call repeatedly. It never
+// returns an error: telemetry is best-effort and a failure to create the
+// directory simply leaves the recorder nil (no-op).
+func (e *Engineer) EnsureTelemetry() {
+	if e == nil || e.telemetry != nil {
+		return
+	}
+	dir, ok := e.telemetryDir()
+	if !ok {
+		return
+	}
+	e.telemetry = mrtelemetry.NewRecorder(dir)
+}
+
+// telemetryAttemptForMR builds the base AttemptRecord identity for an MR,
+// capturing the writer_model at the current moment (ATTRIBUTION INVARIANT).
+// The returned record is ready for StartAttempt; phase timestamps and verdicts
+// are stamped by subsequent Update/Finalize calls as processing progresses.
+func (e *Engineer) telemetryAttemptForMR(mr *MRInfo) mrtelemetry.AttemptRecord {
+	rec := mrtelemetry.AttemptRecord{
+		Rig:         e.rig.Name,
+		SourceBead:  mr.SourceIssue,
+		MRID:        mr.ID,
+		Polecat:     mr.Worker,
+		Branch:      mr.Branch,
+		WriterModel: e.durableReviewWriter(mr),
+		CodexVerdict: mrtelemetry.CodexVerdictNone,
+		CommitSHA:    e.branchCommitSHA(mr),
+	}
+	if rec.Polecat == "" && mr.AgentBead != "" {
+		rec.Polecat = mr.AgentBead
+	}
+	return rec
+}
+
+// telemetryAttemptNumber returns the 1-based ordinal for this source_bead by
+// counting prior terminal attempt records already logged for it. This makes
+// rework attempts increment correctly even when the source bead is reworked by
+// a different model. Returns 1 when no prior records exist or telemetry is
+// disabled.
+func (e *Engineer) telemetryAttemptNumber(mr *MRInfo) int {
+	if e.telemetry == nil || e.telemetry.Dir() == "" {
+		return 1
+	}
+	prior, err := mrtelemetry.CountPriorAttempts(e.telemetry.Dir(), mr.SourceIssue)
+	if err != nil || prior < 0 {
+		return 1
+	}
+	return prior + 1
+}
+
+// classifyFailure maps a ProcessResult to a FailureClass for telemetry. The
+// classification separates substantive implementation-quality failures (which
+// distinguish models) from deterministic validation, reviewer-unavailable,
+// timeout, convention, conflict, and infra noise.
+func classifyFailure(result ProcessResult, isReviewerRejection bool) mrtelemetry.FailureClass {
+	switch {
+	case isReviewerRejection:
+		// A reviewer rejection with concrete blockers is substantive; the
+		// NeedsRework flag is set only for explicit reviewer rejections.
+		return mrtelemetry.FailureSubstantive
+	case result.TestsFailed:
+		return mrtelemetry.FailureValidation
+	case result.SlotTimeout:
+		return mrtelemetry.FailureTimeout
+	case result.ConventionFailed:
+		return mrtelemetry.FailureConvention
+	case result.Conflict:
+		return mrtelemetry.FailureConflict
+	case result.BranchNotFound:
+		return mrtelemetry.FailureInfra
+	case result.Error != "":
+		// Remaining non-terminal errors are infra/push failures.
+		return mrtelemetry.FailureInfra
+	default:
+		return mrtelemetry.FailureNone
+	}
+}
+
+// telemetryStampReview stamps Codex-review phase timestamps and verdict onto
+// the in-progress attempt for mr. startedAt may be zero to leave the start
+// stamp unchanged. tree is the merge-candidate tree SHA (may be empty if not
+// yet known). verdict is the durable review verdict for this attempt. The
+// in-progress handle is looked up by the branch tip commit captured at
+// StartAttempt. Best-effort and nil-safe.
+func (e *Engineer) telemetryStampReview(mr *MRInfo, branch string, tree string, verdict mrtelemetry.CodexVerdict, startedAt time.Time) {
+	if e.telemetry == nil || mr == nil {
+		return
+	}
+	commit := e.branchCommitSHA(mr)
+	e.telemetry.Update(mr.SourceIssue, mr.ID, commit, func(rec *mrtelemetry.AttemptRecord) {
+		if !startedAt.IsZero() {
+			rec.CodexReviewStartedAt = startedAt.UTC().Format(time.RFC3339)
+		}
+		rec.CodexReviewFinishedAt = time.Now().UTC().Format(time.RFC3339)
+		rec.CodexVerdict = verdict
+		if tree != "" {
+			rec.TreeSHA = tree
+		}
+	})
+}
+
+// telemetryStampValidation stamps the deterministic-validation phase timestamps
+// onto the in-progress attempt for mr. started/finished mark gate execution;
+// verdict is "pass"/"fail"/"skipped". Best-effort and nil-safe.
+func (e *Engineer) telemetryStampValidation(mr *MRInfo, started, finished time.Time, verdict string) {
+	if e.telemetry == nil || mr == nil {
+		return
+	}
+	commit := e.branchCommitSHA(mr)
+	e.telemetry.Update(mr.SourceIssue, mr.ID, commit, func(rec *mrtelemetry.AttemptRecord) {
+		if !started.IsZero() {
+			rec.ValidationStartedAt = started.UTC().Format(time.RFC3339)
+		}
+		if !finished.IsZero() {
+			rec.ValidationFinishedAt = finished.UTC().Format(time.RFC3339)
+		}
+		if verdict != "" {
+			rec.ValidationVerdict = verdict
+		}
+	})
+}
+
+// branchCommitSHA resolves the source branch tip commit SHA for telemetry
+// identity. It is best-effort: failures yield "" (the record keeps whatever
+// commit SHA StartAttempt already captured).
+func (e *Engineer) branchCommitSHA(mr *MRInfo) string {
+	if mr == nil || mr.Branch == "" {
+		return ""
+	}
+	sha, err := e.git.Rev(mr.Branch)
+	if err != nil {
+		return ""
+	}
+	return sha
+}
+
+// boolToStr returns one of yesVal/noVal depending on cond. It is a tiny
+// helper for telemetry verdict strings (pass/fail).
+func boolToStr(cond bool, yesVal, noVal string) string {
+	if cond {
+		return yesVal
+	}
+	return noVal
+}
+
+// telemetryFinalize writes the terminal attempt record. decision is the final
+// gate decision; result drives the failure class; isReviewerRejection marks
+// reviewer-driven rejections as substantive. The merge commit (if any) is
+// recorded as commit_sha for merged attempts.
+func (e *Engineer) telemetryFinalize(mr *MRInfo, result ProcessResult, decision mrtelemetry.FinalGateDecision, isReviewerRejection bool) {
+	if e.telemetry == nil || mr == nil {
+		return
+	}
+	commit := e.branchCommitSHA(mr)
+	now := time.Now().UTC().Format(time.RFC3339)
+	e.telemetry.Finalize(mr.SourceIssue, mr.ID, commit, func(rec *mrtelemetry.AttemptRecord) {
+		rec.FinalGateDecision = decision
+		rec.FailureClass = classifyFailure(result, isReviewerRejection)
+		if result.ReviewerRejectionCause != "" {
+			rec.ReviewerCause = result.ReviewerRejectionCause
+		}
+		switch decision {
+		case mrtelemetry.FinalMerged:
+			rec.MergedAt = now
+		case mrtelemetry.FinalRejected, mrtelemetry.FinalFailed:
+			rec.RejectedAt = now
+		}
+		if result.MergeCommit != "" {
+			rec.CommitSHA = result.MergeCommit
+		}
+	})
+}
+
+
 
 // LoadConfig loads merge queue configuration from the rig's config.json.
 func (e *Engineer) LoadConfig() error {
@@ -872,18 +1090,24 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	// verified, refreshed base), skip deterministic gate execution — the polecat
 	// already ran gates after rebasing. The durable multi-model review/HMAC gate
 	// is still enforced separately and cannot be bypassed by the fast path.
+	validationStart := time.Now()
+	validationVerdict := "skipped"
 	if shouldSkipGates {
 		_, _ = fmt.Fprintln(e.output, "[Engineer] Skipping gates (pre-verified by polecat)")
+		validationVerdict = "skipped"
 	} else if len(e.config.Gates) > 0 {
 		// New gates system: run configured quality gates
 		gateResult := e.runGates(ctx)
+		e.telemetryStampValidation(mr, validationStart, time.Now(), boolToStr(gateResult.Success, "pass", "fail"))
 		if !gateResult.Success {
 			return gateResult
 		}
+		validationVerdict = "pass"
 	} else if e.config.RunTests && e.config.TestCommand != "" {
 		// Legacy test command path (backward compatible)
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Running tests: %s\n", e.config.TestCommand)
 		result := e.runTests(ctx)
+		e.telemetryStampValidation(mr, validationStart, time.Now(), boolToStr(result.Success, "pass", "fail"))
 		if !result.Success {
 			return ProcessResult{
 				Success:     false,
@@ -892,7 +1116,9 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 			}
 		}
 		_, _ = fmt.Fprintln(e.output, "[Engineer] Tests passed")
+		validationVerdict = "pass"
 	}
+	_ = validationVerdict
 
 	// PR merge path: when merge_strategy=pr, use the VCS provider's merge API
 	// instead of local squash merge + direct push. This respects branch
@@ -2141,6 +2367,8 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 	}
 	if attested {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review attestation present for tree %s (writer=%s); skipping gate\n", shortSHA(tree), attestationWriter)
+		// Telemetry: a prior PASS attestation satisfies this attempt's review.
+		e.telemetryStampReview(mr, branch, tree, mrtelemetry.CodexVerdictPass, time.Time{})
 		return ProcessResult{Success: true}
 	}
 
@@ -2180,8 +2408,10 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 
 	if runErr != nil {
 		errMsg := fmt.Sprintf("durable review gate failed (%v)", runErr)
+		verdict := mrtelemetry.CodexVerdictFail
 		if gateCtx.Err() == context.DeadlineExceeded {
 			errMsg = fmt.Sprintf("durable review gate timed out after %v", gateTimeout)
+			verdict = mrtelemetry.CodexVerdictUnavailable
 		}
 		if output != "" {
 			cap := output
@@ -2191,6 +2421,10 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 			errMsg = fmt.Sprintf("%s: %s", errMsg, cap)
 		}
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED (%v) - %s\n", elapsed.Truncate(time.Millisecond), errMsg)
+		// Telemetry: gate command failed or timed out. A timeout is treated as
+		// unavailable (reviewer tooling did not return a verdict), not a
+		// substantive FAIL.
+		e.telemetryStampReview(mr, branch, tree, verdict, start)
 		return ProcessResult{
 			Success:     false,
 			TestsFailed: true,
@@ -2212,6 +2446,9 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 		}
 	}
 	if !attested {
+		// Telemetry: gate exited 0 but produced no attestation — the reviewers
+		// did not durably PASS. Treat as no-verdict (not a substantive FAIL).
+		e.telemetryStampReview(mr, branch, tree, mrtelemetry.CodexVerdictNoVerdict, start)
 		return ProcessResult{
 			Success:     false,
 			TestsFailed: true,
@@ -2220,6 +2457,8 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 	}
 
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review attestation recorded for tree %s\n", shortSHA(tree))
+	// Telemetry: durable review PASS — attestation written for this tree.
+	e.telemetryStampReview(mr, branch, tree, mrtelemetry.CodexVerdictPass, start)
 	return ProcessResult{Success: true}
 }
 
@@ -2272,6 +2511,21 @@ func (e *Engineer) ProcessMRInfo(ctx context.Context, mr *MRInfo) ProcessResult 
 	_, _ = fmt.Fprintf(e.output, "  Worker: %s\n", mr.Worker)
 	_, _ = fmt.Fprintf(e.output, "  Source: %s\n", mr.SourceIssue)
 
+	// Telemetry: start a per-MR-attempt record. The writer_model is captured
+	// HERE (at attempt start) so a mid-flight reassignment cannot retroactively
+	// rewrite the writer of this attempt (gastown-wjk attribution invariant).
+	// EnsureTelemetry is idempotent and no-ops when the town runtime root is
+	// unavailable, so this can never block the merge.
+	e.EnsureTelemetry()
+	if e.telemetry != nil {
+		rec := e.telemetryAttemptForMR(mr)
+		rec.Attempt = e.telemetryAttemptNumber(mr)
+		if rec.SubmittedAt == "" {
+			rec.SubmittedAt = time.Now().UTC().Format(time.RFC3339)
+		}
+		e.telemetry.StartAttempt(rec)
+	}
+
 	// Phase 3: Check pre-verification fast-path.
 	// If the polecat already rebased onto the target and ran gates, and the target
 	// hasn't moved since, we can skip running gates entirely (~5s merge).
@@ -2297,6 +2551,10 @@ func (e *Engineer) ProcessMRInfo(ctx context.Context, mr *MRInfo) ProcessResult 
 
 // HandleMRInfoSuccess handles a successful merge from MRInfo.
 func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
+	// Telemetry: finalize this attempt as merged. The merge commit SHA is
+	// recorded as commit_sha for the merged attempt.
+	e.telemetryFinalize(mr, result, mrtelemetry.FinalMerged, false)
+
 	// Release merge slot if this was a conflict resolution
 	// The slot is held while conflict resolution is in progress
 	holder := e.rig.Name + "/refinery"
@@ -2487,6 +2745,14 @@ func (e *Engineer) handleReviewerRejection(mr *MRInfo, result ProcessResult) {
 		cause = "reviewer_rejection"
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: reviewer rejection (cause=%s) — routing through rework-bounce then closing\n", mr.ID, cause)
+
+	// Telemetry: this attempt was rejected by a reviewer with concrete blockers
+	// — a substantive implementation-quality failure. Stamp the Codex verdict
+	// FAIL if it was not already set by runDurableReviewGate (the PR-strategy
+	// path reaches here via GetReviewEvaluation, which does not stamp the
+	// durable-gate verdict), then finalize the attempt record as rejected.
+	e.telemetryStampReview(mr, mr.Branch, "", mrtelemetry.CodexVerdictFail, time.Time{})
+	e.telemetryFinalize(mr, result, mrtelemetry.FinalRejected, true)
 
 	// Step 1: Persist the rejection cause on the MR bead. We do not close
 	// yet -- the rework-bounce shell-out (step 2) needs the MR still open,
@@ -2890,6 +3156,8 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	// lost (e.g., worktree in /tmp wiped by reboot before gt done pushed).
 	// Escalate to mayor so lost work can be re-dispatched (gas-556).
 	if result.BranchNotFound {
+		// Telemetry: terminal infra failure — the attempt cannot proceed.
+		e.telemetryFinalize(mr, result, mrtelemetry.FinalFailed, false)
 		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: branch %s not found on remote — escalating to mayor (possible work loss)\n", mr.ID, mr.Branch)
 		mayorMsg := fmt.Sprintf("BRANCH_MISSING: MR %s branch=%s issue=%s worker=%s — branch not on origin, work may be lost; re-dispatch if needed",
 			mr.ID, mr.Branch, mr.SourceIssue, mr.Worker)
@@ -2969,6 +3237,14 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	} else {
 		_, _ = fmt.Fprintln(e.output, "[Engineer] MR remains in queue for retry")
 	}
+
+	// Telemetry: this attempt is over. A build/test/conflict failure ends the
+	// attempt on this commit; a polecat resubmission (after fixing or after
+	// conflict resolution) is a new attempt with a new commit, recorded as
+	// attempt# + 1. Finalize as failed with the classified failure class
+	// (validation / conflict / infra), NOT substantive — substantive is
+	// reserved for reviewer rejections handled above.
+	e.telemetryFinalize(mr, result, mrtelemetry.FinalFailed, false)
 }
 
 // createConflictResolutionTaskForMR creates a dispatchable task for resolving merge conflicts.
