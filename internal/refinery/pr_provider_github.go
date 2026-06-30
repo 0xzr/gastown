@@ -21,10 +21,6 @@ func (p *githubPRProvider) FindPRNumber(branch string) (int, error) {
 	return p.git.FindPRNumber(branch)
 }
 
-func (p *githubPRProvider) IsPRApproved(prNumber int) (bool, error) {
-	return p.git.IsPRApproved(prNumber)
-}
-
 func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation, error) {
 	// The merge-candidate diff basis: GitHub reviews are submitted against the
 	// PR head, which is the diff the squash merge will land. Recording this
