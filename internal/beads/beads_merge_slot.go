@@ -203,17 +203,33 @@ func (b *Beads) MergeSlotRelease(holder string) error {
 
 // MergeSlotEnsureExists creates the merge slot if it doesn't exist.
 // This is idempotent - safe to call multiple times.
+//
+// Atomicity: uses create-then-check (upsert) rather than check-then-create
+// to avoid a TOCTOU race. Two callers that both observe "not found" and then
+// both call Create would either collide (duplicate label error) or — worse,
+// create duplicate slot beads on different rigs. By attempting Create first
+// and falling back to a lookup on failure, the second caller always finds
+// the slot created by the first (gastown-rvwqi).
 func (b *Beads) MergeSlotEnsureExists() (string, error) {
-	// Check if slot exists first
-	status, err := b.MergeSlotCheck()
-	if err != nil {
-		return "", err
+	// Try to create the slot atomically. On a fresh rig this succeeds
+	// and we return immediately.
+	id, err := b.MergeSlotCreate()
+	if err == nil {
+		return id, nil
 	}
 
+	// Create failed — most likely because another caller raced us and
+	// created the slot first (the bead would be reported as a duplicate
+	// by `bd create`). Fall back to a lookup; if the slot now exists we
+	// return its ID. This matches the EnsureRigBead pattern.
+	status, checkErr := b.MergeSlotCheck()
+	if checkErr != nil {
+		return "", fmt.Errorf("ensuring merge slot: create failed (%w) and check failed (%v)", err, checkErr)
+	}
 	if status.Error == "not found" {
-		// Create it
-		return b.MergeSlotCreate()
+		// Slot still doesn't exist after a failed Create — surface the
+		// original create error rather than silently inventing a slot.
+		return "", fmt.Errorf("ensuring merge slot: %w", err)
 	}
-
 	return status.ID, nil
 }
