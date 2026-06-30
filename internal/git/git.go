@@ -2736,6 +2736,24 @@ func (g *Git) StashListForBranch() ([]StashEntry, error) {
 	return entries, nil
 }
 
+// StashCreate captures the current working-tree and index changes as a stash
+// commit WITHOUT touching the working tree, the index, or the stash list. It is
+// the non-destructive primitive behind preserve-before-reset: `git stash create`
+// returns the SHA of a commit holding the dirty state but leaves the worktree
+// exactly as it was, so a subsequent hard reset / clean can be deferred until
+// the commit has been durably pinned to a ref via CreateRef.
+//
+// Returns ("", nil) when there are no changes to capture (clean tree). This lets
+// callers treat "nothing to preserve" as a non-error and skip the pin step.
+func (g *Git) StashCreate() (string, error) {
+	out, err := g.run("stash", "create")
+	if err != nil {
+		return "", fmt.Errorf("git stash create: %w", err)
+	}
+	// `git stash create` prints nothing when the tree is clean.
+	return strings.TrimSpace(out), nil
+}
+
 // StashPop applies the given stash ref to the working tree and drops it on success.
 // Returns an error if the pop has conflicts (working tree is left as-is for manual
 // resolution). Callers should treat conflict errors as "stop, escalate to user".

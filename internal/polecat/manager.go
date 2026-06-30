@@ -1765,6 +1765,17 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 	// files, detached HEAD, or checked out on an old dog/alpha-* branch).
 	// Reset to the start point directly (not HEAD) to avoid "local changes would
 	// be overwritten" errors when the start point has different file content.
+	//
+	// gastown-lodn: the reset below is destructive and MUST be preceded by a
+	// durable preserve of any dirty / unpreserved-ahead WIP for another bead.
+	// Two production incidents (gastown-34y, gastown-ndk) lost dirty WIP when an
+	// automated dispatch reset a shared polecat worktree onto a new bead's base
+	// before the prior bead's uncommitted work was preserved. ensureResetSafe
+	// fail-closes: if there is unpreserved work and it cannot be durably pinned to
+	// a preserve ref, the polecat needs recovery — we never reset into it.
+	if err := m.ensureResetSafe(polecatGit, name, startPoint); err != nil {
+		return nil, fmt.Errorf("%w: cannot reset %s for reuse: %v", ErrPolecatNeedsRecovery, name, err)
+	}
 	_ = polecatGit.ResetHard(startPoint)
 	_ = polecatGit.CleanForce()
 
@@ -1849,6 +1860,136 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 		CreatedAt: now,
 		UpdatedAt: now,
 	}, nil
+}
+
+// preserveRefNamespace is the durable ref namespace that holds a snapshot of a
+// polecat's working tree captured immediately before a destructive reset. Like
+// refs/quarantine/ (gastown-cet.10), it keeps otherwise-unrecoverable work
+// reachable and auditable instead of being discarded by reset --hard / clean.
+const preserveRefNamespace = "refs/preserve/polecat"
+
+// ensureResetSafe is the fail-closed gate that runs BEFORE any destructive
+// ResetHard/CleanForce on a reused polecat worktree (gastown-lodn).
+//
+// The reuse gate reuseDecisionForPolecat already blocks when git facts signal
+// at-risk work, and f9bd330a quarantines the committed tip of an abandoned
+// polecat branch. Neither covers the production failure mode this guard exists
+// for: dirty working-tree WIP for one bead that an automated dispatch into a
+// DIFFERENT bead is about to destroy by resetting the shared worktree to the
+// new bead's base. The reflog signature is `reset: moving to <base>` with no
+// preceding preserve ref and no stash — the work is simply gone.
+//
+// Contract:
+//   - Nothing at risk (clean tree, no unpreserved-ahead commits, no branch
+//     stashes) → return nil; the caller may reset freely.
+//   - Work at risk that CAN be durably pinned to a preserve ref → pin it and
+//     return nil. The reset proceeds against a now-preserved snapshot.
+//   - Work at risk that CANNOT be pinned (git failure, empty SHA) → return a
+//     non-nil error so the caller returns ErrPolecatNeedsRecovery instead of
+//     resetting. We never destroy uncommitted work we could not first save.
+//
+// The guard is deliberately self-contained and re-derives git facts from the
+// worktree rather than trusting the (possibly stale) reuse decision: the
+// decision and the reset are separated by a fetch + branch math, and a TOCTOU
+// gap between them is exactly what lost gastown-34y and gastown-ndk.
+func (m *Manager) ensureResetSafe(g *git.Git, polecat, startPoint string) error {
+	status, err := g.CheckUncommittedWork()
+	if err != nil {
+		// Cannot prove the tree is safe to reset — fail closed. Resetting
+		// blind is what destroyed the 34y/ndk WIP.
+		return fmt.Errorf("checking uncommitted work: %w", err)
+	}
+
+	branch, _ := g.CurrentBranch()
+	hasDirtyWork := status.HasUncommittedChanges && !status.CleanExcludingRuntime()
+	hasBranchStashes := status.StashCount > 0
+
+	// Unpreserved commits ahead of the comparison base. BranchPreservationStatus
+	// already folds in the pushed source branch and target/custody refs, so a
+	// branch whose tip was pushed (and is thus reachable on the remote) reports
+	// zero here even though it is "ahead" of origin/main.
+	hasUnpreservedCommits := false
+	if branch != "" && branch != "HEAD" {
+		if preservation, perr := g.BranchPreservationStatus(branch, "origin", m.reuseTargetRefs(nil)); perr == nil {
+			hasUnpreservedCommits = preservation.UnpreservedPatchCount > 0
+		} else {
+			// Unknown preservation state — treat as at-risk and fail closed.
+			hasUnpreservedCommits = true
+		}
+	}
+
+	if !hasDirtyWork && !hasBranchStashes && !hasUnpreservedCommits {
+		return nil
+	}
+
+	// There is at-risk work. Preserve it durably before the caller resets.
+	if err := m.preserveDirtyWorktree(g, polecat, startPoint); err != nil {
+		return fmt.Errorf("preserving at-risk WIP before reset: %w", err)
+	}
+	return nil
+}
+
+// preserveDirtyWorktree captures the polecat's working-tree + index state into a
+// durable preserve ref so a subsequent hard reset / clean cannot destroy it
+// (gastown-lodn). It uses `git stash create` — the non-destructive variant that
+// builds a commit object from the dirty state WITHOUT altering the working tree,
+// the index, or the stash list — then pins that commit under
+// refs/preserve/polecat/<rig>/<polecat>/<branch>-<ts>.
+//
+// Branch-owned stashes and unpreserved-ahead commits are also covered: the stash
+// commit captures the full working-tree diff, and pinning the HEAD tip (when the
+// branch has unpreserved commits) keeps those commits reachable. The ref message
+// records the original branch and start point so the work is auditable later.
+func (m *Manager) preserveDirtyWorktree(g *git.Git, polecat, startPoint string) error {
+	branch, _ := g.CurrentBranch()
+	if branch == "" {
+		branch = "detached"
+	}
+
+	ts := strconv.FormatInt(time.Now().UnixMilli(), 36)
+	component := sanitizeRefComponent(branch)
+	if component == "" {
+		component = "unknown"
+	}
+	ref := fmt.Sprintf("%s/%s/%s/%s-%s", preserveRefNamespace, m.rig.Name, polecat, component, ts)
+
+	// Capture dirty working-tree + index state without disturbing the tree.
+	stashSHA, err := g.StashCreate()
+	if err != nil {
+		return fmt.Errorf("stash create for preserve ref %s: %w", ref, err)
+	}
+
+	pinned := false
+	if stashSHA != "" {
+		if err := g.CreateRef(ref, stashSHA); err != nil {
+			return fmt.Errorf("pinning stash commit %s to %s: %w", stashSHA, ref, err)
+		}
+		fmt.Fprintf(os.Stderr, "[polecat] preserved dirty worktree for %s (%s) to %s\n", polecat, branch, ref)
+		pinned = true
+	}
+
+	// If the branch also has unpreserved commits ahead of its comparison base,
+	// pin the HEAD tip too so those commits stay reachable after the reset.
+	tipSHA, tipErr := g.Rev("HEAD")
+	if tipErr == nil && tipSHA != "" {
+		if hasAhead, aheadErr := g.CommitsAheadOf(startPoint, "HEAD"); aheadErr == nil && hasAhead > 0 {
+			tipRef := ref + "-tip"
+			if err := g.CreateRef(tipRef, tipSHA); err != nil {
+				return fmt.Errorf("pinning branch tip %s to %s: %w", tipSHA, tipRef, err)
+			}
+			fmt.Fprintf(os.Stderr, "[polecat] preserved %d ahead commit(s) for %s (%s) to %s\n", hasAhead, polecat, branch, tipRef)
+			pinned = true
+		}
+	}
+
+	if !pinned {
+		// We detected at-risk work (dirty / stashes / unpreserved commits) but
+		// could pin neither a stash commit nor an ahead tip. Refusing to reset
+		// here is the whole point of the guard — never destroy unsaveable work.
+		return fmt.Errorf("at-risk WIP detected for %s on %s but no preserve ref could be created (stash=%q tip-err=%v); refusing to reset",
+			polecat, branch, stashSHA, tipErr)
+	}
+	return nil
 }
 
 // killExistingPolecatSession clears an existing tmux session before reusing or
