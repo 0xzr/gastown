@@ -50,13 +50,34 @@ becomes a human-readable summary, not the structured store.
 
 - **Type:** VARCHAR(255), NOT NULL, DEFAULT `'unknown'`
 - **Semantics:** Identity of the actor that issued the close.
-- **Format:**
-  - Agents: `<rig>/<role>/<name>` — e.g. `gastown/refinery`, `gastown/polecats/quartz`, `gastown/witness`, `gastown/deacon`
+- **Format (relaxed from the original 3-part spec — see "Closed-by format"
+  note below):**
+  - **Singleton role agents:** `<rig>/<role>` — e.g. `gastown/refinery`,
+    `gastown/witness`, `gastown/deacon`, `gastown/mayor`, `gastown/overseer`.
+    Used when the role has exactly one instance per rig (the name is
+    implied by the role).
+  - **Instance agents:** `<rig>/<role>/<name>` — e.g.
+    `gastown/polecats/quartz`, `gastown/crew/opal`. Used when multiple
+    named agents can occupy a role.
+  - **Patrol/role-only callers:** `<rig>/<caller-role>` — e.g.
+    `gastown/patrol` (patrol report is invoked by a singleton patrol role).
+    The matrix previously showed `gastown/<patrol-agent>` and
+    `gastown/<caller>` placeholders; these are now the literal values for
+    singleton-role callers.
   - Users: `user:<handle>` — e.g. `user:mayor`, `user:andrew`
   - Systems: `system:<component>` — e.g. `system:reaper`, `system:dolt-migration`
 - **Writer ownership:** every close path. Populated from process context
   (e.g. `GT_ROLE`, `BD_SESSION_ID`, `USER`, or the calling function's
   `actor` parameter).
+
+**Closed-by format note (Gap #4 from 4-model review):** the original spec
+required 3-part `<rig>/<role>/<name>` for all agents, but the writer matrix
+unavoidably assigns 2-part values to singleton roles (refinery, witness,
+deacon). Forcing 3-part values like `gastown/refinery/refinery` is
+asymmetric with how singleton-role identity is registered and parsed in
+the agent-bead registry. The relaxed format above accepts either form;
+path-parsing consumers MUST tolerate both 2-part and 3-part values by
+checking the segment count before assuming a name.
 
 ### 2. `closure_source`
 
@@ -164,18 +185,48 @@ applicable.
 | `gt done` direct-merge (cmd/done.go:797-847)      | `gastown/polecats/<name>` | `polecat-done` | `direct-merge`                   | NULL | yes (pushed SHA) | yes if verified |
 | `gt done` direct-merge late (cmd/done.go:1110-1157) | `gastown/polecats/<name>` | `polecat-done` | `direct-merge-late`           | NULL | yes | yes if verified |
 | `gt done` no-merge (cmd/done.go:1063-1094)        | `gastown/polecats/<name>` | `polecat-done` | `no-merge`                       | optional | NULL | NULL |
-| sling force-resling (cmd/sling_helpers.go:246-289) | `gastown/<caller>` or `user:<name>` | `sling` | `force-resling`                  | NULL | NULL | NULL |
-| sling polecat-nuked (cmd/polecat.go:2028-2064)    | `gastown/<caller>`       | `sling`         | `polecat-nuked`                  | NULL | NULL | NULL |
-| sling dog-session-failed (cmd/sling_formula.go:64-76) | `gastown/<caller>`    | `sling`         | `dog-session-failed`             | NULL | NULL | NULL |
-| handoff molecule (cmd/handoff.go:1662-1670)       | `gastown/<caller>`       | `handoff`       | `superseded-by-session`          | NULL | NULL | NULL |
+| sling force-resling (cmd/sling_helpers.go:246-289) | `gastown/<caller-role>` or `user:<name>` | `sling` | `force-resling`                  | NULL | NULL | NULL |
+| sling burn-existing-molecules (cmd/sling_helpers.go:281-291) | `gastown/<caller-role>` | `sling` | `force-resling` (closes the molecule wisp itself with reason `"burned: force re-sling"`) | NULL | NULL | NULL |
+| sling polecat-nuked (cmd/polecat.go:2028-2064)    | `gastown/<caller-role>`       | `sling`         | `polecat-nuked`                  | NULL | NULL | NULL |
+| sling dog-session-failed (cmd/sling_formula.go:64-76) | `gastown/<caller-role>`    | `sling`         | `dog-session-failed`             | NULL | NULL | NULL |
+| sling close-context (internal/beads/beads_sling_context.go:106-117) | `gastown/<caller-role>` | `sling` | `force-resling` (closes sling-context wisp; reason propagated verbatim) | NULL | NULL | NULL |
+| handoff molecule (cmd/handoff.go:1662-1670)       | `gastown/<caller-role>`       | `handoff`       | `superseded-by-session`          | NULL | NULL | NULL |
+| handoff stale-mail (internal/beads/handoff.go:193-211) | `gastown/witness`     | `witness`       | `stale-dog-replaced`             | NULL | NULL | NULL |
 | witness orphan recovery (witness/handlers.go:3160-3178) | `gastown/witness`     | `witness`       | `orphan-molecule`                | NULL | NULL | NULL |
+| consult close (internal/beads/beads_consult.go:347-377) | `user:<name>` (from caller) | `user` | `manual-close`                  | NULL | NULL | NULL |
+| consult mirror-result (internal/beads/beads_consult.go:391-...) | `user:<name>` (the `closer` arg) | `user` | `manual-close`                  | NULL | NULL | NULL |
+| channel retention prune (internal/beads/beads_channel.go:447-450) | `gastown/deacon` | `deacon` | `channel-prune` (new trigger value) | NULL | NULL | NULL |
+| channel patrol retention prune (internal/beads/beads_channel.go:520-525) | `gastown/deacon` | `deacon` | `channel-prune` | NULL | NULL | NULL |
 | `gt close` manual (cmd/close.go:84-108)           | `user:<name>`            | `user`          | `manual-close`                   | NULL | NULL | NULL |
 | `gt close --cascade` (cmd/close.go:137-203)       | `user:<name>`            | `user`          | `manual-cascade`                 | NULL | NULL | NULL |
 | `gt polecat identity rename` (cmd/polecat_identity.go:600-625) | `user:<name>` | `rig-bootstrap` | `identity-removed`               | NULL | NULL | NULL |
 | `gt polecat identity remove` (cmd/polecat_identity.go:701-705) | `user:<name>` | `rig-bootstrap` | `identity-removed`               | NULL | NULL | NULL |
 | `gt crew remove` (cmd/crew_lifecycle.go:168-184)  | `user:<name>`            | `rig-bootstrap` | `agent-removed`                  | NULL | NULL | NULL |
-| `gt patrol report` (cmd/patrol_report.go:93-123)  | `gastown/<patrol-agent>` | varies by patrol | varies (e.g. `manual-close`)    | NULL | NULL | NULL |
+| `gt patrol report` (cmd/patrol_report.go:93-123)  | `gastown/patrol` | `patrol` | `manual-close` (the patrol agent invokes `bd close` via the CLI; provenance is deterministic once the call site is fixed — see "Patrol provenance" note below) | NULL | NULL | NULL |
 | escalation `CloseEscalation` (beads/beads_escalation.go:249-280) | the escalator (from `EscalationFields.ClosedBy`) | `escalation` | `escalation-resolved`            | NULL | NULL | NULL |
+
+**Patrol provenance note (Gap #6 from 4-model review):** the matrix
+previously listed `closure_source=varies by patrol` and
+`closure_trigger=varies (e.g. manual-close)` for `gt patrol report`. That
+is non-deterministic and undermines audit/root-cause reliability. The
+correct mapping is `closure_source=patrol` (a new singleton-role source
+value, joining the existing enum) and `closure_trigger=manual-close`
+when the patrol closes a bead directly via the `bd close` CLI. If a
+future patrol variant needs a distinct trigger, add it to the
+`closure_trigger` enum; do not allow free-form trigger strings.
+
+**ClosureSource enum addition:** the original enum (lines 65-69 above)
+must be extended to include `patrol`. `deacon` is also added as a
+distinct source (the existing `gastown/deacon` writes were conflated
+with `convoy` source). Updated enum (also reflected in the matrix):
+`refinery`, `convoy`, `deacon`, `reaper`, `polecat-done`, `sling`,
+`handoff`, `witness`, `patrol`, `user`, `escalation`, `rig-bootstrap`,
+`migration`, `unknown`.
+
+**ClosureTrigger enum additions:** add `channel-prune` (deacon channel
+retention), `consult-closed` (consult bead direct close — alternative
+to mapping consult close to `user/manual-close`), and any future
+patrol-specific triggers as needed.
 
 `closed_by` for agents that originate work on behalf of a user (e.g. polecat
 running `gt close`) is the polecat's rig/role/name, **not** the human. The
@@ -242,14 +293,62 @@ blockers. After migration:
 The cutover is gated on a smoke test: every merge-blocks blocker closed in
 the prior 30 days parses to the same `linked_mr` via both paths.
 
-### `content_hash` change
+### `content_hash` change (Gap #1 from 4-model review)
 
-`internal/types/types.go:118-171` (in the upstream `beads` SDK) excludes
-`closed_at`, `close_reason`, `closed_by_session` from `content_hash`. The
-six new fields are added to `content_hash` so two beads with the same
-content but different provenance hash distinctly. This is a behavior
-change that requires a migration of the `content_hash` cache for all
-existing rows.
+`internal/types/types.go:118-171` (in the upstream `beads` SDK,
+package `github.com/steveyegge/beads/internal/types`) hashes
+`Status` (line 129: `w.str(string(i.Status))`) but **excludes**
+`closed_at`, `close_reason`, and `closed_by_session`. The current hash
+behavior therefore:
+
+- Already mutates on every status transition (open → closed changes the
+  hash because `Status` is hashed).
+- Deliberately does NOT mutate on every `close_reason` rewrite or
+  `closed_by_session` change — this is the documented drift-skip
+  mechanism that lets two clones reconcile without re-syncing rows whose
+  only differences are closure lifecycle metadata.
+
+**Decision (revised): the six new provenance fields are NOT added to
+`content_hash` in this revision.** Adding them would:
+
+- Mutate the hash on every close (status change already does this, so
+  adding 6 more independent hash inputs compounds the hash churn, not
+  reduces it).
+- Force re-sync of otherwise-identical rows whose only difference is
+  that one clone's `closure_source` was filled in later (e.g. via a
+  backfill window) — exactly the drift-skip case the existing
+  exclusion list was designed to prevent.
+- Make test #3 ("same content, different provenance hashes distinctly")
+  pass for the wrong reason: status already distinguishes open from
+  closed, so the test only proves the field is hashed at all, not that
+  the new fields specifically are.
+
+If a future revision wants `same content, different provenance → different
+hash` semantics, the correct approach is to **remove `Status` from the
+hash first** (replacing it with a `lifecycle_marker` enum that
+distinguishes open/in-progress/blocked/deferred/closed-without-source from
+closed-with-source) and then add the new fields. Until that
+re-design lands, provenance lives outside the hash and drift-skip
+behavior is preserved.
+
+The migration therefore does NOT need to rehash the existing
+`content_hash` cache. Future close/update paths that need a hash
+mutation should call `Issue.ComputeContentHash()` explicitly and
+persist the result, but the default write path leaves the hash alone
+on every close/update (matching the current SDK behavior).
+
+**Migration underspec note (Gap #2 from 4-model review):** the previous
+revision said "add to `content_hash`" without specifying where the
+recompute would happen. The SDK's `CloseIssueInTx`
+(`internal/storage/issueops/close.go:46-49`) updates `status`,
+`closed_at`, `updated_at`, `close_reason`, `closed_by_session` but does
+NOT recompute `content_hash`. For this revision (no hash change) the
+gap is moot — nothing needs to recompute. If a future revision adds
+fields to the hash, the implementation MUST extend
+`CloseIssueInTx` AND `UpdateIssueInTx` to call
+`Issue.ComputeContentHash()` after every UPDATE, and the close-path
+writers listed in the matrix must be migrated to use the SDK function
+rather than raw SQL UPDATE statements.
 
 ## Backfill rules
 
@@ -273,6 +372,29 @@ If none of (1)-(4) hold, leave `closure_source='unknown'` and
 `closure_trigger='unknown'`. We mark the row with a `provenance:backfilled`
 or `provenance:unverifiable` label so analysts can distinguish backfilled
 rows from genuine fresh closures.
+
+**Conflict-resolution policy (Gap #5 from 4-model review):** the previous
+revision ranked the sources (events > close_reason > description > audit)
+AND required in test #8 that disagreeing sources raise an error. Those
+two are mutually exclusive — ranked-priority means the lower-priority
+source is silently ignored when the higher-priority source is present,
+which is the opposite of "error on disagreement".
+
+**Revised policy:** sources are ranked by reliability. The
+highest-priority source present for a row is the **authoritative
+value**. If a lower-priority source disagrees, the backfill logs a
+`backfill:source-conflict` warning naming the row and both values
+(`closure_source_backfill` field on the migration report) but does NOT
+fail. The reasoning: refusing to backfill leaves the row as
+`closure_source='unknown'`, which is strictly less informative than the
+authoritative higher-priority source. Operators triage the warnings
+post-backfill; analysts filter by `closure_source != 'unknown'` to avoid
+both fresh closures and conflicted backfills.
+
+Test #8 is correspondingly revised: it verifies that the higher-priority
+source wins AND that the migration report contains a conflict warning
+for the disagreeing lower-priority source. The "disagreement → error"
+assertion is removed.
 
 The backfill is runnable as a one-shot migration command:
 
@@ -392,10 +514,14 @@ to write all six columns.
    `close_reason`, and no audit-log entry, the backfill leaves
    `closure_source='unknown'` and `closure_trigger='unknown'`.
 
-8. **Backfill evidence sources are independent.**
+8. **Backfill evidence sources follow priority ranking, with conflict
+   warnings (NOT errors).**
    A bead with both an `events` row and a parseable `close_reason`
-   agrees on `closure_source` between them; disagreement is reported as
-   an error.
+   uses the higher-priority `events` source as the authoritative
+   `closure_source`. If the lower-priority `close_reason` source would
+   yield a different value, the migration report logs a
+   `backfill:source-conflict` warning naming the row and both values;
+   the backfill does NOT fail.
 
 9. **`close_reason` parsing correctness.**
    For each known pattern (`"Merged in "`, `target_branch:`,
