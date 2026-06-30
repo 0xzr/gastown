@@ -1538,6 +1538,12 @@ type PRReview struct {
 	// effective review (gastown-cet.12.6.1). Empty when the provider did not
 	// report one; ties break on slice order.
 	SubmittedAt string `json:"submitted_at,omitempty"`
+
+	// CommitID is the SHA of the commit the reviewer was looking at when they
+	// submitted the review. It is used to distinguish a review of the final
+	// merge candidate (matching the current PR head) from a stale review of
+	// intermediate commit history (gastown-cet.12.6.7).
+	CommitID string `json:"commit_id,omitempty"`
 }
 
 // IsPRApproved checks whether a GitHub PR has at least one approving review.
@@ -1579,6 +1585,10 @@ func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
 			State       string `json:"state"`
 			Body        string `json:"body"`
 			SubmittedAt string `json:"submittedAt"`
+			CommitID    string `json:"commit_id"`
+			Commit      struct {
+				OID string `json:"oid"`
+			} `json:"commit"`
 		} `json:"reviews"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &parsed); err != nil {
@@ -1586,11 +1596,16 @@ func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
 	}
 	reviews := make([]PRReview, 0, len(parsed.Reviews))
 	for _, r := range parsed.Reviews {
+		commitID := r.CommitID
+		if commitID == "" {
+			commitID = r.Commit.OID
+		}
 		reviews = append(reviews, PRReview{
 			Reviewer:    r.Author.Login,
 			State:       r.State,
 			Body:        r.Body,
 			SubmittedAt: r.SubmittedAt,
+			CommitID:    commitID,
 		})
 	}
 	return reviews, nil
@@ -1613,6 +1628,24 @@ func (g *Git) GetPRReviewDecision(prNumber int) (string, error) {
 		return "", fmt.Errorf("failed to parse gh pr reviewDecision output: %w", err)
 	}
 	return parsed.ReviewDecision, nil
+}
+
+// GetPRHeadOID returns the current head commit OID of the pull request.
+// It is used when the local repository is not on the PR branch (e.g. the
+// refinery merge path has already checked out the target) so the review
+// basis can still be anchored to the actual PR head (gastown-cet.12.6.7).
+func (g *Git) GetPRHeadOID(prNumber int) (string, error) {
+	result, err := runProviderCommand("gh", []string{"pr", "view", fmt.Sprintf("%d", prNumber), "--json", "headRefOid"}, g.workDir, "github pr-head")
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		HeadRefOid string `json:"headRefOid"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &parsed); err != nil {
+		return "", fmt.Errorf("failed to parse gh pr headRefOid output: %w", err)
+	}
+	return parsed.HeadRefOid, nil
 }
 
 // GhPrMerge merges a GitHub PR using the gh CLI, respecting branch protection rules.

@@ -360,3 +360,66 @@ func TestClassifyGitHubUnavailableError(t *testing.T) {
 		t.Errorf("basis not propagated to unavailable result: got %+v want %+v", r.DiffBasis, basis)
 	}
 }
+
+// TestReviewBasis_StaleApprovalUsesCommitHistoryBasis confirms a review whose
+// commitID does not match the current PR head is stamped as commit_history,
+// preventing stale approvals from authorizing the final merge candidate
+// (gastown-cet.12.6.7).
+func TestReviewBasis_StaleApprovalUsesCommitHistoryBasis(t *testing.T) {
+	mergeBase := MergeCandidateBasis("base-sha", "head-sha")
+	stale := git.PRReview{Reviewer: "alice", State: "APPROVED", CommitID: "old-head-sha"}
+	basis := reviewBasis(stale, mergeBase)
+	if basis.IsMergeCandidate() {
+		t.Errorf("stale approval must be stamped commit_history, got %+v", basis)
+	}
+	if basis.Kind != "commit_history" || basis.Head != "old-head-sha" {
+		t.Errorf("unexpected commit_history basis: %+v", basis)
+	}
+}
+
+// TestReviewBasis_CurrentApprovalUsesMergeCandidateBasis confirms a review at
+// the current PR head is treated as reviewing the merge candidate.
+func TestReviewBasis_CurrentApprovalUsesMergeCandidateBasis(t *testing.T) {
+	mergeBase := MergeCandidateBasis("base-sha", "head-sha")
+	current := git.PRReview{Reviewer: "alice", State: "APPROVED", CommitID: "head-sha"}
+	basis := reviewBasis(current, mergeBase)
+	if !basis.IsMergeCandidate() {
+		t.Errorf("current approval must be stamped merge_candidate, got %+v", basis)
+	}
+}
+
+// TestReviewBasis_UnknownHeadDefaultsToMergeCandidate confirms that when the PR
+// head is unknown we cannot distinguish stale reviews, so we fail-open to the
+// merge-candidate basis rather than silently reclassifying every approval as
+// stale.
+func TestReviewBasis_UnknownHeadDefaultsToMergeCandidate(t *testing.T) {
+	mergeBase := DiffBasis{Base: "base-sha"}
+	stale := git.PRReview{Reviewer: "alice", State: "APPROVED", CommitID: "old-head-sha"}
+	basis := reviewBasis(stale, mergeBase)
+	if !basis.IsMergeCandidate() {
+		t.Errorf("unknown head must default to merge_candidate basis, got %+v", basis)
+	}
+}
+
+// TestClassifyCollapsedReviews_StaleApprovalDoesNotCount verifies end-to-end
+// that a stale APPROVED review (commit_history basis) is reclassified by
+// EvaluateReviews and does not contribute to PassCount.
+func TestClassifyCollapsedReviews_StaleApprovalDoesNotCount(t *testing.T) {
+	mergeBase := MergeCandidateBasis("base-sha", "head-sha")
+	reviews := []git.PRReview{
+		{Reviewer: "alice", State: "APPROVED", CommitID: "head-sha"},
+		{Reviewer: "bob", State: "APPROVED", CommitID: "old-head-sha"},
+	}
+	results := classifyCollapsedReviews(collapseReviews(reviews), mergeBase)
+	ev := EvaluateReviews(results, DegradedQuorumRule{})
+
+	if ev.PassCount != 1 {
+		t.Errorf("expected PassCount=1 (only alice), got %d", ev.PassCount)
+	}
+	if ev.NoVerdictCount != 1 {
+		t.Errorf("expected NoVerdictCount=1 (bob reclassified), got %d", ev.NoVerdictCount)
+	}
+	if ev.State != ReviewStateNoVerdict {
+		t.Fatalf("one current PASS and one stale approval must be NO_VERDICT without degraded quorum, got %s", ev.State)
+	}
+}
