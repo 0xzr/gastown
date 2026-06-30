@@ -1,6 +1,11 @@
 package events
 
 import (
+	"bufio"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -255,5 +260,116 @@ func TestSessionPayload_Minimal(t *testing.T) {
 	}
 	if _, ok := p["cwd"]; ok {
 		t.Error("expected no cwd key when empty")
+	}
+}
+
+// TestAppendEvent_CrashSafe verifies the regression for gastown-mobbc:
+// the JSONL write path must fsync before close so an event is durable
+// on disk by the time appendEvent returns. We assert (a) the record is
+// written, (b) it appears as a single well-formed JSONL line, and (c)
+// subsequent reads see the prior record — i.e. an append followed by
+// a "crash" (process exit) does not lose the previously written record.
+func TestAppendEvent_CrashSafe(t *testing.T) {
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, ".events.jsonl")
+
+	ev := Event{
+		Timestamp:  "2026-06-30T12:00:00Z",
+		Source:     "gt",
+		Type:       TypeSling,
+		Actor:      "gastown/polecats/cheedo",
+		Payload:    SlingPayload("gastown-mobbc", "gastown/polecats/cheedo"),
+		Visibility: VisibilityBoth,
+	}
+
+	// Simulate a crash before this point: open the file, write the JSONL
+	// record, and "die" without re-opening. The durability guarantee
+	// requires the record to be on disk and readable by a fresh process.
+	if err := appendEvent(eventsPath, ev); err != nil {
+		t.Fatalf("appendEvent: %v", err)
+	}
+
+	// Re-open in a fresh process (i.e. fresh file descriptor) and read.
+	f, err := os.Open(eventsPath)
+	if err != nil {
+		t.Fatalf("reopen events file after simulated crash: %v", err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	var lines []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scanner: %v", err)
+	}
+
+	if len(lines) != 1 {
+		t.Fatalf("got %d JSONL lines, want 1 (event must survive fsync+close)", len(lines))
+	}
+
+	// Each line must be a single valid JSON object with no embedded
+	// newline — a half-written line would indicate the record was lost
+	// or torn during the Write/Close window.
+	if strings.Contains(lines[0], "\n") {
+		t.Fatalf("JSONL line contains embedded newline (write was not atomic): %q", lines[0])
+	}
+
+	var got Event
+	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
+		t.Fatalf("unmarshal JSONL line: %v\nline: %s", err, lines[0])
+	}
+	if got.Type != TypeSling {
+		t.Errorf("event.Type = %q, want %q", got.Type, TypeSling)
+	}
+	if got.Actor != ev.Actor {
+		t.Errorf("event.Actor = %q, want %q", got.Actor, ev.Actor)
+	}
+}
+
+// TestAppendEvent_MultipleAppendsAllDurable verifies the same crash-safety
+// property under repeated appends. Each call must independently fsync so
+// earlier records survive a crash that occurs after a later append.
+func TestAppendEvent_MultipleAppendsAllDurable(t *testing.T) {
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, ".events.jsonl")
+
+	for i := 0; i < 5; i++ {
+		ev := Event{
+			Timestamp:  "2026-06-30T12:00:0" + string(rune('0'+i)) + "Z",
+			Source:     "gt",
+			Type:       TypeDone,
+			Actor:      "gastown/polecats/cheedo",
+			Payload:    DonePayload("gastown-mobbc", "polecat/cheedo/gastown-mobbc"),
+			Visibility: VisibilityBoth,
+		}
+		if err := appendEvent(eventsPath, ev); err != nil {
+			t.Fatalf("appendEvent #%d: %v", i, err)
+		}
+	}
+
+	data, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events file: %v", err)
+	}
+
+	// 5 records, each terminated by '\n' → exactly 5 non-empty lines.
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("got %d lines, want 5: %q", len(lines), string(data))
+	}
+	for i, line := range lines {
+		var got Event
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Fatalf("line %d not valid JSON: %v\nline: %s", i, err, line)
+		}
+		if got.Type != TypeDone {
+			t.Errorf("line %d Type = %q, want %q", i, got.Type, TypeDone)
+		}
 	}
 }
