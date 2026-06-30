@@ -97,6 +97,14 @@ func (c *TownCLAUDEmdCheck) Run(ctx *CheckContext) *CheckResult {
 
 // Fix updates the town-root CLAUDE.md with missing sections from the
 // embedded template while preserving user customizations.
+//
+// Each missing section is appended with the minimum content needed:
+//   - A missing H2 section: append the entire canonical H2 section.
+//   - A missing H3 subsection: append only that H3 subsection (not the
+//     enclosing H2 section, which may already exist in the user's file).
+//
+// If both an H2 and an H3 subsection it contains are missing, the H2 is
+// appended once (its H3 subsections are skipped to avoid duplication).
 func (c *TownCLAUDEmdCheck) Fix(ctx *CheckContext) error {
 	claudePath := filepath.Join(ctx.TownRoot, "CLAUDE.md")
 	canonical := templates.TownRootCLAUDEmd()
@@ -121,14 +129,46 @@ func (c *TownCLAUDEmdCheck) Fix(ctx *CheckContext) error {
 	// Parse canonical content into H2 sections
 	canonicalSections := parseH2Sections(canonical)
 
-	// For each missing section, find it in the canonical and append
+	// Track which canonical H2 sections we've already appended in full,
+	// and which H3 headings were covered by such an H2 append (so we
+	// don't append the same H3 twice).
+	appendedH2 := make(map[string]bool)
+	coveredH3 := make(map[string]bool)
+
 	var toAppend strings.Builder
 	for _, missing := range c.missingSections {
-		// Find the H2 section that contains this heading
+		if isH2Heading(missing.Heading) {
+			// Append the full canonical H2 section whose heading
+			// starts with the missing H2 heading text.
+			for _, cs := range canonicalSections {
+				if appendedH2[cs.heading] {
+					continue
+				}
+				if strings.HasPrefix(cs.heading, missing.Heading) {
+					toAppend.WriteString("\n")
+					toAppend.WriteString(cs.content)
+					appendedH2[cs.heading] = true
+					// Mark all H3 subsections as covered.
+					for _, line := range strings.Split(cs.content, "\n") {
+						if strings.HasPrefix(line, "### ") {
+							coveredH3[line] = true
+						}
+					}
+					break
+				}
+			}
+			continue
+		}
+
+		// H3 (or deeper) — append only the missing subsection.
+		if coveredH3[missing.Heading] {
+			continue
+		}
 		for _, cs := range canonicalSections {
-			if strings.Contains(cs.content, missing.Heading) {
+			h3 := extractH3FromH2(cs.content, missing.Heading)
+			if h3 != "" {
 				toAppend.WriteString("\n")
-				toAppend.WriteString(cs.content)
+				toAppend.WriteString(h3)
 				break
 			}
 		}
@@ -145,6 +185,44 @@ func (c *TownCLAUDEmdCheck) Fix(ctx *CheckContext) error {
 
 	updated := current + toAppend.String()
 	return os.WriteFile(claudePath, []byte(updated), 0644)
+}
+
+// isH2Heading reports whether heading is an H2 markdown heading
+// (starts with "## " but not "### ").
+func isH2Heading(heading string) bool {
+	return strings.HasPrefix(heading, "## ") && !strings.HasPrefix(heading, "### ")
+}
+
+// extractH3FromH2 extracts a single H3 subsection (heading line plus body
+// up to the next H2 or H3 boundary) from an H2 section body. Returns the
+// empty string if h3Heading is not found.
+func extractH3FromH2(h2Body, h3Heading string) string {
+	lines := strings.Split(h2Body, "\n")
+	var sb strings.Builder
+	inSection := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "### ") ||
+			(strings.HasPrefix(line, "## ") && !strings.HasPrefix(line, "### ")) {
+			if inSection {
+				break
+			}
+			if line == h3Heading {
+				inSection = true
+				sb.WriteString(line)
+				sb.WriteString("\n")
+			}
+		} else if inSection {
+			sb.WriteString(line)
+			sb.WriteString("\n")
+		}
+	}
+	if sb.Len() == 0 {
+		return ""
+	}
+	if !strings.HasSuffix(sb.String(), "\n") {
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
 
 // h2Section represents a section of markdown delimited by H2 headings.
