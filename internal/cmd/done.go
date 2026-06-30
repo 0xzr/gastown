@@ -1435,6 +1435,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// When a polecat re-submits after fixing a gate failure, the old MR
 			// (same branch, different SHA) is stale. Close it so the refinery
 			// doesn't process the old submission.
+			//
+			// GH#2669: also delete the old polecat remote branch so GitHub
+			// auto-closes the upstream PR via head_ref_delete. Mirrors the
+			// mq_submit.go supersede loop (gastown-1r9e P0 retro-audit:
+			// done.go was previously missing the branch-deletion step,
+			// leaving stale PRs open after every polecat re-attempt).
 			if issueID != "" {
 				if oldMRs, findErr := bd.FindOpenMRsForIssue(issueID); findErr == nil {
 					for _, old := range oldMRs {
@@ -1447,6 +1453,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 							continue
 						}
 						fmt.Printf("  %s Superseded old MR: %s\n", style.Dim.Render("○"), old.ID)
+
+						// Delete the old remote branch to auto-close the GitHub PR.
+						// Only polecat branches — non-polecat branches may belong to
+						// contributor forks; deleting them closes upstream PRs. (GH#2669)
+						oldFields := beads.ParseMRFields(old)
+						if oldFields != nil && strings.HasPrefix(oldFields.Branch, "polecat/") {
+							if err := g.DeleteRemoteBranch("origin", oldFields.Branch); err != nil {
+								style.PrintWarning("could not delete superseded branch %s: %v", oldFields.Branch, err)
+							} else {
+								fmt.Printf("  %s Deleted remote branch: %s\n", style.Dim.Render("○"), oldFields.Branch)
+							}
+						}
 					}
 				}
 			}
