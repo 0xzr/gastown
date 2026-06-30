@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -58,7 +59,7 @@ func adHocBDSubprocesses(t *testing.T, repoRoot, path string) []string {
 	var out []string
 	ast.Inspect(file, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
-		if !ok || !isExecCommandCall(call) {
+		if !ok || !isExecCommandCall(call, file) {
 			return true
 		}
 		argIndex := 0
@@ -79,13 +80,39 @@ func adHocBDSubprocesses(t *testing.T, repoRoot, path string) []string {
 	return out
 }
 
-func isExecCommandCall(call *ast.CallExpr) bool {
+func isExecCommandCall(call *ast.CallExpr, file *ast.File) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || (sel.Sel.Name != "Command" && sel.Sel.Name != "CommandContext") {
 		return false
 	}
 	x, ok := sel.X.(*ast.Ident)
-	return ok && x.Name == "exec"
+	if !ok {
+		return false
+	}
+	return importPathForIdent(file, x.Name) == "os/exec"
+}
+
+func importPathForIdent(file *ast.File, name string) string {
+	for _, imp := range file.Imports {
+		local := ""
+		if imp.Name != nil {
+			local = imp.Name.Name
+			if local == "_" || local == "." {
+				continue
+			}
+		} else {
+			pathStr, err := strconv.Unquote(imp.Path.Value)
+			if err != nil {
+				continue
+			}
+			local = path.Base(pathStr)
+		}
+		if local == name {
+			pathStr, _ := strconv.Unquote(imp.Path.Value)
+			return pathStr
+		}
+	}
+	return ""
 }
 
 func selectorName(call *ast.CallExpr) string {
@@ -109,5 +136,33 @@ func isBDCommandArg(expr ast.Expr) bool {
 		return strings.EqualFold(v.Sel.Name, "bdPath")
 	default:
 		return false
+	}
+}
+
+func TestAdHocBDSubprocessDetectsAliasedExecImport(t *testing.T) {
+	repoRoot := t.TempDir()
+	srcDir := filepath.Join(repoRoot, "internal", "witness")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(srcDir, "aliased_exec.go")
+	content := `package witness
+
+import (
+	"context"
+	stdexec "os/exec"
+)
+
+func runAliasedBD() {
+	_ = stdexec.CommandContext(context.Background(), "bd", "list")
+}
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	violations := adHocBDSubprocesses(t, repoRoot, path)
+	if len(violations) == 0 {
+		t.Fatalf("expected a violation for aliased os/exec import, got none")
 	}
 }
