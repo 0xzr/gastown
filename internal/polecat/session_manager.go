@@ -38,7 +38,6 @@ var (
 	ErrSessionRunning                 = errors.New("session already running")
 	ErrSessionNotFound                = errors.New("session not found")
 	ErrIssueInvalid                   = errors.New("issue not found or tombstoned")
-	ErrNoAssignedHook                 = errors.New("no assigned hook for worktree")
 	ErrBranchContaminatedNoAssignment = errors.New("branch has abandoned commits and no hook assignment")
 )
 
@@ -46,6 +45,17 @@ var (
 type SessionManager struct {
 	tmux *tmux.Tmux
 	rig  *rig.Rig
+
+	// agentBeadsForTest, when non-nil, replaces the default agent-bead Beads
+	// client (beads.New(m.rig.Path).ForAgentBead()) used for agent-bead lookups.
+	// Production never sets this; tests inject a client that mirrors the real
+	// town-DB routing (noRoute=true) so the production topology is exercised.
+	agentBeadsForTest *beads.Beads
+	// workBeadsForTest, when non-nil, replaces the default work-bead Beads
+	// client (beads.New(m.rig.Path)) used for routed issue lookups. Tests
+	// inject a client backed by a store that only contains work beads, so
+	// split-store routing is exercised (gastown-cet.10 / gastown-ndk).
+	workBeadsForTest *beads.Beads
 }
 
 // NewSessionManager creates a new polecat session manager for a rig.
@@ -54,6 +64,29 @@ func NewSessionManager(t *tmux.Tmux, r *rig.Rig) *SessionManager {
 		tmux: t,
 		rig:  r,
 	}
+}
+
+// agentBeads returns the Beads instance used for agent-bead lookups (where the
+// polecat's agent bead lives). Mirrors beads.New(m.rig.Path).ForAgentBead():
+// re-roots to the town DB and skips prefix routing so the agent-bead row is
+// found even though its ID is rig-prefixed.
+func (m *SessionManager) agentBeads() *beads.Beads {
+	if m.agentBeadsForTest != nil {
+		return m.agentBeadsForTest
+	}
+	return beads.New(m.rig.Path).ForAgentBead()
+}
+
+// workBeads returns the Beads instance used for normal routed issue lookups
+// (where work beads such as the polecat's hook_bead live). Unlike agentBeads,
+// this client keeps prefix routing enabled so work-bead lookups resolve into
+// the rig DB (gastown-cet.10 / gastown-ndk). Reusing agentBeads() for these
+// lookups silently misses the rig DB.
+func (m *SessionManager) workBeads() *beads.Beads {
+	if m.workBeadsForTest != nil {
+		return m.workBeadsForTest
+	}
+	return beads.New(m.rig.Path)
 }
 
 // SessionStartOptions configures polecat session startup.
@@ -356,7 +389,10 @@ func (m *SessionManager) ensureCanonicalSessionBranch(g *git.Git, polecat string
 		if component == "" {
 			component = "unknown"
 		}
-		quarantineRef := fmt.Sprintf("refs/quarantine/polecat/%s/%s/%s-%s", m.rig.Name, polecat, component, ts)
+		// Append a short random suffix to prevent millisecond collisions when two
+		// polecats quarantine the same branch name concurrently (gastown-cet.10).
+		quarantineRef := fmt.Sprintf("refs/quarantine/polecat/%s/%s/%s-%s-%s",
+			m.rig.Name, polecat, component, ts, uuid.New().String()[:8])
 		if err := g.CreateRef(quarantineRef, tipSHA); err != nil {
 			return "", fmt.Errorf("quarantining %s tip (%s) to %s: %w", currentBranch, tipSHA, quarantineRef, err)
 		}
