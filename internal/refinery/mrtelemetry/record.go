@@ -429,6 +429,12 @@ func (rec AttemptRecord) submitToCodexVerdictDuration() time.Duration {
 	return d
 }
 
+// SubmitToVerdictDuration is the exported form of the elapsed submit-to-
+// Codex-verdict duration, for use by the report command.
+func (rec AttemptRecord) SubmitToVerdictDuration() time.Duration {
+	return rec.submitToCodexVerdictDuration()
+}
+
 // MedianDuration returns the median of a slice of durations. Zero for empty.
 func MedianDuration(ds []time.Duration) time.Duration {
 	if len(ds) == 0 {
