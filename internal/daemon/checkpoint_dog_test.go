@@ -309,3 +309,94 @@ func TestCheckpointWorktree_OnFeatureBranch_KeepsCurrentBranch(t *testing.T) {
 		t.Errorf("expected WIP checkpoint message, got %q", msg)
 	}
 }
+
+// checkpointOrphanRepoNoOrigin creates a git repo with NO remote "origin",
+// on a "main" branch with one initial commit. Used to exercise the
+// default-branch resolution failure path: refs/remotes/origin/HEAD does not
+// exist and there is no origin/main either, so checkpointDefaultBranch
+// returns "".
+func checkpointOrphanRepoNoOrigin(t *testing.T) (workDir string, polecatName string) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	polecatName = "opal"
+	workDir = filepath.Join(tmpDir, "work")
+	runCheckpointCmd(t, tmpDir, "git", "init", "--initial-branch=main", workDir)
+	runCheckpointCmd(t, workDir, "git", "config", "user.email", "test@test.com")
+	runCheckpointCmd(t, workDir, "git", "config", "user.name", "Test")
+	runCheckpointCmd(t, workDir, "git", "checkout", "-b", "main")
+	checkpointWriteFile(t, workDir, "README.md", "# Test\n")
+	runCheckpointCmd(t, workDir, "git", "add", ".")
+	runCheckpointCmd(t, workDir, "git", "commit", "-m", "initial commit")
+	return workDir, polecatName
+}
+
+func TestIsProtectedCheckpointBranch_DefaultResolutionFails_IsProtected(t *testing.T) {
+	// Regression for gastown-cet.12.12: when no remote origin/main can be
+	// resolved and refs/remotes/origin/HEAD is absent, isProtectedCheckpointBranch
+	// must treat the current branch as protected (fail-closed) so we don't
+	// silently commit a WIP checkpoint to the default branch.
+	workDir, _ := checkpointOrphanRepoNoOrigin(t)
+
+	if !isProtectedCheckpointBranch(workDir, "main") {
+		t.Error("expected 'main' to be treated as protected when default branch cannot be resolved")
+	}
+	if !isProtectedCheckpointBranch(workDir, "feature") {
+		t.Error("expected 'feature' to be treated as protected when default branch cannot be resolved")
+	}
+	if isProtectedCheckpointBranch(workDir, "") {
+		t.Error("empty branch should remain unprotected")
+	}
+}
+
+func TestEnsureCheckpointBranch_NoOrigin_ReturnsError(t *testing.T) {
+	// Regression for gastown-cet.12.12: with no origin remote, ensureCheckpointBranch
+	// must return an error so the caller refuses to commit (the daemon's
+	// checkpointWorktree already logs and returns false on error).
+	workDir, polecatName := checkpointOrphanRepoNoOrigin(t)
+
+	d := &Daemon{logger: log.New(os.Stdout, "", 0)}
+
+	_, err := d.ensureCheckpointBranch(workDir, polecatName)
+	if err == nil {
+		t.Fatal("expected ensureCheckpointBranch to return error when default branch cannot be resolved")
+	}
+
+	// No branch switch should have happened — we must still be on main, with
+	// no wip/ branch created and no commit landed.
+	if got := checkpointHeadBranch(t, workDir); got != "main" {
+		t.Errorf("expected to remain on main, got %q", got)
+	}
+	if msg := checkpointHeadMessage(t, workDir); msg != "initial commit" {
+		t.Errorf("main was polluted by ensureCheckpointBranch failure path; got %q", msg)
+	}
+}
+
+func TestCheckpointWorktree_NoOrigin_DoesNotCommitOnDefault(t *testing.T) {
+	// End-to-end regression for gastown-cet.12.12: with no origin remote,
+	// dirtying main must NOT result in a WIP commit on main. Earlier
+	// (fail-open) behavior would silently commit WIP directly to main
+	// because isProtectedCheckpointBranch returned false on resolution
+	// failure. With the fix, ensureCheckpointBranch returns an error and
+	// checkpointWorktree refuses to commit.
+	workDir, polecatName := checkpointOrphanRepoNoOrigin(t)
+
+	d := &Daemon{logger: log.New(os.Stdout, "", 0)}
+
+	checkpointWriteFile(t, workDir, "feature.go", "package main\n")
+
+	if d.checkpointWorktree(workDir, "gastown", polecatName) {
+		t.Fatal("checkpointWorktree must refuse to commit when default branch cannot be resolved")
+	}
+
+	// main must remain clean — no WIP commit on it.
+	if got := checkpointHeadBranch(t, workDir); got != "main" {
+		t.Errorf("expected to remain on main (refused), got branch %q", got)
+	}
+	if msg := checkpointHeadMessage(t, workDir); msg != "initial commit" {
+		t.Errorf("main was polluted by WIP commit despite fail-closed fix; got %q", msg)
+	}
+	// Working tree must still be dirty — checkpoint did not advance.
+	if statusOut := runCheckpointCmd(t, workDir, "git", "status", "--porcelain"); strings.TrimSpace(statusOut) == "" {
+		t.Error("expected working tree to remain dirty (checkpoint was refused, not consumed)")
+	}
+}

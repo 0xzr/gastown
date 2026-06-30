@@ -174,30 +174,44 @@ func checkpointWIPBranchName(polecatName string) string {
 
 // isProtectedCheckpointBranch reports whether branch is the repository default
 // branch on which WIP checkpoints are forbidden.
+//
+// Fail-closed: if the default branch cannot be resolved (e.g., the remote is
+// unreachable and no origin/main or origin/master exists, or the worktree has
+// no configured origin), the branch is treated as protected. Callers must
+// refuse to commit on it rather than guessing. This prevents a regression
+// where checkpointDefaultBranch returned "" and a polecat on "main" silently
+// received WIP commits on the default branch.
 func isProtectedCheckpointBranch(workDir, branch string) bool {
 	if branch == "" {
 		return false
 	}
 	defaultBranch := checkpointDefaultBranch(workDir)
-	return defaultBranch != "" && branch == defaultBranch
+	if defaultBranch == "" {
+		return true
+	}
+	return branch == defaultBranch
 }
 
 // ensureCheckpointBranch returns the branch that should receive the WIP
 // checkpoint. If the worktree is on the default branch, it creates/resets and
 // switches to wip/<polecatName> so the checkpoint cannot land on main. If the
 // worktree is already on a feature branch, that branch is returned unchanged.
+//
+// Fail-closed: when the default branch cannot be resolved, this returns an
+// error rather than passing through. Callers must not commit on an
+// indeterminate branch — doing so can pollute the default branch when the
+// operator only thought the worktree was on a feature branch.
 func (d *Daemon) ensureCheckpointBranch(workDir, polecatName string) (string, error) {
 	current := checkpointCurrentBranch(workDir)
 	if current == "" {
 		return "", fmt.Errorf("could not determine current branch")
 	}
-	if !isProtectedCheckpointBranch(workDir, current) {
-		return current, nil
-	}
-
 	defaultBranch := checkpointDefaultBranch(workDir)
 	if defaultBranch == "" {
 		return "", fmt.Errorf("could not determine default branch")
+	}
+	if current != defaultBranch {
+		return current, nil
 	}
 
 	wip := checkpointWIPBranchName(polecatName)
