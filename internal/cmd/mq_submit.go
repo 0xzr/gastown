@@ -264,11 +264,30 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	// MR would conflict against the partial diff. Block submission with
 	// actionable remediation unless the caller opts out via
 	// --allow-stacked-branch (audit-only escape hatch for non-code closes).
-	if !mqSubmitAllowStacked {
-		if stackedErr := checkStackedBranchForSubmit(g, branch, target); stackedErr != nil {
-			return stackedErr
+	// We always run the check so we can stamp base_sha/commits_ahead on the MR
+	// description; with --allow-stacked-branch we capture the scope info instead of
+	// returning the error.
+	sbInfo, stackedErr := CheckStackedBranch(g, branch, target)
+	var stackedInfo *StackedBranchInfo
+	if stackedErr != nil {
+		var stacked *ErrStackedBranch
+		if errors.As(stackedErr, &stacked) {
+			if !mqSubmitAllowStacked {
+				return stackedErr
+			}
+			stackedInfo = sbInfo
+		} else {
+			// Non-stacked error (couldn't read git). Warn but don't block.
+			style.PrintWarning("could not run stacked-branch check against %s: %v (proceeding; refinery will catch real issues)", target, stackedErr)
 		}
+	} else {
+		stackedInfo = sbInfo
 	}
+
+	// gastown-cet.2.3 acceptance criterion #1: stamp scope keys so the MR
+	// advertises enough information to reconstruct the full diff, not just
+	// the tip SHA.
+	description += FormatStackedBranchScopeKeys(stackedInfo)
 
 	// Check if MR bead already exists for this branch+SHA (idempotency)
 	var mrIssue *beads.Issue
@@ -541,33 +560,3 @@ Please verify state and execute lifecycle action.
 	}
 }
 
-// checkStackedBranchForSubmit is the entry point used by gt mq submit (and,
-// indirectly, gt done) to fail fast when a branch has more than one commit
-// ahead of the target's merge-base. It wraps CheckStackedBranch and returns
-// the structured error so callers see the actionable remediation directly.
-//
-// Resolving against the target ref the MR will actually target (rather than
-// a generic "main") matters: polecats may target an integration branch when
-// working under a convoy epic, and the merge-base against that integration
-// branch is what determines whether the branch is stacked.
-//
-// Errors that are NOT ErrStackedBranch (e.g. transient git failures) are
-// wrapped with context but do not block submission — the refinery will
-// catch real problems. The whole point of this guard is to fail fast on
-// the specific hq-try2 class, not to be a generic pre-flight check.
-func checkStackedBranchForSubmit(g *git.Git, branch, target string) error {
-	targetRef := target
-	if targetRef == "" {
-		targetRef = "origin/" + target
-	}
-	if _, err := CheckStackedBranch(g, branch, targetRef); err != nil {
-		var stacked *ErrStackedBranch
-		if errors.As(err, &stacked) {
-			return err // Already actionable; bubble up.
-		}
-		// Non-stacked error (couldn't read git). Warn but don't block.
-		style.PrintWarning("could not run stacked-branch check against %s: %v (proceeding; refinery will catch real issues)", targetRef, err)
-		return nil
-	}
-	return nil
-}

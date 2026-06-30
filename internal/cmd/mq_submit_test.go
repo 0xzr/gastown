@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -210,4 +212,79 @@ func TestValidateMoleculePrereqs(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestMqSubmitStampsScopeKeys is a characterization test for the MR description
+// construction in runMqSubmit. It rebuilds the same description prefix and
+// scope-key suffix that runMqSubmit appends, then asserts the resulting
+// description round-trips through beads.ParseMRFields. This catches
+// gastown-73a regressions where CheckStackedBranch info was computed but never
+// stamped onto the MR.
+func TestMqSubmitStampsScopeKeys(t *testing.T) {
+	repo := setupMqSubmitTestRepoWithStackedBranch(t)
+	g := gitpkg.NewGit(repo)
+
+	info, err := CheckStackedBranch(g, "polecat/slit/gastown-73a", "main")
+	if err == nil {
+		t.Fatalf("CheckStackedBranch did not flag stacked branch; info=%+v", info)
+	}
+	var stacked *ErrStackedBranch
+	if !errors.As(err, &stacked) {
+		t.Fatalf("expected ErrStackedBranch, got %T: %v", err, err)
+	}
+
+	branch := "polecat/slit/gastown-73a"
+	target := "main"
+	issueID := "gastown-73a"
+	rigName := "gastown"
+	commitSHA := stacked.TipSHA
+	worker := "slit"
+
+	// Exact construction order from runMqSubmit (lines ~245-297).
+	description := fmt.Sprintf("branch: %s\ntarget: %s\nsource_issue: %s\nrig: %s",
+		branch, target, issueID, rigName)
+	if commitSHA != "" {
+		description += fmt.Sprintf("\ncommit_sha: %s", commitSHA)
+	}
+	if worker != "" {
+		description += fmt.Sprintf("\nworker: %s", worker)
+	}
+	description += FormatStackedBranchScopeKeys(info)
+
+	fields := beads.ParseMRFields(&beads.Issue{Description: description})
+	if fields == nil {
+		t.Fatal("ParseMRFields returned nil for stamped description")
+	}
+	if fields.BaseSHA != stacked.MergeBase {
+		t.Errorf("BaseSHA=%q, want %q", fields.BaseSHA, stacked.MergeBase)
+	}
+	if fields.CommitsAhead != stacked.CommitsAhead {
+		t.Errorf("CommitsAhead=%d, want %d", fields.CommitsAhead, stacked.CommitsAhead)
+	}
+}
+
+// setupMqSubmitTestRepoWithStackedBranch creates a repo with a 2-commit polecat
+// branch on top of local main. No origin remote is required because the test
+// exercises only CheckStackedBranch and the scope-key formatting.
+func setupMqSubmitTestRepoWithStackedBranch(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	runGitForMQSubmitTest(t, repo, "init")
+	runGitForMQSubmitTest(t, repo, "config", "user.email", "test@example.com")
+	runGitForMQSubmitTest(t, repo, "config", "user.name", "Test User")
+
+	writeMQSubmitTestFile(t, repo, "README.md", "main\n")
+	runGitForMQSubmitTest(t, repo, "add", "README.md")
+	runGitForMQSubmitTest(t, repo, "commit", "-m", "initial")
+	runGitForMQSubmitTest(t, repo, "checkout", "-b", "polecat/slit/gastown-73a")
+
+	writeMQSubmitTestFile(t, repo, "feature.go", "package x\n")
+	runGitForMQSubmitTest(t, repo, "add", "feature.go")
+	runGitForMQSubmitTest(t, repo, "commit", "-m", "feature 1")
+
+	writeMQSubmitTestFile(t, repo, "feature.go", "package x\n// extra\n")
+	runGitForMQSubmitTest(t, repo, "add", "feature.go")
+	runGitForMQSubmitTest(t, repo, "commit", "-m", "feature 2")
+
+	return repo
 }

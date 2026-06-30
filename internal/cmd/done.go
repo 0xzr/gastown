@@ -1280,19 +1280,24 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// merge-base and commit count onto the MR bead description —
 		// acceptance criterion #1 requires that the MR advertises enough
 		// information to reconstruct the full diff, not just the tip SHA.
+		// This is needed for BOTH normal and --allow-stacked-branch stacked MRs,
+		// so we always run the check. Without --allow-stacked-branch a stacked
+		// branch is rejected; with the flag we capture the info and stamp it.
+		info, stackedErr := CheckStackedBranch(g, branch, target)
 		var stackedInfo *StackedBranchInfo
-		if !doneAllowStacked {
-			info, stackedErr := CheckStackedBranch(g, branch, target)
-			if stackedErr != nil {
-				var stacked *ErrStackedBranch
-				if errors.As(stackedErr, &stacked) {
+		if stackedErr != nil {
+			var stacked *ErrStackedBranch
+			if errors.As(stackedErr, &stacked) {
+				if !doneAllowStacked {
 					return stackedErr
 				}
+				stackedInfo = info
+			} else {
 				// Non-stacked error (couldn't read git). Warn but don't block.
 				style.PrintWarning("could not run stacked-branch check against %s: %v (proceeding; refinery will catch real issues)", target, stackedErr)
-			} else {
-				stackedInfo = info
 			}
+		} else {
+			stackedInfo = info
 		}
 
 		// Resume: skip MR creation if already completed in a previous run (gt-aufru).
@@ -1344,14 +1349,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// just the tip SHA. Recording the merge-base and commit count
 			// lets the refinery detect a partial-diff replay attempt and
 			// lets reviewers see whether earlier commits were dropped.
-			if stackedInfo != nil {
-				if stackedInfo.MergeBase != "" {
-					description += fmt.Sprintf("\nbase_sha: %s", stackedInfo.MergeBase)
-				}
-				if stackedInfo.CommitsAhead > 0 {
-					description += fmt.Sprintf("\ncommits_ahead: %d", stackedInfo.CommitsAhead)
-				}
-			}
+			description += FormatStackedBranchScopeKeys(stackedInfo)
 			if doneSkipVerify {
 				description += "\nskip_verify: true"
 			}

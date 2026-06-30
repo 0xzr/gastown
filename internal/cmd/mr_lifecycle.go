@@ -145,3 +145,23 @@ func CheckStackedBranch(g *git.Git, branch, targetRef string) (*StackedBranchInf
 	}
 	return info, nil
 }
+
+// FormatStackedBranchScopeKeys returns the stacked-branch scope-key lines that
+// should be appended to an MR bead description. When the submitted branch is
+// stacked, the MR must advertise the merge-base and commit count so the
+// refinery can detect a partial-diff replay attempt (gastown-cet.2.3
+// acceptance criterion #1). Returns the empty string when there is nothing
+// meaningful to record.
+func FormatStackedBranchScopeKeys(info *StackedBranchInfo) string {
+	var extras string
+	if info == nil {
+		return extras
+	}
+	if info.MergeBase != "" {
+		extras += fmt.Sprintf("\nbase_sha: %s", info.MergeBase)
+	}
+	if info.CommitsAhead > 0 {
+		extras += fmt.Sprintf("\ncommits_ahead: %d", info.CommitsAhead)
+	}
+	return extras
+}

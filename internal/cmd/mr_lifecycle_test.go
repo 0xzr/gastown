@@ -189,6 +189,95 @@ func TestErrStackedBranchErrorFormat(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// gastown-cet.2.3 / gastown-73a: scope-key stamping
+// ---------------------------------------------------------------------------
+
+// TestFormatStackedBranchScopeKeys verifies the helper used by both `gt done`
+// and `gt mq submit` to append base_sha and commits_ahead to an MR description.
+// This is the unit-level contract; TestDoneStampsScopeKeys and
+// TestMqSubmitStampsScopeKeys exercise the path through each command.
+func TestFormatStackedBranchScopeKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		info *StackedBranchInfo
+		want []string
+	}{
+		{
+			name: "stacked branch with merge-base",
+			info: &StackedBranchInfo{
+				MergeBase:    "deadbeef00000000000000000000000000000000",
+				CommitsAhead: 3,
+			},
+			want: []string{
+				"base_sha: deadbeef00000000000000000000000000000000",
+				"commits_ahead: 3",
+			},
+		},
+		{
+			name: "single-commit branch omits zero-count",
+			info: &StackedBranchInfo{
+				MergeBase:    "cafebabe",
+				CommitsAhead: 1,
+			},
+			want: []string{"base_sha: cafebabe"},
+		},
+		{
+			name: "nil info yields empty string",
+			info: nil,
+			want: []string{},
+		},
+		{
+			name: "no merge-base yields empty string",
+			info: &StackedBranchInfo{CommitsAhead: 2},
+			want: []string{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := FormatStackedBranchScopeKeys(tc.info)
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("FormatStackedBranchScopeKeys(%+v) = %q, missing %q", tc.info, got, w)
+				}
+			}
+		})
+	}
+}
+
+// TestStackedBranchScopeKeysRoundTrip reads real a stacked git repo, runs
+// CheckStackedBranch, then confirms that appending FormatStackedBranchScopeKeys
+// to an MR description produces values that beads.ParseMRFields can read back.
+// This is the regression case for gastown-73a: the scope keys must be present
+// and parseable on the MR bead, not just hard-coded in field-helper tests.
+func TestStackedBranchScopeKeysRoundTrip(t *testing.T) {
+	repo := setupThreeCommitBranchRepo(t)
+	g := gitpkg.NewGit(repo)
+
+	info, err := CheckStackedBranch(g, "feature/polybot-stack", "main")
+	if err == nil {
+		t.Fatalf("CheckStackedBranch did not flag stacked branch; info=%+v", info)
+	}
+	var stacked *ErrStackedBranch
+	if !errors.As(err, &stacked) {
+		t.Fatalf("expected ErrStackedBranch, got %T: %v", err, err)
+	}
+
+	description := "branch: polecat/quartz/gastown-73a\ntarget: main\nsource_issue: gastown-73a\nrig: gastown"
+	description += FormatStackedBranchScopeKeys(info)
+
+	fields := beads.ParseMRFields(&beads.Issue{Description: description})
+	if fields == nil {
+		t.Fatal("ParseMRFields returned nil for stamped description")
+	}
+	if fields.BaseSHA != stacked.MergeBase {
+		t.Errorf("BaseSHA=%q, want %q", fields.BaseSHA, stacked.MergeBase)
+	}
+	if fields.CommitsAhead != stacked.CommitsAhead {
+		t.Errorf("CommitsAhead=%d, want %d", fields.CommitsAhead, stacked.CommitsAhead)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // hq-6sdu: terminal-state classification for source-bead guard
 // ---------------------------------------------------------------------------
 

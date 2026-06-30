@@ -1756,3 +1756,80 @@ func testRunGit(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
 	}
 }
+
+// TestDoneStampsScopeKeys is a characterization test for the MR description
+// construction in runDone. It rebuilds the same description prefix and scope-key
+// suffix that runDone appends, then asserts the resulting description round-
+// trips through beads.ParseMRFields. This catches gastown-73a regressions
+// where CheckStackedBranch info was computed but never stamped onto the MR.
+func TestDoneStampsScopeKeys(t *testing.T) {
+	repo := setupDoneTestRepoWithStackedBranch(t)
+	g := gitpkg.NewGit(repo)
+
+	info, err := CheckStackedBranch(g, "polecat/slit/gastown-73a", "main")
+	if err == nil {
+		t.Fatalf("CheckStackedBranch did not flag stacked branch; info=%+v", info)
+	}
+	var stacked *ErrStackedBranch
+	if !errors.As(err, &stacked) {
+		t.Fatalf("expected ErrStackedBranch, got %T: %v", err, err)
+	}
+
+	branch := "polecat/slit/gastown-73a"
+	target := "main"
+	issueID := "gastown-73a"
+	rigName := "gastown"
+	commitSHA := stacked.TipSHA
+
+	// Exact construction order from runDone (lines ~1341-1359).
+	description := fmt.Sprintf("branch: %s\ntarget: %s\nsource_issue: %s\nrig: %s",
+		branch, target, issueID, rigName)
+	if commitSHA != "" {
+		description += fmt.Sprintf("\ncommit_sha: %s", commitSHA)
+	}
+	description += FormatStackedBranchScopeKeys(info)
+
+	fields := beads.ParseMRFields(&beads.Issue{Description: description})
+	if fields == nil {
+		t.Fatal("ParseMRFields returned nil for stamped description")
+	}
+	if fields.BaseSHA != stacked.MergeBase {
+		t.Errorf("BaseSHA=%q, want %q", fields.BaseSHA, stacked.MergeBase)
+	}
+	if fields.CommitsAhead != stacked.CommitsAhead {
+		t.Errorf("CommitsAhead=%d, want %d", fields.CommitsAhead, stacked.CommitsAhead)
+	}
+}
+
+// setupDoneTestRepoWithStackedBranch creates a repo with a 2-commit polecat
+// branch. The branch is on top of local main with no origin remote, which is
+// sufficient for CheckStackedBranch to compute merge-base and commit count.
+func setupDoneTestRepoWithStackedBranch(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	testRunGit(t, repo, "init")
+	testRunGit(t, repo, "config", "user.email", "test@example.com")
+	testRunGit(t, repo, "config", "user.name", "Test User")
+
+	writeDoneTestFile(t, repo, "README.md", "main\n")
+	testRunGit(t, repo, "add", "README.md")
+	testRunGit(t, repo, "commit", "-m", "initial")
+	testRunGit(t, repo, "checkout", "-b", "polecat/slit/gastown-73a")
+
+	writeDoneTestFile(t, repo, "feature.go", "package x\n")
+	testRunGit(t, repo, "add", "feature.go")
+	testRunGit(t, repo, "commit", "-m", "feature 1")
+
+	writeDoneTestFile(t, repo, "feature.go", "package x\n// extra\n")
+	testRunGit(t, repo, "add", "feature.go")
+	testRunGit(t, repo, "commit", "-m", "feature 2")
+
+	return repo
+}
+
+func writeDoneTestFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
