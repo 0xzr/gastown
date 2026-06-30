@@ -115,8 +115,16 @@ func write(event Event) error {
 		return nil
 	}
 
-	eventsPath := filepath.Join(townRoot, EventsFile)
+	return appendEvent(filepath.Join(townRoot, EventsFile), event)
+}
 
+// appendEvent serializes event as a single JSONL record and appends it to
+// the file at eventsPath. The write is crash-safe: the data is fsync'd to
+// disk before the file descriptor is closed, so a kernel panic or power
+// loss after this function returns cannot lose the event. Uses flock for
+// cross-process synchronization since multiple gt processes may write
+// concurrently.
+func appendEvent(eventsPath string, event Event) error {
 	// Marshal event to JSON
 	data, err := json.Marshal(event)
 	if err != nil {
@@ -139,6 +147,15 @@ func write(event Event) error {
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("writing event: %w", err)
+	}
+
+	// Sync to disk before close: O_APPEND only guarantees atomicity at the
+	// file level, not durability. A kernel panic or power loss between
+	// successful Write() and Close() can lose the event. fsync forces the
+	// kernel to flush dirty pages so the appended record survives a crash.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("syncing events file: %w", err)
 	}
 
 	if err := f.Close(); err != nil {
