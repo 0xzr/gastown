@@ -32,24 +32,41 @@ type mergeSlotData struct {
 }
 
 // parseMergeSlotData decodes the merge slot state from a bead's Description field.
-func parseMergeSlotData(issue *Issue) mergeSlotData {
+// It returns an error if the Description is present but not valid JSON — the
+// merge slot stores serialized conflict-resolution state, so silently treating
+// a malformed/truncated Description as an empty (available) slot would let a
+// second actor acquire concurrently and break merge-queue serialization.
+func parseMergeSlotData(issue *Issue) (mergeSlotData, error) {
 	if issue.Description == "" {
-		return mergeSlotData{}
+		return mergeSlotData{}, nil
 	}
 	var data mergeSlotData
-	_ = json.Unmarshal([]byte(issue.Description), &data)
-	return data
+	if err := json.Unmarshal([]byte(issue.Description), &data); err != nil {
+		return mergeSlotData{}, fmt.Errorf("parsing merge slot state: %w", err)
+	}
+	return data, nil
 }
 
 // mergeSlotStatusFromIssue builds a MergeSlotStatus from a bead issue.
+// If the slot state cannot be parsed, the status is reported as unavailable
+// with an Error so callers do not treat a corrupt slot as freely acquirable.
 func mergeSlotStatusFromIssue(issue *Issue) *MergeSlotStatus {
-	data := parseMergeSlotData(issue)
-	return &MergeSlotStatus{
-		ID:        issue.ID,
-		Available: data.Holder == "",
-		Holder:    data.Holder,
-		Waiters:   data.Waiters,
+	data, err := parseMergeSlotData(issue)
+	status := &MergeSlotStatus{
+		ID:      issue.ID,
+		Waiters: data.Waiters,
 	}
+	if err != nil {
+		status.Error = err.Error()
+		// A corrupt slot is NOT safe to acquire — report unavailable and
+		// preserve any holder that did decode so the state isn't lost.
+		status.Available = false
+		status.Holder = data.Holder
+		return status
+	}
+	status.Available = data.Holder == ""
+	status.Holder = data.Holder
+	return status
 }
 
 // getMergeSlotBead finds the merge slot bead (label=gt:merge-slot).
@@ -110,7 +127,12 @@ func (b *Beads) MergeSlotAcquire(holder string, addWaiter bool) (*MergeSlotStatu
 		return nil, fmt.Errorf("acquiring merge slot: %w", err)
 	}
 
-	data := parseMergeSlotData(issue)
+	data, err := parseMergeSlotData(issue)
+	if err != nil {
+		// The slot state is corrupt/unreadable. Refuse to acquire rather
+		// than risk letting a second actor through on a falsely-empty slot.
+		return nil, fmt.Errorf("acquiring merge slot: %w", err)
+	}
 
 	if data.Holder != "" && data.Holder != holder {
 		// Slot is held by someone else.
@@ -173,7 +195,11 @@ func (b *Beads) MergeSlotRelease(holder string) error {
 		return fmt.Errorf("releasing merge slot: %w", err)
 	}
 
-	data := parseMergeSlotData(issue)
+	data, err := parseMergeSlotData(issue)
+	if err != nil {
+		// Slot state is corrupt/unreadable. Refuse to mutate it blindly.
+		return fmt.Errorf("releasing merge slot: %w", err)
+	}
 
 	if data.Holder == "" {
 		return nil // Already available
