@@ -1,17 +1,21 @@
 package polecat
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	beadsSDK "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
@@ -1165,5 +1169,316 @@ func TestReadModelAssignment_MalformedJSONReturnsEmpty(t *testing.T) {
 	}
 	if got := readModelAssignment(tmpTown, "gastown-bad"); got != "" {
 		t.Errorf("readModelAssignment(bad json) = %q, want empty", got)
+	}
+}
+
+// splitStoreFake is a beadsdk.Storage used to inject agent-bead and work-bead
+// lookups separately. The two factories on SessionManager (agentBeads /
+// workBeads) accept different Beads instances, so the test can model the
+// production routing topology: agent beads live in the town DB, work beads
+// live in the rig DB (gastown-cet.10).
+type splitStoreFake struct {
+	beadsSDK.Storage
+	issues map[string]*beadsSDK.Issue
+	labels map[string][]string
+}
+
+func (f *splitStoreFake) GetIssue(_ context.Context, id string) (*beadsSDK.Issue, error) {
+	issue, ok := f.issues[id]
+	if !ok {
+		return nil, fmt.Errorf("issue %s not found", id)
+	}
+	return issue, nil
+}
+
+func (f *splitStoreFake) GetLabels(_ context.Context, issueID string) ([]string, error) {
+	return f.labels[issueID], nil
+}
+
+func (f *splitStoreFake) Close() error { return nil }
+
+// makeSplitStore wraps a splitStoreFake in a Beads instance backed by the
+// fake store. Returning two separate Beads (one for agentBeadsForTest, one
+// for workBeadsForTest) exercises the routing-split code path the production
+// factory uses: agent-bead reads via noRoute+town, work-bead reads via the
+// normal routed rig client (gastown-cet.10).
+func makeSplitStore(workDir string, issues map[string]*beadsSDK.Issue) *beads.Beads {
+	store := &splitStoreFake{issues: issues, labels: make(map[string][]string)}
+	return beads.NewWithStore(workDir, store)
+}
+
+// TestReadHookBead_HonorsCurrentlyHookedWorkBead exercises the readHookBead
+// fallback path: when the agent-bead hook_bead references a work bead that
+// is still hooked and assigned to this polecat, readHookBead returns it.
+// Regression coverage for gastown-cet.10.
+func TestReadHookBead_HonorsCurrentlyHookedWorkBead(t *testing.T) {
+	workDir, _ := setupSessionBranchTestRepo(t)
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+
+	agentID := sm.agentBeadIDForSession("toast")
+	assignee := "gastown/polecats/toast"
+	issueID := "gastown-ndk"
+
+	issues := map[string]*beadsSDK.Issue{
+		agentID: {
+			ID:          agentID,
+			Title:       "Agent bead for toast",
+			Description: "hook_bead: " + issueID + "\n",
+			IssueType:   beadsSDK.IssueType("agent"),
+			Status:      beadsSDK.StatusOpen,
+		},
+		issueID: {
+			ID:        issueID,
+			Title:     "Hooked work bead",
+			IssueType: beadsSDK.TypeTask,
+			Status:    beadsSDK.Status(beads.StatusHooked),
+			Assignee:  assignee,
+		},
+	}
+
+	// Inject split stores that mirror production: agentBeads targets the
+	// town DB, workBeads targets the rig DB. Both fakes back onto a single
+	// in-memory store for the test.
+	sm.agentBeadsForTest = makeSplitStore(workDir, issues)
+	sm.workBeadsForTest = makeSplitStore(workDir, issues)
+
+	if got := sm.readHookBead("toast"); got != issueID {
+		t.Fatalf("readHookBead = %q, want %q", got, issueID)
+	}
+}
+
+// TestReadHookBead_RejectsStaleHookBead verifies that a hook_bead pointing
+// to a work bead that is no longer hooked is rejected, so a stale legacy
+// field cannot misclassify the branch (gastown-cet.10).
+func TestReadHookBead_RejectsStaleHookBead(t *testing.T) {
+	cases := []struct {
+		name   string
+		status beadsSDK.Status
+	}{
+		{"closed", beadsSDK.StatusClosed},
+		{"open but unassigned", beadsSDK.StatusOpen},
+		{"in_progress", beadsSDK.StatusInProgress},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.status), func(t *testing.T) {
+			workDir, _ := setupSessionBranchTestRepo(t)
+			sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+			agentID := sm.agentBeadIDForSession("toast")
+			issueID := "gastown-ndk"
+
+			issues := map[string]*beadsSDK.Issue{
+				agentID: {
+					ID:          agentID,
+					Title:       "Agent bead for toast",
+					Description: "hook_bead: " + issueID + "\n",
+					IssueType:   beadsSDK.IssueType("agent"),
+					Status:      beadsSDK.StatusOpen,
+				},
+				issueID: {
+					ID:        issueID,
+					Title:     "Stale work bead",
+					IssueType: beadsSDK.TypeTask,
+					Status:    tc.status,
+					Assignee:  "gastown/polecats/toast",
+				},
+			}
+
+			sm.agentBeadsForTest = makeSplitStore(workDir, issues)
+			sm.workBeadsForTest = makeSplitStore(workDir, issues)
+
+			if got := sm.readHookBead("toast"); got != "" {
+				t.Fatalf("readHookBead = %q, want empty (status=%s)", got, tc.status)
+			}
+		})
+	}
+}
+
+// TestReadHookBead_RejectsMismatchedAssignee verifies that a hook_bead
+// pointing to a work bead assigned to a different polecat is rejected.
+// Stale references that survived polecat reassignment must not be honored.
+func TestReadHookBead_RejectsMismatchedAssignee(t *testing.T) {
+	workDir, _ := setupSessionBranchTestRepo(t)
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	agentID := sm.agentBeadIDForSession("toast")
+	issueID := "gastown-ndk"
+
+	issues := map[string]*beadsSDK.Issue{
+		agentID: {
+			ID:          agentID,
+			Title:       "Agent bead for toast",
+			Description: "hook_bead: " + issueID + "\n",
+			IssueType:   beadsSDK.IssueType("agent"),
+			Status:      beadsSDK.StatusOpen,
+		},
+		issueID: {
+			ID:        issueID,
+			Title:     "Reassigned to a different polecat",
+			IssueType: beadsSDK.TypeTask,
+			Status:    beadsSDK.Status(beads.StatusHooked),
+			Assignee:  "gastown/polecats/furiosa", // not toast
+		},
+	}
+
+	sm.agentBeadsForTest = makeSplitStore(workDir, issues)
+	sm.workBeadsForTest = makeSplitStore(workDir, issues)
+
+	if got := sm.readHookBead("toast"); got != "" {
+		t.Fatalf("readHookBead = %q, want empty (assignee mismatch)", got)
+	}
+}
+
+// TestReadHookBead_WorkBeadMissingFromRigDB ensures that if the work-bead
+// store does not see the hook_bead ID (i.e., the production topology where
+// the work bead lives in the rig DB and the noRoute agent-bead client
+// cannot find it), readHookBead treats the hook as stale rather than
+// silently trusting the agent-bead description. Regression coverage for
+// gastown-cet.10 — the prior fix used the agent-bead client for Show, which
+// always missed the rig DB and misclassified every valid hook as stale.
+func TestReadHookBead_WorkBeadMissingFromRigDB(t *testing.T) {
+	workDir, _ := setupSessionBranchTestRepo(t)
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	agentID := sm.agentBeadIDForSession("toast")
+	issueID := "gastown-ndk"
+
+	// agentBeadsForTest sees both (the town-DB fake holds the agent bead).
+	// workBeadsForTest sees neither (the rig-DB fake is empty), mimicking the
+	// production bug where a noRoute client misses the rig DB.
+	agentOnly := map[string]*beadsSDK.Issue{
+		agentID: {
+			ID:          agentID,
+			Title:       "Agent bead for toast",
+			Description: "hook_bead: " + issueID + "\n",
+			IssueType:   beadsSDK.IssueType("agent"),
+			Status:      beadsSDK.StatusOpen,
+		},
+	}
+	rigEmpty := map[string]*beadsSDK.Issue{}
+
+	sm.agentBeadsForTest = makeSplitStore(workDir, agentOnly)
+	sm.workBeadsForTest = makeSplitStore(workDir, rigEmpty)
+
+	if got := sm.readHookBead("toast"); got != "" {
+		t.Fatalf("readHookBead = %q, want empty (work bead not in rig DB)", got)
+	}
+}
+
+// TestEnsureCanonicalSessionBranch_ReadHookBeadFallback exercises the full
+// path: ensureCanonicalSessionBranch with no opts.Issue must use the
+// agent-bead hook_bead (when currently hooked) as the effective issue.
+func TestEnsureCanonicalSessionBranch_ReadHookBeadFallback(t *testing.T) {
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	agentID := sm.agentBeadIDForSession("toast")
+	assignee := "gastown/polecats/toast"
+	issueID := "gastown-ndk"
+
+	issues := map[string]*beadsSDK.Issue{
+		agentID: {
+			ID:          agentID,
+			Title:       "Agent bead for toast",
+			Description: "hook_bead: " + issueID + "\n",
+			IssueType:   beadsSDK.IssueType("agent"),
+			Status:      beadsSDK.StatusOpen,
+		},
+		issueID: {
+			ID:        issueID,
+			Title:     "Fallback hooked issue",
+			IssueType: beadsSDK.TypeTask,
+			Status:    beadsSDK.Status(beads.StatusHooked),
+			Assignee:  assignee,
+		},
+	}
+	sm.agentBeadsForTest = makeSplitStore(workDir, issues)
+	sm.workBeadsForTest = makeSplitStore(workDir, issues)
+
+	branch, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{})
+	if err != nil {
+		t.Fatalf("ensureCanonicalSessionBranch: %v", err)
+	}
+	if !strings.Contains(branch, "/"+issueID+"@") {
+		t.Fatalf("expected branch to use hook_bead issue %s, got %q", issueID, branch)
+	}
+}
+
+// TestEnsureCanonicalSessionBranch_ReadHookBeadFallback_Stale verifies that
+// when opts.Issue is empty AND the hook_bead is stale, the session manager
+// must NOT silently inherit the stale issue.
+func TestEnsureCanonicalSessionBranch_ReadHookBeadFallback_Stale(t *testing.T) {
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	agentID := sm.agentBeadIDForSession("toast")
+	assignee := "gastown/polecats/toast"
+	issueID := "gastown-ndk"
+
+	issues := map[string]*beadsSDK.Issue{
+		agentID: {
+			ID:          agentID,
+			Title:       "Agent bead for toast",
+			Description: "hook_bead: " + issueID + "\n",
+			IssueType:   beadsSDK.IssueType("agent"),
+			Status:      beadsSDK.StatusOpen,
+		},
+		issueID: {
+			ID:        issueID,
+			Title:     "Closed stale issue",
+			IssueType: beadsSDK.TypeTask,
+			Status:    beadsSDK.StatusClosed,
+			Assignee:  assignee,
+		},
+	}
+	sm.agentBeadsForTest = makeSplitStore(workDir, issues)
+	sm.workBeadsForTest = makeSplitStore(workDir, issues)
+
+	branch, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{})
+	if err != nil {
+		t.Fatalf("ensureCanonicalSessionBranch: %v", err)
+	}
+	if strings.Contains(branch, issueID) {
+		t.Fatalf("expected stale hook_bead %s to be ignored, got branch %q", issueID, branch)
+	}
+}
+
+// TestEnsureCanonicalSessionBranch_QuarantineRefUniqueSuffix verifies that
+// the quarantine ref includes a short random suffix so two polecats
+// quarantining the same branch within the same millisecond cannot collide
+// and silently overwrite each other's abandoned tip (gastown-cet.10).
+func TestEnsureCanonicalSessionBranch_QuarantineRefUniqueSuffix(t *testing.T) {
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+
+	oldBranch := "polecat/toast/gt-old@seed"
+	if err := repoGit.CheckoutNewBranch(oldBranch, "main"); err != nil {
+		t.Fatalf("checkout old WIP branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "abandoned.txt"), []byte("abandoned\n"), 0644); err != nil {
+		t.Fatalf("write abandoned.txt: %v", err)
+	}
+	if err := repoGit.Add("abandoned.txt"); err != nil {
+		t.Fatalf("git add abandoned.txt: %v", err)
+	}
+	if err := repoGit.Commit("abandoned WIP commit"); err != nil {
+		t.Fatalf("git commit abandoned.txt: %v", err)
+	}
+
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	if _, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-new"}); err != nil {
+		t.Fatalf("ensureCanonicalSessionBranch: %v", err)
+	}
+
+	refs, err := repoGit.ListRefs("refs/quarantine/polecat/gastown/toast/*")
+	if err != nil {
+		t.Fatalf("list quarantine refs: %v", err)
+	}
+	if len(refs) == 0 {
+		t.Fatalf("expected a quarantine ref for the abandoned branch, found none")
+	}
+	quarantineRef := refs[0]
+
+	// Expected format: refs/quarantine/polecat/gastown/toast/<component>-<ts>-<8-char-suffix>.
+	// The trailing 8-char segment is the unique discriminator added in this fix.
+	matched, _ := regexp.MatchString(`refs/quarantine/polecat/gastown/toast/[^/]+-[a-z0-9]+-[a-z0-9]{8}$`, quarantineRef)
+	if !matched {
+		t.Fatalf("quarantine ref %q does not match expected format with unique suffix", quarantineRef)
 	}
 }
