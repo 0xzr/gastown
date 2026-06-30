@@ -1596,6 +1596,34 @@ func (g *Git) GetPRReviews(prNumber int) ([]PRReview, error) {
 	return reviews, nil
 }
 
+// GetPRBaseBranch returns the actual base/target branch of a GitHub PR (e.g.
+// "main", "release", "feature/x"), as reported by the gh CLI. This is the PR's
+// authoritatively-reported merge target — callers that need to compute the
+// merge-candidate diff basis must use this rather than a hardcoded "main",
+// because a transient gh/auth/network failure cannot be allowed to silently
+// fall back to "origin/main" for a PR that actually targets another branch
+// (gastown-cet.12.6.6).
+//
+// Returns an empty string with no error only when gh succeeds but the PR
+// genuinely has no resolvable base branch (which would be a gh bug); callers
+// should treat empty the same as an error and fail closed.
+func (g *Git) GetPRBaseBranch(prNumber int) (string, error) {
+	// Bounded via runProviderCommand: a hung gh (auth relogin, paginate loop)
+	// returns ErrProviderTimeout which the caller maps to a fail-closed
+	// verdict rather than passing on an unconfirmed state.
+	result, err := runProviderCommand("gh", []string{"pr", "view", fmt.Sprintf("%d", prNumber), "--json", "baseRefName"}, g.workDir, "github pr-base-ref")
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		BaseRefName string `json:"baseRefName"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &parsed); err != nil {
+		return "", fmt.Errorf("failed to parse gh pr view output: %w", err)
+	}
+	return parsed.BaseRefName, nil
+}
+
 // GetPRReviewDecision returns the overall GitHub review decision for a PR.
 // Known values: APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, "".
 func (g *Git) GetPRReviewDecision(prNumber int) (string, error) {
@@ -1741,6 +1769,46 @@ func (g *Git) GetBitbucketPRParticipants(workspace, repoSlug string, prID int) (
 		})
 	}
 	return participants, nil
+}
+
+// GetBitbucketPRDestination returns the destination/target branch of a
+// Bitbucket PR (e.g. "main", "release", "feature/x"), as reported by the
+// Bitbucket Cloud REST API. This is the PR's authoritatively-reported merge
+// target — callers that need to compute the merge-candidate diff basis must
+// use this rather than a hardcoded "main", because a transient
+// curl/auth/network failure cannot be allowed to silently fall back to
+// "origin/main" for a PR that actually targets another branch
+// (gastown-cet.12.6.6).
+//
+// Returns an empty string with no error only when the API succeeds but the PR
+// genuinely has no resolvable destination branch (which would be a Bitbucket
+// API bug); callers should treat empty the same as an error and fail closed.
+func (g *Git) GetBitbucketPRDestination(workspace, repoSlug string, prID int) (string, error) {
+	token := os.Getenv("BITBUCKET_TOKEN")
+	if token == "" {
+		return "", fmt.Errorf("BITBUCKET_TOKEN is required for Bitbucket PR operations")
+	}
+	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d",
+		workspace, repoSlug, prID)
+	// runProviderCommand enforces the bounded timeout, kills the entire
+	// process group on context cancellation, and scrubs BITBUCKET_TOKEN from
+	// any returned error / output. The raw "Authorization: Bearer <token>"
+	// arg never appears in err.Error().
+	result, err := runProviderCommand("curl", []string{"-s", "-H", "Authorization: Bearer " + token, url}, g.workDir, "bitbucket get-destination", token)
+	if err != nil {
+		return "", err
+	}
+	var pr struct {
+		Destination struct {
+			Branch struct {
+				Name string `json:"name"`
+			} `json:"branch"`
+		} `json:"destination"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &pr); err != nil {
+		return "", fmt.Errorf("failed to parse Bitbucket response: %w", err)
+	}
+	return pr.Destination.Branch.Name, nil
 }
 
 // BitbucketPRMerge merges a Bitbucket PR via the REST API.

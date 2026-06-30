@@ -31,7 +31,18 @@ func (p *githubPRProvider) GetReviewEvaluation(prNumber int) (*ReviewEvaluation,
 	// makes the review packet identify the exact diff reviewed (gastown-cet.8),
 	// so a verdict against intermediate commit history can be distinguished
 	// from a verdict against the final merge candidate.
-	basis := p.mergeCandidateBasis()
+	//
+	// Resolve the PR's actual base/target branch from the provider. We must
+	// NOT fall back to a hardcoded "origin/main" when the resolver fails or
+	// returns an empty result — a transient gh/auth/network failure would
+	// otherwise let review evaluation continue and PASS with a basis from
+	// origin/main for a PR that actually targets a release or other non-main
+	// branch (gastown-cet.12.6.6). The fix: surface the resolver error and
+	// fail closed via the UNAVAILABLE evaluation path.
+	basis, err := p.mergeCandidateBasis(prNumber)
+	if err != nil {
+		return classifyGitHubUnavailableError(err, DiffBasis{}), nil
+	}
 
 	reviews, err := p.git.GetPRReviews(prNumber)
 	if err != nil {
@@ -206,14 +217,42 @@ func collapseReviews(reviews []git.PRReview) []git.PRReview {
 }
 
 // mergeCandidateBasis returns the merge-candidate diff basis for the PR under
-// review. Base is the merge target tip (origin/<target>); head is the branch
-// tip. Both are resolved on a best-effort basis — an empty component means
-// "unknown", which EvaluateReviews treats as a merge-candidate basis (the safe
-// default) rather than a commit-history basis.
-func (p *githubPRProvider) mergeCandidateBasis() DiffBasis {
-	base, _ := p.git.RemoteBranchTip("origin", "main")
+// review. Base is the merge target tip (origin/<PR-target-branch>); head is
+// the local HEAD SHA.
+//
+// The PR's base/target branch is resolved authoritatively from the gh CLI via
+// GetPRBaseBranch. A resolver failure (auth, network, timeout, parse error)
+// or an empty base branch returned by the provider are treated as errors,
+// NOT silently replaced with "main" — that silent fallback is the original
+// hardcoded-main bug (gastown-cet.12.6.6). The caller maps a returned error
+// to a fail-closed UNAVAILABLE evaluation so the merge cannot authoritatively
+// PASS against a basis whose target branch was never confirmed.
+//
+// On a clean resolver success with a concrete target branch (e.g. "main",
+// "release"), the basis is authoritative and behaves identically to the
+// pre-fix semantics for legitimate main-target PRs.
+func (p *githubPRProvider) mergeCandidateBasis(prNumber int) (DiffBasis, error) {
+	baseBranch, err := p.git.GetPRBaseBranch(prNumber)
+	if err != nil {
+		return DiffBasis{}, fmt.Errorf("resolve GitHub PR base branch: %w", err)
+	}
+	if baseBranch == "" {
+		return DiffBasis{}, fmt.Errorf("GitHub PR base branch is empty (gh returned no baseRefName)")
+	}
+	base, err := p.git.RemoteBranchTip("origin", baseBranch)
+	if err != nil {
+		return DiffBasis{}, fmt.Errorf("resolve origin/%s tip: %w", baseBranch, err)
+	}
+	if base == "" {
+		// RemoteBranchTip returns "", nil when the branch ref is absent on
+		// origin (git ls-remote --heads exits 0 with empty output). Without
+		// this check we'd silently fall back to an empty-base merge-candidate
+		// basis — same fail-open class as the original hardcoded-main bug,
+		// just one resolution step later (gastown-cet.12.6.6).
+		return DiffBasis{}, fmt.Errorf("origin/%s tip is empty: branch ref not present on remote", baseBranch)
+	}
 	head, _ := p.git.Rev("HEAD")
-	return MergeCandidateBasis(base, head)
+	return MergeCandidateBasis(base, head), nil
 }
 
 func (p *githubPRProvider) MergePR(prNumber int, method string) (string, error) {
