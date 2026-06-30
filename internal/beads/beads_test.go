@@ -2602,6 +2602,13 @@ func TestParseAgentBeadID(t *testing.T) {
 		{"gt-gastown-crew-polecat", "gastown", "crew", "polecat", true},
 		// Worker name collides with role keyword + hyphenated rig
 		{"gt-my-rig-polecat-witness", "my-rig", "polecat", "witness", true},
+		// Rig name collides with a named-role keyword (gastown-4mrx):
+		// a singleton role (witness/refinery) on a rig whose name equals
+		// "polecat" or "crew" — must NOT parse as a collapsed named agent.
+		{"gt-polecat-witness", "polecat", "witness", "", true},
+		{"gt-polecat-refinery", "polecat", "refinery", "", true},
+		{"gt-crew-witness", "crew", "witness", "", true},
+		{"bd-crew-refinery", "crew", "refinery", "", true},
 		// Collapsed form: prefix == rig (e.g., rig "ff" with prefix "ff")
 		{"ff-witness", "ff", "witness", "", true},                // collapsed rig-level singleton
 		{"ff-refinery", "ff", "refinery", "", true},              // collapsed rig-level singleton

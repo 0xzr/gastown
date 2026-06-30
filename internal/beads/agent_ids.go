@@ -113,6 +113,20 @@ func isNamedRole(s string) bool {
 	return false
 }
 
+// containsRigLevelRole reports whether any of the given ID parts is a
+// rig-level singleton role keyword (witness, refinery). It is used to
+// disambiguate collapsed agent IDs whose first part coincides with a
+// named-role keyword: if a genuine singleton role appears elsewhere, the
+// first part is a rig name, not a collapsed named-role marker.
+func containsRigLevelRole(parts []string) bool {
+	for _, p := range parts {
+		if isRigLevelRole(p) {
+			return true
+		}
+	}
+	return false
+}
+
 // ExtractAgentPrefix extracts the prefix from an agent ID.
 // Agent IDs have the format: prefix-rig-role-name or prefix-role
 // The prefix is always the part before the first hyphen.
@@ -185,8 +199,12 @@ func ValidateAgentID(id string) error {
 		if isTownLevelNamedRole(parts[0]) {
 			return nil // Valid town-level named agent: gt-dog-alpha
 		}
-		// Check if first part is a named role (collapsed form: prefix-role-name)
-		if isNamedRole(parts[0]) {
+		// Check if first part is a named role (collapsed form: prefix-role-name).
+		// Skip this when the second part is a genuine singleton role keyword:
+		// then parts[0] is a rig name that coincides with a named-role keyword
+		// (e.g. "gt-polecat-witness" = witness on rig "polecat"), handled below
+		// as a rig-level singleton. Mirrors the ParseAgentBeadID disambiguation.
+		if isNamedRole(parts[0]) && !isRigLevelRole(parts[1]) {
 			return nil // Valid collapsed named agent: ff-polecat-nux (prefix == rig)
 		}
 		// Check if second part is a rig-level singleton role
@@ -406,7 +424,15 @@ func ParseAgentBeadID(id string) (rig, role, name string, ok bool) {
 
 	// Check for collapsed named agent: prefix-role-name (e.g., ff-polecat-nux)
 	// This happens when prefix == rig, so the rig component was omitted.
-	if isNamedRole(parts[0]) {
+	//
+	// Only accept this interpretation when no genuine singleton role keyword
+	// (witness, refinery) follows. Otherwise parts[0] is a rig name that
+	// coincides with a named-role keyword — e.g. "gt-polecat-witness" is a
+	// witness on a rig named "polecat", not a collapsed polecat named
+	// "witness". Falling through lets the right-scan below find the real
+	// singleton role. This mirrors the gt-n0d9z fix, which disambiguated the
+	// symmetric case (a worker name colliding with a role keyword).
+	if isNamedRole(parts[0]) && !containsRigLevelRole(parts[1:]) {
 		return prefix, parts[0], strings.Join(parts[1:], "-"), true
 	}
 

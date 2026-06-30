@@ -149,6 +149,14 @@ func TestValidateAgentID(t *testing.T) {
 		{"polecat named crew", "gt-gastown-polecat-crew", false, ""},
 		{"crew named polecat", "gt-gastown-crew-polecat", false, ""},
 
+		// Valid: rig name collides with a named-role keyword (gastown-4mrx).
+		// These are singletons (witness/refinery) on a rig whose name happens
+		// to equal "polecat" or "crew" — NOT collapsed named agents.
+		{"rig named polecat with witness", "gt-polecat-witness", false, ""},
+		{"rig named polecat with refinery", "gt-polecat-refinery", false, ""},
+		{"rig named crew with witness", "gt-crew-witness", false, ""},
+		{"rig named crew with refinery", "bd-crew-refinery", false, ""},
+
 		// Invalid: witness/refinery with extra parts (no named role to the left)
 		{"witness with name", "gt-gastown-witness-extra", true, "cannot have name suffix"},
 		{"refinery with name", "gt-beads-refinery-extra", true, "cannot have name suffix"},
