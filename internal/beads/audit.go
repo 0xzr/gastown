@@ -49,7 +49,19 @@ func (b *Beads) DetachMoleculeWithAudit(pinnedBeadID string, opts DetachOptions)
 		return issue, nil // Nothing to detach
 	}
 
-	// Log the detach operation
+	// Clear attachment fields by passing nil
+	newDesc := SetAttachmentFields(issue, nil)
+
+	// Update the issue first. The audit log entry is only written if the
+	// mutation succeeds, so the log can never record a detach that didn't
+	// happen (e.g. when the underlying storage call fails). Previously the
+	// audit was written before Update, so a failed update left a false
+	// entry on disk and made subsequent forensic reads untrustworthy.
+	if err := b.Update(pinnedBeadID, UpdateOptions{Description: &newDesc}); err != nil {
+		return nil, fmt.Errorf("updating pinned bead: %w", err)
+	}
+
+	// Log the detach operation after the update succeeds.
 	operation := opts.Operation
 	if operation == "" {
 		operation = "detach"
@@ -64,16 +76,11 @@ func (b *Beads) DetachMoleculeWithAudit(pinnedBeadID string, opts DetachOptions)
 		PreviousState:    issue.Status,
 	}
 	if err := b.LogDetachAudit(entry); err != nil {
-		// Log error but don't fail the detach operation
+		// Log error but don't fail the detach operation: the state change is
+		// already durable, and losing one audit line is preferable to
+		// surfacing a "detach failed" error to a caller whose data was
+		// actually updated.
 		fmt.Fprintf(os.Stderr, "Warning: failed to write audit log: %v\n", err)
-	}
-
-	// Clear attachment fields by passing nil
-	newDesc := SetAttachmentFields(issue, nil)
-
-	// Update the issue
-	if err := b.Update(pinnedBeadID, UpdateOptions{Description: &newDesc}); err != nil {
-		return nil, fmt.Errorf("updating pinned bead: %w", err)
 	}
 
 	// Re-fetch to return updated state
