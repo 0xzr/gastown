@@ -2831,6 +2831,7 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 	}
 	var result BranchPreservationStatus
 	var candidates []string
+	var lastErr error
 	hasEvidence := len(nonEmptyUnique(targets)) > 0
 
 	if includeExactBranch && localBranch != "" && localBranch != "HEAD" {
@@ -2846,14 +2847,21 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 				return result, nil
 			}
 			candidates = append(candidates, remoteSHA)
-		default:
-			// Remote source branch is gone. Common after post-merge cleanup
-			// deletes the merged branch: PushRemoteBranchTip returns either a
-			// lookup error or an empty SHA with a nil error. Both mean the
-			// exact pushed source branch no longer exists on the remote, so
-			// flag it for callers to warn instead of hard-blocking capacity
-			// (hq-4do).
+		case err == nil && remoteSHA == "":
+			// GENUINE missing-branch signal (gastown-1gd): ls-remote succeeded
+			// but reported no SHA for this branch. Common after post-merge
+			// cleanup deletes the merged branch (hq-4do). Flag it for callers
+			// so they can warn instead of hard-blocking capacity, and fall
+			// through to compare against target/custody refs.
 			result.RemoteSourceBranchMissing = true
+		default:
+			// err != nil: a real probe failure (network timeout, auth denied,
+			// permission denied, etc.) — NOT a missing branch. Recording this
+			// as RemoteSourceBranchMissing would silently mask transient
+			// failures and let callers nuke live work, so propagate the error
+			// via lastErr instead. The function surfaces lastErr at the bottom
+			// when no comparison ref produced evidence.
+			lastErr = err
 		}
 	}
 
@@ -2884,10 +2892,18 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 		if hasEvidence {
 			return result, fmt.Errorf("no target/custody refs resolved")
 		}
+		// Prefer surfacing the probe error over errNoComparisonRefs (gastown-1gd):
+		// if PushRemoteBranchTip failed (network/auth/timeout) and no other
+		// evidence path yielded candidates, the operator needs to see the
+		// real error rather than "no comparison refs resolved" — the latter
+		// hides whether the polecat is genuinely unpreserved or just could
+		// not be probed.
+		if lastErr != nil {
+			return result, lastErr
+		}
 		return result, errNoComparisonRefs
 	}
 
-	var lastErr error
 	for _, ref := range candidates {
 		candidate, err := g.preservationAgainstRef(ref)
 		if err != nil {

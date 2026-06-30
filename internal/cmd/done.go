@@ -575,6 +575,17 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		defaultBranch = rigCfg.DefaultBranch
 	}
 
+	// gastown-1gd: validate the fallback defaultBranch itself. The MR-target
+	// guard at the bottom of this function (isValidMergeTarget) refuses targets
+	// equal to the rig name, but its fallback was the *unvalidated* defaultBranch
+	// here — a misconfigured rig with DefaultBranch="" or DefaultBranch equal
+	// to rigName would silently produce an MR targeting "<rig>/<rig>" or
+	// origin/ origin/, neither of which is mergeable. Fail fast up here so the
+	// operator sees a clear error instead of a malformed MR submission.
+	if !isValidMergeTarget(defaultBranch, rigName) {
+		return fmt.Errorf("rig %q has invalid configured default branch %q (must be a non-empty branch distinct from the rig name); refusing to submit MR with unsafe target — fix rig config then retry", rigName, defaultBranch)
+	}
+
 	// For COMPLETED, we need an issue ID and branch must not be the default branch
 	var mrID string
 	var pushFailed bool

@@ -3333,3 +3333,49 @@ func TestBranchPreservationStatus_RemoteSourceBranchMissing(t *testing.T) {
 		t.Error("UnpreservedPatchCount = 0, want > 0 (feature work not on main)")
 	}
 }
+
+// TestBranchPreservationStatus_RemoteProbeErrorNotFlaggedAsMissing covers
+// gastown-1gd: PushRemoteBranchTip can fail for reasons other than "branch
+// deleted" — network timeout, auth denied, permission denied, malformed
+// remote URL. The old code lumped every non-nil error in with the genuine
+// missing-branch signal and set RemoteSourceBranchMissing=true, which would
+// silently let a watcher treat a transient probe failure as a permanent
+// post-merge cleanup warning and nuke the slot. The fix must:
+//
+//  1. Only set RemoteSourceBranchMissing=true when ls-remote succeeded but
+//     returned an empty SHA (the genuine missing-branch signal).
+//  2. Treat a real probe error (non-nil err from PushRemoteBranchTip) as an
+//     unknown — propagate it via the function's returned error rather than
+//     conflating with missing-branch.
+func TestBranchPreservationStatus_RemoteProbeErrorNotFlaggedAsMissing(t *testing.T) {
+	localDir, _, _ := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	// Replace the real `origin` remote with a URL that points at a malformed
+	// host so ls-remote fails with a non-nil error (connection refused /
+	// unable to resolve). This simulates a transient or auth failure distinct
+	// from "branch missing": ls-remote errors, NOT a successful empty result.
+	for _, args := range [][]string{
+		{"git", "remote", "remove", "origin"},
+		{"git", "remote", "add", "origin", "https://nonexistent.invalid.example/no-such-repo"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = localDir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+	}
+
+	// Probe a branch name; PushRemoteBranchTip will fail at ls-remote.
+	_, err := g.BranchPreservationStatus("polecat/dementus/gastown-1gd", "origin", nil)
+	if err == nil {
+		t.Fatal("BranchPreservationStatus returned nil err for an unreachable remote; want the probe error surfaced")
+	}
+	// The returned error must be the probe error itself, not errNoComparisonRefs
+	// or some other incidental sentinel — callers need to distinguish a
+	// transient probe failure from a genuine missing-source-branch signal
+	// (gastown-1gd).
+	if errors.Is(err, errNoComparisonRefs) {
+		t.Fatalf("err = errNoComparisonRefs, want the underlying probe error to be surfaced; got %v", err)
+	}
+}

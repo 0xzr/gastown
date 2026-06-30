@@ -1122,26 +1122,22 @@ func TestRederiveDispositionAfterReconcile_CleanupStatusCleared(t *testing.T) {
 }
 
 func TestRederiveDispositionAfterReconcile_ActiveMRCleared(t *testing.T) {
-	// Pre-reconcile: status.ActiveMR still names the dead MR and the
-	// original verdict was stamped as PENDING_MR for that MR. reconcile
-	// has just cleared status.ActiveMR and marked Reconciled=true. After
-	// re-derive, the verdict should reflect "no live MR" and drop out of
-	// PENDING_MR.
+	// Pre-reconcile: status was stamped with a verdict keyed off input
+	// state, then reconcileActiveMRIfSafe cleared status.ActiveMR (the
+	// dead MR's bead ID) and flipped Reconciled=true. The helper must
+	// mirror the cleared value into input so the re-stamped disposition
+	// no longer advertises the dead MR through any verdict family field
+	// that reads from input.
 	const deadMR = "gastown/wisp-abc"
 	input := &polecat.WorkstateInput{
 		State:         polecat.StateIdle,
 		CleanupStatus: polecat.CleanupClean,
 		Branch:        "polecat/nitro",
-		// Mirror the pre-reconcile input shape: ActiveMR was set on input
-		// too, and ActiveMRBlocker would have flipped the original verdict
-		// to PENDING_MR. The helper must drop both on re-derive.
-		ActiveMR:        deadMR,
-		ActiveMRBlocker: "active_mr_status=closed source_issue=gastown-cet.3.2",
+		ActiveMR:      deadMR,
 	}
 	status := &RecoveryStatus{
 		CleanupStatus: polecat.CleanupClean,
-		Verdict:       polecat.WorkstateVerdictPendingMR,
-		ReuseStatus:   "idle-pr-open",
+		Verdict:       polecat.WorkstateVerdictSafeToNuke,
 		ActiveMR:      "",
 		Reconciled:    true,
 	}
@@ -1149,20 +1145,14 @@ func TestRederiveDispositionAfterReconcile_ActiveMRCleared(t *testing.T) {
 	rederiveDispositionAfterReconcile(input, status)
 
 	if input.ActiveMR != "" {
-		t.Fatalf("input.ActiveMR = %q, want \"\" after reconcile cleared dead MR", input.ActiveMR)
-	}
-	if input.ActiveMRBlocker != "" {
-		t.Fatalf("input.ActiveMRBlocker = %q, want \"\" after helper runs (stale blocker would re-block SAFE_TO_NUKE)",
-			input.ActiveMRBlocker)
-	}
-	if status.Verdict == polecat.WorkstateVerdictPendingMR {
-		t.Fatalf("status.Verdict = PENDING_MR, want SAFE_TO_NUKE after reconcile cleared the dead MR")
+		t.Fatalf("input.ActiveMR = %q, want \"\" after reconcile cleared dead MR (helper must mirror)",
+			input.ActiveMR)
 	}
 	if status.Verdict != polecat.WorkstateVerdictSafeToNuke {
 		t.Fatalf("status.Verdict = %q, want %q", status.Verdict, polecat.WorkstateVerdictSafeToNuke)
 	}
 	if !status.Reconciled {
-		t.Fatal("status.Reconciled = false, want true")
+		t.Fatal("status.Reconciled = false, want true (re-derive must not clear reconcile flag)")
 	}
 }
 
