@@ -2615,10 +2615,15 @@ func TestParseAgentBeadID(t *testing.T) {
 		{"bd-beads-witness", "beads", "witness", "", true},            // bd prefix rig-level singleton
 		{"bd-beads-polecat-pearl", "beads", "polecat", "pearl", true}, // bd prefix rig-level named
 		{"hq-mayor", "", "mayor", "", true},                           // hq prefix town-level
+		// Prefix length is no longer constrained to 2-3 chars — both short and
+		// long prefixes are accepted as long as a hyphen follows them.
+		{"x-mayor", "", "mayor", "", true},    // 1-char prefix now parses as town-level
+		{"abcd-mayor", "", "mayor", "", true}, // 4-char prefix now parses as town-level
+		{"xyz-gastown-witness", "gastown", "witness", "", true}, // 3+ char prefix per-rig
 		// Truly invalid patterns
-		{"x-mayor", "", "", "", false},    // Prefix too short (1 char)
-		{"abcd-mayor", "", "", "", false}, // Prefix too long (4 chars)
-		{"", "", "", "", false},
+		{"", "", "", "", false},           // empty string
+		{"nohyphen", "", "", "", false},    // no hyphen at all
+		{"-mayor", "", "", "", false},     // hyphen at position 0 (no prefix)
 	}
 
 	for _, tt := range tests {

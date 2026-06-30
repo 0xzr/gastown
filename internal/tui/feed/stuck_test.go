@@ -560,11 +560,16 @@ func TestDeriveSessionName(t *testing.T) {
 	}
 }
 
-// TestCheckAll_InvalidBeadID tests that invalid bead IDs are skipped
+// TestCheckAll_InvalidBeadID tests that invalid bead IDs are skipped.
+// We use "nohyphen" (no hyphen at all) which ParseAgentBeadID rejects regardless
+// of prefix length. We avoid strings like "invalid-id" because the parser
+// happily splits those into rig/role/name components as long as a hyphen
+// exists — callers that need to filter to known agent roles should use
+// IsAgentSessionBead rather than ParseAgentBeadID alone.
 func TestCheckAll_InvalidBeadID(t *testing.T) {
 	mock := newMockHealthSource()
-	mock.agents["invalid-id"] = &beads.Issue{
-		ID:        "invalid-id",
+	mock.agents["nohyphen"] = &beads.Issue{
+		ID:        "nohyphen",
 		UpdatedAt: time.Now().Format(time.RFC3339),
 	}
 
@@ -574,8 +579,6 @@ func TestCheckAll_InvalidBeadID(t *testing.T) {
 		t.Fatalf("CheckAll: %v", err)
 	}
 
-	// Invalid bead ID should be skipped (ParseAgentBeadID returns ok=false for single-char prefix)
-	// "invalid-id" has prefix "invalid" which is > 3 chars, so ParseAgentBeadID will return false
 	if len(agents) != 0 {
 		t.Errorf("expected 0 agents for invalid bead ID, got %d", len(agents))
 	}
