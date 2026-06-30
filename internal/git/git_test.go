@@ -3333,3 +3333,156 @@ func TestBranchPreservationStatus_RemoteSourceBranchMissing(t *testing.T) {
 		t.Error("UnpreservedPatchCount = 0, want > 0 (feature work not on main)")
 	}
 }
+
+// installFakeCurl writes a fake curl executable into a temp directory and
+// prepends that directory to PATH. The fake honors three env vars:
+//
+//   - FAKE_CURL_EXIT: exit code (default 0)
+//   - FAKE_CURL_STDOUT: bytes to write to stdout
+//   - FAKE_CURL_AUTH: if set, echoed to stderr (to test token redaction)
+//
+// It also verifies that curl was invoked with --fail, failing loudly otherwise.
+// Tests using this helper must not run in parallel because they mutate PATH.
+func installFakeCurl(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "curl")
+	script := `#!/bin/sh
+found_fail=0
+for arg in "$@"; do
+  if [ "$arg" = "--fail" ]; then
+    found_fail=1
+  fi
+done
+if [ "$found_fail" -eq 0 ]; then
+  echo "missing --fail" >&2
+  exit 99
+fi
+if [ -n "$FAKE_CURL_AUTH" ]; then
+  echo "$FAKE_CURL_AUTH" >&2
+fi
+if [ -n "$FAKE_CURL_STDOUT" ]; then
+  printf '%s' "$FAKE_CURL_STDOUT"
+fi
+exit "${FAKE_CURL_EXIT:-0}"
+`
+	if err := os.WriteFile(fake, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake curl: %v", err)
+	}
+	origPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", origPath) })
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+origPath)
+	return dir
+}
+
+func TestBitbucketPRMerge_UsesFailFlag(t *testing.T) {
+	const secret = "BB-TOKEN-XYZ"
+	dir := initTestRepo(t)
+	installFakeCurl(t)
+
+	t.Setenv("BITBUCKET_TOKEN", secret)
+	t.Setenv("FAKE_CURL_STDOUT", `{"merge_commit":{"hash":"abc123"}}`)
+
+	g := NewGit(dir)
+	sha, err := g.BitbucketPRMerge("workspace", "repo", 42, "merge_commit")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sha != "abc123" {
+		t.Errorf("sha = %q, want abc123", sha)
+	}
+}
+
+func TestBitbucketPRMerge_FailsClosedOnHTTPError(t *testing.T) {
+	const secret = "BB-TOKEN-XYZ"
+	dir := initTestRepo(t)
+	installFakeCurl(t)
+
+	t.Setenv("BITBUCKET_TOKEN", secret)
+	// curl exit 22 is the code --fail uses for HTTP 4xx/5xx.
+	t.Setenv("FAKE_CURL_EXIT", "22")
+	t.Setenv("FAKE_CURL_STDOUT", `{"type":"error","error":{"message":"Conflicting changes"}}`)
+
+	g := NewGit(dir)
+	sha, err := g.BitbucketPRMerge("workspace", "repo", 42, "merge_commit")
+	if err == nil {
+		t.Fatal("expected error for HTTP 4xx/5xx response, got nil")
+	}
+	if sha != "" {
+		t.Errorf("sha = %q, want empty on failure", sha)
+	}
+	// Error must not fall back to local HEAD, so ensure no local SHA leakage.
+	localHead, _ := g.Rev("HEAD")
+	if strings.Contains(err.Error(), localHead) {
+		t.Errorf("error leaked local HEAD %q: %v", localHead, err)
+	}
+}
+
+func TestBitbucketPRMerge_FailsClosedOnEmptyMergeHash(t *testing.T) {
+	const secret = "BB-TOKEN-XYZ"
+	dir := initTestRepo(t)
+	installFakeCurl(t)
+
+	t.Setenv("BITBUCKET_TOKEN", secret)
+	// Bitbucket can return 200 OK with a body whose merge_commit.hash is empty
+	// (or missing). That must be treated as a failure, not a success using local
+	// HEAD.
+	t.Setenv("FAKE_CURL_STDOUT", `{"merge_commit":{"hash":""}}`)
+
+	g := NewGit(dir)
+	sha, err := g.BitbucketPRMerge("workspace", "repo", 42, "merge_commit")
+	if err == nil {
+		t.Fatal("expected error when merge_commit.hash is empty, got nil")
+	}
+	if sha != "" {
+		t.Errorf("sha = %q, want empty on failure", sha)
+	}
+	localHead, _ := g.Rev("HEAD")
+	if strings.Contains(err.Error(), localHead) {
+		t.Errorf("error leaked local HEAD %q: %v", localHead, err)
+	}
+}
+
+func TestBitbucketPRMerge_RedactsTokenInError(t *testing.T) {
+	const secret = "BB-REDACT-SECRET"
+	dir := initTestRepo(t)
+	installFakeCurl(t)
+
+	t.Setenv("BITBUCKET_TOKEN", secret)
+	t.Setenv("FAKE_CURL_EXIT", "22")
+	// Simulate curl echoing the Authorization header to stderr, which happens
+	// when a Bitbucket error response includes the request headers.
+	t.Setenv("FAKE_CURL_AUTH", "Authorization: Bearer "+secret)
+	t.Setenv("FAKE_CURL_STDOUT", `{"type":"error","error":{"message":"Bad request"}}`)
+
+	g := NewGit(dir)
+	_, err := g.BitbucketPRMerge("workspace", "repo", 42, "merge_commit")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("error leaked BITBUCKET_TOKEN: %v", err)
+	}
+	if !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Errorf("expected [REDACTED] marker in error, got: %v", err)
+	}
+}
+
+func TestBitbucketPRMerge_ReturnsMergeCommitHash(t *testing.T) {
+	const secret = "BB-TOKEN-XYZ"
+	dir := initTestRepo(t)
+	installFakeCurl(t)
+
+	t.Setenv("BITBUCKET_TOKEN", secret)
+	t.Setenv("FAKE_CURL_STDOUT", `{"merge_commit":{"hash":"deadbeef1234567890abcdef1234567890abcdef"}}`)
+
+	g := NewGit(dir)
+	sha, err := g.BitbucketPRMerge("workspace", "repo", 42, "squash")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "deadbeef1234567890abcdef1234567890abcdef"
+	if sha != want {
+		t.Errorf("sha = %q, want %q", sha, want)
+	}
+}

@@ -1618,24 +1618,27 @@ func (g *Git) GetPRReviewDecision(prNumber int) (string, error) {
 // GhPrMerge merges a GitHub PR using the gh CLI, respecting branch protection rules.
 // The method parameter should be "merge", "squash", or "rebase".
 // Returns the merge commit SHA on success.
+//
+// The provider call is routed through runProviderCommand so the merge path
+// inherits the shared bounded timeout and process-group kill behavior. gh
+// stores its own authentication token, so no additional redacted tokens are
+// passed, but the helper still scrubs any echoed credentials from stdout/stderr.
 func (g *Git) GhPrMerge(prNumber int, method string) (string, error) {
 	args := []string{"pr", "merge", fmt.Sprintf("%d", prNumber), "--" + method, "--delete-branch"}
-	cmd := exec.Command("gh", args...)
-	cmd.Dir = g.workDir
-	out, err := cmd.CombinedOutput()
+	_, err := runProviderCommand("gh", args, g.workDir, "gh pr merge")
 	if err != nil {
-		return "", fmt.Errorf("gh pr merge failed: %s: %w", strings.TrimSpace(string(out)), err)
+		return "", err
 	}
 
-	// After merge, pull the target branch to get the merge commit locally
+	// After merge, pull the target branch to get the merge commit locally.
 	if _, pullErr := g.run("pull", "origin"); pullErr != nil {
-		// Non-fatal: the merge succeeded on GitHub, we just can't get the SHA locally
+		// Non-fatal: the merge succeeded on GitHub, we just can't get the SHA locally.
 		return "", nil
 	}
-	// Get the latest commit on HEAD (should be the merge commit)
+	// Get the latest commit on HEAD (should be the merge commit).
 	sha, revErr := g.Rev("HEAD")
 	if revErr != nil {
-		return "", nil // Merge succeeded, just can't determine SHA
+		return "", nil // Merge succeeded, just can't determine SHA.
 	}
 	return sha, nil
 }
@@ -1746,6 +1749,15 @@ func (g *Git) GetBitbucketPRParticipants(workspace, repoSlug string, prID int) (
 // BitbucketPRMerge merges a Bitbucket PR via the REST API.
 // The strategy parameter should be "merge_commit", "squash", or "fast_forward".
 // Returns the merge commit SHA on success (if available).
+//
+// The provider call is routed through runProviderCommand with curl --fail so
+// HTTP 4xx/5xx responses are treated as command failures rather than being
+// silently unmarshalled as a successful merge. The token is supplied as a
+// redacted argument so it cannot leak through stdout, stderr, or error paths.
+//
+// The function fails closed: an HTTP error or a response whose merge_commit.hash
+// is empty returns an error instead of falling back to the local HEAD, which
+// could falsely report a merge as successful.
 func (g *Git) BitbucketPRMerge(workspace, repoSlug string, prID int, strategy string) (string, error) {
 	token := os.Getenv("BITBUCKET_TOKEN")
 	if token == "" {
@@ -1754,14 +1766,17 @@ func (g *Git) BitbucketPRMerge(workspace, repoSlug string, prID int, strategy st
 	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d/merge",
 		workspace, repoSlug, prID)
 	body := fmt.Sprintf(`{"merge_strategy":"%s","close_source_branch":true}`, strategy)
-	cmd := exec.Command("curl", "-s", "-X", "POST",
-		"-H", "Authorization: Bearer "+token,
+	// --fail makes curl exit non-zero on HTTP 4xx/5xx. Without it, error JSON
+	// would be written to stdout and could unmarshal with an empty hash,
+	// causing a false success report.
+	result, err := runProviderCommand("curl", []string{
+		"-s", "--fail", "-X", "POST",
+		"-H", "Authorization: Bearer " + token,
 		"-H", "Content-Type: application/json",
-		"-d", body, url)
-	cmd.Dir = g.workDir
-	out, err := cmd.CombinedOutput()
+		"-d", body, url,
+	}, g.workDir, "bitbucket merge", token)
 	if err != nil {
-		return "", fmt.Errorf("bitbucket merge failed: %s: %w", strings.TrimSpace(string(out)), err)
+		return "", err
 	}
 
 	var resp struct {
@@ -1769,25 +1784,17 @@ func (g *Git) BitbucketPRMerge(workspace, repoSlug string, prID int, strategy st
 			Hash string `json:"hash"`
 		} `json:"merge_commit"`
 	}
-	if err := json.Unmarshal(bytes.TrimSpace(out), &resp); err != nil {
-		// Merge may have succeeded but response parsing failed — pull to get SHA.
-		if _, pullErr := g.run("pull", "origin"); pullErr == nil {
-			if sha, revErr := g.Rev("HEAD"); revErr == nil {
-				return sha, nil
-			}
-		}
-		return "", nil
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &resp); err != nil {
+		return "", fmt.Errorf("failed to parse bitbucket merge response: %w", err)
+	}
+	if resp.MergeCommit.Hash == "" {
+		return "", fmt.Errorf("bitbucket merge succeeded but response missing merge_commit.hash")
 	}
 
-	// Sync local state after remote merge.
-	if _, pullErr := g.run("pull", "origin"); pullErr != nil {
-		return resp.MergeCommit.Hash, nil
-	}
-	if resp.MergeCommit.Hash != "" {
-		return resp.MergeCommit.Hash, nil
-	}
-	sha, _ := g.Rev("HEAD")
-	return sha, nil
+	// Sync local state after remote merge. The verified hash is always
+	// returned; a local pull failure is non-fatal.
+	_, _ = g.run("pull", "origin")
+	return resp.MergeCommit.Hash, nil
 }
 
 // RemoteRef is a ref observed through ls-remote.
