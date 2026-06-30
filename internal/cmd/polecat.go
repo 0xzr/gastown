@@ -1221,6 +1221,17 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	if polecatCheckRecoveryReconcileCleanup {
 		reconcileCleanupStatusIfSafe(&status, bd, agentBeadID, p, fields)
 		reconcileActiveMRIfSafe(&status, bd, agentBeadID, fields)
+		if status.Reconciled {
+			// Re-derive the verdict against the post-reconcile state (gastown-1gd).
+			// DecideWorkstate ran against the pre-reconcile snapshot of CleanupStatus
+			// and ActiveMR, so verdict-family fields (Verdict/Reason/Blockers/
+			// SafeToNuke/ReuseStatus/MQStatus/RecoveryActions) are stale whenever
+			// reconcile actually mutated status. Mirror the cleared values into
+			// input, refresh MQ facts against the new branch state, and re-stamp
+			// disposition so JSON/human output reports SAFE_TO_NUKE rather than
+			// a verdict keyed off the just-cleared MR or stale cleanup status.
+			rederiveDispositionAfterReconcile(&input, &status)
+		}
 	}
 
 	// JSON output
@@ -1343,6 +1354,33 @@ func applyWorkstateDispositionToRecoveryStatus(status *RecoveryStatus, dispositi
 	status.RecoveryActions = recoveryActionsForBlockers(disposition.Blockers)
 	status.Confidence = disposition.Confidence
 	status.Signals = disposition.Signals
+}
+
+// rederiveDispositionAfterReconcile refreshes the verdict-family fields on
+// status after a reconcile pass has mutated CleanupStatus / ActiveMR (gastown-1gd).
+// The original DecideWorkstate call ran against the pre-reconcile snapshot of
+// input, so Verdict/Reason/Blockers/SafeToNuke/ReuseStatus/MQStatus/RecoveryActions
+// are stale whenever reconcile actually changed status. This helper mirrors the
+// post-reconcile CleanupStatus and ActiveMR into input and re-stamps
+// disposition so downstream JSON / human-readable output reports the
+// up-to-date verdict.
+//
+// The MQ-check fields (MQCheckRequired / HasSubmittableWork / MQNotRequired /
+// MRSubmitted) were populated by applyMQFactsToWorkstateInput before reconcile
+// ran; reconcile does not change the branch's MQ state, so those facts are
+// still accurate. Re-running them here would require a live *beads.Beads and
+// is unnecessary for the verdict refresh this helper provides.
+//
+// Safe to call only when status.Reconciled is true: when nothing changed, the
+// original disposition is already accurate.
+func rederiveDispositionAfterReconcile(input *polecat.WorkstateInput, status *RecoveryStatus) {
+	if input == nil || status == nil {
+		return
+	}
+	input.CleanupStatus = status.CleanupStatus
+	input.ActiveMR = status.ActiveMR
+	disposition := polecat.DecideWorkstate(*input)
+	applyWorkstateDispositionToRecoveryStatus(status, disposition)
 }
 
 type issueShower interface {

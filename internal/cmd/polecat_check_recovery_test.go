@@ -1070,3 +1070,111 @@ func containsString(items []string, want string) bool {
 	}
 	return false
 }
+
+// TestRederiveDispositionAfterReconcile verifies the helper that refreshes the
+// verdict-family fields after reconcile mutates CleanupStatus / ActiveMR
+// (gastown-1gd). Without the helper, the verdict stamped before reconcile still
+// references the dead MR or pre-reconcile cleanup status, so JSON / human
+// output reports NEEDS_RECOVERY or PENDING_MR for state reconcile has just
+// cleared.
+
+func TestRederiveDispositionAfterReconcile_CleanupStatusCleared(t *testing.T) {
+	// Pre-reconcile: input has stale cleanup_status, status carries the
+	// verdict computed against that snapshot, and reconcile has just cleared
+	// status.CleanupStatus to clean + flipped Reconciled=true.
+	input := &polecat.WorkstateInput{
+		State:         polecat.StateIdle,
+		CleanupStatus: polecat.CleanupUnpushed,
+		Branch:        "polecat/nitro",
+	}
+	status := &RecoveryStatus{
+		CleanupStatus: polecat.CleanupClean,
+		Verdict:       polecat.WorkstateVerdictNeedsRecovery,
+		Reason:        "cleanup-unpushed",
+		Blockers:      []string{"cleanup_status=unpushed"},
+		NeedsRecovery: true,
+		Reconciled:    true,
+	}
+
+	rederiveDispositionAfterReconcile(input, status)
+
+	if input.CleanupStatus != polecat.CleanupClean {
+		t.Fatalf("input.CleanupStatus = %q, want %q (post-reconcile value must be mirrored)",
+			input.CleanupStatus, polecat.CleanupClean)
+	}
+	if status.Verdict != polecat.WorkstateVerdictSafeToNuke {
+		t.Fatalf("status.Verdict = %q, want %q after re-derive against clean cleanup_status",
+			status.Verdict, polecat.WorkstateVerdictSafeToNuke)
+	}
+	if status.NeedsRecovery || len(status.Blockers) != 0 {
+		t.Fatalf("status after re-derive still flags recovery: needs=%v blockers=%v",
+			status.NeedsRecovery, status.Blockers)
+	}
+	if !status.Reusable || !status.SafeToNuke {
+		t.Fatalf("status.Reusable/SafeToNuke = (%v, %v), want both true after re-derive",
+			status.Reusable, status.SafeToNuke)
+	}
+	// Reconciled must be preserved so callers can still detect that a
+	// reconcile pass actually mutated state.
+	if !status.Reconciled {
+		t.Fatal("status.Reconciled = false, want true (re-derive must not clear reconcile flag)")
+	}
+}
+
+func TestRederiveDispositionAfterReconcile_ActiveMRCleared(t *testing.T) {
+	// Pre-reconcile: status.ActiveMR still names the dead MR and the
+	// original verdict was stamped as PENDING_MR for that MR. reconcile
+	// has just cleared status.ActiveMR and marked Reconciled=true. After
+	// re-derive, the verdict should reflect "no live MR" and drop out of
+	// PENDING_MR.
+	const deadMR = "gastown/wisp-abc"
+	input := &polecat.WorkstateInput{
+		State:         polecat.StateIdle,
+		CleanupStatus: polecat.CleanupClean,
+		Branch:        "polecat/nitro",
+		// Mirror the pre-reconcile input shape: ActiveMR was set on input
+		// too, and ActiveMRBlocker would have flipped the original verdict
+		// to PENDING_MR. The helper must drop both on re-derive.
+		ActiveMR:        deadMR,
+		ActiveMRBlocker: "active_mr_status=closed source_issue=gastown-cet.3.2",
+	}
+	status := &RecoveryStatus{
+		CleanupStatus: polecat.CleanupClean,
+		Verdict:       polecat.WorkstateVerdictPendingMR,
+		ReuseStatus:   "idle-pr-open",
+		ActiveMR:      "",
+		Reconciled:    true,
+	}
+
+	rederiveDispositionAfterReconcile(input, status)
+
+	if input.ActiveMR != "" {
+		t.Fatalf("input.ActiveMR = %q, want \"\" after reconcile cleared dead MR", input.ActiveMR)
+	}
+	if input.ActiveMRBlocker != "" {
+		t.Fatalf("input.ActiveMRBlocker = %q, want \"\" after helper runs (stale blocker would re-block SAFE_TO_NUKE)",
+			input.ActiveMRBlocker)
+	}
+	if status.Verdict == polecat.WorkstateVerdictPendingMR {
+		t.Fatalf("status.Verdict = PENDING_MR, want SAFE_TO_NUKE after reconcile cleared the dead MR")
+	}
+	if status.Verdict != polecat.WorkstateVerdictSafeToNuke {
+		t.Fatalf("status.Verdict = %q, want %q", status.Verdict, polecat.WorkstateVerdictSafeToNuke)
+	}
+	if !status.Reconciled {
+		t.Fatal("status.Reconciled = false, want true")
+	}
+}
+
+func TestRederiveDispositionAfterReconcile_NilArgs(t *testing.T) {
+	// Defensive: nil inputs must not crash; the helper is a no-op then.
+	rederiveDispositionAfterReconcile(nil, &RecoveryStatus{Verdict: polecat.WorkstateVerdictSafeToNuke})
+	rederiveDispositionAfterReconcile(&polecat.WorkstateInput{}, nil)
+
+	// Sanity: verdict untouched after the no-op call.
+	status := &RecoveryStatus{Verdict: polecat.WorkstateVerdictSafeToNuke, Reconciled: true}
+	rederiveDispositionAfterReconcile(nil, status)
+	if status.Verdict != polecat.WorkstateVerdictSafeToNuke {
+		t.Fatalf("nil-input call mutated verdict: got %q", status.Verdict)
+	}
+}
