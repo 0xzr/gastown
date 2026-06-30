@@ -1904,21 +1904,25 @@ func (m *Manager) ensureResetSafe(g *git.Git, polecat, startPoint string) error 
 	hasDirtyWork := status.HasUncommittedChanges && !status.CleanExcludingRuntime()
 	hasBranchStashes := status.StashCount > 0
 
-	// Unpreserved commits ahead of the comparison base. BranchPreservationStatus
-	// already folds in the pushed source branch and target/custody refs, so a
-	// branch whose tip was pushed (and is thus reachable on the remote) reports
-	// zero here even though it is "ahead" of origin/main.
-	hasUnpreservedCommits := false
-	if branch != "" && branch != "HEAD" {
-		if preservation, perr := g.BranchPreservationStatus(branch, "origin", m.reuseTargetRefs(nil)); perr == nil {
-			hasUnpreservedCommits = preservation.UnpreservedPatchCount > 0
-		} else {
-			// Unknown preservation state — treat as at-risk and fail closed.
-			hasUnpreservedCommits = true
-		}
+	// Commits ahead of the start point we are about to reset onto. Measured
+	// directly against startPoint (not BranchPreservationStatus) because the
+	// question this guard answers is "will the reset discard commits?" — and
+	// any commit reachable from HEAD but not from startPoint is discarded by
+	// `git reset --hard startPoint`. Whether those commits are also pushed to
+	// a remote source branch is irrelevant to the discard; pinning the tip is
+	// cheap and conservative, so we treat ahead > 0 as at-risk unconditionally.
+	// CommitsAheadOf errors (unresolvable base) fail closed via the preserve
+	// step below: it re-checks aheadness and refuses to reset if it cannot pin.
+	hasAheadCommits := false
+	if ahead, aheadErr := g.CommitsAheadOf(startPoint, "HEAD"); aheadErr == nil {
+		hasAheadCommits = ahead > 0
+	} else {
+		// Cannot prove HEAD is at or behind the start point — fail closed.
+		hasAheadCommits = true
 	}
+	_ = branch // branch is recorded into the preserve ref name for auditability
 
-	if !hasDirtyWork && !hasBranchStashes && !hasUnpreservedCommits {
+	if !hasDirtyWork && !hasBranchStashes && !hasAheadCommits {
 		return nil
 	}
 
@@ -1931,15 +1935,14 @@ func (m *Manager) ensureResetSafe(g *git.Git, polecat, startPoint string) error 
 
 // preserveDirtyWorktree captures the polecat's working-tree + index state into a
 // durable preserve ref so a subsequent hard reset / clean cannot destroy it
-// (gastown-lodn). It uses `git stash create` — the non-destructive variant that
-// builds a commit object from the dirty state WITHOUT altering the working tree,
-// the index, or the stash list — then pins that commit under
+// (gastown-lodn). It uses PreserveWorktreeSnapshot — the non-destructive variant
+// that builds a commit object from the dirty state WITHOUT altering the working
+// tree, the index, or the stash list — then pins that commit under
 // refs/preserve/polecat/<rig>/<polecat>/<branch>-<ts>.
 //
-// Branch-owned stashes and unpreserved-ahead commits are also covered: the stash
-// commit captures the full working-tree diff, and pinning the HEAD tip (when the
-// branch has unpreserved commits) keeps those commits reachable. The ref message
-// records the original branch and start point so the work is auditable later.
+// Unpushed-ahead commits are also covered: pinning the HEAD tip (when the branch
+// has commits ahead of startPoint) keeps those commits reachable after the reset.
+// The ref name records the original branch so the work is auditable later.
 func (m *Manager) preserveDirtyWorktree(g *git.Git, polecat, startPoint string) error {
 	branch, _ := g.CurrentBranch()
 	if branch == "" {
@@ -1953,23 +1956,24 @@ func (m *Manager) preserveDirtyWorktree(g *git.Git, polecat, startPoint string) 
 	}
 	ref := fmt.Sprintf("%s/%s/%s/%s-%s", preserveRefNamespace, m.rig.Name, polecat, component, ts)
 
-	// Capture dirty working-tree + index state without disturbing the tree.
-	stashSHA, err := g.StashCreate()
+	// Capture dirty working-tree + index state (incl. untracked files) without
+	// disturbing the tree. Returns "" only when the tree is genuinely clean.
+	snapshotSHA, err := g.PreserveWorktreeSnapshot()
 	if err != nil {
-		return fmt.Errorf("stash create for preserve ref %s: %w", ref, err)
+		return fmt.Errorf("snapshot for preserve ref %s: %w", ref, err)
 	}
 
 	pinned := false
-	if stashSHA != "" {
-		if err := g.CreateRef(ref, stashSHA); err != nil {
-			return fmt.Errorf("pinning stash commit %s to %s: %w", stashSHA, ref, err)
+	if snapshotSHA != "" {
+		if err := g.CreateRef(ref, snapshotSHA); err != nil {
+			return fmt.Errorf("pinning snapshot commit %s to %s: %w", snapshotSHA, ref, err)
 		}
 		fmt.Fprintf(os.Stderr, "[polecat] preserved dirty worktree for %s (%s) to %s\n", polecat, branch, ref)
 		pinned = true
 	}
 
-	// If the branch also has unpreserved commits ahead of its comparison base,
-	// pin the HEAD tip too so those commits stay reachable after the reset.
+	// If the branch also has commits ahead of the start point, pin the HEAD tip
+	// too so those commits stay reachable after the reset.
 	tipSHA, tipErr := g.Rev("HEAD")
 	if tipErr == nil && tipSHA != "" {
 		if hasAhead, aheadErr := g.CommitsAheadOf(startPoint, "HEAD"); aheadErr == nil && hasAhead > 0 {
@@ -1983,11 +1987,11 @@ func (m *Manager) preserveDirtyWorktree(g *git.Git, polecat, startPoint string) 
 	}
 
 	if !pinned {
-		// We detected at-risk work (dirty / stashes / unpreserved commits) but
-		// could pin neither a stash commit nor an ahead tip. Refusing to reset
+		// We detected at-risk work (dirty / stashes / ahead commits) but could
+		// pin neither a snapshot commit nor an ahead tip. Refusing to reset
 		// here is the whole point of the guard — never destroy unsaveable work.
-		return fmt.Errorf("at-risk WIP detected for %s on %s but no preserve ref could be created (stash=%q tip-err=%v); refusing to reset",
-			polecat, branch, stashSHA, tipErr)
+		return fmt.Errorf("at-risk WIP detected for %s on %s but no preserve ref could be created (snapshot=%q tip-err=%v); refusing to reset",
+			polecat, branch, snapshotSHA, tipErr)
 	}
 	return nil
 }

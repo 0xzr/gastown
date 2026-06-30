@@ -2736,22 +2736,82 @@ func (g *Git) StashListForBranch() ([]StashEntry, error) {
 	return entries, nil
 }
 
-// StashCreate captures the current working-tree and index changes as a stash
-// commit WITHOUT touching the working tree, the index, or the stash list. It is
-// the non-destructive primitive behind preserve-before-reset: `git stash create`
-// returns the SHA of a commit holding the dirty state but leaves the worktree
-// exactly as it was, so a subsequent hard reset / clean can be deferred until
-// the commit has been durably pinned to a ref via CreateRef.
+// PreserveWorktreeSnapshot captures the current working-tree + index state as a
+// commit object WITHOUT moving HEAD, altering the stash list, or touching the
+// working tree. It is the non-destructive primitive behind preserve-before-reset
+// (gastown-lodn): the returned SHA can be pinned to a durable ref via CreateRef
+// so a subsequent `git reset --hard` / `git clean -fd` can never destroy the
+// work it represents.
 //
-// Returns ("", nil) when there are no changes to capture (clean tree). This lets
-// callers treat "nothing to preserve" as a non-error and skip the pin step.
-func (g *Git) StashCreate() (string, error) {
-	out, err := g.run("stash", "create")
-	if err != nil {
-		return "", fmt.Errorf("git stash create: %w", err)
+// Implementation: `git add -A` stages every change (including untracked files),
+// `git write-tree` materializes that index into a tree object, and
+// `git commit-tree <tree> -p HEAD` builds a commit whose parent is the current
+// HEAD — all without advancing any branch. A final `git reset` (mixed, no
+// --hard) restores the index to HEAD so the caller's pre-existing staged state
+// is dropped back to the working tree; the working-tree files themselves are
+// never modified by any step.
+//
+// Unlike `git stash create`, this captures UNTRACKED files even when they are
+// the only change — the failure mode that lost gastown-34y / gastown-ndk was a
+// dirty worktree whose at-risk work was largely untracked, and `git stash
+// create` (even with --include-untracked) returns an empty SHA when no tracked
+// file is modified. commit-tree has no such blind spot.
+//
+// Returns ("", nil) when the tree is clean (write-tree == HEAD's tree). This
+// lets callers treat "nothing to preserve" as a non-error and skip the pin step.
+func (g *Git) PreserveWorktreeSnapshot() (string, error) {
+	// Stage every working-tree change, including untracked files. This is the
+	// only step that touches the index; we restore it before returning.
+	if err := g.Add("-A"); err != nil {
+		return "", fmt.Errorf("git add -A for preserve snapshot: %w", err)
 	}
-	// `git stash create` prints nothing when the tree is clean.
-	return strings.TrimSpace(out), nil
+
+	// Restore the index to HEAD on every return path so the caller's working
+	// state is not left with everything staged. reset (mixed) does not touch
+	// the working tree.
+	defer func() { _ = g.resetToHead() }()
+
+	treeSHA, err := g.writeTree()
+	if err != nil {
+		return "", fmt.Errorf("git write-tree for preserve snapshot: %w", err)
+	}
+
+	// If the staged tree is identical to HEAD's tree, there is nothing to
+	// preserve — avoid creating an empty snapshot commit.
+	headTree, err := g.headTreeSHA()
+	if err == nil && headTree != "" && headTree == treeSHA {
+		return "", nil
+	}
+
+	commitSHA, err := g.commitTree(treeSHA, "preserve snapshot (gastown-lodn)")
+	if err != nil {
+		return "", fmt.Errorf("git commit-tree for preserve snapshot: %w", err)
+	}
+	return commitSHA, nil
+}
+
+// writeTree writes the current index to a tree object and returns its SHA.
+func (g *Git) writeTree() (string, error) {
+	return g.run("write-tree")
+}
+
+// headTreeSHA returns the tree SHA of HEAD, or ("", error) if HEAD is unborn.
+func (g *Git) headTreeSHA() (string, error) {
+	return g.run("rev-parse", "HEAD^{tree}")
+}
+
+// commitTree creates a commit object from the given tree SHA with HEAD as its
+// parent, without advancing any branch. The commit is detached until a caller
+// pins it with CreateRef.
+func (g *Git) commitTree(treeSHA, message string) (string, error) {
+	return g.run("commit-tree", treeSHA, "-p", "HEAD", "-m", message)
+}
+
+// resetToHead resets the index to HEAD (mixed reset) without touching the
+// working tree. Used by PreserveWorktreeSnapshot to restore staged state.
+func (g *Git) resetToHead() error {
+	_, err := g.run("reset", "HEAD")
+	return err
 }
 
 // StashPop applies the given stash ref to the working tree and drops it on success.

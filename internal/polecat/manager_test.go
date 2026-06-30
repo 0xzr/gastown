@@ -1390,7 +1390,272 @@ func TestReuseIdlePolecat_UsesCanonicalOriginDefaultBranch(t *testing.T) {
 	}
 }
 
-// TestAddWithOptions_ResumeBranch verifies gh#3602: when ResumeBranch is set,
+// setupPreserveManagerTest builds a minimal Manager over a fresh git repo with
+// an origin/main remote ref, suitable for exercising ensureResetSafe /
+// preserveDirtyWorktree against a real worktree without the full polecat pool.
+func setupPreserveManagerTest(t *testing.T) (*Manager, *git.Git) {
+	t.Helper()
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+	mgr := NewManager(&rig.Rig{Name: "gastown", Path: workDir}, git.NewGit(workDir), nil)
+	return mgr, repoGit
+}
+
+// TestEnsureResetSafe_PreservesDirtyWorktree is the core gastown-lodn
+// regression test: a reused polecat worktree carries uncommitted dirty WIP. The
+// reset path must NOT destroy it — ensureResetSafe pins the dirty state to a
+// durable preserve ref before allowing the caller to reset.
+func TestEnsureResetSafe_PreservesDirtyWorktree(t *testing.T) {
+	mgr, repoGit := setupPreserveManagerTest(t)
+
+	// Dirty working-tree WIP for a (different) bead — uncommitted changes that
+	// a naive ResetHard + CleanForce would discard.
+	if err := os.WriteFile(filepath.Join(mgr.rig.Path, "session_manager.go"), []byte("dirty WIP\n"), 0644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+
+	startPoint := "origin/main"
+	if err := mgr.ensureResetSafe(repoGit, "furiosa", startPoint); err != nil {
+		t.Fatalf("ensureResetSafe with dirty tree: %v", err)
+	}
+
+	// A preserve ref must now exist holding the dirty snapshot.
+	refs, err := repoGit.ListRefs("refs/preserve/polecat/gastown/furiosa/*")
+	if err != nil {
+		t.Fatalf("list preserve refs: %v", err)
+	}
+	if len(refs) == 0 {
+		t.Fatal("expected a preserve ref pinning the dirty WIP, found none")
+	}
+	for _, ref := range refs {
+		if sha, err := repoGit.Rev(ref); err != nil || sha == "" {
+			t.Fatalf("preserve ref %q did not resolve to a commit", ref)
+		}
+	}
+}
+
+// TestEnsureResetSafe_PreservesUnpushedCommits verifies that a branch with
+// commits ahead of the start point (and not pushed to a durable remote) gets
+// its tip pinned to a preserve ref before reset, so the commits stay reachable.
+func TestEnsureResetSafe_PreservesUnpushedCommits(t *testing.T) {
+	mgr, repoGit := setupPreserveManagerTest(t)
+
+	// Create a feature branch with an unpushed commit.
+	if err := repoGit.CheckoutNewBranch("polecat/furiosa/gt-34y@seed", "origin/main"); err != nil {
+		t.Fatalf("checkout feature branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mgr.rig.Path, "wip.go"), []byte("wip\n"), 0644); err != nil {
+		t.Fatalf("write wip file: %v", err)
+	}
+	if err := repoGit.Add("wip.go"); err != nil {
+		t.Fatalf("git add wip.go: %v", err)
+	}
+	if err := repoGit.Commit("WIP for 34y"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	tipSHA, err := repoGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("resolve tip: %v", err)
+	}
+
+	if err := mgr.ensureResetSafe(repoGit, "furiosa", "origin/main"); err != nil {
+		t.Fatalf("ensureResetSafe with unpushed commits: %v", err)
+	}
+
+	// The branch tip must be pinned to a preserve ref so it survives reset.
+	refs, err := repoGit.ListRefs("refs/preserve/polecat/gastown/furiosa/*-tip")
+	if err != nil {
+		t.Fatalf("list preserve tip refs: %v", err)
+	}
+	if len(refs) == 0 {
+		t.Fatal("expected a preserve -tip ref pinning the unpushed branch tip, found none")
+	}
+	pinnedSHA, err := repoGit.Rev(refs[0])
+	if err != nil {
+		t.Fatalf("resolve preserve tip ref: %v", err)
+	}
+	if pinnedSHA != tipSHA {
+		t.Fatalf("preserve tip ref = %s, want branch tip %s", pinnedSHA, tipSHA)
+	}
+}
+
+// TestEnsureResetSafe_CleanTreeIsNoop verifies the common path: a clean
+// worktree with no stashes and no unpreserved commits must not create any
+// preserve ref and must return nil (the reset may proceed freely).
+func TestEnsureResetSafe_CleanTreeIsNoop(t *testing.T) {
+	mgr, repoGit := setupPreserveManagerTest(t)
+
+	if err := mgr.ensureResetSafe(repoGit, "furiosa", "origin/main"); err != nil {
+		t.Fatalf("ensureResetSafe on clean tree: %v", err)
+	}
+
+	refs, err := repoGit.ListRefs("refs/preserve/polecat/gastown/furiosa/*")
+	if err != nil {
+		t.Fatalf("list preserve refs: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("clean tree should create no preserve ref, found %v", refs)
+	}
+}
+
+// TestPreserveDirtyWorktree_CreatesReachableRef verifies the preserve ref is a
+// real commit object (not just an update-ref that could dangle) whose tree
+// contains the dirty file, so the work is recoverable after reset.
+func TestPreserveDirtyWorktree_CreatesReachableRef(t *testing.T) {
+	mgr, repoGit := setupPreserveManagerTest(t)
+
+	if err := os.WriteFile(filepath.Join(mgr.rig.Path, "session_manager.go"), []byte("dirty WIP\n"), 0644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+
+	if err := mgr.preserveDirtyWorktree(repoGit, "furiosa", "origin/main"); err != nil {
+		t.Fatalf("preserveDirtyWorktree: %v", err)
+	}
+
+	refs, err := repoGit.ListRefs("refs/preserve/polecat/gastown/furiosa/*")
+	if err != nil {
+		t.Fatalf("list preserve refs: %v", err)
+	}
+	if len(refs) == 0 {
+		t.Fatal("expected a preserve ref, found none")
+	}
+	// The pinned commit must exist as a real object reachable via rev-parse.
+	stashRef := ""
+	for _, ref := range refs {
+		if !strings.HasSuffix(ref, "-tip") {
+			stashRef = ref
+			break
+		}
+	}
+	if stashRef == "" {
+		t.Fatalf("expected a stash-derived preserve ref, found only %v", refs)
+	}
+	// git cat-file confirms it is a real commit object, not a dangling pointer.
+	if out, err := exec.Command("git", "-C", mgr.rig.Path, "cat-file", "-t", stashRef).Output(); err != nil || strings.TrimSpace(string(out)) != "commit" {
+		t.Fatalf("preserve ref %q is not a commit object (out=%q err=%v)", stashRef, out, err)
+	}
+}
+
+// TestPreserveWorktreeSnapshot_DoesNotDisturbWorktree is the side-effect
+// guarantee: preserving a dirty worktree must leave the working tree byte-for-
+// byte intact (files, untracked status, and staged state) so the polecat keeps
+// running against the same tree until the reset actually fires. If this
+// invariant breaks, the preserve step itself becomes a destructive operation.
+func TestPreserveWorktreeSnapshot_DoesNotDisturbWorktree(t *testing.T) {
+	mgr, repoGit := setupPreserveManagerTest(t)
+
+	// Mix of tracked modification + untracked file — the realistic WIP shape.
+	if err := os.WriteFile(filepath.Join(mgr.rig.Path, "README.md"), []byte("# modified WIP\n"), 0644); err != nil {
+		t.Fatalf("modify tracked file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mgr.rig.Path, "new_wip.go"), []byte("package wip\n"), 0644); err != nil {
+		t.Fatalf("write untracked file: %v", err)
+	}
+
+	beforeStatus, err := repoGit.Status()
+	if err != nil {
+		t.Fatalf("status before: %v", err)
+	}
+	beforeReadme, _ := os.ReadFile(filepath.Join(mgr.rig.Path, "README.md"))
+	beforeNew, _ := os.ReadFile(filepath.Join(mgr.rig.Path, "new_wip.go"))
+	_ = beforeStatus
+
+	if err := mgr.preserveDirtyWorktree(repoGit, "furiosa", "origin/main"); err != nil {
+		t.Fatalf("preserveDirtyWorktree: %v", err)
+	}
+
+	afterStatus, err := repoGit.Status()
+	if err != nil {
+		t.Fatalf("status after: %v", err)
+	}
+	afterReadme, _ := os.ReadFile(filepath.Join(mgr.rig.Path, "README.md"))
+	afterNew, _ := os.ReadFile(filepath.Join(mgr.rig.Path, "new_wip.go"))
+
+	// Working-tree contents must be unchanged.
+	if string(afterReadme) != string(beforeReadme) {
+		t.Fatalf("README.md mutated by preserve: before=%q after=%q", beforeReadme, afterReadme)
+	}
+	if string(afterNew) != string(beforeNew) {
+		t.Fatalf("new_wip.go mutated by preserve: before=%q after=%q", beforeNew, afterNew)
+	}
+	// Untracked status must survive — the file must not become staged-only.
+	if !sliceContains(afterStatus.Untracked, "new_wip.go") && !sliceContains(afterStatus.Modified, "new_wip.go") {
+		t.Fatalf("new_wip.go dropped from working-tree status by preserve: %+v", afterStatus)
+	}
+	if !sliceContains(afterStatus.Modified, "README.md") {
+		t.Fatalf("README.md modification dropped from working-tree status by preserve: %+v", afterStatus)
+	}
+}
+
+// TestEnsureResetSafe_PreservesThenResetProceeds verifies the full contract:
+// at-risk work is preserved to a ref, ensureResetSafe returns nil, and the
+// caller's subsequent reset does NOT lose the work (it is reachable via the
+// preserve ref). This is the gastown-lodn regression end-to-end.
+func TestEnsureResetSafe_PreservesThenResetProceeds(t *testing.T) {
+	mgr, repoGit := setupPreserveManagerTest(t)
+
+	// Dirty WIP for the "other" bead — the exact 34y/ndk scenario.
+	wipContent := []byte("package wip\n// precious uncommitted work\n")
+	if err := os.WriteFile(filepath.Join(mgr.rig.Path, "session_manager.go"), wipContent, 0644); err != nil {
+		t.Fatalf("write dirty WIP: %v", err)
+	}
+
+	if err := mgr.ensureResetSafe(repoGit, "furiosa", "origin/main"); err != nil {
+		t.Fatalf("ensureResetSafe: %v", err)
+	}
+
+	// Snapshot the preserve ref BEFORE the destructive reset.
+	refs, err := repoGit.ListRefs("refs/preserve/polecat/gastown/furiosa/*")
+	if err != nil {
+		t.Fatalf("list preserve refs: %v", err)
+	}
+	if len(refs) == 0 {
+		t.Fatal("preserve ref must exist before reset")
+	}
+	preserveRef := ""
+	for _, ref := range refs {
+		if !strings.HasSuffix(ref, "-tip") {
+			preserveRef = ref
+			break
+		}
+	}
+	if preserveRef == "" {
+		t.Fatalf("no snapshot preserve ref found among %v", refs)
+	}
+
+	// Now perform the destructive reset the guard authorized.
+	if err := repoGit.ResetHard("origin/main"); err != nil {
+		t.Fatalf("ResetHard: %v", err)
+	}
+	_ = repoGit.CleanForce()
+
+	// The WIP is gone from the worktree...
+	if _, err := os.Stat(filepath.Join(mgr.rig.Path, "session_manager.go")); !os.IsNotExist(err) {
+		t.Fatalf("session_manager.go should have been destroyed by reset+clean, stat err=%v", err)
+	}
+	// ...but the preserve ref still resolves and still holds the WIP content.
+	snapshotSHA, err := repoGit.Rev(preserveRef)
+	if err != nil {
+		t.Fatalf("preserve ref %q no longer resolves after reset: %v", preserveRef, err)
+	}
+	// The snapshot commit's tree must contain session_manager.go with the WIP.
+	out, err := exec.Command("git", "-C", mgr.rig.Path, "show", snapshotSHA+":session_manager.go").Output()
+	if err != nil {
+		t.Fatalf("show preserved session_manager.go: %v", err)
+	}
+	if string(out) != string(wipContent) {
+		t.Fatalf("preserved session_manager.go = %q, want %q", out, wipContent)
+	}
+}
+
+func sliceContains(slice []string, want string) bool {
+	for _, s := range slice {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
 // AddWithOptions checks out the named existing branch instead of creating a
 // fresh polecat/<name>/<bead>@<ts> branch. This lets `gt sling --branch/--pr`
 // resume work on an existing PR branch without creating duplicates.
