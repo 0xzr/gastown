@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "rigs": {
+    "gastown": {
+      "git_url": "https://github.com/0xzr/gastown.git",
+      "added_at": "2026-06-30T21:10:00.493577891-04:00",
+      "beads": {
+        "repo": "",
+        "prefix": "gt"
+      }
+    },
+    "gtviz": {
+      "git_url": "file:///home/ubuntu/gt-town-backups/gtviz-origin.git",
+      "added_at": "2026-06-30T21:10:20.226631371-04:00",
+      "beads": {
+        "repo": "",
+        "prefix": "gtviz"
+      }
+    },
+    "polybot": {
+      "git_url": "https://github.com/0xzr/polybot-v3.git",
+      "added_at": "2026-06-30T21:10:17.547467981-04:00",
+      "beads": {
+        "repo": "",
+        "prefix": "polybot"
+      }
+    }
+  }
+}

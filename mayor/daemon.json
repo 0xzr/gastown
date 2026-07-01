@@ -1,0 +1,77 @@
+{
+  "heartbeat": {
+    "enabled": true,
+    "interval": "3m"
+  },
+  "patrols": {
+    "checkpoint_dog": {
+      "enabled": true,
+      "interval": "10m"
+    },
+    "compactor_dog": {
+      "enabled": true,
+      "interval": "24h",
+      "threshold": 2000
+    },
+    "deacon": {
+      "enabled": true,
+      "interval": "5m",
+      "agent": "deacon"
+    },
+    "doctor_dog": {
+      "enabled": true,
+      "interval": "5m"
+    },
+    "dolt_backup": {
+      "enabled": true,
+      "interval": "15m"
+    },
+    "handler": {
+      "enabled": true
+    },
+    "jsonl_git_backup": {
+      "enabled": true,
+      "interval": "15m",
+      "scrub": true
+    },
+    "main_branch_test": {
+      "enabled": true,
+      "interval": "30m",
+      "timeout": "10m"
+    },
+    "refinery": {
+      "agent": "refinery",
+      "enabled": true,
+      "interval": "5m",
+      "rigs": [
+        "gastown",
+        "polybot",
+        "gtviz"
+      ]
+    },
+    "scheduled_maintenance": {
+      "enabled": true,
+      "window": "03:00",
+      "interval": "daily",
+      "threshold": 1000
+    },
+    "wisp_reaper": {
+      "enabled": true,
+      "interval": "30m",
+      "max_age": "24h",
+      "delete_age": "168h"
+    },
+    "witness": {
+      "agent": "witness",
+      "enabled": true,
+      "interval": "5m",
+      "rigs": [
+        "gastown",
+        "polybot",
+        "gtviz"
+      ]
+    }
+  },
+  "type": "daemon-patrol-config",
+  "version": 1
+}

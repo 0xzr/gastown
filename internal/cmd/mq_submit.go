@@ -556,9 +556,25 @@ Please verify state and execute lifecycle action.
 // catch real problems. The whole point of this guard is to fail fast on
 // the specific hq-try2 class, not to be a generic pre-flight check.
 func checkStackedBranchForSubmit(g *git.Git, branch, target string) error {
-	targetRef := target
-	if targetRef == "" {
-		targetRef = "origin/" + target
+	if target == "" {
+		target = "main"
+	}
+	// Compare against the REMOTE target ref, refreshed. Using the LOCAL ref
+	// (e.g. a session-start "main" that has since advanced) makes the merge-base
+	// stale, so already-merged commits are miscounted as "stacked" and a clean
+	// single-commit branch is refused — which silently orphans the work (submit
+	// blocked -> no MR bead -> branch stranded on origin, invisible to the queue).
+	// Fetch so the remote-tracking ref is current before computing the merge-base.
+	// If the fetch fails we may fall back to a stale origin/<target> and reproduce
+	// the same false-stacked miscount, so surface the failure rather than hiding it.
+	if fetchErr := g.Fetch("origin"); fetchErr != nil {
+		style.PrintWarning("could not fetch origin before stacked-branch check: %v (proceeding against possibly-stale origin/%s)", fetchErr, strings.TrimPrefix(target, "origin/"))
+	}
+	targetRef := "origin/" + strings.TrimPrefix(target, "origin/")
+	if _, err := g.Rev(targetRef); err != nil {
+		// Remote-tracking ref unresolvable (e.g. no remote) — fall back to the
+		// caller's target rather than failing the whole submit.
+		targetRef = target
 	}
 	if _, err := CheckStackedBranch(g, branch, targetRef); err != nil {
 		var stacked *ErrStackedBranch
