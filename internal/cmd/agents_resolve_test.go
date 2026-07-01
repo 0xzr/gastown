@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -120,6 +121,18 @@ func TestPickBestAgentBeadRejectsSameRankDuplicates(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "multiple matching agent beads") {
 		t.Fatalf("error = %q, want duplicate diagnostic", err)
+	}
+}
+
+func TestAgentIssueListArgsUseLiveAgentLabel(t *testing.T) {
+	args := agentIssueListArgs()
+	if !slices.Contains(args, "--label=gt:agent") {
+		t.Fatalf("agentIssueListArgs() = %v, want --label=gt:agent", args)
+	}
+	for _, forbidden := range []string{"--type=agent", "--include-infra"} {
+		if slices.Contains(args, forbidden) {
+			t.Fatalf("agentIssueListArgs() = %v, must not include %s", args, forbidden)
+		}
 	}
 }
 
