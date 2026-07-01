@@ -32,18 +32,30 @@ type mergeSlotData struct {
 }
 
 // parseMergeSlotData decodes the merge slot state from a bead's Description field.
-func parseMergeSlotData(issue *Issue) mergeSlotData {
+// It returns an error when the description is present but not valid JSON, so
+// callers can distinguish "slot is empty" from "slot data is corrupted".
+func parseMergeSlotData(issue *Issue) (mergeSlotData, error) {
 	if issue.Description == "" {
-		return mergeSlotData{}
+		return mergeSlotData{}, nil
 	}
 	var data mergeSlotData
-	_ = json.Unmarshal([]byte(issue.Description), &data)
-	return data
+	if err := json.Unmarshal([]byte(issue.Description), &data); err != nil {
+		return mergeSlotData{}, fmt.Errorf("parsing merge slot data: %w", err)
+	}
+	return data, nil
 }
 
 // mergeSlotStatusFromIssue builds a MergeSlotStatus from a bead issue.
+// When the description cannot be parsed, the returned status carries the parse
+// error in its Error field so the caller can report it without masking it.
 func mergeSlotStatusFromIssue(issue *Issue) *MergeSlotStatus {
-	data := parseMergeSlotData(issue)
+	data, err := parseMergeSlotData(issue)
+	if err != nil {
+		return &MergeSlotStatus{
+			ID:    issue.ID,
+			Error: err.Error(),
+		}
+	}
 	return &MergeSlotStatus{
 		ID:        issue.ID,
 		Available: data.Holder == "",
@@ -110,7 +122,10 @@ func (b *Beads) MergeSlotAcquire(holder string, addWaiter bool) (*MergeSlotStatu
 		return nil, fmt.Errorf("acquiring merge slot: %w", err)
 	}
 
-	data := parseMergeSlotData(issue)
+	data, err := parseMergeSlotData(issue)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring merge slot: %w", err)
+	}
 
 	if data.Holder != "" && data.Holder != holder {
 		// Slot is held by someone else.
@@ -173,7 +188,10 @@ func (b *Beads) MergeSlotRelease(holder string) error {
 		return fmt.Errorf("releasing merge slot: %w", err)
 	}
 
-	data := parseMergeSlotData(issue)
+	data, err := parseMergeSlotData(issue)
+	if err != nil {
+		return fmt.Errorf("releasing merge slot: %w", err)
+	}
 
 	if data.Holder == "" {
 		return nil // Already available
@@ -230,6 +248,11 @@ func (b *Beads) MergeSlotEnsureExists() (string, error) {
 		// Slot still doesn't exist after a failed Create — surface the
 		// original create error rather than silently inventing a slot.
 		return "", fmt.Errorf("ensuring merge slot: %w", err)
+	}
+	if status.Error != "" {
+		// Slot exists but its description could not be parsed. Surface the
+		// corruption instead of returning a slot with unusable data.
+		return "", fmt.Errorf("ensuring merge slot: corrupt merge slot data: %s", status.Error)
 	}
 	return status.ID, nil
 }
