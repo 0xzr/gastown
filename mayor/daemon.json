@@ -45,8 +45,7 @@
       "interval": "5m",
       "rigs": [
         "gastown",
-        "polybot",
-        "gtviz"
+        "polybot"
       ]
     },
     "scheduled_maintenance": {
@@ -67,8 +66,7 @@
       "interval": "5m",
       "rigs": [
         "gastown",
-        "polybot",
-        "gtviz"
+        "polybot"
       ]
     }
   },
