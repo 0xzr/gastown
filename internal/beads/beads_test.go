@@ -1028,6 +1028,48 @@ func TestBdSupportsAllowStale_TimeoutTreatsProbeAsUnsupported(t *testing.T) {
 	}
 }
 
+func TestBdSupportsAllowStale_ReprobesAfterTransientFailure(t *testing.T) {
+	bdAllowStaleMu.Lock()
+	prevPath := bdAllowStalePath
+	prevResult := bdAllowStaleResult
+	bdAllowStaleMu.Unlock()
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(func() {
+		bdAllowStaleMu.Lock()
+		bdAllowStalePath = prevPath
+		bdAllowStaleResult = prevResult
+		bdAllowStaleMu.Unlock()
+	})
+
+	dir := t.TempDir()
+	// Phase 1: stub claims --allow-stale is unsupported. The probe should
+	// return false and MUST NOT populate the cache — otherwise a transient
+	// probe failure would permanently mark the path as unsupported.
+	writeAllowStaleBDStub(t, dir, false)
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+origPath)
+
+	if BdSupportsAllowStale() {
+		t.Fatal("expected non-supporting stub to report no --allow-stale support")
+	}
+
+	bdAllowStaleMu.Lock()
+	cachedAfterFailure := bdAllowStalePath
+	bdAllowStaleMu.Unlock()
+	if cachedAfterFailure != "" {
+		t.Fatalf("probe failure must not populate cache; cached path = %q", cachedAfterFailure)
+	}
+
+	// Phase 2: swap the stub for a supporting version at the same path. The
+	// next call must re-probe (no cache entry to short-circuit on) and return
+	// true. Before the fix, the cache was populated with the failure result,
+	// so this call would silently return false from cache.
+	writeAllowStaleBDStub(t, dir, true)
+	if !BdSupportsAllowStale() {
+		t.Fatal("expected supporting stub to report --allow-stale support after transient failure")
+	}
+}
+
 func TestBDListSlowListDoesNotBlockUnrelatedList(t *testing.T) {
 	if os.Getenv("GT_BEADS_LIST_CONCURRENCY_HELPER") == "1" {
 		runBDListConcurrencyHelper(t)

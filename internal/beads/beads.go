@@ -57,21 +57,28 @@ func BdSupportsAllowStale() bool {
 }
 
 // BdSupportsAllowStaleWithEnv returns true if the installed bd binary accepts
-// --allow-stale, probing with the provided environment when supplied.
+// --allow-stale. The provided env is used for the probe command when a probe
+// runs, but the result is cached per resolved bd path: subsequent calls with
+// the same bd path return the cached result without re-probing, regardless
+// of env.
 func BdSupportsAllowStaleWithEnv(env []string) bool {
 	bdPath, err := exec.LookPath("bd")
 	if err != nil {
 		return false
 	}
 
+	// Fast path: cache hit. Hold the lock through the comparison so the
+	// bdAllowStalePath/bdAllowStaleResult read is consistent with the
+	// subsequent write below; otherwise a concurrent goroutine could update
+	// the cache between the read and the write and silently overwrite our
+	// probe result with its own.
 	bdAllowStaleMu.Lock()
-	cachedPath := bdAllowStalePath
-	cachedResult := bdAllowStaleResult
-	bdAllowStaleMu.Unlock()
-
-	if cachedPath == bdPath {
-		return cachedResult
+	if bdAllowStalePath == bdPath {
+		result := bdAllowStaleResult
+		bdAllowStaleMu.Unlock()
+		return result
 	}
+	bdAllowStaleMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), bdAllowStaleProbeTimeout)
 	defer cancel()
@@ -89,17 +96,30 @@ func BdSupportsAllowStaleWithEnv(env []string) bool {
 	// Check output for "unknown flag" to detect lack of support. Treat probe
 	// errors/timeouts as unsupported so higher-level commands fail closed
 	// instead of hanging on a wedged bd subprocess.
+	//
+	// Probe failures are intentionally NOT cached: a transient failure
+	// (timeout, exec error, wedge) would otherwise permanently mark the path
+	// as unsupported, even after the underlying issue clears. Only positive
+	// results populate the cache; a failed probe causes the next call to
+	// re-probe, allowing recovery once the bd binary becomes responsive.
 	probeOut := strings.TrimSpace(combinedOut.String())
 	supported := err == nil && probeOut != "" && !strings.Contains(probeOut, "unknown flag")
 
 	bdAllowStaleMu.Lock()
-	if bdAllowStalePath != bdPath {
+	if supported && bdAllowStalePath != bdPath {
 		bdAllowStalePath = bdPath
 		bdAllowStaleResult = supported
+		bdAllowStaleMu.Unlock()
+		return supported
 	}
-	result := bdAllowStaleResult
+	// Either the probe failed (don't cache) or another goroutine already
+	// cached a result for this bd path while we were probing. Return our
+	// locally-computed value either way: a stale cache entry for a different
+	// path is irrelevant to this bd, and a concurrent cache hit for the same
+	// path would have produced the same answer (or one we should overwrite on
+	// the next call, since probe failures are not cached).
 	bdAllowStaleMu.Unlock()
-	return result
+	return supported
 }
 
 // MaybePrependAllowStale prepends --allow-stale to args if bd supports it.
