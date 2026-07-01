@@ -200,15 +200,11 @@ func (b *Beads) MergeSlotRelease(holder string) error {
 		return fmt.Errorf("slot release failed: held by %q, not %q", data.Holder, holder)
 	}
 
-	// Clear holder; promote first waiter if any.
-	var newHolder string
-	var remainingWaiters []string
-	if len(data.Waiters) > 0 {
-		newHolder = data.Waiters[0]
-		remainingWaiters = data.Waiters[1:]
-	}
-
-	newData := mergeSlotData{Holder: newHolder, Waiters: remainingWaiters}
+	// Release the slot by clearing the holder. The Waiters queue is preserved
+	// verbatim — the next caller to invoke MergeSlotAcquire will remove itself
+	// from Waiters itself, so a waiter that crashed, timed out, or gave up
+	// never inherits the slot without re-acquiring it (gastown-b6s92).
+	newData := mergeSlotData{Holder: "", Waiters: data.Waiters}
 	newDesc, _ := json.Marshal(newData)
 	desc := string(newDesc)
 
