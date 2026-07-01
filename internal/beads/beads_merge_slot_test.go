@@ -1,6 +1,7 @@
 package beads
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -165,5 +166,150 @@ func TestMergeSlotEnsureExists_CreateFailsAndSlotMissing(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "dolt unavailable") {
 		t.Errorf("expected error to wrap create failure, got: %v", err)
+	}
+}
+
+// TestMergeSlotRelease_DoesNotPromoteWaiters verifies the retro-bug fix
+// (from hq-5qyhj via gastown-b6s92): releasing the merge slot must NOT
+// promote Waiters[0] to be the new holder. Unconditional promotion risks
+// handing the slot to a waiter that is no longer live (process crashed,
+// retry timed out, gave up), stranding the slot under a holder that never
+// called Acquire. The correct behavior is to clear the holder and leave
+// the waiters queue intact so the next Acquire — from a current waiter or
+// a new requestor — can take the slot legitimately.
+func TestMergeSlotRelease_DoesNotPromoteWaiters(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	// Use the existing mock framework but extend the script: the
+	// "release-with-data" state makes the slot appear pre-seeded with a
+	// holder and two waiters in its Description, so MergeSlotRelease
+	// sees a non-empty Waiters list and exercises the promotion path
+	// (which we want to confirm is now a no-op). The mock also captures
+	// the latest --description written via `bd update` so we can verify
+	// the post-release state without rerunning show (the mock's bd
+	// doesn't persist writes itself).
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "bd.log")
+	stateFile := filepath.Join(binDir, "bd.state")
+	writeFile := filepath.Join(binDir, "bd.last_desc")
+
+	// The Description is embedded as a JSON string and the inner double
+	// quotes must be escaped so the resulting shell heredoc-style printf
+	// produces a valid JSON object for `bd show`.
+	script := `#!/bin/sh
+LOG="$MOCK_BD_LOG"
+STATE="$MOCK_BD_SLOT_STATE_FILE"
+WRITE_FILE='` + writeFile + `'
+printf 'args=%s\n' "$*" >> "$LOG"
+
+cmd=""
+for arg in "$@"; do
+  case "$arg" in --*) ;; *) cmd="$arg"; break ;; esac
+done
+
+state_val="$(cat "$STATE" 2>/dev/null)"
+
+case "$cmd" in
+  init|config|migrate)
+    exit 0
+    ;;
+  create)
+    if [ "$state_val" = "create-dup" ]; then
+      echo "error: issue with label gt:merge-slot already exists" >&2
+      exit 1
+    fi
+    printf '{"id":"gt-merge-slot-test","title":"merge-slot","status":"open","labels":["gt:merge-slot"]}\n'
+    exit 0
+    ;;
+  list)
+    if [ "$state_val" = "release-with-data" ]; then
+      printf '[{"id":"gt-merge-slot-test","title":"merge-slot","status":"open","labels":["gt:merge-slot"]}]\n'
+      exit 0
+    fi
+    printf '[]\n'
+    exit 0
+    ;;
+  show)
+    if [ "$state_val" = "release-with-data" ]; then
+      printf '%s\n' '[{"id":"gt-merge-slot-test","title":"merge-slot","status":"open","description":"{\"holder\":\"rigA/refinery\",\"waiters\":[\"w1\",\"w2\"]}","labels":["gt:merge-slot"]}]'
+      exit 0
+    fi
+    echo "error: issue not found" >&2
+    exit 1
+    ;;
+  update)
+    # Capture --description=... so the test can verify what was written.
+    for arg in "$@"; do
+      case "$arg" in
+        --description=*)
+          printf '%s' "${arg#--description=}" > "$WRITE_FILE"
+          ;;
+      esac
+    done
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MOCK_BD_LOG", logPath)
+	t.Setenv("MOCK_BD_SLOT_STATE_FILE", stateFile)
+	setMockBDState(t, stateFile, "release-with-data")
+
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	bd := NewIsolated(tmpDir)
+
+	// Pre-flight: MergeSlotCheck observes the seeded state with holder
+	// and two waiters. This confirms our mock is wired correctly.
+	pre, err := bd.MergeSlotCheck()
+	if err != nil {
+		t.Fatalf("MergeSlotCheck (pre): %v", err)
+	}
+	if pre.Holder != "rigA/refinery" || len(pre.Waiters) != 2 ||
+		pre.Waiters[0] != "w1" || pre.Waiters[1] != "w2" {
+		t.Fatalf("mock setup invalid: holder=%q waiters=%#v", pre.Holder, pre.Waiters)
+	}
+
+	// The actual assertion: releasing the slot must clear the holder
+	// and preserve the waiters queue. It must NOT promote Waiters[0]
+	// into the holder field.
+	if err := bd.MergeSlotRelease("rigA/refinery"); err != nil {
+		t.Fatalf("MergeSlotRelease: %v", err)
+	}
+
+	// Verify the post-release state by reading what was written to
+	// `bd update`. The mock captures --description=..., so we can
+	// inspect the exact JSON MergeSlotRelease persisted.
+	written, err := os.ReadFile(writeFile)
+	if err != nil {
+		t.Fatalf("read captured description: %v", err)
+	}
+	var post struct {
+		Holder  string   `json:"holder"`
+		Waiters []string `json:"waiters"`
+	}
+	if err := json.Unmarshal(written, &post); err != nil {
+		t.Fatalf("decode captured slot data: %v (raw=%q)", err, written)
+	}
+
+	if post.Holder != "" {
+		t.Errorf("holder must be empty after release; got %q (would mean Waiters[0] was promoted)", post.Holder)
+	}
+	if len(post.Waiters) != 2 {
+		t.Fatalf("waiters must be preserved (len=2); got %#v", post.Waiters)
+	}
+	if post.Waiters[0] != "w1" || post.Waiters[1] != "w2" {
+		t.Errorf("waiters order must be unchanged; got %#v", post.Waiters)
 	}
 }
