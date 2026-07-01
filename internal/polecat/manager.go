@@ -254,8 +254,12 @@ func (m *Manager) CheckDoltHealth() error {
 	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
 		// Use a lightweight beads operation to verify Dolt is responsive
 		_, err := m.beads.Show("__health_check_nonexistent__")
-		if err == nil || errors.Is(err, beads.ErrNotFound) || strings.Contains(err.Error(), "not found") {
-			// Dolt is healthy — a "not found" error means the DB responded
+		if err == nil || errors.Is(err, beads.ErrNotFound) || strings.Contains(err.Error(), "not found") ||
+			strings.Contains(err.Error(), "no issue found matching") ||
+			strings.Contains(err.Error(), "no issues found matching") {
+			// Dolt is healthy — a "not found" / "no issue(s) found matching" error means the DB responded.
+			// bd's message is "no issue found matching <id>" (singular); older builds emitted the plural
+			// form. Match both so a healthy DB is never treated as unhealthy (gt-dolt-health singular skew).
 			return nil
 		}
 		// Optimistic lock errors mean Dolt is alive but busy with concurrent writes
