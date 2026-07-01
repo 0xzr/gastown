@@ -1,6 +1,7 @@
 package beads
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -320,5 +321,128 @@ func TestMergeSlotEnsureExists_CreateFailsAndSlotCorrupt(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "parsing merge slot data") {
 		t.Errorf("expected error to wrap parse error, got: %v", err)
+	}
+}
+
+// installMockBDReleaseStateful installs a mock bd that maintains a
+// persistent slot description in $MOCK_BD_RELEASE_DESC_FILE.
+//
+//	list: always returns the merge-slot bead (id=gt-merge-slot-test)
+//	show: returns the bead with the description read from the file
+//	update --description=...: writes the description value back to the
+//	  file so tests can inspect the post-Release state
+//
+// Tests seed the file with an initial {holder, waiters} JSON and then
+// assert on the JSON captured after Release runs.
+func installMockBDReleaseStateful(t *testing.T) (logPath, descFile string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	binDir := t.TempDir()
+	logPath = filepath.Join(binDir, "bd.log")
+	descFile = filepath.Join(binDir, "bd.release.desc")
+
+	script := `#!/bin/sh
+LOG="$MOCK_BD_LOG"
+DESC="$MOCK_BD_RELEASE_DESC_FILE"
+printf 'args=%s\n' "$*" >> "$LOG"
+
+cmd=""
+for arg in "$@"; do
+  case "$arg" in --*) ;; *) cmd="$arg"; break ;; esac
+done
+
+case "$cmd" in
+  init|config|migrate)
+    exit 0
+    ;;
+  list)
+    # Always claim the merge-slot bead exists for the test.
+    printf '[{"id":"gt-merge-slot-test","title":"merge-slot","status":"open","labels":["gt:merge-slot"]}]\n'
+    exit 0
+    ;;
+  show)
+    desc=$(cat "$DESC" 2>/dev/null || echo "{}")
+    # Emit a JSON array containing one bead whose description is the
+    # contents of $DESC. Escape backslashes and double-quotes so the
+    # description is a valid JSON string value.
+    escaped=$(printf '%s' "$desc" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '[{"id":"gt-merge-slot-test","title":"merge-slot","status":"open","description":"%s","labels":["gt:merge-slot"]}]\n' "$escaped"
+    exit 0
+    ;;
+  update)
+    # Walk the args, capture the last --description=... value, and write
+    # it back to $DESC so the test can read post-Release state.
+    new_desc=""
+    for arg in "$@"; do
+      case "$arg" in
+        --description=*) new_desc="${arg#--description=}" ;;
+      esac
+    done
+    if [ -n "$new_desc" ]; then
+      printf '%s' "$new_desc" > "$DESC"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MOCK_BD_LOG", logPath)
+	t.Setenv("MOCK_BD_RELEASE_DESC_FILE", descFile)
+	return logPath, descFile
+}
+
+// TestMergeSlotRelease_DoesNotPromoteWaiters verifies that MergeSlotRelease
+// clears the holder without auto-promoting Waiters[0]. A waiter that may
+// already be dead (crashed, timed out, gave up) must not be silently
+// handed the slot; the next legitimate Acquire from any live actor takes
+// the freed slot and removes itself from the waiters queue.
+func TestMergeSlotRelease_DoesNotPromoteWaiters(t *testing.T) {
+	_, descFile := installMockBDReleaseStateful(t)
+
+	// Seed: slot is held by "alpha" with a single waiter "beta".
+	if err := os.WriteFile(descFile, []byte(`{"holder":"alpha","waiters":["beta"]}`), 0644); err != nil {
+		t.Fatalf("seed description: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	bd := NewIsolated(tmpDir)
+	if err := bd.MergeSlotRelease("alpha"); err != nil {
+		t.Fatalf("MergeSlotRelease: %v", err)
+	}
+
+	// The mock captured the description that Release wrote via `update`.
+	captured, err := os.ReadFile(descFile)
+	if err != nil {
+		t.Fatalf("read captured description: %v", err)
+	}
+
+	var result mergeSlotData
+	if err := json.Unmarshal(captured, &result); err != nil {
+		t.Fatalf("unmarshal captured description: %v\nraw: %s", err, captured)
+	}
+
+	// Holder must be cleared: the legacy code auto-promoted Waiters[0]
+	// ("beta") to the holder on release. The fix preserves Waiters and
+	// forces the next Acquire to legitimately reclaim the slot.
+	if result.Holder != "" {
+		t.Errorf("after Release, holder should be cleared (waiter must NOT be auto-promoted); got %q", result.Holder)
+	}
+
+	wantWaiters := []string{"beta"}
+	if len(result.Waiters) != len(wantWaiters) || result.Waiters[0] != wantWaiters[0] {
+		t.Errorf("after Release, waiters should be preserved as %v; got %v", wantWaiters, result.Waiters)
 	}
 }

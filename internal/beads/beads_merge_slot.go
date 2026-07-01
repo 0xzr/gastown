@@ -179,6 +179,15 @@ func (b *Beads) MergeSlotAcquire(holder string, addWaiter bool) (*MergeSlotStatu
 
 // MergeSlotRelease releases the merge slot after conflict resolution completes.
 // If holder is provided, it verifies the slot is held by that holder before releasing.
+//
+// Releasing clears the holder and leaves the waiters queue intact. The next
+// MergeSlotAcquire call (from any actor — a current waiter or a newcomer) will
+// then take the freed slot legitimately. We deliberately do NOT auto-promote
+// Waiters[0] on release: a waiter that registered interest may no longer be
+// live (process crashed, retry timed out, gave up), and silently handing the
+// slot to it strands the slot under a holder that never called Acquire.
+// The holder-vs-waiters split is enforced by Acquire itself, which removes
+// the caller from Waiters when it successfully takes the slot.
 func (b *Beads) MergeSlotRelease(holder string) error {
 	issue, err := b.getMergeSlotBead()
 	if err != nil {
@@ -200,15 +209,9 @@ func (b *Beads) MergeSlotRelease(holder string) error {
 		return fmt.Errorf("slot release failed: held by %q, not %q", data.Holder, holder)
 	}
 
-	// Clear holder; promote first waiter if any.
-	var newHolder string
-	var remainingWaiters []string
-	if len(data.Waiters) > 0 {
-		newHolder = data.Waiters[0]
-		remainingWaiters = data.Waiters[1:]
-	}
-
-	newData := mergeSlotData{Holder: newHolder, Waiters: remainingWaiters}
+	// Clear the holder but preserve the waiters queue. Any waiter (or any
+	// new requestor) can take the slot on the next Acquire call.
+	newData := mergeSlotData{Holder: "", Waiters: data.Waiters}
 	newDesc, _ := json.Marshal(newData)
 	desc := string(newDesc)
 
