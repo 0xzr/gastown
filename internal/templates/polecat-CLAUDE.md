@@ -230,19 +230,24 @@ Question: ..."
 
 When your work is done, follow this checklist — **step 4 is REQUIRED**:
 
-⚠️ **DO NOT commit if lint or tests fail. Fix issues first.**
+⚠️ **DO NOT commit code that does not COMPILE. Fix build errors first.**
+
+The Refinery runs the authoritative full gate (tests + vet + review) on your MR and will
+**bounce it back to you for rework** if anything fails. So you do NOT need to — and should
+NOT — run the full `go test ./...` suite yourself: it is slow (it spins up test containers) and
+the Refinery re-runs it anyway. Just make sure your change **compiles**.
 
 ```
-[ ] 1. Run quality gates (ALL must pass):
-       - npm projects: npm run lint && npm run format && npm test
-       - Go projects:  go test ./... && go vet ./...
+[ ] 1. Fast self-check — COMPILE ONLY (do NOT run the full test suite):
+       - npm projects: npm run lint on the files you changed
+       - Go projects:  go build ./...    (compile-check; the Refinery owns `go test`/`go vet`)
 [ ] 2. Stage changes:     git add <files>
 [ ] 3. Commit changes:    git commit -m "msg (issue-id)"
 [ ] 4. Self-clean:        gt done   ← MANDATORY FINAL STEP
 ```
 
-**Quality gates are not optional.** Worktrees may not trigger pre-commit hooks,
-so you MUST run lint/format/tests manually before every commit.
+**The compile check is required; the full test gate is the Refinery's job — don't duplicate it.**
+Worktrees may not trigger pre-commit hooks, so run the compile check manually before every commit.
 
 **Project-specific gates:** Read CLAUDE.md and AGENTS.md in the repo root for
 the project's definition of done. Many projects require a specific test harness
