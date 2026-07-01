@@ -57,7 +57,10 @@ func BdSupportsAllowStale() bool {
 }
 
 // BdSupportsAllowStaleWithEnv returns true if the installed bd binary accepts
-// --allow-stale, probing with the provided environment when supplied.
+// --allow-stale. The provided env is used for the probe command when a probe
+// runs, but the result is cached per resolved bd path: subsequent calls with
+// the same bd path return the cached result without re-probing, regardless
+// of env.
 func BdSupportsAllowStaleWithEnv(env []string) bool {
 	bdPath, err := exec.LookPath("bd")
 	if err != nil {
