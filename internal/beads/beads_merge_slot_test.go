@@ -129,16 +129,20 @@ func TestMergeSlotStatusFromIssue(t *testing.T) {
 // installMockBDMergeSlotRecorder installs a mock bd binary whose behaviour is
 // driven by the slot state in $MOCK_BD_SLOT_STATE_FILE:
 //
-//   - "create-ok"      : `bd create` succeeds and emits a JSON bead
-//   - "create-dup"     : `bd create` fails with a duplicate-style error; `bd
+//   - "create-ok"        : `bd create` succeeds and emits a JSON bead
+//   - "create-dup"       : `bd create` fails with a duplicate-style error; `bd
 //     list` and `bd show` then resolve to the existing slot
 //     (the race that MergeSlotEnsureExists must survive).
-//   - "create-fail"    : `bd create` fails with an unexpected error; the slot
+//   - "create-fail"      : `bd create` fails with an unexpected error; the slot
 //     still does NOT exist (MergeSlotCheck returns "not
 //     found") so we must surface the create error.
-//   - "create-corrupt" : `bd create` fails with a duplicate-style error; `bd
+//   - "create-corrupt"   : `bd create` fails with a duplicate-style error; `bd
 //     show` then resolves to an existing slot with corrupt JSON
 //     description (so MergeSlotEnsureExists surfaces the parse error).
+//   - "held-update-fail" : the merge slot bead exists (returned by list/show)
+//     and is held by another actor; `bd update` fails. Used to verify
+//     MergeSlotAcquire surfaces a waiter-add update failure instead of
+//     silently dropping the waiter.
 func installMockBDMergeSlotRecorder(t *testing.T) (logPath, stateFile string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -183,6 +187,12 @@ case "$cmd" in
       printf '[{"id":"gt-merge-slot-existing","title":"merge-slot","status":"open","labels":["gt:merge-slot"]}]\n'
       exit 0
     fi
+    if [ "$(cat "$STATE" 2>/dev/null)" = "held-update-fail" ]; then
+      # Slot exists and is held by another actor. MergeSlotAcquire should
+      # treat this as the "slot held" branch.
+      printf '[{"id":"gt-merge-slot-held","title":"merge-slot","status":"open","labels":["gt:merge-slot"]}]\n'
+      exit 0
+    fi
     # Default: no merge slot exists.
     printf '[]\n'
     exit 0
@@ -197,10 +207,27 @@ case "$cmd" in
       printf '[{"id":"gt-merge-slot-existing","title":"merge-slot","status":"open","description":"{not-json","labels":["gt:merge-slot"]}]\n'
       exit 0
     fi
+    if [ "$(cat "$STATE" 2>/dev/null)" = "held-update-fail" ]; then
+      # Held by another actor -- MergeSlotAcquire will hit the
+      # waiter-add branch and attempt an update (which this mock
+      # will then fail).
+      # Inner JSON quotes are backslash-escaped so the surrounding
+      # description string remains valid JSON.
+      json_value='{\"holder\":\"other-actor\",\"waiters\":[]}'
+      printf '[{"id":"gt-merge-slot-held","title":"merge-slot","status":"open","description":"%s","labels":["gt:merge-slot"]}]\n' "$json_value"
+      exit 0
+    fi
     echo "error: issue not found" >&2
     exit 1
     ;;
   update)
+    if [ "$(cat "$STATE" 2>/dev/null)" = "held-update-fail" ]; then
+      # Update failure (e.g. Dolt hiccup during waiter persistence).
+      # MergeSlotAcquire must surface this as the caller's error rather
+      # than silently leaving the waiter off the queue.
+      echo "error: dolt timeout on update" >&2
+      exit 1
+    fi
     exit 0
     ;;
   *)
@@ -320,5 +347,40 @@ func TestMergeSlotEnsureExists_CreateFailsAndSlotCorrupt(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "parsing merge slot data") {
 		t.Errorf("expected error to wrap parse error, got: %v", err)
+	}
+}
+
+// TestMergeSlotAcquire_AddWaiterUpdateFails_SurfacesError covers the bug where
+// MergeSlotAcquire's waiter-add branch (slot held by another actor + caller
+// requested queueing) discarded b.Update's error with `_ =`. If the update
+// failed (Dolt hiccup, bd timeout), the caller saw nil error and silently
+// dropped the waiter from the queue. The fix checks the error and wraps it as
+// "adding merge slot waiter: %w" so callers can react (log + retry) instead
+// of believing they were added to the queue.
+func TestMergeSlotAcquire_AddWaiterUpdateFails_SurfacesError(t *testing.T) {
+	_, stateFile := installMockBDMergeSlotRecorder(t)
+	setMockBDState(t, stateFile, "held-update-fail")
+
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	bd := NewIsolated(tmpDir)
+	// Slot is held by "other-actor"; we ask to be queued. The mock's
+	// `bd update` will fail, and MergeSlotAcquire must surface that to
+	// the caller rather than return a successful-looking status.
+	status, err := bd.MergeSlotAcquire("requester", true)
+	if err == nil {
+		t.Fatalf("expected error when waiter-add update fails, got status=%+v", status)
+	}
+	if status != nil {
+		t.Errorf("expected nil status on error, got %+v", status)
+	}
+	if !strings.Contains(err.Error(), "adding merge slot waiter") {
+		t.Errorf("expected wrapped 'adding merge slot waiter' error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "dolt timeout on update") {
+		t.Errorf("expected underlying update failure to be wrapped, got: %v", err)
 	}
 }
