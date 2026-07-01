@@ -160,6 +160,96 @@ func TestReaperQueriesUseTypedDependencyColumns(t *testing.T) {
 	}
 }
 
+// TestCleanDanglingParentRefsQueries verifies that CleanDanglingParentRefs uses
+// the same predicate as the Scan anomaly so counts cannot diverge, and that the
+// delete statement is race-safe (NOT EXISTS guards) and batched (LIMIT).
+//
+// Regression guard for gastown-3bdqa: when the count and delete predicates
+// diverge, the cleanup silently undercounts and the dangling_parent_ref
+// anomaly never resolves.
+func TestCleanDanglingParentRefsQueries(t *testing.T) {
+	sourcePath := "reaper.go"
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", sourcePath, err)
+	}
+	source := string(data)
+
+	cleanBody := sourceBetween(t, source, "func CleanDanglingParentRefs(", "func purgeClosedWisps(")
+	if cleanBody == "" {
+		t.Fatal("CleanDanglingParentRefs function not found")
+	}
+
+	// The count query must mirror the Scan anomaly predicate exactly so the
+	// reported count equals the count that gets deleted.
+	for _, want := range []string{
+		"SELECT COUNT(*) FROM wisp_dependencies wd",
+		"LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id",
+		"LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id",
+		"wd.type = 'parent-child'",
+		"wd.depends_on_external IS NULL",
+		"wd.depends_on_wisp_id IS NOT NULL OR wd.depends_on_issue_id IS NOT NULL",
+		"pw.id IS NULL",
+		"pi.id IS NULL",
+	} {
+		if !strings.Contains(cleanBody, want) {
+			t.Errorf("CleanDanglingParentRefs count query missing %q", want)
+		}
+	}
+
+	// The delete must use NOT EXISTS guards for race-safety (a row whose parent
+	// is created concurrently between count and delete must not be removed).
+	for _, want := range []string{
+		"DELETE FROM wisp_dependencies",
+		"type = 'parent-child'",
+		"depends_on_external IS NULL",
+		"NOT EXISTS (SELECT 1 FROM wisps pw WHERE pw.id = wisp_dependencies.depends_on_wisp_id)",
+		"NOT EXISTS (SELECT 1 FROM issues pi WHERE pi.id = wisp_dependencies.depends_on_issue_id)",
+		"LIMIT ?",
+	} {
+		if !strings.Contains(cleanBody, want) {
+			t.Errorf("CleanDanglingParentRefs delete query missing %q", want)
+		}
+	}
+
+	// Cleanup must commit via DOLT_COMMIT to persist deletes.
+	if !strings.Contains(cleanBody, "DOLT_COMMIT") {
+		t.Error("CleanDanglingParentRefs should commit via DOLT_COMMIT")
+	}
+	if !strings.Contains(cleanBody, "isNothingToCommit") {
+		t.Error("CleanDanglingParentRefs should suppress nothing-to-commit errors via isNothingToCommit")
+	}
+}
+
+// TestPurgeCallsCleanDanglingParentRefs verifies that Purge invokes the dangling
+// parent cleanup so the dog run drains historical backlogs even when no purge
+// candidates exist (retention has not expired).
+//
+// Regression guard for gastown-3bdqa: without this, the dangling_parent_ref
+// anomaly persists across every run where retention has not expired.
+func TestPurgeCallsCleanDanglingParentRefs(t *testing.T) {
+	sourcePath := "reaper.go"
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", sourcePath, err)
+	}
+	source := string(data)
+
+	// Purge body must call CleanDanglingParentRefs after mail purge and before
+	// returning. Errors must be surfaced as anomalies, not propagated as
+	// purge failure (so the dog run does not regress to "failed").
+	purgeBody := sourceBetween(t, source, "func Purge(", "func CleanDanglingParentRefs(")
+	if !strings.Contains(purgeBody, "CleanDanglingParentRefs(db, dbName, dryRun)") {
+		t.Fatal("Purge should call CleanDanglingParentRefs(db, dbName, dryRun)")
+	}
+	if !strings.Contains(purgeBody, `"dangling_cleanup_failed"`) {
+		t.Error("Purge should surface CleanDanglingParentRefs errors as dangling_cleanup_failed anomaly")
+	}
+	if !strings.Contains(purgeBody, "result.DanglingCleaned = dangling.Cleaned") {
+		t.Error("Purge should propagate DanglingCleaned to PurgeResult")
+	}
+}
+
 // TestReapQueryNoDatabaseNameInjection verifies that the Reap function's batch
 // SELECT query does not inject the database name into the SQL string. Previously,
 // dbName was passed as a Sprintf arg but the format string didn't use it, causing

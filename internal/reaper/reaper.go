@@ -121,11 +121,20 @@ type ReapResult struct {
 
 // PurgeResult holds the results of a purge operation.
 type PurgeResult struct {
-	Database    string    `json:"database"`
-	WispsPurged int       `json:"wisps_purged"`
-	MailPurged  int       `json:"mail_purged"`
-	DryRun      bool      `json:"dry_run,omitempty"`
-	Anomalies   []Anomaly `json:"anomalies,omitempty"`
+	Database        string `json:"database"`
+	WispsPurged     int    `json:"wisps_purged"`
+	MailPurged      int    `json:"mail_purged"`
+	DanglingCleaned int    `json:"dangling_cleaned,omitempty"`
+	DryRun          bool   `json:"dry_run,omitempty"`
+	Anomalies       []Anomaly `json:"anomalies,omitempty"`
+}
+
+// DanglingCleanResult holds the results of a dangling parent ref cleanup.
+type DanglingCleanResult struct {
+	Database  string    `json:"database"`
+	Cleaned   int       `json:"cleaned"`
+	DryRun    bool      `json:"dry_run,omitempty"`
+	Anomalies []Anomaly `json:"anomalies,omitempty"`
 }
 
 // ClosedEntry records an individual issue closure with details for logging.
@@ -574,6 +583,125 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 		return result, fmt.Errorf("purge mail: %w", err)
 	}
 	result.MailPurged = mailPurged
+
+	// Sweep dangling parent-child wisp_dependencies rows. These accumulate when
+	// a wisp or issue parent is purged by a path that did not cascade-clean
+	// wisp_dependencies (or predates the cleanup). Always run, even when the
+	// wisp purge found zero candidates — historical backlogs only drain when
+	// this passes. Errors surface as anomalies but do not fail the purge so
+	// the dog run does not regress into a "failed" state.
+	// (gastown-3bdqa)
+	dangling, err := CleanDanglingParentRefs(db, dbName, dryRun)
+	if err != nil {
+		result.Anomalies = append(result.Anomalies, Anomaly{
+			Type:    "dangling_cleanup_failed",
+			Message: fmt.Sprintf("dangling parent cleanup failed: %v", err),
+		})
+		return result, nil
+	}
+	result.DanglingCleaned = dangling.Cleaned
+	result.Anomalies = append(result.Anomalies, dangling.Anomalies...)
+
+	return result, nil
+}
+
+// CleanDanglingParentRefs removes parent-child wisp_dependencies rows whose
+// parent wisp or issue no longer exists. The Scan anomaly "dangling_parent_ref"
+// reports these rows; this function is the remediation.
+//
+// Rows are deleted in batches of DefaultBatchSize with an explicit LIMIT to
+// keep individual delete statements bounded. Each batch is committed via
+// DOLT_COMMIT after the SQL transaction flushes to the working set.
+//
+// Safe to run repeatedly. With dryRun=true, no rows are modified and Cleaned
+// reflects the count that would be removed.
+//
+// Resolves gastown-3bdqa: purge leaves dangling wisp parent dependency records
+// when no purge candidates exist (retention has not expired). Historical
+// accumulation is drained on the first successful run.
+func CleanDanglingParentRefs(db *sql.DB, dbName string, dryRun bool) (*DanglingCleanResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	result := &DanglingCleanResult{Database: dbName, DryRun: dryRun}
+
+	// Single-statement count using the same predicate as the Scan anomaly so
+	// counts cannot diverge. The WHERE clause mirrors the anomaly query exactly.
+	const danglingCountQuery = `
+		SELECT COUNT(*) FROM wisp_dependencies wd
+		LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id
+		LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id
+		WHERE wd.type = 'parent-child'
+		  AND wd.depends_on_external IS NULL
+		  AND (wd.depends_on_wisp_id IS NOT NULL OR wd.depends_on_issue_id IS NOT NULL)
+		  AND pw.id IS NULL
+		  AND pi.id IS NULL`
+
+	var count int
+	if err := db.QueryRowContext(ctx, danglingCountQuery).Scan(&count); err != nil {
+		return nil, fmt.Errorf("count dangling parent refs: %w", err)
+	}
+	if count == 0 {
+		return result, nil
+	}
+	result.Cleaned = count
+
+	if dryRun {
+		return result, nil
+	}
+
+	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+		return nil, fmt.Errorf("disable autocommit: %w", err)
+	}
+	defer func() {
+		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
+	}()
+
+	// Batched delete: same predicate as the count, with LIMIT to keep each
+	// statement bounded. NOT EXISTS guards prevent deleting rows whose parent
+	// was created concurrently between count and delete (race-safe).
+	const danglingDeleteQuery = `
+		DELETE FROM wisp_dependencies
+		WHERE type = 'parent-child'
+		  AND depends_on_external IS NULL
+		  AND (depends_on_wisp_id IS NOT NULL OR depends_on_issue_id IS NOT NULL)
+		  AND NOT EXISTS (SELECT 1 FROM wisps pw WHERE pw.id = wisp_dependencies.depends_on_wisp_id)
+		  AND NOT EXISTS (SELECT 1 FROM issues pi WHERE pi.id = wisp_dependencies.depends_on_issue_id)
+		LIMIT ?`
+
+	deleted := 0
+	for {
+		sqlResult, err := db.ExecContext(ctx, danglingDeleteQuery, DefaultBatchSize)
+		if err != nil {
+			return nil, fmt.Errorf("delete dangling batch: %w", err)
+		}
+		affected, _ := sqlResult.RowsAffected()
+		deleted += int(affected)
+		if int(affected) < DefaultBatchSize {
+			break
+		}
+	}
+	result.Cleaned = deleted
+
+	if deleted > 0 {
+		// Flush SQL transaction to working set before DOLT_COMMIT.
+		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+			result.Anomalies = append(result.Anomalies, Anomaly{
+				Type:    "sql_commit_failed",
+				Message: fmt.Sprintf("sql commit after dangling cleanup failed: %v", err),
+			})
+			return result, nil
+		}
+		commitMsg := fmt.Sprintf("reaper: clean %d dangling parent refs in %s", deleted, dbName)
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+			if !isNothingToCommit(err) {
+				result.Anomalies = append(result.Anomalies, Anomaly{
+					Type:    "dolt_commit_failed",
+					Message: fmt.Sprintf("dolt commit after dangling cleanup failed: %v", err),
+				})
+			}
+		}
+	}
 
 	return result, nil
 }
