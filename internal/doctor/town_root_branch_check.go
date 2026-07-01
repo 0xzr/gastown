@@ -4,14 +4,22 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/git"
 )
 
-// TownRootBranchCheck verifies that the town root directory is on the main branch.
-// The town root should always stay on main to avoid confusion and broken gt commands.
-// Accidental branch switches can happen when git commands run in the wrong directory.
+// TownRootBranchCheck verifies that the town root directory is on the default branch.
+// The town root should always stay on the default branch to avoid confusion and
+// broken gt commands. Accidental branch switches can happen when git commands
+// run in the wrong directory.
+//
+// The "expected" branch is resolved at Run time from origin (via
+// RemoteDefaultBranch), so this works regardless of whether the project uses
+// "main", "master", "develop", or any other default.
 type TownRootBranchCheck struct {
 	FixableCheck
-	currentBranch string // Cached during Run for use in Fix
+	currentBranch  string // Cached during Run for use in Fix
+	expectedBranch string // Cached during Run for use in Fix
 }
 
 // NewTownRootBranchCheck creates a new town root branch check.
@@ -27,7 +35,7 @@ func NewTownRootBranchCheck() *TownRootBranchCheck {
 	}
 }
 
-// Run checks if the town root is on the main branch.
+// Run checks if the town root is on the expected default branch.
 func (c *TownRootBranchCheck) Run(ctx *CheckContext) *CheckResult {
 	// Get current branch
 	cmd := exec.Command("git", "branch", "--show-current")
@@ -45,6 +53,14 @@ func (c *TownRootBranchCheck) Run(ctx *CheckContext) *CheckResult {
 	branch := strings.TrimSpace(string(out))
 	c.currentBranch = branch
 
+	// Resolve expected branch from the town root's origin remote.
+	// This honors whatever default the project actually uses (main/master/develop/...).
+	expected := git.NewGit(ctx.TownRoot).RemoteDefaultBranch()
+	if expected == "" {
+		expected = "main" // absolute fallback
+	}
+	c.expectedBranch = expected
+
 	// Empty branch means detached HEAD
 	if branch == "" {
 		return &CheckResult{
@@ -52,15 +68,15 @@ func (c *TownRootBranchCheck) Run(ctx *CheckContext) *CheckResult {
 			Status:  StatusWarning,
 			Message: "Town root is in detached HEAD state",
 			Details: []string{
-				"The town root should be on the main branch",
+				fmt.Sprintf("The town root should be on the %s branch", expected),
 				"Detached HEAD can cause gt commands to fail",
 			},
-			FixHint: "Run 'gt doctor --fix' or manually: cd ~/gt && git checkout main",
+			FixHint: fmt.Sprintf("Run 'gt doctor --fix' or manually: cd ~/gt && git checkout %s", expected),
 		}
 	}
 
-	// Accept main or master
-	if branch == "main" || branch == "master" || branch == "gt_managed" {
+	// Accept the expected default branch or the legacy main/master/gt_managed values.
+	if branch == expected || branch == "main" || branch == "master" || branch == "gt_managed" {
 		return &CheckResult{
 			Name:    c.Name(),
 			Status:  StatusOK,
@@ -74,19 +90,31 @@ func (c *TownRootBranchCheck) Run(ctx *CheckContext) *CheckResult {
 		Status:  StatusError,
 		Message: fmt.Sprintf("Town root is on wrong branch: %s", branch),
 		Details: []string{
-			"The town root (~/gt) must stay on main branch",
+			fmt.Sprintf("The town root (~/gt) must stay on the %s branch", expected),
 			fmt.Sprintf("Currently on: %s", branch),
 			"This can cause gt commands to fail (missing rigs.json, etc.)",
 			"The branch switch was likely accidental (git command in wrong dir)",
 		},
-		FixHint: "Run 'gt doctor --fix' or manually: cd ~/gt && git checkout main",
+		FixHint: fmt.Sprintf("Run 'gt doctor --fix' or manually: cd ~/gt && git checkout %s", expected),
 	}
 }
 
-// Fix switches the town root back to main branch.
+// Fix switches the town root back to the expected default branch.
+//
+// The expected branch is computed by RemoteDefaultBranch() against the town
+// root's origin remote, so this respects custom default branches (develop, etc.)
+// rather than hardcoding "main"/"master".
 func (c *TownRootBranchCheck) Fix(ctx *CheckContext) error {
-	// Only fix if we're not already on main
-	if c.currentBranch == "main" || c.currentBranch == "master" || c.currentBranch == "gt_managed" {
+	// Only fix if we're not already on the expected branch (or a legacy safe value).
+	expected := c.expectedBranch
+	if expected == "" {
+		expected = git.NewGit(ctx.TownRoot).RemoteDefaultBranch()
+		if expected == "" {
+			expected = "main"
+		}
+		c.expectedBranch = expected
+	}
+	if c.currentBranch == expected || c.currentBranch == "main" || c.currentBranch == "master" || c.currentBranch == "gt_managed" {
 		return nil
 	}
 
@@ -99,19 +127,14 @@ func (c *TownRootBranchCheck) Fix(ctx *CheckContext) error {
 	}
 
 	if strings.TrimSpace(string(out)) != "" {
-		return fmt.Errorf("cannot switch to main: uncommitted changes in town root (stash or commit first)")
+		return fmt.Errorf("cannot switch to %s: uncommitted changes in town root (stash or commit first)", expected)
 	}
 
-	// Switch to main
-	cmd = exec.Command("git", "checkout", "main")
+	// Switch to the configured default branch.
+	cmd = exec.Command("git", "checkout", expected) //nolint:gosec // G204: branch name from git config
 	cmd.Dir = ctx.TownRoot
 	if err := cmd.Run(); err != nil {
-		// Try master if main doesn't exist
-		cmd = exec.Command("git", "checkout", "master")
-		cmd.Dir = ctx.TownRoot
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to checkout main: %w", err)
-		}
+		return fmt.Errorf("failed to checkout %s: %w", expected, err)
 	}
 
 	return nil
