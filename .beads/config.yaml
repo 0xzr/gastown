@@ -56,3 +56,5 @@ sync.remote: "git+https://github.com/steveyegge/gastown.git"
 storage.backend: dolt
 dolt.server: "127.0.0.1"
 dolt.port: 3307
+
+routing.mode: "explicit"
