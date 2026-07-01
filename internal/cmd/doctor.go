@@ -82,6 +82,7 @@ Rig checks (with --rig flag):
   - mayor-clone-exists       Verify mayor/rig/ clone exists (fixable)
   - polecat-clones-valid     Verify polecat directories are valid clones
   - beads-config-valid       Verify beads configuration (fixable)
+  - merge-slot-integrity     Detect corrupt merge-slot Description per rig (fixable)
 
 Routing checks (fixable):
   - routes-config            Check beads routing configuration
@@ -239,6 +240,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewStaleAgentBeadsCheck())
 	d.Register(doctor.NewRigBeadsCheck())
 	d.Register(doctor.NewRoleBeadsCheck())
+	d.Register(doctor.NewMergeSlotIntegrityCheck())
 
 	// NOTE: StaleAttachmentsCheck removed - staleness detection belongs in Deacon molecule
 
