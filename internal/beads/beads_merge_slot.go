@@ -142,7 +142,9 @@ func (b *Beads) MergeSlotAcquire(holder string, addWaiter bool) (*MergeSlotStatu
 				data.Waiters = append(data.Waiters, holder)
 				newDesc, _ := json.Marshal(data)
 				desc := string(newDesc)
-				_ = b.Update(issue.ID, UpdateOptions{Description: &desc})
+				if err := b.Update(issue.ID, UpdateOptions{Description: &desc}); err != nil {
+					return nil, fmt.Errorf("adding merge slot waiter: %w", err)
+				}
 			}
 		}
 		return &MergeSlotStatus{
