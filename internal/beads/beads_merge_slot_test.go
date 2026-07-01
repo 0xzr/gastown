@@ -11,13 +11,16 @@ import (
 // installMockBDMergeSlotRecorder installs a mock bd binary whose behaviour is
 // driven by the slot state in $MOCK_BD_SLOT_STATE_FILE:
 //
-//   - "create-ok"      : `bd create` succeeds and emits a JSON bead
-//   - "create-dup"     : `bd create` fails with a duplicate-style error; `bd
+//   - "create-ok"       : `bd create` succeeds and emits a JSON bead
+//   - "create-dup"      : `bd create` fails with a duplicate-style error; `bd
 //     list` and `bd show` then resolve to the existing slot
 //     (the race that MergeSlotEnsureExists must survive).
-//   - "create-fail"    : `bd create` fails with an unexpected error; the slot
+//   - "create-fail"     : `bd create` fails with an unexpected error; the slot
 //     still does NOT exist (MergeSlotCheck returns "not
 //     found") so we must surface the create error.
+//   - "held-update-fail": slot already exists, held by another actor, and
+//     `bd update` fails. Exercises the waiter-add branch of
+//     MergeSlotAcquire (gastown-3y5kz).
 func installMockBDMergeSlotRecorder(t *testing.T) (logPath, stateFile string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -62,6 +65,12 @@ case "$cmd" in
       printf '[{"id":"gt-merge-slot-existing","title":"merge-slot","status":"open","labels":["gt:merge-slot"]}]\n'
       exit 0
     fi
+    if [ "$(cat "$STATE" 2>/dev/null)" = "held-update-fail" ]; then
+      # Slot exists and is held by another actor — exercises the waiter-add
+      # branch in MergeSlotAcquire (gastown-3y5kz).
+      printf '[{"id":"gt-merge-slot-existing","title":"merge-slot","status":"open","labels":["gt:merge-slot"]}]\n'
+      exit 0
+    fi
     # Default: no merge slot exists.
     printf '[]\n'
     exit 0
@@ -71,10 +80,18 @@ case "$cmd" in
       printf '[{"id":"gt-merge-slot-existing","title":"merge-slot","status":"open","description":"{}","labels":["gt:merge-slot"]}]\n'
       exit 0
     fi
+    if [ "$(cat "$STATE" 2>/dev/null)" = "held-update-fail" ]; then
+      printf '[{"id":"gt-merge-slot-existing","title":"merge-slot","status":"open","description":"{\"holder\":\"other-actor\",\"waiters\":[]}","labels":["gt:merge-slot"]}]\n'
+      exit 0
+    fi
     echo "error: issue not found" >&2
     exit 1
     ;;
   update)
+    if [ "$(cat "$STATE" 2>/dev/null)" = "held-update-fail" ]; then
+      echo "error: dolt unavailable" >&2
+      exit 1
+    fi
     exit 0
     ;;
   *)
@@ -165,5 +182,43 @@ func TestMergeSlotEnsureExists_CreateFailsAndSlotMissing(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "dolt unavailable") {
 		t.Errorf("expected error to wrap create failure, got: %v", err)
+	}
+}
+
+// TestMergeSlotAcquire_AddWaiterUpdateFails_SurfacesError is the regression
+// test for gastown-3y5kz: MergeSlotAcquire's waiter-add branch previously
+// discarded the b.Update error with `_ =`. If the update failed, the caller
+// would see a nil error despite the waiter not being persisted, silently
+// losing waiters from the queue.
+//
+// With the fix, MergeSlotAcquire must return a wrapped error when the
+// waiter-add Update fails, so callers can surface the failure (e.g. log + retry)
+// instead of believing they were added to the queue.
+func TestMergeSlotAcquire_AddWaiterUpdateFails_SurfacesError(t *testing.T) {
+	_, stateFile := installMockBDMergeSlotRecorder(t)
+	setMockBDState(t, stateFile, "held-update-fail")
+
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	bd := NewIsolated(tmpDir)
+	// Acquire as a different actor than the holder ("other-actor") so we
+	// enter the "slot held by someone else" branch with addWaiter=true.
+	status, err := bd.MergeSlotAcquire("test-actor", true)
+	if err == nil {
+		t.Fatalf("expected error when waiter-add Update fails, got status=%+v", status)
+	}
+	if !strings.Contains(err.Error(), "adding merge slot waiter") {
+		t.Errorf("expected error to mention 'adding merge slot waiter', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "dolt unavailable") {
+		t.Errorf("expected error to wrap underlying bd error, got: %v", err)
+	}
+	// Caller must not receive a misleading "I added you to the waiters"
+	// status on failure.
+	if status != nil {
+		t.Errorf("expected nil status on waiter-add failure, got %+v", status)
 	}
 }
