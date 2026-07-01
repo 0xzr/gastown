@@ -151,8 +151,14 @@ func FormatAgentDescription(title string, fields *AgentFields) string {
 }
 
 // ParseAgentFields extracts agent fields from an issue's description.
+// Handles descriptions where newlines are escaped as literal "\n" sequences
+// (the format bd list --json currently returns for multi-line descriptions).
 func ParseAgentFields(description string) *AgentFields {
 	fields := &AgentFields{}
+
+	// Normalize escaped newlines so the same parser works regardless of whether
+	// the caller got the description from JSON (literal \n) or in-memory text.
+	description = strings.ReplaceAll(description, "\\n", "\n")
 
 	for _, line := range strings.Split(description, "\n") {
 		line = strings.TrimSpace(line)

@@ -651,7 +651,17 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	}
 
 	if err != nil {
-		return nil, b.wrapError(err, stderr.String(), args)
+		// `bd show --json` for a missing bead exits 1 with the not-found message in STDOUT
+		// (JSON {"error":"no issues found matching..."}) while stderr may be empty. wrapError
+		// only inspects stderr, so fold the stdout not-found signal in so the error is correctly
+		// classified as ErrNotFound (matching in-process storeShow). Without this, callers like
+		// the polecat Dolt health check treat a healthy "not found" response as a Dolt failure
+		// and refuse to spawn lanes.
+		errText := stderr.String()
+		if so := stdout.String(); strings.Contains(so, "no issue found") || strings.Contains(so, "no issues found") {
+			errText = strings.TrimSpace(errText + "\nno issue found " + so)
+		}
+		return nil, b.wrapError(err, errText, args)
 	}
 
 	// Handle bd exit code 0 bug: when issue not found,
