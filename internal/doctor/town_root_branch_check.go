@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/git"
 )
 
 // TownRootBranchCheck verifies that the town root directory is on the main branch.
@@ -90,20 +92,23 @@ func (c *TownRootBranchCheck) Fix(ctx *CheckContext) error {
 		return nil
 	}
 
-	// Check for uncommitted changes that would block checkout
-	cmd := exec.Command("git", "status", "--porcelain")
-	cmd.Dir = ctx.TownRoot
-	out, err := cmd.Output()
+	// Check for uncommitted changes that would block checkout. We use
+	// CleanExcludingRuntime so transient toolchain state under .beads/,
+	// .runtime/, .logs/, node_modules/, etc. does not block the fix.
+	// The previous check refused on ANY porcelain output, which made the
+	// fix path unusable in any town root with live runtime artifacts
+	// (gastown-25nzx).
+	status, err := git.NewGit(ctx.TownRoot).Status()
 	if err != nil {
 		return fmt.Errorf("failed to check git status: %w", err)
 	}
 
-	if strings.TrimSpace(string(out)) != "" {
+	if !status.CleanExcludingRuntime() {
 		return fmt.Errorf("cannot switch to main: uncommitted changes in town root (stash or commit first)")
 	}
 
 	// Switch to main
-	cmd = exec.Command("git", "checkout", "main")
+	cmd := exec.Command("git", "checkout", "main")
 	cmd.Dir = ctx.TownRoot
 	if err := cmd.Run(); err != nil {
 		// Try master if main doesn't exist
