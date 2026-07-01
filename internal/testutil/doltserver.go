@@ -123,6 +123,9 @@ func startSharedDoltContainer() {
 // The container is terminated automatically when the test finishes.
 func StartIsolatedDoltContainer(t *testing.T) string {
 	t.Helper()
+	if testing.Short() || os.Getenv("GT_TEST_SHORT") == "1" {
+		t.Skip("integration test needs a Dolt container; skipped in -short / fast-gate mode")
+	}
 	if !isDockerAvailable() {
 		t.Skip("Docker not available, skipping test")
 	}
@@ -154,7 +157,27 @@ func StartIsolatedDoltContainer(t *testing.T) string {
 // EnsureDoltContainerForTestMain starts a shared Dolt container for use in
 // TestMain functions. Call TerminateDoltContainer() after m.Run() to clean up.
 // Sets both GT_DOLT_PORT and BEADS_DOLT_PORT process-wide.
+// isShortTestRun reports whether the test binary is running in -short mode. It is safe to call from
+// TestMain (unlike testing.Short(), which panics before flags are parsed): it inspects os.Args (go
+// test passes -test.short=true to the test binary) and GT_TEST_SHORT.
+func isShortTestRun() bool {
+	if os.Getenv("GT_TEST_SHORT") == "1" {
+		return true
+	}
+	for _, a := range os.Args {
+		if a == "-test.short" || a == "-test.short=true" {
+			return true
+		}
+	}
+	return false
+}
+
 func EnsureDoltContainerForTestMain() error {
+	// -short / fast-gate mode: skip the container entirely. Dolt-needing tests then self-skip via
+	// setupTestStore/beadsdk.Open failure (same path as Docker-absent).
+	if isShortTestRun() {
+		return nil
+	}
 	if !isDockerAvailable() {
 		return fmt.Errorf("Docker not available")
 	}
@@ -167,6 +190,9 @@ func EnsureDoltContainerForTestMain() error {
 // test if Docker is not available.
 func RequireDoltContainer(t *testing.T) {
 	t.Helper()
+	if testing.Short() || os.Getenv("GT_TEST_SHORT") == "1" {
+		t.Skip("integration test needs a Dolt container; skipped in -short / fast-gate mode (run full suite for integration coverage)")
+	}
 	if !isDockerAvailable() {
 		t.Skip("Docker not available, skipping test")
 	}
