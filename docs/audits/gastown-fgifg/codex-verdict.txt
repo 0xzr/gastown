@@ -3,29 +3,24 @@
   "findings": [
     {
       "classification": "BLOCKING",
-      "citation": ".beads/config.yaml: storage.backend=dolt, dolt.server=127.0.0.1, dolt.port=3307 in commit 664aaf60",
-      "explanation": "The commit message says the change is for the gtviz rig, but the edited config is gastown's root .beads/config.yaml. Since gtviz has its own separate bare repo and .beads/config.yaml, this does not configure gtviz and instead changes gastown behavior."
-    },
-    {
-      "classification": "BLOCKING",
-      "citation": ".beads/config.yaml: dolt.port: 3307",
-      "explanation": "Every bd invocation from gastown root will now default to Dolt on 127.0.0.1:3307. That is a repository-wide behavioral side effect unrelated to the stated gtviz scope and can route gastown issue operations to the wrong or unavailable Dolt service."
+      "citation": "process: no telemetry event for 664aaf60 in /home/ubuntu/gt-town/.runtime/refinery-telemetry/refinery-gate-20260624.jsonl; no gate log at /home/ubuntu/gt-town/.runtime/refinery-gate-logs/ in 19:10Z-19:59Z window",
+      "explanation": "Bypass-merge: commit 664aaf60 reached origin/main with no telemetry event and no gate log in the 19:10Z-19:59Z window. The committer date is 2026-06-24T19:39:50Z; the surrounding gate logs are at 19:10:04Z and 19:59:12Z, with no entry between them. There is no event for 664aaf60 in refinery-gate-20260624.jsonl (295 lines, grep returns no matches). Per the strict four-model rule (m3 / codex / umans-kimi / umans-glm) established in gastown-cet.12.4, every merge to main must have a recorded gate panel. This is strictly worse than the gastown-cet.12.4 degraded-quorum case. Follow-up: file bead to require a CI failure when a commit reaches main without a gate record, and to investigate the refinery pipeline for the 2026-06-24T19:10Z-19:59Z gap."
     },
     {
       "classification": "MAJOR",
-      "citation": "internal/doctor/dolt_config_check.go behavior: validates each .beads/ independently",
-      "explanation": "Because doctor validation is per-.beads directory, adding Dolt keys to gastown cannot satisfy gtviz's independent config check. The intended fix must be applied to gtviz's own .beads/config.yaml, with its own port choice."
+      "citation": "commit subject 'for new gtviz rig'; diff in /home/ubuntu/gt-town/gastown/.beads/config.yaml",
+      "explanation": "Commit message is misleading: the subject says 'add explicit shared Dolt config keys for new gtviz rig' but the change is in the gastown root .beads/config.yaml, not in any gtviz file. The gtviz rig did not exist at the time of the commit (gtviz .beads/config.yaml was created 2026-06-30T19:58:43-04:00 per stat(1), six days after this commit landed at 2026-06-24T19:39:50Z). The change actually fixed the gastown root's own dolt-config doctor-check, which the message does not say. Follow-up: file bead to require commit-message scope review (and have the merge-queue reject commits whose subject says 'for X rig' but whose diff is in a different rig's tree)."
     },
     {
       "classification": "MAJOR",
-      "citation": "commit 664aaf60: no tests or gate-panel telemetry entry on record",
-      "explanation": "This changes issue-tracker backend selection and cross-rig operational wiring without test coverage or a recorded gate panel, leaving no evidence that bd operations and doctor checks still behave correctly."
+      "citation": "internal/doctor/dolt_config_check_test.go: not updated; .beads/config.yaml:55-57 are new key set",
+      "explanation": "No tests added. The change is to a key set the doctor check (internal/doctor/dolt_config_check.go) requires; no test in internal/doctor/dolt_config_check_test.go was updated to assert the gastown-root key set is recognized by checkBeadsDir. Follow-up: file bead to add a test."
     },
     {
       "classification": "MINOR",
-      "citation": ".beads/config.yaml: dolt.server: \"127.0.0.1\" vs dolt.port: 3307",
-      "explanation": "The new YAML mixes quoted and unquoted scalar style. It is not functionally wrong, but it is inconsistent and should follow the existing config style."
+      "citation": ".beads/config.yaml:55-57 (style: bare vs quoted strings)",
+      "explanation": "Quote-style inconsistency: dolt.server: \"127.0.0.1\" is quoted (because the YAML scalar 127.0.0.1 could be ambiguously parsed) but dolt.port: 3307 is bare. The doctor check parser (configYAMLValues at internal/doctor/dolt_config_check.go:204) trims quotes, so both work, but the asymmetry is jarring. Pre-existing config style also mixes; this is a low-priority cleanup. Follow-up: include in any rework commit."
     }
   ],
-  "summary": "FAIL: the commit is out of scope for the stated gtviz purpose and introduces a dangerous gastown-wide Dolt default on port 3307 without tests or gate evidence."
+  "summary": "FAIL — codex reviewed this v2 audit on the corrected facts (the v1 audit was rejected by this reviewer on 2026-07-02T09:01:22Z for the wrong remediation path, the wrong port-coupling claim, and the author-vs-committer timestamp). With the F1/F2/F3 corrections, the change in 664aaf60 is still FAIL: the single BLOCKING is the bypass-merge (zero gate telemetry at the 19:39:50Z landing time), the MAJOR findings are the misleading commit message (subject says gtviz, diff is in gastown root) and the missing tests, and the MINOR is the quote-style inconsistency. Required: investigate the refinery pipeline for the 2026-06-24T19:10Z-19:59Z gap and require a gate record for any future merge to main."
 }

@@ -3,34 +3,29 @@
   "findings": [
     {
       "classification": "BLOCKING",
-      "citation": ".beads/config.yaml:54-56",
-      "explanation": "The commit message says the shared Dolt keys are 'for new gtviz rig', but they were added to gastown's root .beads/config.yaml instead of /home/ubuntu/gt-town/gtviz/.repo.git/.beads/config.yaml. Since the doctor check validates every .beads/ dir independently, this change does not satisfy the stated intent for the gtviz rig and alters the wrong bead's configuration."
-    },
-    {
-      "classification": "BLOCKING",
-      "citation": ".beads/config.yaml:54-56",
-      "explanation": "Setting storage.backend='dolt' and dolt.port=3307 in the gastown root config changes default storage resolution for every 'bd' invocation in the gastown worktree. This is an invasive side effect on the main repo when the stated target is a separate rig."
+      "citation": "process: no telemetry event for 664aaf60 in /home/ubuntu/gt-town/.runtime/refinery-telemetry/refinery-gate-20260624.jsonl; no gate log at /home/ubuntu/gt-town/.runtime/refinery-gate-logs/ in 19:10Z-19:59Z window",
+      "explanation": "Bypass-merge: commit 664aaf60 reached origin/main with zero gate telemetry. The committer date is 2026-06-24T19:39:50Z; the surrounding gate logs are at 19:10:04Z and 19:59:12Z, with no entry between them. There is no event for 664aaf60 in refinery-gate-20260624.jsonl (295 lines, grep returns no matches). Per the strict four-model rule (m3 / codex / umans-kimi / umans-glm) established in gastown-cet.12.4, every merge to main must have a recorded gate panel. This is strictly worse than the gastown-cet.12.4 degraded-quorum case. Follow-up: file bead to require a CI failure when a commit reaches main without a gate record, and to investigate the refinery pipeline for the 2026-06-24T19:10Z-19:59Z gap."
     },
     {
       "classification": "MAJOR",
-      "citation": "diff (no test files)",
-      "explanation": "No tests were added for the new shared Dolt config. Given the doctor check has explicit expectations (storage.backend, dolt.server, dolt.port), there should be coverage that the correct .beads/config.yaml values are present and that unintended directories are not flagged."
+      "citation": "commit subject 'for new gtviz rig'; diff in /home/ubuntu/gt-town/gastown/.beads/config.yaml",
+      "explanation": "Misleading subject: the commit says 'add explicit shared Dolt config keys for new gtviz rig' but the change is in the gastown root .beads/config.yaml. The gtviz rig was bootstrapped six days later (gtviz .beads/config.yaml was created 2026-06-30T19:58:43-04:00 per stat(1), six days after this commit landed at 2026-06-24T19:39:50Z). The gtviz bootstrap independently wrote the same three keys (storage.backend: dolt, dolt.server: 127.0.0.1, dolt.port: 3307), so the change in 664aaf60 was effectively redundant for the gtviz rig and only meaningful for the gastown root's doctor-check. The commit message does not acknowledge this. Follow-up: file bead to require commit-message scope review."
     },
     {
       "classification": "MAJOR",
-      "citation": "commit metadata",
-      "explanation": "No telemetry entry exists for this commit and no gate panel is on record, violating the process audited in gastown-cet.12.4 under the strict four-model rule."
+      "citation": "internal/doctor/dolt_config_check_test.go: not updated",
+      "explanation": "No tests added. The change is to a key set the doctor check (internal/doctor/dolt_config_check.go) requires; no test in internal/doctor/dolt_config_check_test.go was updated to assert the gastown-root key set is recognized. Follow-up: file bead to add a test."
     },
     {
       "classification": "MAJOR",
-      "citation": ".beads/config.yaml:54-56",
-      "explanation": "Cross-rig port coupling is a risk: port 3307 is claimed here for gastown, but if gtviz subsequently uses the same port and backend it may connect to the wrong database or compete with the gastown Dolt server. The server key is loopback-only, so external exposure is not the concern, but the coupling itself can cause runtime misrouting."
+      "citation": "gastown-cet.12.4 strict four-model rule not applied at landing time",
+      "explanation": "Process violation: the gastown-cet.12.4 audit established a strict four-model rule (m3 / codex / umans-kimi / umans-glm) for re-reviews of merged commits. Commit 664aaf60 (landing 2026-06-24T19:39:50Z) was merged without any record of any reviewer being invoked — strictly worse than the gastown-cet.12.4 degraded-quorum case. Follow-up: file bead to enforce the four-model rule at merge time and reject commits that lack a recorded gate panel."
     },
     {
       "classification": "MINOR",
-      "citation": ".beads/config.yaml:54-56",
-      "explanation": "Style inconsistency: storage.backend uses a bare string while dolt.server and dolt.port are quoted. The file should use consistent scalar quoting for string values."
+      "citation": ".beads/config.yaml:55-57 (style: bare vs quoted strings)",
+      "explanation": "Quote-style inconsistency: dolt.server: \"127.0.0.1\" is quoted but dolt.port: 3307 is bare. The doctor check parser (configYAMLValues at internal/doctor/dolt_config_check.go:204) trims quotes, so both work, but the asymmetry is jarring. Pre-existing config style also mixes; this is a low-priority cleanup. Follow-up: include in any rework commit."
     }
   ],
-  "summary": "The change is placed in the wrong location: it modifies gastown's root .beads/config.yaml while claiming to configure the separate gtviz rig, and in doing so forces all gastown-root commands onto Dolt at port 3307. This has blocking correctness and side-effect implications. The commit also lacks tests and a gate panel, and introduces cross-rig port coupling. It should be reverted and the three keys added to /home/ubuntu/gt-town/gtviz/.repo.git/.beads/config.yaml instead, with tests and consistent quoting."
+  "summary": "FAIL — On the corrected facts (v1 had pointed to a non-existent /home/ubuntu/gt-town/gtviz/.repo.git/.beads/config.yaml and claimed gtviz uses a different port; v2 verifies F1 the active gtviz beads dir is /home/ubuntu/gt-town/gtviz/.beads/ and F2 gtviz uses port 3307), the change in 664aaf60 is still a strict bypass-merge. The single BLOCKING is zero gate telemetry. The MAJOR findings are: misleading commit message (subject says gtviz, diff is in gastown root), no tests added, and the gastown-cet.12.4 four-model rule was not applied at landing time. The MINOR is the quote-style inconsistency. Required: investigate the refinery pipeline for the 2026-06-24T19:10Z-19:59Z gap, enforce the four-model rule at merge time, and require a gate record for any future merge to main."
 }
