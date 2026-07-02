@@ -103,6 +103,7 @@ directory.
 - For direct-mode merges to the resolved default target, local tests or polecat pre-verification are not enough.
 - After the local merge creates the exact candidate tree and before any push, run `/home/ubuntu/gastown-spike/dropin/refinery-gate.sh` against the merged worktree.
 - Pass the model that wrote the source bead as `--writer`; recover it from `assigned_agent:` in the MR's `agent_bead`, then from `$GT_TOWN_ROOT/.runtime/model-assignments/<source-issue>.json`. If still unknown, pass `unknown`, which requires all four core reviewers.
+- The durable gate can legitimately outlive a Claude/Codex Bash tool call. Do not rely on the tool timeout. Start the gate detached with `nohup`, write `GATE_EXIT=<rc>` to a log, and use later short Bash calls to poll the process/log/attestation until the gate finishes. Never wrap the gate in `timeout`, `head`, `tail`, or a pipeline that can mask or kill `refinery-gate.sh` before it writes `gate_complete`.
 - Do not push unless the gate exits 0 and `/home/ubuntu/.gt-gate-attestations/<tree>` verifies against `/home/ubuntu/.gt-gate-hmac-key` for `git rev-parse HEAD^{tree}` and that writer.
 - If the gate fails, inspect its JSON/telemetry/logs before classifying it. Reviewer/tooling unavailability is deferred review, not a code rejection.
 
@@ -237,8 +238,12 @@ GATE: Cannot proceed to merge without fix OR bead filed
 ```
 **FORBIDDEN**: Note failure and merge without tracking.
 
-**merge-push**: Merge to effective target and push immediately
+**merge-push**: Merge to effective target, start the durable gate, then push only after the gate clears.
+
+Run this start block once:
 ```bash
+set -euo pipefail
+
 ## Resolve <merge-target> per Target Resolution Rule above.
 git checkout <merge-target>
 git merge --ff-only temp
@@ -246,18 +251,26 @@ git merge --ff-only temp
 # HARD STOP: run durable multi-model gate and verify HMAC attestation for the
 # exact merged tree before pushing. Use the source polecat's writer model, not
 # the refinery model; use unknown only if the writer cannot be recovered.
+# If invoking this from an agent Bash tool, do not hold a single tool call open
+# for the whole gate. Start it detached with nohup, return from the tool, then
+# run exactly the poll/verify/push block below in short follow-up Bash calls.
+# Do not pipe through tail/head or wrap the gate in timeout.
 MERGE_TREE=$(git rev-parse 'HEAD^{tree}')
 WRITER=$(
   bd show <agent-bead> --json 2>/dev/null |
     jq -r '.[0].description // ""' 2>/dev/null |
     awk -F': ' '/^assigned_agent:/{print $2; exit}'
-)
+) || WRITER=""
 if [ -z "$WRITER" ] || [ "$WRITER" = "null" ]; then
   TOWN_ROOT="${GT_TOWN_ROOT:-/home/ubuntu/gt-town}"
   WRITER=$(jq -r '.agent // empty' "$TOWN_ROOT/.runtime/model-assignments/<source-issue>.json" 2>/dev/null || true)
 fi
 [ -n "$WRITER" ] || WRITER=unknown
 case "$WRITER" in codex-*) WRITER=codex;; esac
+GATE_LOG="/tmp/refinery-gate-${MERGE_TREE}.log"
+GATE_PID_FILE="/tmp/refinery-gate-${MERGE_TREE}.pid"
+GATE_WRITER_FILE="/tmp/refinery-gate-${MERGE_TREE}.writer"
+printf '%s\n' "$WRITER" >"$GATE_WRITER_FILE"
 
 GT_REVIEW_GATE_WORKTREE="$PWD" \
 GT_REVIEW_GATE_BRANCH="<polecat-branch>" \
@@ -267,7 +280,34 @@ GT_RIG="{{ .RigName }}" \
 GT_GATE_ATTEST_DIR="/home/ubuntu/.gt-gate-attestations" \
 GT_GATE_HMAC_KEY="/home/ubuntu/.gt-gate-hmac-key" \
 GT_REFINERY_RUN_ALL_GATES_FALLBACK="/home/ubuntu/gt-town/{{ .RigName }}/mayor/rig/scripts/run-all-gates.sh" \
-  /home/ubuntu/gastown-spike/dropin/refinery-gate.sh --worktree "$PWD" --writer "$WRITER" --timeout 1800
+  nohup bash -c '
+    /home/ubuntu/gastown-spike/dropin/refinery-gate.sh --worktree "$1" --writer "$2" --timeout 1800
+    rc=$?
+    printf "GATE_EXIT=%s\n" "$rc"
+    exit "$rc"
+  ' sh "$PWD" "$WRITER" >"$GATE_LOG" 2>&1 &
+printf '%s\n' "$!" >"$GATE_PID_FILE"
+echo "durable gate started: pid=$(cat "$GATE_PID_FILE") log=$GATE_LOG"
+```
+
+Then rerun exactly this self-contained poll/verify/push block in later short Bash calls until it exits 0. Exit 75 means the gate is still running; do not push, and check again later:
+```bash
+set -euo pipefail
+
+MERGE_TREE=$(git rev-parse 'HEAD^{tree}')
+GATE_LOG="/tmp/refinery-gate-${MERGE_TREE}.log"
+GATE_PID_FILE="/tmp/refinery-gate-${MERGE_TREE}.pid"
+GATE_WRITER_FILE="/tmp/refinery-gate-${MERGE_TREE}.writer"
+[ -s "$GATE_PID_FILE" ] || { echo "durable gate pid file missing: $GATE_PID_FILE"; exit 2; }
+[ -s "$GATE_WRITER_FILE" ] || { echo "durable gate writer file missing: $GATE_WRITER_FILE"; exit 2; }
+if kill -0 "$(cat "$GATE_PID_FILE")" 2>/dev/null; then
+  echo "gate still running; check again later: $GATE_LOG"
+  exit 75
+fi
+grep -q '^GATE_EXIT=0$' "$GATE_LOG"
+grep -q '"decision":"MERGE"' "$GATE_LOG"
+WRITER=$(cat "$GATE_WRITER_FILE")
+case "$WRITER" in codex-*) WRITER=codex;; esac
 
 REPO_ID=$(git config --get remote.origin.url 2>/dev/null || git rev-parse --show-toplevel)
 REPO_KEY=$(printf '%s' "$REPO_ID" | sha256sum | awk '{print substr($1,1,16)}')
