@@ -636,8 +636,9 @@ func TestDryRunSkipsSideEffects(t *testing.T) {
 	}
 }
 
-// TestIsCompactResume tests the isCompactResume detection logic including
-// compaction-triggered handoff cycles (GH#1965).
+// TestIsCompactResume tests the lightweight compact/resume detection logic.
+// A compaction-triggered handoff cycle must run a normal fresh prime so it can
+// load durable handoff mail instead of trying to resume an overfull transcript.
 func TestIsCompactResume(t *testing.T) {
 	// Save and restore package-level state
 	origSource := primeHookSource
@@ -674,10 +675,10 @@ func TestIsCompactResume(t *testing.T) {
 			wantCompact: false,
 		},
 		{
-			name:          "compaction_handoff_cycle",
+			name:          "compaction_handoff_cycle_runs_full_prime",
 			hookSource:    "startup",
 			handoffReason: "compaction",
-			wantCompact:   true,
+			wantCompact:   false,
 		},
 		{
 			name:          "normal_handoff_not_compact",

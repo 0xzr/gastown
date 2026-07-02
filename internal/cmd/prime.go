@@ -402,17 +402,12 @@ func signalAgentReady() {
 	_ = t.SetEnvironment(name, tmux.EnvAgentReady, "1")
 }
 
-// isCompactResume returns true if the current prime is running after compaction or resume.
+// isCompactResume returns true if the current prime is running after explicit
+// compact or resume hooks.
 // In these cases, the agent already has role context in compressed memory and only needs
 // a brief identity confirmation plus hook/work status.
-//
-// This also returns true for compaction-triggered handoff cycles (crew workers).
-// When PreCompact runs "gt handoff --cycle --reason compaction", the new session
-// gets source="startup" but the handoff marker carries reason="compaction".
-// Without this, the new session runs full prime with AUTONOMOUS WORK MODE,
-// causing the agent to re-initialize instead of continuing. (GH#1965)
 func isCompactResume() bool {
-	return primeHookSource == "compact" || primeHookSource == "resume" || primeHandoffReason == "compaction"
+	return primeHookSource == "compact" || primeHookSource == "resume"
 }
 
 // warnRoleMismatch outputs a prominent warning if GT_ROLE disagrees with cwd detection.

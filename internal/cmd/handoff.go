@@ -80,6 +80,8 @@ var (
 	handoffYes        bool
 )
 
+const handoffCycleStartupPrompt = "Context compacted. Run `gt prime --hook`, read your handoff mail, then proceed."
+
 func init() {
 	handoffCmd.Flags().BoolVarP(&handoffWatch, "watch", "w", true, "Switch to new session (for remote handoff)")
 	handoffCmd.Flags().BoolVarP(&handoffDryRun, "dry-run", "n", false, "Show what would be done without executing")
@@ -554,12 +556,9 @@ func runHandoffCycle() error {
 		_ = events.LogFeed(events.TypeHandoff, agent, events.HandoffPayload(subject, true))
 	}
 
-	// Build restart command with --continue so the new session resumes
-	// the previous conversation (preserves context across compaction cycles).
-	restartCmd, err := buildRestartCommandWithOpts(currentSession, buildRestartCommandOpts{
-		ContinueSession: true,
-		ContinuePrompt:  "Context compacted. Continue your previous task.",
-	})
+	// Build a fresh restart command. Compaction cycles must not use --continue:
+	// the previous transcript is the thing that just exceeded the useful window.
+	restartCmd, err := buildHandoffCycleRestartCommand(currentSession)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "handoff --cycle: could not build restart command: %v\n", err)
 		return err
@@ -781,10 +780,19 @@ type buildRestartCommandOpts struct {
 	// ContinueSession is true. If empty, falls back to a generic
 	// continuation message.
 	ContinuePrompt string
+	// StartupPrompt appends bounded instructions to the normal startup beacon
+	// for a fresh session. Ignored when ContinueSession is true.
+	StartupPrompt string
 }
 
 func buildRestartCommand(sessionName string) (string, error) {
 	return buildRestartCommandWithOpts(sessionName, buildRestartCommandOpts{})
+}
+
+func buildHandoffCycleRestartCommand(sessionName string) (string, error) {
+	return buildRestartCommandWithOpts(sessionName, buildRestartCommandOpts{
+		StartupPrompt: handoffCycleStartupPrompt,
+	})
 }
 
 func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpts) (string, error) {
@@ -824,6 +832,12 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 		} else {
 			beacon = "Your account was rotated to avoid a rate limit. Continue your previous task."
 		}
+	} else if opts.StartupPrompt != "" {
+		beacon = session.BuildStartupPrompt(session.BeaconConfig{
+			Recipient: identity.BeaconAddress(),
+			Sender:    "self",
+			Topic:     "handoff",
+		}, opts.StartupPrompt)
 	} else if isPatrolRole(simpleRole) {
 		// Patrol roles (refinery, witness, deacon) must re-enter their patrol
 		// loop on handoff, not "wait for instructions." Without this, idle

@@ -341,6 +341,82 @@ func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
 			t.Errorf("expected no --continue flag when ContinueSession is false, got: %q", cmd)
 		}
 	})
+
+	t.Run("StartupPrompt starts fresh with bounded instruction", func(t *testing.T) {
+		cmd, err := buildRestartCommandWithOpts("gt-crew-bear", buildRestartCommandOpts{
+			StartupPrompt: handoffCycleStartupPrompt,
+		})
+		if err != nil {
+			t.Fatalf("buildRestartCommandWithOpts: %v", err)
+		}
+		if strings.Contains(cmd, "--continue") {
+			t.Errorf("expected no --continue flag with StartupPrompt, got: %q", cmd)
+		}
+		if !strings.Contains(cmd, "Context compacted") {
+			t.Errorf("expected bounded compaction prompt in restart command, got: %q", cmd)
+		}
+		if !strings.Contains(cmd, "prime --hook") {
+			t.Errorf("expected prime --hook instruction in restart command, got: %q", cmd)
+		}
+	})
+}
+
+func TestBuildHandoffCycleRestartCommandStartsFresh(t *testing.T) {
+	setupHandoffTestRegistry(t)
+
+	origCwd, _ := os.Getwd()
+	origGTAgent := os.Getenv("GT_AGENT")
+	origTownRoot := os.Getenv("GT_TOWN_ROOT")
+	origRoot := os.Getenv("GT_ROOT")
+
+	townRoot := t.TempDir()
+
+	t.Cleanup(func() {
+		_ = os.Chdir(origCwd)
+		_ = os.Setenv("GT_AGENT", origGTAgent)
+		_ = os.Setenv("GT_TOWN_ROOT", origTownRoot)
+		_ = os.Setenv("GT_ROOT", origRoot)
+	})
+	rigPath := filepath.Join(townRoot, "gastown")
+	crewDir := filepath.Join(rigPath, "crew", "bear")
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := os.MkdirAll(crewDir, 0755); err != nil {
+		t.Fatalf("mkdir crew dir: %v", err)
+	}
+
+	townSettings := config.NewTownSettings()
+	townSettings.DefaultAgent = "claude"
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), config.NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	_ = os.Setenv("GT_AGENT", "")
+	_ = os.Setenv("GT_TOWN_ROOT", "")
+	_ = os.Setenv("GT_ROOT", "")
+	_ = os.Chdir(crewDir)
+
+	cmd, err := buildHandoffCycleRestartCommand("gt-crew-bear")
+	if err != nil {
+		t.Fatalf("buildHandoffCycleRestartCommand: %v", err)
+	}
+	if strings.Contains(cmd, "--continue") {
+		t.Fatalf("handoff --cycle must start fresh, got --continue in: %q", cmd)
+	}
+	if !strings.Contains(cmd, "Context compacted") {
+		t.Fatalf("expected compaction startup prompt, got: %q", cmd)
+	}
+	if !strings.Contains(cmd, "prime --hook") {
+		t.Fatalf("expected prime --hook instruction, got: %q", cmd)
+	}
 }
 
 func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
