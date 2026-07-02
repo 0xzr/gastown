@@ -3093,6 +3093,56 @@ func readExistingDoltDatabase(beadsDir string) string {
 	return ""
 }
 
+// ConfiguredProductionDatabases returns the databases expected for the current
+// town: the town-level HQ database plus every rig registered in mayor/rigs.json.
+// It intentionally does not scan every .dolt-data directory, because retired or
+// orphaned databases may still exist on disk after a rig is removed.
+func ConfiguredProductionDatabases(townRoot string) []string {
+	var databases []string
+	seen := make(map[string]bool)
+	add := func(db string) {
+		db = strings.TrimSpace(strings.TrimSuffix(db, "-"))
+		if db == "" || seen[db] {
+			return
+		}
+		seen[db] = true
+		databases = append(databases, db)
+	}
+
+	if db := readExistingDoltDatabase(filepath.Join(townRoot, ".beads")); db != "" {
+		add(db)
+	} else {
+		add("hq")
+	}
+
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigsCfg, err := config.LoadRigsConfig(rigsPath)
+	if err != nil || rigsCfg == nil {
+		return databases
+	}
+
+	rigNames := make([]string, 0, len(rigsCfg.Rigs))
+	for rigName := range rigsCfg.Rigs {
+		rigNames = append(rigNames, rigName)
+	}
+	sort.Strings(rigNames)
+
+	for _, rigName := range rigNames {
+		entry := rigsCfg.Rigs[rigName]
+		if db := readExistingDoltDatabase(FindRigBeadsDir(townRoot, rigName)); db != "" {
+			add(db)
+			continue
+		}
+		if entry.BeadsConfig != nil && entry.BeadsConfig.Prefix != "" {
+			add(entry.BeadsConfig.Prefix)
+			continue
+		}
+		add(rigName)
+	}
+
+	return databases
+}
+
 // collectReferencedDatabases returns a set of database names referenced by
 // any rig's metadata.json dolt_database field. It checks multiple sources
 // to avoid falsely flagging legitimate databases as orphans (gt-q8f6n):

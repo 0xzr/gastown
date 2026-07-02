@@ -25,6 +25,7 @@ This is infrastructure work. You:
 | Variable | Source | Description |
 |----------|--------|-------------|
 | port | config | Dolt server port (default 3307) |
+| databases | config | Comma-separated production databases derived from town config |
 | latency_threshold | config | Latency warning threshold (default 1s) |
 
 ## Safety
@@ -92,24 +93,37 @@ du -sh <townRoot>/daemon/
 Warn if > 500MB (the disk budget threshold). The Go-side `CleanDaemonDir()` runs
 on heartbeat to enforce this, but report the current state for visibility.
 
-**4. Database count (orphan detection):**
+**4. Production database checks:**
+The configured production databases are:
+```text
+{{databases}}
+```
+Use this list for per-database health and backup freshness checks. Do not probe
+legacy database names such as `gt` or `mo` unless they appear in this configured
+list.
+
+**5. Database count (orphan detection):**
 ```sql
 SHOW DATABASES;
 ```
-Count databases matching orphan patterns: testdb_*, beads_t*, beads_pt*, doctest_*.
+Use `SHOW DATABASES` only to identify extra or orphaned databases outside the
+configured production list. Count databases matching orphan patterns:
+testdb_*, beads_t*, beads_pt*, doctest_*.
 If orphan count > threshold, recommend cleanup:
 ```bash
 gt dolt cleanup
 ```
 
-**5. Backup freshness:**
+**6. Backup freshness:**
 Check modification time of backup files. Warn if backups are stale
-(older than 2x the configured backup interval).
+(older than 2x the configured backup interval). Check only configured production
+databases from `{{databases}}`.
 
-**6. Record all findings:**
+**7. Record all findings:**
 - Connection count and utilization percentage
 - Data directory disk usage
 - Daemon directory disk usage (warn if > 500MB)
+- Configured production databases checked
 - Orphan database count and names
 - Backup freshness per database
 
@@ -174,6 +188,10 @@ Status: COMPLETE"
 [vars.port]
 description = "Dolt server port"
 default = "3307"
+
+[vars.databases]
+description = "Comma-separated production databases derived from town config"
+default = "hq"
 
 [vars.latency_threshold]
 description = "Latency warning threshold"

@@ -2,8 +2,14 @@ package daemon
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/formula"
 )
 
 func TestDoctorDogInterval(t *testing.T) {
@@ -33,10 +39,11 @@ func TestDoctorDogInterval(t *testing.T) {
 }
 
 func TestDoctorDogDatabases(t *testing.T) {
-	// Default databases
-	dbs := doctorDogDatabases(nil)
-	if len(dbs) != 3 {
-		t.Errorf("expected 3 default databases, got %d", len(dbs))
+	// Default databases come from town metadata/config, not a stale hardcoded
+	// hq/gt/mo list.
+	dbs := doctorDogDatabases(nil, t.TempDir())
+	if len(dbs) != 1 || dbs[0] != "hq" {
+		t.Errorf("expected default town database [hq], got %#v", dbs)
 	}
 
 	// Custom databases
@@ -48,9 +55,60 @@ func TestDoctorDogDatabases(t *testing.T) {
 			},
 		},
 	}
-	dbs = doctorDogDatabases(config)
+	dbs = doctorDogDatabases(config, t.TempDir())
 	if len(dbs) != 2 {
 		t.Errorf("expected 2 custom databases, got %d", len(dbs))
+	}
+}
+
+func TestDoctorDogDatabasesUsesRegisteredRigMetadata(t *testing.T) {
+	townRoot := t.TempDir()
+	writeDoctorDogMetadata(t, filepath.Join(townRoot, ".beads"), "hq")
+	writeDoctorDogMetadata(t, filepath.Join(townRoot, "gastown", ".beads"), "gastown")
+	writeDoctorDogMetadata(t, filepath.Join(townRoot, "polybot", ".beads"), "polybot")
+	writeDoctorDogMetadata(t, filepath.Join(townRoot, "gtviz", ".beads"), "gtviz")
+	writeDoctorDogRigs(t, townRoot, map[string]string{
+		"gastown": "gt-",
+		"polybot": "polybot",
+	})
+
+	got := doctorDogDatabases(nil, townRoot)
+	want := []string{"hq", "gastown", "polybot"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("doctorDogDatabases() = %#v, want %#v", got, want)
+	}
+}
+
+func TestDoctorDogDatabasesFallsBackToRigPrefix(t *testing.T) {
+	townRoot := t.TempDir()
+	writeDoctorDogMetadata(t, filepath.Join(townRoot, ".beads"), "hq")
+	writeDoctorDogRigs(t, townRoot, map[string]string{
+		"laneassist": "la-",
+	})
+
+	got := doctorDogDatabases(nil, townRoot)
+	want := []string{"hq", "la"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("doctorDogDatabases() = %#v, want %#v", got, want)
+	}
+}
+
+func TestDoctorDogFormulaConsumesDatabasesVariable(t *testing.T) {
+	t.Parallel()
+
+	content, err := formula.GetEmbeddedFormulaContent("mol-dog-doctor")
+	if err != nil {
+		t.Fatalf("GetEmbeddedFormulaContent(mol-dog-doctor): %v", err)
+	}
+	text := string(content)
+	for _, want := range []string{
+		"[vars.databases]",
+		"{{databases}}",
+		"Do not probe\nlegacy database names such as `gt` or `mo`",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("doctor formula missing %q", want)
+		}
 	}
 }
 
@@ -192,5 +250,49 @@ func TestDoctorDogConfigThresholdFields(t *testing.T) {
 	}
 	if config.BackupStaleSeconds != 1800.0 {
 		t.Errorf("expected backup_stale_seconds=1800, got %.0f", config.BackupStaleSeconds)
+	}
+}
+
+func writeDoctorDogMetadata(t *testing.T, beadsDir, db string) {
+	t.Helper()
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(map[string]any{
+		"backend":       "dolt",
+		"database":      "dolt",
+		"dolt_mode":     "server",
+		"dolt_database": db,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeDoctorDogRigs(t *testing.T, townRoot string, prefixes map[string]string) {
+	t.Helper()
+	rigs := make(map[string]any, len(prefixes))
+	for name, prefix := range prefixes {
+		rigs[name] = map[string]any{
+			"git_url": "https://example.com/" + name + ".git",
+			"beads":   map[string]string{"prefix": prefix},
+		}
+	}
+	data, err := json.Marshal(map[string]any{
+		"version": 1,
+		"rigs":    rigs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	if err := os.MkdirAll(filepath.Dir(rigsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rigsPath, data, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

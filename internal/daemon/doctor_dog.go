@@ -2,9 +2,11 @@ package daemon
 
 import (
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 // Operational constants — timeouts needed to perform checks.
@@ -80,13 +82,13 @@ func doctorDogInterval(config *DaemonPatrolConfig) time.Duration {
 }
 
 // doctorDogDatabases returns the list of production databases for health checks.
-func doctorDogDatabases(config *DaemonPatrolConfig) []string {
+func doctorDogDatabases(config *DaemonPatrolConfig, townRoot string) []string {
 	if config != nil && config.Patrols != nil && config.Patrols.DoctorDog != nil {
 		if len(config.Patrols.DoctorDog.Databases) > 0 {
 			return config.Patrols.DoctorDog.Databases
 		}
 	}
-	return []string{"hq", "gt", "mo"}
+	return doltserver.ConfiguredProductionDatabases(townRoot)
 }
 
 // runDoctorDog pours a mol-dog-doctor molecule for agent execution.
@@ -105,6 +107,7 @@ func (d *Daemon) runDoctorDog() {
 
 	mol := d.pourDogMolecule(constants.MolDogDoctor, map[string]string{
 		"port":              strconv.Itoa(port),
+		"databases":         strings.Join(doctorDogDatabases(d.patrolConfig, d.config.TownRoot), ","),
 		"latency_threshold": strconv.FormatFloat(latencyThreshold, 'f', 0, 64) + "ms",
 		"orphan_threshold":  strconv.Itoa(orphanCount),
 		"backup_threshold":  strconv.FormatFloat(backupStaleSec, 'f', 0, 64) + "s",

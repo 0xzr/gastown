@@ -110,31 +110,7 @@ func runHealth(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	report := &HealthReport{
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-	}
-
-	// 1. Dolt Server
-	report.Server = checkServerHealth(townRoot)
-
-	// 2. Databases (only if server is running)
-	if report.Server.Running {
-		report.Databases = checkDatabaseHealth(report.Server.Port)
-	}
-
-	// 3. Pollution scan
-	if report.Server.Running {
-		report.Pollution = checkPollution(report.Server.Port)
-	}
-
-	// 4. Backups
-	report.Backups = checkBackupHealth(townRoot)
-
-	// 5. Processes
-	report.Processes = checkProcessHealth(report.Server.Port)
-
-	// 6. Orphans
-	report.Orphans = checkOrphanDBs(townRoot)
+	report := buildHealthReport(townRoot, defaultHealthReportDeps())
 
 	if healthJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -144,6 +120,59 @@ func runHealth(cmd *cobra.Command, args []string) error {
 
 	printHealthReport(report)
 	return nil
+}
+
+type healthReportDeps struct {
+	checkServerHealth    func(string) *ServerHealth
+	productionDatabases  func(string) []string
+	checkDatabaseHealth  func(int, []string) []DatabaseHealth
+	checkPollution       func(int, []string) []PollutionRecord
+	checkBackupHealth    func(string) *BackupHealth
+	checkProcessHealth   func(int) *ProcessHealth
+	checkOrphanDatabases func(string) []OrphanDB
+}
+
+func defaultHealthReportDeps() healthReportDeps {
+	return healthReportDeps{
+		checkServerHealth:    checkServerHealth,
+		productionDatabases:  doltserver.ConfiguredProductionDatabases,
+		checkDatabaseHealth:  checkDatabaseHealth,
+		checkPollution:       checkPollution,
+		checkBackupHealth:    checkBackupHealth,
+		checkProcessHealth:   checkProcessHealth,
+		checkOrphanDatabases: checkOrphanDBs,
+	}
+}
+
+func buildHealthReport(townRoot string, deps healthReportDeps) *HealthReport {
+	report := &HealthReport{
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	// 1. Dolt Server
+	report.Server = deps.checkServerHealth(townRoot)
+
+	// 2. Databases (only if server is running)
+	productionDBs := deps.productionDatabases(townRoot)
+	if report.Server.Running {
+		report.Databases = deps.checkDatabaseHealth(report.Server.Port, productionDBs)
+	}
+
+	// 3. Pollution scan
+	if report.Server.Running {
+		report.Pollution = deps.checkPollution(report.Server.Port, productionDBs)
+	}
+
+	// 4. Backups
+	report.Backups = deps.checkBackupHealth(townRoot)
+
+	// 5. Processes
+	report.Processes = deps.checkProcessHealth(report.Server.Port)
+
+	// 6. Orphans
+	report.Orphans = deps.checkOrphanDatabases(townRoot)
+
+	return report
 }
 
 func checkServerHealth(townRoot string) *ServerHealth {
@@ -177,8 +206,7 @@ func checkServerHealth(townRoot string) *ServerHealth {
 	return sh
 }
 
-func checkDatabaseHealth(port int) []DatabaseHealth {
-	productionDBs := []string{"hq", "gt", "mo"}
+func checkDatabaseHealth(port int, productionDBs []string) []DatabaseHealth {
 	var results []DatabaseHealth
 
 	for _, dbName := range productionDBs {
@@ -218,8 +246,7 @@ func checkDatabaseHealth(port int) []DatabaseHealth {
 	return results
 }
 
-func checkPollution(port int) []PollutionRecord {
-	productionDBs := []string{"hq", "gt", "mo"}
+func checkPollution(port int, productionDBs []string) []PollutionRecord {
 	var records []PollutionRecord
 
 	// Known pollution patterns to check in the issues table.
