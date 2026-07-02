@@ -89,6 +89,9 @@ Routing checks (fixable):
   - prefix-mismatch          Detect rigs.json vs routes.jsonl prefix mismatches (fixable)
   - database-prefix          Detect database vs routes.jsonl prefix mismatches (fixable)
 
+Rig data integrity checks (fixable):
+  - merge-slot-integrity     Detect rigs whose merge-slot bead has a corrupt Description (fixable)
+
 Lifecycle checks (fixable):
   - lifecycle-defaults          Ensure daemon.json has all lifecycle patrol entries (fixable)
 
@@ -265,6 +268,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewAgentBeadsCheck())
 	d.Register(doctor.NewStaleAgentBeadsCheck())
 	d.Register(doctor.NewRigBeadsCheck())
+	d.Register(doctor.NewMergeSlotIntegrityCheck())
 	d.Register(doctor.NewRoleBeadsCheck())
 
 	// NOTE: StaleAttachmentsCheck removed - staleness detection belongs in Deacon molecule
