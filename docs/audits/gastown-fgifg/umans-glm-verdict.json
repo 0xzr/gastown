@@ -1,0 +1,36 @@
+{
+  "verdict": "FAIL",
+  "findings": [
+    {
+      "classification": "BLOCKING",
+      "citation": ".beads/config.yaml:55-58 + commit message",
+      "explanation": "Scope mismatch: the commit message states the keys are 'for new gtviz rig', but the edit lands in the gastown MAIN repo's root .beads/config.yaml. The gtviz rig is a separate bare repo at /home/ubuntu/gt-town/gtviz/.repo.git with its own .beads/ directory, and internal/doctor/dolt_config_check.go validates each .beads/ dir independently. The three required keys (storage.backend, dolt.server, dolt.port) must be present in the gtviz rig's config to satisfy the doctor check for that rig; adding them to gastown does not fulfill the stated intent."
+    },
+    {
+      "classification": "BLOCKING",
+      "citation": ".beads/config.yaml:55 storage.backend: dolt",
+      "explanation": "Unintended side effect on the gastown root. By setting storage.backend='dolt' (plus dolt.port=3307) at gastown's root config, every 'bd' invocation in the gastown repo will now resolve Dolt as the storage backend and target port 3307 by default. The commit provides no evidence that gastown root is intended to be a shared-Dolt beads dir; this silently changes gastown's runtime behavior and may route gastown writes into the town-level Dolt instance."
+    },
+    {
+      "classification": "MAJOR",
+      "citation": "refinery-gate-*.jsonl (absent) + gastown-cet.12.4",
+      "explanation": "No gate panel on record for this commit. The prior audit gastown-cet.12.4 established the strict four-model rule (m3 / codex / umans-kimi / umans-glm). A commit touching cross-rig shared infrastructure config should have produced a telemetry entry in a refinery-gate-YYYYMMDD.jsonl file; none exists, so the four-model review was not performed."
+    },
+    {
+      "classification": "MAJOR",
+      "citation": ".beads/config.yaml:58 dolt.port: \"3307\"",
+      "explanation": "Cross-rig port coupling risk. Port 3307 is the town-level default Dolt port. If gtviz is expected to consume these keys (per the commit message) it will point at the town-level Dolt instance rather than its own, potentially reading/writing the wrong database. The gtviz rig may require a distinct port; hardcoding the town-level port here is not safe without explicit confirmation that gtviz and gastown share a single Dolt server."
+    },
+    {
+      "classification": "MINOR",
+      "citation": ".beads/config.yaml (no test diff)",
+      "explanation": "No tests added or updated. While config-only changes sometimes skip tests, this change alters default storage resolution for the gastown root and should include at minimum a regression test asserting that the gastown root config does (or does not) declare storage.backend, locking in the intended behavior."
+    },
+    {
+      "classification": "MINOR",
+      "citation": ".beads/config.yaml:55-58",
+      "explanation": "Style inconsistency: existing keys use quoted strings (dolt.idle-timeout: \"0\", export.auto: \"false\", sync.remote: \"git+https://...\") but the new storage.backend: dolt is bare. Either all values should be quoted or none; the mixed style breaks the file's existing convention."
+    }
+  ],
+  "summary": "The commit fails on two blocking fronts: it edits the wrong file (gastown root config instead of the gtviz rig's own .beads/config.yaml), and it silently flips gastown's default storage backend to Dolt on port 3307, changing runtime behavior for the main repo without justification. A missing four-model gate panel violates the strict rule from gastown-cet.12.4, and the hardcoded town-level port risks cross-rig database coupling if gtviz inherits these settings. Minor issues include absent tests and inconsistent quoting of the new keys."
+}

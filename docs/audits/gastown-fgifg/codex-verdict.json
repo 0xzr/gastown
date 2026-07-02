@@ -1,0 +1,31 @@
+{
+  "verdict": "FAIL",
+  "findings": [
+    {
+      "classification": "BLOCKING",
+      "citation": ".beads/config.yaml: storage.backend=dolt, dolt.server=127.0.0.1, dolt.port=3307 in commit 664aaf60",
+      "explanation": "The commit message says the change is for the gtviz rig, but the edited config is gastown's root .beads/config.yaml. Since gtviz has its own separate bare repo and .beads/config.yaml, this does not configure gtviz and instead changes gastown behavior."
+    },
+    {
+      "classification": "BLOCKING",
+      "citation": ".beads/config.yaml: dolt.port: 3307",
+      "explanation": "Every bd invocation from gastown root will now default to Dolt on 127.0.0.1:3307. That is a repository-wide behavioral side effect unrelated to the stated gtviz scope and can route gastown issue operations to the wrong or unavailable Dolt service."
+    },
+    {
+      "classification": "MAJOR",
+      "citation": "internal/doctor/dolt_config_check.go behavior: validates each .beads/ independently",
+      "explanation": "Because doctor validation is per-.beads directory, adding Dolt keys to gastown cannot satisfy gtviz's independent config check. The intended fix must be applied to gtviz's own .beads/config.yaml, with its own port choice."
+    },
+    {
+      "classification": "MAJOR",
+      "citation": "commit 664aaf60: no tests or gate-panel telemetry entry on record",
+      "explanation": "This changes issue-tracker backend selection and cross-rig operational wiring without test coverage or a recorded gate panel, leaving no evidence that bd operations and doctor checks still behave correctly."
+    },
+    {
+      "classification": "MINOR",
+      "citation": ".beads/config.yaml: dolt.server: \"127.0.0.1\" vs dolt.port: 3307",
+      "explanation": "The new YAML mixes quoted and unquoted scalar style. It is not functionally wrong, but it is inconsistent and should follow the existing config style."
+    }
+  ],
+  "summary": "FAIL: the commit is out of scope for the stated gtviz purpose and introduces a dangerous gastown-wide Dolt default on port 3307 without tests or gate evidence."
+}

@@ -1,0 +1,36 @@
+{
+  "verdict": "FAIL",
+  "findings": [
+    {
+      "classification": "BLOCKING",
+      "citation": ".beads/config.yaml:55-57 (added lines); commit message 'for new gtviz rig'",
+      "explanation": "Scope mismatch: the commit message says 'for new gtviz rig' but the change is in the GASTOWN root .beads/config.yaml, not the gtviz rig's own .beads/config.yaml. The gtviz rig lives in a separate repo (/home/ubuntu/gt-town/gtviz/.repo.git, see /home/ubuntu/gt-town/gtviz/config.json) and has its own .beads/ directory created by rig bootstrap. The doctor check (internal/doctor/dolt_config_check.go::checkBeadsDir) walks every .beads/ in the town and validates each one independently. Adding these keys only to the gastown root leaves the gtviz rig's .beads/config.yaml without them, so the doctor check will still WARN for the gtviz rig. The intended fix was for the gtviz rig, but it landed in the wrong repo."
+    },
+    {
+      "classification": "BLOCKING",
+      "citation": "internal/doctor/dolt_config_check.go:155-185; .beads/config.yaml:55-57",
+      "explanation": "Implicit port coupling: the commit hardcodes dolt.port: 3307 in the GASTOWN root, but the gtviz rig's dolt server is at a different port (gtviz uses its own port per config.json). The doctor check resolves the port from dolt-server.port file or metadata.json (dolt_config_check.go:175 doltPortFile). The static 3307 in the root config is the TOWN dolt port, not the gtviz rig's. If gtviz connects to port 3307 thinking it's its own server, it will hit the wrong database. Cross-rig dolt port coupling is a configuration error."
+    },
+    {
+      "classification": "MAJOR",
+      "citation": ".beads/config.yaml:55-57",
+      "explanation": "Side effect on every other beads command in the gastown root: setting storage.backend: dolt + dolt.server: 127.0.0.1 + dolt.port: 3307 at the root level changes the default for ALL bd invocations in the gastown root. Any existing local beads commands that were using an embedded backend or a different port will now silently switch to the town Dolt. The change should be scoped to a specific beads dir (e.g., .beads/gtviz/config.yaml) or to the gtviz rig's own config, not the root."
+    },
+    {
+      "classification": "MAJOR",
+      "citation": "commit 664aaf60 (no test files added)",
+      "explanation": "No tests added for the new config keys. internal/doctor/dolt_config_check_test.go:46 sets up a similar config but only covers the doctor check itself, not whether the keys are correctly consumed by bd commands. The new behavior (town-root beads now resolves storage.backend='dolt' + port 3307 by default) is untested."
+    },
+    {
+      "classification": "MAJOR",
+      "citation": "process: no telemetry entry in /home/ubuntu/gt-town/.runtime/refinery-telemetry/refinery-gate-20260624.jsonl",
+      "explanation": "Process violation: the commit reached origin/main with no gate panel on record. There is no telemetry event for commit 664aaf60 in any refinery-gate-YYYYMMDD.jsonl file, and no gate log at /home/ubuntu/gt-town/.runtime/refinery-gate-logs/ for the commit hash 664aaf6. Per the corrected strict four-model rule (m3 / codex / umans-kimi / umans-glm), every merge to main must have a recorded gate panel. This is the same class of degraded-quorum bypass that the gtviz initial-commit audit (gastown-cet.12.4) flagged. Follow-up: file bead to require a CI failure when a commit reaches main without a gate record."
+    },
+    {
+      "classification": "MINOR",
+      "citation": ".beads/config.yaml:55-57 (style: bare vs quoted strings)",
+      "explanation": "Inconsistent quoting: dolt.server: \"127.0.0.1\" is quoted (because YAML scalar 127.0.0.1 could be ambiguously parsed) but dolt.port: 3307 is bare. The doctor check parser (configYAMLValues at line 215) trims quotes, so both work, but the asymmetry is jarring. dolt.server could be `dolt.server: 127.0.0.1` since the value is not ambiguous. (Alternatively, keep both quoted for safety — but pick one style.)"
+    }
+  ],
+  "summary": "FAIL — The commit adds three valid Dolt config keys but lands them in the wrong location: the GASTOWN root .beads/config.yaml instead of the gtviz rig's own .beads/config.yaml. The doctor check (internal/doctor/dolt_config_check.go) validates every .beads/ independently, so the gtviz rig will still fail the check after this commit. Additionally, hardcoding port 3307 in the root config creates implicit cross-rig coupling (gtviz's own port is different), and the change becomes the default for all bd invocations in the gastown root, which is a broad side effect for what the message describes as a single-rig fix. No tests added, and the commit reached main with no gate panel on record (no telemetry event for 664aaf60), repeating the degraded-quorum bypass pattern flagged in gastown-cet.12.4. Required: revert or relocate the change to the gtviz rig's own .beads/config.yaml (gtviz repo), and require a gate record for any future merge."
+}
