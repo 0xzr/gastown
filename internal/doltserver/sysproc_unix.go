@@ -15,12 +15,6 @@ func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-// setTestProcessGroup puts a test-owned server in its own process group and
-// asks the kernel to kill it if the test binary dies abruptly.
-func setTestProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
-}
-
 // processIsAlive checks whether a process with the given PID is still running.
 func processIsAlive(pid int) bool {
 	process, err := os.FindProcess(pid)
