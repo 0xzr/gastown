@@ -67,6 +67,7 @@ Dog agent or daemon orchestrator.
 When run by a Dog:
   gt reaper scan --db=gastown          # Discover candidates
   gt reaper reap --db=gastown          # Close stale wisps
+  gt reaper clean-dangling --db=gastown # Remove dangling parent dep records
   gt reaper purge --db=gastown         # Delete old closed wisps + mail
   gt reaper auto-close --db=gastown    # Close stale issues`,
 	RunE: requireSubcommand,
@@ -370,6 +371,88 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 	},
 }
 
+var reaperCleanDanglingCmd = &cobra.Command{
+	Use:   "clean-dangling",
+	Short: "Remove dangling wisp parent dependency records",
+	Long: `Delete wisp_dependencies rows of type 'parent-child' whose parent
+wisp or issue no longer exists. These accumulate when a parent is purged by a
+path that did not cascade-clean wisp_dependencies, and they show up as
+'dangling_parent_ref' anomalies in scan output.
+
+This is a dedicated reaper step that runs on every cycle regardless of purge
+candidates, so the historical backlog drains even when retention has not
+expired (gastown-3bdqa).
+
+When --db is provided, cleans a single database. When omitted, auto-discovers
+all databases on the Dolt server and cleans each one.
+
+Returns the count of removed rows. Use --dry-run to preview.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		databases := reaperDatabaseNames()
+
+		var results []*reaper.DanglingCleanResult
+		for i, dbName := range databases {
+			if err := waitBeforeReaperDatabase(i); err != nil {
+				return err
+			}
+			if err := reaper.ValidateDBName(dbName); err != nil {
+				fmt.Fprintf(os.Stderr, "skip invalid db: %s\n", dbName)
+				continue
+			}
+
+			db, err := reaper.OpenDB(reaperHost, reaperPort, dbName, 30*time.Second, 30*time.Second)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: connect error: %v\n", dbName, err)
+				continue
+			}
+
+			if ok, err := reaper.HasReaperSchema(db); err != nil {
+				fmt.Fprintf(os.Stderr, "%s: schema check error: %v\n", dbName, err)
+				db.Close()
+				continue
+			} else if !ok {
+				db.Close()
+				continue
+			}
+
+			result, err := reaper.CleanDanglingParentRefs(db, dbName, reaperDryRun)
+			db.Close()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: clean-dangling error: %v\n", dbName, err)
+				continue
+			}
+			results = append(results, result)
+		}
+
+		if reaperJSON {
+			fmt.Println(reaper.FormatJSON(results))
+		} else {
+			var totalCleaned int
+			for _, r := range results {
+				prefix := ""
+				if r.DryRun {
+					prefix = "[DRY RUN] would "
+				}
+				fmt.Printf("%s: %scleaned %d dangling parent refs\n",
+					r.Database, prefix, r.Cleaned)
+				for _, a := range r.Anomalies {
+					fmt.Printf("  %s %s\n", style.Warning.Render("ANOMALY:"), a.Message)
+				}
+				totalCleaned += r.Cleaned
+			}
+			if len(results) > 1 {
+				prefix := ""
+				if reaperDryRun {
+					prefix = "[DRY RUN] "
+				}
+				fmt.Printf("\n%sClean-dangling summary (%d databases): cleaned %d dangling parent refs\n",
+					prefix, len(results), totalCleaned)
+			}
+		}
+		return nil
+	},
+}
+
 var reaperAutoCloseCmd = &cobra.Command{
 	Use:   "auto-close",
 	Short: "Close stale issues past stale-age",
@@ -591,18 +674,18 @@ func init() {
 		}
 	}
 
-	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRunCmd, reaperDatabasesCmd} {
+	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperCleanDanglingCmd, reaperAutoCloseCmd, reaperRunCmd, reaperDatabasesCmd} {
 		cmd.Flags().StringVar(&reaperDB, "db", "", "Database name (required for single-db commands)")
 		cmd.Flags().StringVar(&reaperHost, "host", defaultHost, "Dolt server host (env: GT_DOLT_HOST)")
 		cmd.Flags().IntVar(&reaperPort, "port", defaultPort, "Dolt server port (env: GT_DOLT_PORT)")
 		cmd.Flags().BoolVar(&reaperDryRun, "dry-run", false, "Report what would happen without acting")
 	}
-	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRunCmd} {
+	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperCleanDanglingCmd, reaperAutoCloseCmd, reaperRunCmd} {
 		cmd.Flags().StringVar(&reaperDBDelay, "db-delay", "250ms", "Delay between databases to reduce Dolt load")
 	}
 
 	// JSON output flag for single-db commands
-	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperDatabasesCmd} {
+	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperCleanDanglingCmd, reaperAutoCloseCmd, reaperDatabasesCmd} {
 		cmd.Flags().BoolVar(&reaperJSON, "json", false, "Output as JSON")
 	}
 
@@ -622,6 +705,7 @@ func init() {
 	reaperCmd.AddCommand(reaperScanCmd)
 	reaperCmd.AddCommand(reaperReapCmd)
 	reaperCmd.AddCommand(reaperPurgeCmd)
+	reaperCmd.AddCommand(reaperCleanDanglingCmd)
 	reaperCmd.AddCommand(reaperAutoCloseCmd)
 	reaperCmd.AddCommand(reaperRunCmd)
 

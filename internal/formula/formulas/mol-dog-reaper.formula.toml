@@ -85,6 +85,9 @@ gt reaper scan --db=<name> --port={{dolt_port}} \\
 
 **4. Decide whether to proceed:**
 - If no candidates found across all databases, including `molecule_step_candidates`, skip remaining steps
+- EXCEPTION: still run the `clean-dangling` step (next) if any scan reported a
+  `dangling_parent_ref` anomaly — dangling refs drain independent of purge
+  candidates and retention windows (gastown-3bdqa)
 - If anomalies are severe, consider escalating before proceeding
 
 **Exit criteria:** Scan complete, candidates identified, anomalies flagged."""
@@ -117,9 +120,41 @@ log a warning and consider escalating.
 **Exit criteria:** All stale wisps closed (or dry-run counts reported)."""
 
 [[steps]]
+id = "clean-dangling"
+title = "Clean dangling wisp parent dependency records"
+needs = ["reap"]
+description = """
+Remove `wisp_dependencies` rows of type `parent-child` whose parent wisp or
+issue no longer exists. These accumulate when a parent is purged by a path that
+did not cascade-clean `wisp_dependencies`, and they show up as
+`dangling_parent_ref` anomalies in scan output.
+
+This step runs on EVERY cycle, independent of purge candidates, so the
+historical backlog drains even when retention has not expired and the purge
+step has nothing to delete (gastown-3bdqa).
+
+**1. For each database scanned in the scan step:**
+```bash
+gt reaper clean-dangling --db=<name> --port={{dolt_port}} \\
+  --db-delay={{db_delay}} \\
+  {{#if dry_run}}--dry-run{{/if}} --json
+```
+
+**2. Inspect results:**
+- `cleaned` is the count of dangling parent refs removed (or that would be, in dry-run)
+- `dangling_cleanup_failed` / `sql_commit_failed` / `dolt_commit_failed`
+  anomalies indicate the cleanup could not persist its deletes — flag these
+- A zero `cleaned` count is normal once the backlog has drained
+
+**Safety:** Only touches `wisp_dependencies` rows whose parent is already gone
+(wisp AND issue both missing). Active parent links are never deleted.
+
+**Exit criteria:** Dangling parent refs removed (or dry-run count reported)."""
+
+[[steps]]
 id = "purge"
 title = "Purge old closed wisps and mail"
-needs = ["reap"]
+needs = ["clean-dangling"]
 description = """
 Delete closed wisps past purge_age and closed mail past mail_delete_age.
 
