@@ -577,6 +577,27 @@ func TestIsRuntimeRunning_ShellWithNodeChild(t *testing.T) {
 	})
 }
 
+// waitForPaneCommand polls GetPaneCommand until it returns want or the timeout
+// elapses. After NewSessionWithCommand, pane_current_command can transiently
+// report the just-replaced shell (e.g. "sh") for a few milliseconds while
+// respawn-pane's new process registers — especially under the load of a full
+// parallel test suite. This mirrors the tolerance already applied in
+// TestIsAgentRunning (retry loop) and via WaitForShellReady. See gs-2v7.
+func waitForPaneCommand(t *testing.T, tm *Tmux, session, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var cmd string
+	for time.Now().Before(deadline) {
+		var err error
+		cmd, err = tm.GetPaneCommand(session)
+		if err == nil && cmd == want {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("pane command for %q never settled to %q (last saw %q) within %s", session, want, cmd, timeout)
+}
+
 // TestGetPaneCommand_MultiPane verifies that GetPaneCommand returns pane 0's
 // command even when a split pane exists and is active. This is the core fix
 // for gs-2v7: without explicit pane 0 targeting, health checks would see the
@@ -593,7 +614,11 @@ func TestGetPaneCommand_MultiPane(t *testing.T) {
 	}
 	defer func() { _ = tm.KillSession(sessionName) }()
 
-	// Verify pane 0 shows "sleep"
+	// Verify pane 0 shows "sleep". Use a polling wait rather than a single
+	// read: under a loaded parallel test run, respawn-pane's replacement of the
+	// initial shell with "sleep" is not instant and GetPaneCommand can briefly
+	// return the stale shell ("sh") right after creation.
+	waitForPaneCommand(t, tm, sessionName, "sleep", 3*time.Second)
 	cmd, err := tm.GetPaneCommand(sessionName)
 	if err != nil {
 		t.Fatalf("GetPaneCommand before split: %v", err)
