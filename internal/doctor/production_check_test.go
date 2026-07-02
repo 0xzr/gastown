@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -23,6 +24,7 @@ func TestProductionChecksRegistered(t *testing.T) {
 	want := []string{
 		"prod-dolt-service",
 		"prod-dolt-databases",
+		"prod-rig-inventory",
 		"prod-dolt-query-canary",
 		"prod-daemon-heartbeat",
 		"prod-tmux-ownership",
@@ -35,6 +37,90 @@ func TestProductionChecksRegistered(t *testing.T) {
 	}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("ProductionChecks names = %#v, want %#v", names, want)
+	}
+}
+
+func TestProductionRigInventoryCheckReportsConfiguredRigs(t *testing.T) {
+	root := t.TempDir()
+	for _, rig := range []string{"gastown", "polybot"} {
+		if err := os.MkdirAll(filepath.Join(root, rig, "polecats"), 0o755); err != nil {
+			t.Fatalf("mkdir rig: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(root, rig, "config.json"), []byte(`{"type":"rig"}`), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	}
+	deps := productionRigInventoryDeps{
+		loadRigs: func(gotRoot string) (map[string]config.RigEntry, string, error) {
+			if gotRoot != root {
+				t.Fatalf("root = %q, want %q", gotRoot, root)
+			}
+			return map[string]config.RigEntry{
+				"polybot": {BeadsConfig: &config.BeadsConfig{Prefix: "pb"}},
+				"gastown": {BeadsConfig: &config.BeadsConfig{Prefix: "gt"}},
+			}, filepath.Join(root, "mayor", "rigs.json"), nil
+		},
+		hasSession: func(name string) (bool, error) {
+			switch name {
+			case "pb-witness", "pb-refinery", "gt-witness", "gt-refinery":
+				return true, nil
+			default:
+				return false, nil
+			}
+		},
+		countDirs: func(path string) (int, error) {
+			switch path {
+			case filepath.Join(root, "polybot", "polecats"):
+				return 2, nil
+			case filepath.Join(root, "gastown", "polecats"):
+				return 3, nil
+			default:
+				return 0, nil
+			}
+		},
+		schedulerMax: func(root string) (int, error) { return 3, nil },
+	}
+
+	res := newProductionRigInventoryCheck(deps).Run(&CheckContext{TownRoot: root})
+	if res.Status != StatusOK {
+		t.Fatalf("Status = %v, want OK; message=%q details=%v", res.Status, res.Message, res.Details)
+	}
+	if !strings.Contains(res.Message, "gastown,polybot") {
+		t.Fatalf("Message = %q, want sorted rig names", res.Message)
+	}
+	if !detailsContain(res.Details, "Scheduler max_polecats (town-wide): 3") {
+		t.Fatalf("Details = %#v, want scheduler max evidence", res.Details)
+	}
+	if !detailsContain(res.Details, "Rig polybot: prefix=pb witness=running refinery=running polecats=2") {
+		t.Fatalf("Details = %#v, want polybot runtime evidence", res.Details)
+	}
+}
+
+func TestProductionRigInventoryCheckWarnsOnStoppedRuntime(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "polybot", "polecats"), 0o755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "polybot", "config.json"), []byte(`{"type":"rig"}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	deps := productionRigInventoryDeps{
+		loadRigs: func(string) (map[string]config.RigEntry, string, error) {
+			return map[string]config.RigEntry{
+				"polybot": {BeadsConfig: &config.BeadsConfig{Prefix: "polybot"}},
+			}, filepath.Join(root, "mayor", "rigs.json"), nil
+		},
+		hasSession:   func(string) (bool, error) { return false, nil },
+		countDirs:    func(string) (int, error) { return 0, nil },
+		schedulerMax: func(string) (int, error) { return 3, nil },
+	}
+
+	res := newProductionRigInventoryCheck(deps).Run(&CheckContext{TownRoot: root})
+	if res.Status != StatusWarning {
+		t.Fatalf("Status = %v, want Warning; message=%q details=%v", res.Status, res.Message, res.Details)
+	}
+	if !detailsContain(res.Details, "witness=stopped refinery=stopped") {
+		t.Fatalf("Details = %#v, want stopped runtime evidence", res.Details)
 	}
 }
 

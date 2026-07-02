@@ -11,7 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
+	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 // ProductionChecks returns the focused, read-only checks for production triage.
@@ -20,6 +23,7 @@ func ProductionChecks() []Check {
 	return []Check{
 		newProductionDoltServiceCheck(defaultProductionServiceDeps()),
 		newProductionDoltDatabasesCheck(doltDeps),
+		newProductionRigInventoryCheck(defaultProductionRigInventoryDeps()),
 		newProductionDoltQueryCanaryCheck(defaultProductionDoltQueryCanaryDeps()),
 		newProductionDaemonHeartbeatCheck(defaultProductionDaemonDeps()),
 		NewProductionTmuxOwnershipCheck(),
@@ -29,6 +33,139 @@ func ProductionChecks() []Check {
 		newProductionRandomDoltListenersCheck(defaultProductionDoltListenerDeps()),
 		newProductionLegacyDatabasePollutionCheck(doltDeps),
 		newProductionUMANSEvidenceCheck(defaultProductionUMANSDeps()),
+	}
+}
+
+type productionRigInventoryDeps struct {
+	loadRigs     func(string) (map[string]config.RigEntry, string, error)
+	hasSession   func(string) (bool, error)
+	countDirs    func(string) (int, error)
+	schedulerMax func(string) (int, error)
+}
+
+func defaultProductionRigInventoryDeps() productionRigInventoryDeps {
+	return productionRigInventoryDeps{
+		loadRigs:     loadProductionRigsConfig,
+		hasSession:   tmux.NewTmux().HasSession,
+		countDirs:    countChildDirs,
+		schedulerMax: loadProductionSchedulerMax,
+	}
+}
+
+type ProductionRigInventoryCheck struct {
+	BaseCheck
+	deps productionRigInventoryDeps
+}
+
+func NewProductionRigInventoryCheck() *ProductionRigInventoryCheck {
+	return newProductionRigInventoryCheck(defaultProductionRigInventoryDeps())
+}
+
+func newProductionRigInventoryCheck(deps productionRigInventoryDeps) *ProductionRigInventoryCheck {
+	return &ProductionRigInventoryCheck{
+		BaseCheck: BaseCheck{
+			CheckName:        "prod-rig-inventory",
+			CheckDescription: "Enumerate configured production rigs and runtime sessions",
+			CheckCategory:    CategoryProduction,
+		},
+		deps: deps,
+	}
+}
+
+func (c *ProductionRigInventoryCheck) Run(ctx *CheckContext) *CheckResult {
+	rigs, source, err := c.deps.loadRigs(ctx.TownRoot)
+	if err != nil {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusError,
+			Message: "cannot load configured rigs",
+			Details: []string{err.Error()},
+		}
+	}
+	if len(rigs) == 0 {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusError,
+			Message: "no rigs configured in rigs.json",
+			Details: []string{"Source: " + source},
+		}
+	}
+
+	names := make([]string, 0, len(rigs))
+	for name := range rigs {
+		if strings.TrimSpace(name) != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+
+	status := StatusOK
+	details := []string{"Source: " + source}
+	if maxPolecats, err := c.deps.schedulerMax(ctx.TownRoot); err == nil {
+		details = append(details, fmt.Sprintf("Scheduler max_polecats (town-wide): %d", maxPolecats))
+	} else {
+		status = maxStatus(status, StatusWarning)
+		details = append(details, "Scheduler max_polecats unavailable: "+err.Error())
+	}
+
+	for _, name := range names {
+		entry := rigs[name]
+		prefix := name
+		if entry.BeadsConfig != nil && strings.TrimSpace(entry.BeadsConfig.Prefix) != "" {
+			prefix = strings.TrimSpace(entry.BeadsConfig.Prefix)
+		}
+
+		rigDir := filepath.Join(ctx.TownRoot, name)
+		dirStatus := "present"
+		if info, err := os.Stat(rigDir); err != nil || !info.IsDir() {
+			status = maxStatus(status, StatusError)
+			dirStatus = "missing"
+		}
+
+		configStatus := "present"
+		if info, err := os.Stat(filepath.Join(rigDir, "config.json")); err != nil || info.IsDir() {
+			status = maxStatus(status, StatusWarning)
+			configStatus = "missing"
+		}
+
+		witness := runtimeSessionStatus(c.deps.hasSession, session.WitnessSessionName(prefix))
+		refinery := runtimeSessionStatus(c.deps.hasSession, session.RefinerySessionName(prefix))
+		if witness != "running" || refinery != "running" {
+			status = maxStatus(status, StatusWarning)
+		}
+
+		polecats, polecatErr := c.deps.countDirs(filepath.Join(rigDir, "polecats"))
+		if polecatErr != nil {
+			status = maxStatus(status, StatusWarning)
+		}
+		crew, crewErr := c.deps.countDirs(filepath.Join(rigDir, "crew"))
+		if crewErr != nil {
+			status = maxStatus(status, StatusWarning)
+		}
+
+		line := fmt.Sprintf("Rig %s: prefix=%s witness=%s refinery=%s polecats=%d crew=%d dir=%s config=%s",
+			name, prefix, witness, refinery, polecats, crew, dirStatus, configStatus)
+		if polecatErr != nil {
+			line += " polecat_count_error=" + polecatErr.Error()
+		}
+		if crewErr != nil {
+			line += " crew_count_error=" + crewErr.Error()
+		}
+		details = append(details, line)
+	}
+
+	message := "configured rigs: " + formatStringList(names)
+	if status == StatusWarning {
+		message = "configured rigs need attention: " + formatStringList(names)
+	}
+	if status == StatusError {
+		message = "configured rig inventory is broken: " + formatStringList(names)
+	}
+	return &CheckResult{
+		Name:    c.Name(),
+		Status:  status,
+		Message: message,
+		Details: details,
 	}
 }
 
@@ -408,6 +545,60 @@ func readLastLogLine(path string) (logEvidence, error) {
 		return logEvidence{Path: path, ModTime: info.ModTime()}, fmt.Errorf("empty log")
 	}
 	return logEvidence{Path: path, Line: last, ModTime: info.ModTime()}, nil
+}
+
+func loadProductionRigsConfig(townRoot string) (map[string]config.RigEntry, string, error) {
+	var lastErr error
+	for _, path := range []string{
+		filepath.Join(townRoot, "mayor", "rigs.json"),
+		filepath.Join(townRoot, "rigs.json"),
+	} {
+		rigsConfig, err := config.LoadRigsConfig(path)
+		if err == nil {
+			return rigsConfig.Rigs, path, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("rigs.json not found")
+	}
+	return nil, "", lastErr
+}
+
+func loadProductionSchedulerMax(townRoot string) (int, error) {
+	settings, err := config.LoadOrCreateTownSettings(config.TownSettingsPath(townRoot))
+	if err != nil {
+		return 0, err
+	}
+	return settings.Scheduler.GetMaxPolecats(), nil
+}
+
+func countChildDirs(path string) (int, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func runtimeSessionStatus(hasSession func(string) (bool, error), name string) string {
+	running, err := hasSession(name)
+	if err != nil {
+		return "unknown"
+	}
+	if running {
+		return "running"
+	}
+	return "stopped"
 }
 
 func cleanSortedStrings(values []string) []string {
