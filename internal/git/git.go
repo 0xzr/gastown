@@ -1399,6 +1399,23 @@ func (g *Git) HasUpstreamRemote() (bool, error) {
 	return true, nil
 }
 
+// HasRemote returns true if a remote with the given name is configured.
+// Mirrors HasUpstreamRemote for arbitrary remote names: a missing remote
+// returns (false, nil) so callers can fall back to non-remote evidence paths
+// without surfacing a probe error that masks the legitimate "no comparison
+// refs" signal (gastown-1gd). A real git failure (corrupt repo, permission
+// denied on the remote list) is still surfaced as an error.
+func (g *Git) HasRemote(name string) (bool, error) {
+	_, err := g.run("remote", "get-url", name)
+	if err != nil {
+		if strings.Contains(err.Error(), "No such remote") {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // FetchUpstream fetches from the upstream remote.
 func (g *Git) FetchUpstream() error {
 	_, err := g.run("fetch", "upstream")
@@ -2835,33 +2852,46 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 	hasEvidence := len(nonEmptyUnique(targets)) > 0
 
 	if includeExactBranch && localBranch != "" && localBranch != "HEAD" {
-		remoteSHA, err := g.PushRemoteBranchTip(remote, localBranch)
-		switch {
-		case err == nil && remoteSHA != "":
-			hasEvidence = true
-			result.ComparisonBase = remote + "/" + localBranch
-			if contains, containsErr := g.refContainsHead(remoteSHA); containsErr == nil && contains {
-				result.Preserved = true
-				result.UnpreservedPatchCount = 0
-				result.Evidence = "exact_remote_branch"
-				return result, nil
+		// Skip the exact-branch probe when the remote is not configured
+		// (gastown-1gd). Temp repos, fresh clones, and unit-test fixtures
+		// frequently have no origin, and `git ls-remote <missing-remote>`
+		// produces a hard error that masks the "no comparison refs" signal
+		// callers rely on to treat unpushed local work as such. The probe
+		// error path below still fires for *configured-but-unreachable*
+		// remotes (network/auth failures); only the truly-missing case is
+		// short-circuited here.
+		if hasRemote, hasErr := g.HasRemote(remote); hasErr == nil && !hasRemote {
+			// No remote → no exact-branch probe. Fall through to other
+			// evidence paths (upstream/targets/default-branch ref lookup).
+		} else {
+			remoteSHA, err := g.PushRemoteBranchTip(remote, localBranch)
+			switch {
+			case err == nil && remoteSHA != "":
+				hasEvidence = true
+				result.ComparisonBase = remote + "/" + localBranch
+				if contains, containsErr := g.refContainsHead(remoteSHA); containsErr == nil && contains {
+					result.Preserved = true
+					result.UnpreservedPatchCount = 0
+					result.Evidence = "exact_remote_branch"
+					return result, nil
+				}
+				candidates = append(candidates, remoteSHA)
+			case err == nil && remoteSHA == "":
+				// GENUINE missing-branch signal (gastown-1gd): ls-remote succeeded
+				// but reported no SHA for this branch. Common after post-merge
+				// cleanup deletes the merged branch (hq-4do). Flag it for callers
+				// so they can warn instead of hard-blocking capacity, and fall
+				// through to compare against target/custody refs.
+				result.RemoteSourceBranchMissing = true
+			default:
+				// err != nil: a real probe failure (network timeout, auth denied,
+				// permission denied, etc.) — NOT a missing branch. Recording this
+				// as RemoteSourceBranchMissing would silently mask transient
+				// failures and let callers nuke live work, so propagate the error
+				// via lastErr instead. The function surfaces lastErr at the bottom
+				// when no comparison ref produced evidence.
+				lastErr = err
 			}
-			candidates = append(candidates, remoteSHA)
-		case err == nil && remoteSHA == "":
-			// GENUINE missing-branch signal (gastown-1gd): ls-remote succeeded
-			// but reported no SHA for this branch. Common after post-merge
-			// cleanup deletes the merged branch (hq-4do). Flag it for callers
-			// so they can warn instead of hard-blocking capacity, and fall
-			// through to compare against target/custody refs.
-			result.RemoteSourceBranchMissing = true
-		default:
-			// err != nil: a real probe failure (network timeout, auth denied,
-			// permission denied, etc.) — NOT a missing branch. Recording this
-			// as RemoteSourceBranchMissing would silently mask transient
-			// failures and let callers nuke live work, so propagate the error
-			// via lastErr instead. The function surfaces lastErr at the bottom
-			// when no comparison ref produced evidence.
-			lastErr = err
 		}
 	}
 
