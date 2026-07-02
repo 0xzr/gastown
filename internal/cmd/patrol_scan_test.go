@@ -46,6 +46,26 @@ func TestPatrolScanOutputJSON(t *testing.T) {
 				},
 			},
 		},
+		Stranded: &PatrolScanStrandedOutput{
+			Checked: 2,
+			Found:   1,
+			Items: []PatrolScanStrandedItem{
+				{
+					Polecat:            "delta",
+					Branch:             "polecat/delta/gt-x",
+					Issue:              "gt-x",
+					CleanupStatus:      "has_unpushed",
+					UnpushedCommits:    2,
+					ComparisonBase:     "origin/main",
+					ActivityAgeSeconds: 1800,
+					SessionRunning:     true,
+					ProcessAlive:       true,
+					Action:             "nudge_gt_done",
+					NudgeTarget:        "gastown/polecats/delta",
+					SuggestedMessage:   "Run `gt done` now",
+				},
+			},
+		},
 		Fleet: &witness.FleetState{
 			Rig:                  "gastown",
 			ActiveImplementation: []string{"alpha"},
@@ -121,6 +141,22 @@ func TestPatrolScanOutputJSON(t *testing.T) {
 	if parsed.Fleet.IsEmpty {
 		t.Error("Fleet.IsEmpty = true; want false (gates + impl present)")
 	}
+	if parsed.Stranded == nil {
+		t.Fatal("Stranded = nil; want populated")
+	}
+	if parsed.Stranded.Found != 1 {
+		t.Errorf("Stranded.Found = %d, want 1", parsed.Stranded.Found)
+	}
+	if len(parsed.Stranded.Items) != 1 {
+		t.Fatalf("len(Stranded.Items) = %d, want 1", len(parsed.Stranded.Items))
+	}
+	stranded := parsed.Stranded.Items[0]
+	if stranded.UnpushedCommits != 2 {
+		t.Errorf("stranded UnpushedCommits = %d, want 2", stranded.UnpushedCommits)
+	}
+	if stranded.NudgeTarget != "gastown/polecats/delta" {
+		t.Errorf("stranded NudgeTarget = %q, want gastown/polecats/delta", stranded.NudgeTarget)
+	}
 }
 
 // TestOutputPatrolScanJSON_CapturesBuffer verifies the io.Writer seam
@@ -142,12 +178,27 @@ func TestOutputPatrolScanJSON_CapturesBuffer(t *testing.T) {
 		PostSubmitGate: []string{"alpha"},
 		IsEmpty:        false,
 	}
-	if err := outputPatrolScanJSON(&buf, "gastown", "2026-06-29T00:00:00Z", zombie, nil, nil, fleet, nil); err != nil {
+	stranded := &PatrolScanStrandedOutput{
+		Checked: 1,
+		Found:   1,
+		Items: []PatrolScanStrandedItem{
+			{
+				Polecat:         "delta",
+				UnpushedCommits: 1,
+				Action:          "nudge_gt_done",
+				NudgeTarget:     "gastown/polecats/delta",
+			},
+		},
+	}
+	if err := outputPatrolScanJSON(&buf, "gastown", "2026-06-29T00:00:00Z", zombie, nil, nil, stranded, fleet, nil); err != nil {
 		t.Fatalf("outputPatrolScanJSON: %v", err)
 	}
 	got := buf.String()
 	for _, want := range []string{
 		`"rig": "gastown"`,
+		`"stranded"`,
+		`"nudge_gt_done"`,
+		`"gastown/polecats/delta"`,
 		`"fleet"`,
 		`"PostSubmitGate"`,
 		`"alpha"`,
@@ -164,7 +215,7 @@ func TestOutputPatrolScanJSON_CapturesBuffer(t *testing.T) {
 // patrol must still emit valid JSON without a fleet field.
 func TestOutputPatrolScanJSON_NilFleetIsOmitted(t *testing.T) {
 	var buf bytes.Buffer
-	if err := outputPatrolScanJSON(&buf, "gastown", "2026-06-29T00:00:00Z", nil, nil, nil, nil, nil); err != nil {
+	if err := outputPatrolScanJSON(&buf, "gastown", "2026-06-29T00:00:00Z", nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("outputPatrolScanJSON: %v", err)
 	}
 	if strings.Contains(buf.String(), `"Fleet"`) {

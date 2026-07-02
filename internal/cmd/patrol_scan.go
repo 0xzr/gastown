@@ -12,17 +12,23 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/alerts"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/witness"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 var (
-	patrolScanJSON    bool
-	patrolScanNotify  bool
-	patrolScanRig     string
-	patrolScanVerbose bool
+	patrolScanJSON         bool
+	patrolScanNotify       bool
+	patrolScanRig          string
+	patrolScanVerbose      bool
+	patrolScanStrandedOnly bool
 )
 
 var patrolScanCmd = &cobra.Command{
@@ -52,7 +58,8 @@ Examples:
   gt patrol scan                    # Scan current rig
   gt patrol scan --rig gastown      # Scan specific rig
   gt patrol scan --json             # Machine-readable output
-  gt patrol scan --notify           # Send mail on zombie detection`,
+  gt patrol scan --notify           # Send mail on zombie detection
+  gt patrol scan --stranded-only --json  # Nudge-only stranded commit evidence`,
 	RunE: runPatrolScan,
 }
 
@@ -61,6 +68,7 @@ func init() {
 	patrolScanCmd.Flags().BoolVar(&patrolScanNotify, "notify", false, "Send mail to witness/mayor when active-work zombies are detected")
 	patrolScanCmd.Flags().StringVar(&patrolScanRig, "rig", "", "Rig to scan (default: infer from cwd or GT_RIG)")
 	patrolScanCmd.Flags().BoolVarP(&patrolScanVerbose, "verbose", "v", false, "Verbose output")
+	patrolScanCmd.Flags().BoolVar(&patrolScanStrandedOnly, "stranded-only", false, "Only emit live idle unpushed-commit nudge candidates; runs no zombie, stall, or completion actions")
 
 	patrolCmd.AddCommand(patrolScanCmd)
 }
@@ -74,6 +82,7 @@ type PatrolScanOutput struct {
 	Zombies     *PatrolScanZombieOutput   `json:"zombies"`
 	Stalls      *PatrolScanStallOutput    `json:"stalls,omitempty"`
 	Completions *PatrolScanCompleteOutput `json:"completions,omitempty"`
+	Stranded    *PatrolScanStrandedOutput `json:"stranded,omitempty"`
 	// Fleet is the per-bucket polecat composition: implementation,
 	// post-submit gate, recovery-held, idle. Patrol consumers (witness,
 	// mayor) read this to answer "is anything actually in flight?" without
@@ -136,6 +145,32 @@ type PatrolScanCompleteItem struct {
 	CompletionTime string `json:"completion_time,omitempty"`
 }
 
+// PatrolScanStrandedOutput holds live-but-idle polecats with unpushed work.
+type PatrolScanStrandedOutput struct {
+	Checked int                      `json:"checked"`
+	Found   int                      `json:"found"`
+	Items   []PatrolScanStrandedItem `json:"items,omitempty"`
+	Errors  []string                 `json:"errors,omitempty"`
+}
+
+// PatrolScanStrandedItem is a single nudge candidate discovered by patrol scan.
+type PatrolScanStrandedItem struct {
+	Polecat            string `json:"polecat"`
+	Branch             string `json:"branch,omitempty"`
+	Issue              string `json:"issue,omitempty"`
+	CleanupStatus      string `json:"cleanup_status"`
+	UnpushedCommits    int    `json:"unpushed_commits"`
+	ComparisonBase     string `json:"comparison_base,omitempty"`
+	ActivityAgeSeconds int64  `json:"activity_age_seconds"`
+	SessionRunning     bool   `json:"session_running"`
+	HeartbeatFresh     bool   `json:"heartbeat_fresh"`
+	HeartbeatExists    bool   `json:"heartbeat_exists"`
+	ProcessAlive       bool   `json:"process_alive"`
+	Action             string `json:"action"`
+	NudgeTarget        string `json:"nudge_target"`
+	SuggestedMessage   string `json:"suggested_message"`
+}
+
 func runPatrolScan(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -160,12 +195,22 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	workDir := townRoot
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)
+	diagnostics := cmd.ErrOrStderr()
+
+	if patrolScanStrandedOnly {
+		strandedResult := runPatrolScanPhase(diagnostics, "stranded commit detection", func() *PatrolScanStrandedOutput {
+			return detectStrandedUnpushedPolecats(townRoot, rigName)
+		})
+		if patrolScanJSON {
+			return outputPatrolScanJSON(os.Stdout, rigName, timestamp, nil, nil, nil, strandedResult, nil, nil)
+		}
+		return outputPatrolScanStrandedHuman(rigName, strandedResult)
+	}
 
 	// Run all three detection passes.
 	// Note: DetectZombiePolecats takes a router param but does NOT send mail
 	// internally — it only uses the router for workspace context. Notifications
 	// are sent exclusively below via --notify, avoiding double-send.
-	diagnostics := cmd.ErrOrStderr()
 	zombieResult := runPatrolScanPhase(diagnostics, "zombie detection", func() *witness.DetectZombiePolecatsResult {
 		return witness.DetectZombiePolecats(bd, workDir, rigName, router)
 	})
@@ -209,7 +254,7 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	}
 
 	if patrolScanJSON {
-		return outputPatrolScanJSON(os.Stdout, rigName, timestamp, zombieResult, stallResult, completionResult, fleet, receipts)
+		return outputPatrolScanJSON(os.Stdout, rigName, timestamp, zombieResult, stallResult, completionResult, nil, fleet, receipts)
 	}
 
 	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, receipts)
@@ -365,10 +410,121 @@ func alertResIssueID(res *alerts.RecordResult) string {
 	return res.IssueID
 }
 
-func outputPatrolScanJSON(w io.Writer, rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, fleet *witness.FleetState, receipts []witness.PatrolReceipt) error {
+func detectStrandedUnpushedPolecats(townRoot, rigName string) *PatrolScanStrandedOutput {
+	output := &PatrolScanStrandedOutput{}
+	if townRoot != "" {
+		_ = session.InitRegistry(townRoot)
+	}
+
+	mgr, r, err := getPolecatManager(rigName)
+	if err != nil {
+		output.Errors = append(output.Errors, fmt.Sprintf("manager: %v", err))
+		return output
+	}
+
+	polecats, err := mgr.List()
+	if err != nil {
+		output.Errors = append(output.Errors, fmt.Sprintf("list polecats: %v", err))
+		return output
+	}
+
+	bd := beads.New(r.Path)
+	t := tmux.NewTmux()
+	activityGrace := config.LoadOperationalConfig(townRoot).GetWitnessConfig().StartupActivityGraceD()
+	now := time.Now()
+
+	for _, p := range polecats {
+		if p == nil {
+			continue
+		}
+		output.Checked++
+
+		sessionRunning, heartbeatFresh, heartbeatExists, processAlive, err := mgr.LivenessSignals(p.Name)
+		if err != nil {
+			output.Errors = append(output.Errors, fmt.Sprintf("%s liveness: %v", p.Name, err))
+			continue
+		}
+		if !sessionRunning || !processAlive {
+			continue
+		}
+
+		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), p.Name)
+		activity, err := t.GetSessionActivity(sessionName)
+		if err != nil {
+			output.Errors = append(output.Errors, fmt.Sprintf("%s activity: %v", p.Name, err))
+			continue
+		}
+		activityAge := now.Sub(activity)
+		if activityAge < activityGrace {
+			continue
+		}
+
+		cleanupStatus := ""
+		activeMR := ""
+		agentBeadID := polecatBeadIDForRig(r, rigName, p.Name)
+		if _, fields, err := bd.GetAgentBead(agentBeadID); err == nil && fields != nil {
+			cleanupStatus = fields.CleanupStatus
+			activeMR = fields.ActiveMR
+		}
+
+		targetRefs := recoveryTargetRefs(bd, p.Issue, activeMR, p.Branch)
+		gitState, err := getStrandedGitState(p.ClonePath, targetRefs)
+		if err != nil {
+			output.Errors = append(output.Errors, fmt.Sprintf("%s git_state: %v", p.Name, err))
+			continue
+		}
+		if gitState == nil || gitState.UnpushedCommits <= 0 {
+			continue
+		}
+		if cleanupStatus == "" {
+			cleanupStatus = string(polecat.CleanupUnpushed)
+		}
+
+		nudgeTarget := fmt.Sprintf("%s/polecats/%s", rigName, p.Name)
+		output.Items = append(output.Items, PatrolScanStrandedItem{
+			Polecat:            p.Name,
+			Branch:             p.Branch,
+			Issue:              p.Issue,
+			CleanupStatus:      cleanupStatus,
+			UnpushedCommits:    gitState.UnpushedCommits,
+			ComparisonBase:     gitState.ComparisonBase,
+			ActivityAgeSeconds: int64(activityAge.Seconds()),
+			SessionRunning:     sessionRunning,
+			HeartbeatFresh:     heartbeatFresh,
+			HeartbeatExists:    heartbeatExists,
+			ProcessAlive:       processAlive,
+			Action:             "nudge_gt_done",
+			NudgeTarget:        nudgeTarget,
+			SuggestedMessage:   fmt.Sprintf("You have %d unpushed commit(s) on %s. Run `gt done` now so your own session pushes and submits through the normal refinery gate. If `gt done` fails, report the exact error; do not mark the work done manually.", gitState.UnpushedCommits, p.Branch),
+		})
+	}
+
+	output.Found = len(output.Items)
+	return output
+}
+
+func getStrandedGitState(worktreePath string, targets []string) (*GitState, error) {
+	state := &GitState{Clean: true}
+	worktreeGit := git.NewGit(worktreePath)
+	branch, _ := worktreeGit.CurrentBranch()
+	status, err := worktreeGit.BranchTargetStatus(branch, "origin", targets)
+	if err != nil {
+		return state, err
+	}
+	state.ComparisonBase = status.ComparisonBase
+	state.UnpreservedPatchCount = status.UnpreservedPatchCount
+	if status.UnpreservedPatchCount > 0 {
+		state.UnpushedCommits = status.UnpreservedPatchCount
+		state.Clean = false
+	}
+	return state, nil
+}
+
+func outputPatrolScanJSON(w io.Writer, rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, strandedResult *PatrolScanStrandedOutput, fleet *witness.FleetState, receipts []witness.PatrolReceipt) error {
 	output := PatrolScanOutput{
 		Rig:       rigName,
 		Timestamp: timestamp,
+		Stranded:  strandedResult,
 		Fleet:     fleet,
 		Receipts:  receipts,
 	}
@@ -445,6 +601,27 @@ func outputPatrolScanJSON(w io.Writer, rigName, timestamp string, zombieResult *
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(output)
+}
+
+func outputPatrolScanStrandedHuman(rigName string, strandedResult *PatrolScanStrandedOutput) error {
+	fmt.Printf("%s Stranded commit scan: %s\n\n", style.Bold.Render("🔍"), rigName)
+	if strandedResult == nil {
+		fmt.Printf("%s No stranded scan result\n", style.Dim.Render("○"))
+		return nil
+	}
+	if len(strandedResult.Items) == 0 {
+		fmt.Printf("%s No stranded unpushed polecats found (checked %d)\n", style.Success.Render("✓"), strandedResult.Checked)
+		return nil
+	}
+	for _, item := range strandedResult.Items {
+		fmt.Printf("  ⚠ %s: %d unpushed commit(s)", item.Polecat, item.UnpushedCommits)
+		if item.Branch != "" {
+			fmt.Printf(" on %s", item.Branch)
+		}
+		fmt.Println()
+		fmt.Printf("    Action: %s %s\n", item.Action, item.NudgeTarget)
+	}
+	return nil
 }
 
 func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, _ []witness.PatrolReceipt) error {
