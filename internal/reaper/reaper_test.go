@@ -746,9 +746,8 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisp_dependencies wd"):
 		// Count of dangling parent-child rows whose parent wisp/issue is gone.
 		// Mirrors CleanDanglingParentRefs' danglingParentCountQuery predicate.
-		c.state.mu.Lock()
+		// Lock already held by the outer defer in QueryContext.
 		count := len(c.state.danglingDeps)
-		c.state.mu.Unlock()
 		return fakeCountRows(count), nil
 	case strings.Contains(normalized, "SELECT w.id FROM wisps w") && strings.Contains(normalized, "created_at <"):
 		if err := validateStaleWispQuery(normalized); err != nil {
@@ -793,13 +792,12 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 				limit = int(n)
 			}
 		}
-		c.state.mu.Lock()
+		// Lock already held by the outer defer in ExecContext.
 		removed := 0
 		for len(c.state.danglingDeps) > 0 && removed < limit {
 			c.state.danglingDeps = c.state.danglingDeps[1:]
 			removed++
 		}
-		c.state.mu.Unlock()
 		return fakeReaperResult(int64(removed)), nil
 	case normalized == "SET @@autocommit = 0" || normalized == "SET @@autocommit = 1" || normalized == "ROLLBACK" || normalized == "COMMIT" || strings.HasPrefix(normalized, "CALL DOLT_COMMIT"):
 		return fakeReaperResult(0), nil
