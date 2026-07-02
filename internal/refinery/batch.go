@@ -311,6 +311,10 @@ func (e *Engineer) ProcessBatch(ctx context.Context, batch []*MRInfo, target str
 // processSingleMR handles the degenerate case of a batch with one MR.
 func (e *Engineer) processSingleMR(ctx context.Context, mr *MRInfo, target string) *BatchResult {
 	result := &BatchResult{}
+	// Begin per-attempt telemetry (gastown-wjk) for the batch single-MR path.
+	// doMerge/runGates/runDurableReviewGate accumulate timestamps; the terminal
+	// branches below finalize the record. Best-effort/nil-safe.
+	e.beginTelemetryAttempt(mr, mr.CreatedAt)
 	processResult := e.doMerge(ctx, mr.Branch, target, mr.SourceIssue, mr)
 	if processResult.Success {
 		result.Merged = []*MRInfo{mr}
@@ -319,8 +323,10 @@ func (e *Engineer) processSingleMR(ctx context.Context, mr *MRInfo, target strin
 		e.HandleMRInfoSuccess(mr, processResult)
 	} else if processResult.Conflict {
 		result.Conflicts = []*MRInfo{mr}
+		e.finalizeTelemetryFailure(processResult)
 	} else if processResult.TestsFailed {
 		result.Culprits = []*MRInfo{mr}
+		e.finalizeTelemetryFailure(processResult)
 	} else if processResult.BranchNotFound {
 		// Branch not found on remote — escalate to mayor via HandleMRInfoFailure (gas-556).
 		e.HandleMRInfoFailure(mr, processResult)
@@ -329,6 +335,7 @@ func (e *Engineer) processSingleMR(ctx context.Context, mr *MRInfo, target strin
 		// Convention check failed (e.g., WIP commit message). Treat as a queue
 		// conflict so the MR is removed from the ready queue without polluting main.
 		result.Conflicts = []*MRInfo{mr}
+		e.finalizeTelemetryFailure(processResult)
 	} else if processResult.NoMerge {
 		// Source issue has no_merge flag — intentionally blocked. Dequeue silently.
 		_, _ = fmt.Fprintf(e.output, "[Batch] MR %s: no_merge flag set, dequeuing\n", mr.ID)
@@ -339,6 +346,7 @@ func (e *Engineer) processSingleMR(ctx context.Context, mr *MRInfo, target strin
 		e.HandleMRInfoFailure(mr, processResult)
 	} else {
 		result.Error = fmt.Errorf("merge failed: %s", processResult.Error)
+		e.finalizeTelemetryFailure(processResult)
 	}
 	return result
 }

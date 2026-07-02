@@ -26,6 +26,7 @@ import (
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/refinery/mrtelemetry"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
@@ -420,6 +421,21 @@ type Engineer struct {
 	// gastown-cet.12.6.2). Production code leaves this nil and uses the real
 	// beads.Create path.
 	recordReviewerAuditBeadFunc func(mr *MRInfo, ev *ReviewEvaluation) (string, error)
+
+	// telemetry records per-MR-attempt + per-review-attempt data for the
+	// per-writer-model evaluation (gastown-wjk). It is nil-safe: every
+	// instrumentation point guards on nil and never propagates errors back
+	// into the merge path. Set by NewEngineer from the town-root runtime dir;
+	// tests may override or zero it.
+	telemetry *mrtelemetry.Recorder
+
+	// currentAttempt is the in-progress telemetry handle for the MR being
+	// processed. The refinery is single-threaded per rig (one MR at a time), so
+	// a single slot is sufficient. It is set in ProcessMRInfo/processSingleMR
+	// at attempt start and finalized in HandleMRInfoSuccess/Failure/
+	// handleReviewerRejection. Nil when telemetry is disabled or no attempt is
+	// in flight.
+	currentAttempt *mrtelemetry.AttemptHandle
 }
 
 // DefaultReworkRouterTimeout bounds the external `gt mq reject` call that
@@ -464,7 +480,7 @@ func NewEngineer(r *rig.Rig) *Engineer {
 	}
 	beadsClient := beads.New(r.Path)
 
-	return &Engineer{
+	e := &Engineer{
 		rig:     r,
 		beads:   beadsClient,
 		git:     git.NewGit(gitDir),
@@ -484,6 +500,27 @@ func NewEngineer(r *rig.Rig) *Engineer {
 		mergeSlotMaxRetries:   10,
 		mergeSlotRetryBackoff: 500 * time.Millisecond,
 	}
+	// Wire per-attempt telemetry (gastown-wjk). Best-effort: if the town root
+	// cannot be resolved, telemetry stays nil and every instrumentation point
+	// is a no-op. The recorder writes to <townRoot>/.runtime/refinery-telemetry/.
+	e.telemetry = newTelemetryRecorder(e)
+	return e
+}
+
+// newTelemetryRecorder builds the per-attempt telemetry recorder for the
+// engineer's rig, resolving the town root via durableReviewTownRoot. Returns
+// nil (telemetry disabled) if the town root cannot be resolved, so the
+// engineer is always usable even outside a fully-configured town.
+func newTelemetryRecorder(e *Engineer) *mrtelemetry.Recorder {
+	if e == nil {
+		return nil
+	}
+	townRoot, ok := e.durableReviewTownRoot()
+	if !ok || townRoot == "" {
+		return nil
+	}
+	dir := filepath.Join(townRoot, ".runtime", "refinery-telemetry")
+	return mrtelemetry.NewRecorder(dir).WithErrOut(e.output)
 }
 
 // SetOutput sets the output writer for user-facing messages.
@@ -1640,7 +1677,17 @@ func parseGoFailingPackages(output string) map[string]struct{} {
 
 // runGates executes all pre-merge gates (backward-compatible entry point).
 func (e *Engineer) runGates(ctx context.Context) ProcessResult {
-	return e.runGatesForPhase(ctx, GatePhasePreMerge)
+	// Record the validation (deterministic-gate) phase timing + verdict for the
+	// current telemetry attempt (gastown-wjk). Best-effort/nil-safe: a no-op
+	// when no attempt is in flight or telemetry is disabled.
+	start := time.Now()
+	res := e.runGatesForPhase(ctx, GatePhasePreMerge)
+	verdict := mrtelemetry.ValidationVerdictPass
+	if !res.Success {
+		verdict = mrtelemetry.ValidationVerdictFail
+	}
+	e.recordTelemetryValidation(start, time.Now(), verdict)
+	return res
 }
 
 // runGatesForPhase executes gates matching the given phase.
@@ -2150,7 +2197,7 @@ func (e *Engineer) isEmptyReviewDiff(branch, target string) (bool, error) {
 // the m3-degenerate-PASS incident where m3 returned PASS on the empty gtviz
 // initial commit and the gate treated that zero-content PASS as approval,
 // enabling a degraded-quorum bypass.
-func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target string, mr *MRInfo, skipGates bool, reviewBase string) ProcessResult {
+func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target string, mr *MRInfo, skipGates bool, reviewBase string) (res ProcessResult) {
 	if !e.durableReviewRequiredForMR(mr, skipGates, target) {
 		return ProcessResult{Success: true}
 	}
@@ -2223,9 +2270,16 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Running durable review gate for tree %s (writer=%s)...\n", shortSHA(tree), attestationWriter)
 
+	// Record the codex/durable-review phase start (gastown-wjk). The deferred
+	// closure records finish + verdict derived from the named return `res`.
+	codexStart := time.Now()
 	gateTimeout := e.durableReviewGateTimeout()
 	gateCtx, cancel := context.WithTimeout(ctx, gateTimeout)
 	defer cancel()
+	defer func() {
+		verdict := codexVerdictFromDurableGate(res, gateCtx)
+		e.recordTelemetryCodexReview(codexStart, time.Now(), verdict)
+	}()
 	gateTmuxSocket := durableReviewGateTmuxSocket(branch, tree)
 	defer func() {
 		if err := tmux.NewTmuxWithSocket(gateTmuxSocket).KillServerAndRemoveSocket(); err != nil {
@@ -2357,6 +2411,10 @@ func (e *Engineer) ProcessMRInfo(ctx context.Context, mr *MRInfo) ProcessResult 
 	if target == "" {
 		target = e.rig.DefaultBranch()
 	}
+	// Begin per-attempt telemetry (gastown-wjk). Writer attribution is captured
+	// HERE, at processing start, so a mid-flight model reassignment does not
+	// retrobably change the recorded writer of this attempt. Best-effort/nil-safe.
+	e.beginTelemetryAttempt(mr, mr.CreatedAt)
 	// MR fields are directly on the struct
 	_, _ = fmt.Fprintln(e.output, "[Engineer] Processing MR:")
 	_, _ = fmt.Fprintf(e.output, "  Branch: %s\n", mr.Branch)
@@ -2548,6 +2606,10 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 
 	// 5. Log success
 	_, _ = fmt.Fprintf(e.output, "[Engineer] ✓ Merged: %s (commit: %s)\n", mr.ID, result.MergeCommit)
+
+	// Finalize the per-attempt telemetry record as a successful merge
+	// (gastown-wjk). Best-effort/nil-safe; idempotent if already finalized.
+	e.finalizeTelemetryMerged(result.MergeCommit)
 }
 
 func (e *Engineer) clearAgentActiveMR(agentBeadID string) error {
@@ -2704,6 +2766,11 @@ func (e *Engineer) handleReviewerRejection(mr *MRInfo, result ProcessResult) {
 			}
 		}
 	}
+
+	// Finalize the per-attempt telemetry record as a reviewer rejection
+	// (gastown-wjk). NeedsRework maps to decision=rejected, failure_class=
+	// substantive_implementation, codex_verdict=FAIL. Best-effort/nil-safe.
+	e.finalizeTelemetryFailure(result)
 }
 
 // routeRejectionToReworkBounce invokes `gt mq reject` on the still-open MR
@@ -2978,6 +3045,9 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	if result.SlotTimeout {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] ✗ Slot timeout: %s - %s\n", mr.ID, result.Error)
 		_, _ = fmt.Fprintln(e.output, "[Engineer] MR remains in queue for automatic retry (slot contention)")
+		// Finalize this attempt as a slot-timeout (infra/timeout) terminal
+		// outcome — the retry will be recorded as a new attempt. (gastown-wjk)
+		e.finalizeTelemetryFailure(result)
 		return
 	}
 
@@ -2985,6 +3055,8 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	// No polecat or mayor notification needed; the MR is simply dequeued.
 	if result.NoMerge {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: no_merge flag set on source issue, dequeued\n", mr.ID)
+		// Finalize as a no_merge terminal outcome (not a failure). (gastown-wjk)
+		e.finalizeTelemetryFailure(result)
 		return
 	}
 
@@ -2993,6 +3065,9 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	// No polecat notification needed; the PR just needs a human review on GitHub.
 	if result.NeedsApproval {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: PR awaiting human approval, will retry next poll\n", mr.ID)
+		// Finalize this attempt as needs-approval (non-substantive); the retry
+		// becomes a new attempt. (gastown-wjk)
+		e.finalizeTelemetryFailure(result)
 		return
 	}
 
@@ -3016,6 +3091,8 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 		if err := mayorCmd.Run(); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about missing branch: %v\n", err)
 		}
+		// Finalize this attempt as branch-not-found (infra). (gastown-wjk)
+		e.finalizeTelemetryFailure(result)
 		return
 	}
 
@@ -3087,6 +3164,11 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	} else {
 		_, _ = fmt.Fprintln(e.output, "[Engineer] MR remains in queue for retry")
 	}
+
+	// Finalize the per-attempt telemetry record as a build/conflict/test
+	// failure (gastown-wjk). failure_class is derived from ProcessResult
+	// flags (deterministic_validation / conflict / infra). Best-effort.
+	e.finalizeTelemetryFailure(result)
 }
 
 // createConflictResolutionTaskForMR creates a dispatchable task for resolving merge conflicts.
