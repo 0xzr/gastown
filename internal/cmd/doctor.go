@@ -74,6 +74,9 @@ Crew workspace checks:
 Migration checks (fixable):
   - sparse-checkout          Detect legacy sparse checkout across all rigs
 
+Rig data integrity checks (fixable):
+  - merge-slot-integrity     Detect rigs whose merge-slot bead has a corrupt Description (fixable)
+
 Rig checks (with --rig flag):
   - rig-is-git-repo          Verify rig is a valid git repository
   - git-exclude-configured   Check .git/info/exclude has Gas Town dirs (fixable)
@@ -265,6 +268,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewAgentBeadsCheck())
 	d.Register(doctor.NewStaleAgentBeadsCheck())
 	d.Register(doctor.NewRigBeadsCheck())
+	d.Register(doctor.NewMergeSlotIntegrityCheck())
 	d.Register(doctor.NewRoleBeadsCheck())
 
 	// NOTE: StaleAttachmentsCheck removed - staleness detection belongs in Deacon molecule
