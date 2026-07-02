@@ -597,6 +597,57 @@ func TestRoleNames(t *testing.T) {
 	}
 }
 
+func TestRenderRole_OutputLanguageEnglishOnlyAllRoles(t *testing.T) {
+	tmpl, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	entries, err := templateFS.ReadDir("roles")
+	if err != nil {
+		t.Fatalf("ReadDir(roles) error = %v", err)
+	}
+
+	const want = "OUTPUT LANGUAGE: English only — all mail, notes, bead comments, handoffs, reports."
+	data := RoleData{
+		RigName:       "rig1",
+		TownRoot:      "/test/town",
+		TownName:      "town",
+		WorkDir:       "/test/town/rig1/polecats/furiosa",
+		DefaultBranch: "main",
+		Polecat:       "furiosa",
+		Polecats:      []string{"furiosa"},
+		DogName:       "alpha",
+		BeadsDir:      "/test/town/rig1/.beads",
+		IssuePrefix:   "rig1",
+		MayorSession:  "gt-town-mayor",
+		DeaconSession: "gt-town-deacon",
+	}
+
+	checked := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || name == "base.md.tmpl" || !strings.HasSuffix(name, ".md.tmpl") {
+			continue
+		}
+
+		role := strings.TrimSuffix(name, ".md.tmpl")
+		data.Role = role
+		output, err := tmpl.RenderRole(role, data)
+		if err != nil {
+			t.Fatalf("RenderRole(%q) error = %v", role, err)
+		}
+		if count := strings.Count(output, want); count != 1 {
+			t.Fatalf("RenderRole(%q) contains English-only rule %d times, want 1", role, count)
+		}
+		checked++
+	}
+
+	if checked == 0 {
+		t.Fatal("no role templates checked")
+	}
+}
+
 func TestRenderRole_BootUsesNudgeNotRawTmux(t *testing.T) {
 	tmpl, err := New()
 	if err != nil {
