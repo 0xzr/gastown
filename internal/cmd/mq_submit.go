@@ -556,6 +556,11 @@ Please verify state and execute lifecycle action.
 // catch real problems. The whole point of this guard is to fail fast on
 // the specific hq-try2 class, not to be a generic pre-flight check.
 func checkStackedBranchForSubmit(g *git.Git, branch, target string) error {
+	_, err := checkStackedBranchForSubmitInfo(g, branch, target)
+	return err
+}
+
+func checkStackedBranchForSubmitInfo(g *git.Git, branch, target string) (*StackedBranchInfo, error) {
 	if target == "" {
 		target = "main"
 	}
@@ -566,9 +571,10 @@ func checkStackedBranchForSubmit(g *git.Git, branch, target string) error {
 	// blocked -> no MR bead -> branch stranded on origin, invisible to the queue).
 	// Fetch so the remote-tracking ref is current before computing the merge-base.
 	// If the fetch fails we may fall back to a stale origin/<target> and reproduce
-	// the same false-stacked miscount, so surface the failure rather than hiding it.
+	// the same false-stacked miscount, so fail closed instead of packaging from
+	// an untrusted view of the target.
 	if fetchErr := g.Fetch("origin"); fetchErr != nil {
-		style.PrintWarning("could not fetch origin before stacked-branch check: %v (proceeding against possibly-stale origin/%s)", fetchErr, strings.TrimPrefix(target, "origin/"))
+		return nil, fmt.Errorf("fetch origin before stacked-branch check: %w", fetchErr)
 	}
 	targetRef := "origin/" + strings.TrimPrefix(target, "origin/")
 	if _, err := g.Rev(targetRef); err != nil {
@@ -576,14 +582,15 @@ func checkStackedBranchForSubmit(g *git.Git, branch, target string) error {
 		// caller's target rather than failing the whole submit.
 		targetRef = target
 	}
-	if _, err := CheckStackedBranch(g, branch, targetRef); err != nil {
+	info, err := CheckStackedBranch(g, branch, targetRef)
+	if err != nil {
 		var stacked *ErrStackedBranch
 		if errors.As(err, &stacked) {
-			return err // Already actionable; bubble up.
+			return nil, err // Already actionable; bubble up.
 		}
 		// Non-stacked error (couldn't read git). Warn but don't block.
 		style.PrintWarning("could not run stacked-branch check against %s: %v (proceeding; refinery will catch real issues)", targetRef, err)
-		return nil
+		return nil, nil
 	}
-	return nil
+	return info, nil
 }

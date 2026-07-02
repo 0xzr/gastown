@@ -1282,17 +1282,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// information to reconstruct the full diff, not just the tip SHA.
 		var stackedInfo *StackedBranchInfo
 		if !doneAllowStacked {
-			info, stackedErr := CheckStackedBranch(g, branch, target)
+			info, stackedErr := checkStackedBranchForSubmitInfo(g, branch, target)
 			if stackedErr != nil {
-				var stacked *ErrStackedBranch
-				if errors.As(stackedErr, &stacked) {
-					return stackedErr
-				}
-				// Non-stacked error (couldn't read git). Warn but don't block.
-				style.PrintWarning("could not run stacked-branch check against %s: %v (proceeding; refinery will catch real issues)", target, stackedErr)
-			} else {
-				stackedInfo = info
+				return stackedErr
 			}
+			stackedInfo = info
 		}
 
 		// Resume: skip MR creation if already completed in a previous run (gt-aufru).

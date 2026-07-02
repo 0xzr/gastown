@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/steveyegge/gastown/internal/git"
 )
@@ -61,19 +62,30 @@ type ErrStackedBranch struct {
 // single source of truth for the user-facing "how do I fix this" guidance
 // for hq-try2-class failures; tests assert on substrings of this output.
 func (e *ErrStackedBranch) Error() string {
+	targetRemote := stackedBranchRemoteTarget(e.Target)
 	return fmt.Sprintf(
 		"refusing to package stacked branch %q: %d commits ahead of %s merge-base %s (tip %s).\n"+
 			"Refinery cherry-picks a single commit_sha and the earlier commits will not be included.\n"+
 			"Fix one of the following:\n"+
 			"  1. Squash the branch into a single commit before resubmitting:\n"+
-			"       git fetch origin && git checkout %s && git merge --squash origin/%s\n"+
+			"       git fetch origin && git checkout %s && git merge --squash %s\n"+
 			"       git commit -m \"<your message>\" && git push origin %s\n"+
 			"  2. Or, if the stacked commits intentionally depend on each other,\n"+
 			"     split the work so each polecat issue produces a single-commit branch.\n"+
 			"After the branch is single-commit, re-run `gt done` (or `gt mq submit`).",
 		e.Branch, e.CommitsAhead, e.Target, e.MergeBase, e.TipSHA,
-		e.Branch, e.Target, e.Branch,
+		e.Branch, targetRemote, e.Branch,
 	)
+}
+
+func stackedBranchRemoteTarget(target string) string {
+	target = strings.TrimSpace(target)
+	target = strings.TrimPrefix(target, "refs/remotes/")
+	target = strings.TrimPrefix(target, "refs/heads/")
+	if strings.HasPrefix(target, "origin/") {
+		return target
+	}
+	return "origin/" + target
 }
 
 // CheckStackedBranch returns ErrStackedBranch if the branch has more than one

@@ -122,6 +122,39 @@ func TestCheckStackedBranch_SingleCommitPasses(t *testing.T) {
 	}
 }
 
+func TestCheckStackedBranchForSubmitUsesFreshOriginTarget(t *testing.T) {
+	repo := setupStaleLocalMainRepo(t)
+
+	g := gitpkg.NewGit(repo)
+	_, err := CheckStackedBranch(g, "feature/clean", "main")
+	var stacked *ErrStackedBranch
+	if !errors.As(err, &stacked) {
+		t.Fatalf("local main should look falsely stacked before the submit helper refreshes origin; got %T: %v", err, err)
+	}
+	_, err = CheckStackedBranch(g, "feature/clean", "origin/main")
+	if !errors.As(err, &stacked) {
+		t.Fatalf("stale origin/main should look falsely stacked before the submit helper refreshes origin; got %T: %v", err, err)
+	}
+
+	info, err := checkStackedBranchForSubmitInfo(g, "feature/clean", "main")
+	if err != nil {
+		t.Fatalf("checkStackedBranchForSubmitInfo rejected clean branch against origin/main: %v", err)
+	}
+	if info == nil {
+		t.Fatal("checkStackedBranchForSubmitInfo returned nil info without error")
+	}
+	if info.Stacked {
+		t.Fatalf("Stacked=true for clean branch against fresh origin/main; info=%+v", info)
+	}
+	if info.CommitsAhead != 1 {
+		t.Fatalf("CommitsAhead=%d, want 1 against fresh origin/main", info.CommitsAhead)
+	}
+	originMain := strings.TrimSpace(runMRTestGitOutput(t, repo, "rev-parse", "origin/main"))
+	if info.MergeBase != originMain {
+		t.Fatalf("MergeBase=%s, want origin/main %s", info.MergeBase, originMain)
+	}
+}
+
 // TestCheckStackedBranch_NoOpBranchPasses: if the branch tip is identical
 // to the merge-base (no new commits), it must NOT be flagged as stacked.
 // This is the "nothing to merge" case and should fall through cleanly.
@@ -179,12 +212,16 @@ func TestErrStackedBranchErrorFormat(t *testing.T) {
 		"deadbeef",
 		"Refinery cherry-picks a single commit_sha",
 		"Squash",
+		"git merge --squash origin/main",
 		"git push origin polecat/quartz/gt-abc",
 		"re-run `gt done`",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("ErrStackedBranch.Error() missing %q\nfull message:\n%s", want, msg)
 		}
+	}
+	if strings.Contains(msg, "origin/origin/main") {
+		t.Errorf("ErrStackedBranch.Error() double-prefixed target:\n%s", msg)
 	}
 }
 
@@ -470,6 +507,47 @@ func setupNoOpBranchRepo(t *testing.T) string {
 	return repo
 }
 
+func setupStaleLocalMainRepo(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote.git")
+	runMRTestGit(t, tmp, "init", "--bare", remote)
+
+	seed := filepath.Join(tmp, "seed")
+	runMRTestGit(t, tmp, "clone", remote, seed)
+	runMRTestGit(t, seed, "config", "user.email", "test@example.com")
+	runMRTestGit(t, seed, "config", "user.name", "Test User")
+	writeMRTestFile(t, seed, "README.md", "base\n")
+	runMRTestGit(t, seed, "add", "README.md")
+	runMRTestGit(t, seed, "commit", "-m", "base")
+	runMRTestGit(t, seed, "branch", "-M", "main")
+	runMRTestGit(t, seed, "push", "-u", "origin", "main")
+	runMRTestGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	local := filepath.Join(tmp, "local")
+	runMRTestGit(t, tmp, "clone", remote, local)
+	runMRTestGit(t, local, "config", "user.email", "test@example.com")
+	runMRTestGit(t, local, "config", "user.name", "Test User")
+
+	upstream := filepath.Join(tmp, "upstream")
+	runMRTestGit(t, tmp, "clone", remote, upstream)
+	runMRTestGit(t, upstream, "config", "user.email", "test@example.com")
+	runMRTestGit(t, upstream, "config", "user.name", "Test User")
+	for i := 1; i <= 3; i++ {
+		writeMRTestFile(t, upstream, "README.md", fmt.Sprintf("base\nupstream %d\n", i))
+		runMRTestGit(t, upstream, "add", "README.md")
+		runMRTestGit(t, upstream, "commit", "-m", fmt.Sprintf("upstream %d", i))
+	}
+	runMRTestGit(t, upstream, "push", "origin", "main")
+
+	runMRTestGit(t, local, "fetch", upstream, "main:refs/tmp/latest-main")
+	runMRTestGit(t, local, "checkout", "-b", "feature/clean", "refs/tmp/latest-main")
+	writeMRTestFile(t, local, "feature.go", "package x\n")
+	runMRTestGit(t, local, "add", "feature.go")
+	runMRTestGit(t, local, "commit", "-m", "add feature")
+	return local
+}
+
 func runMRTestGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -478,6 +556,17 @@ func runMRTestGit(t *testing.T, dir string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
+}
+
+func runMRTestGitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
 }
 
 func writeMRTestFile(t *testing.T, dir, name, content string) {
