@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/steveyegge/gastown/internal/wisp"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -732,64 +734,150 @@ func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 	}
 }
 
-// TestIsRigOperational_FailSafeOnDoltUnavailable verifies that when Dolt is
-// unavailable and we can't check the rig bead for docked status, we fail-safe
-// by assuming the rig is NOT operational. This prevents wasting API credits
-// starting witnesses for potentially docked rigs. (Regression test for
-// bug where witnesses started for docked rigs during Dolt outage)
+func setupRigOperationalTest(t *testing.T, townRoot, rigName, prefix string) {
+	t.Helper()
+
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(filepath.Join(rigPath, "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configJSON := fmt.Sprintf(`{"beads": {"prefix": %q}}`, prefix)
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(configJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	townBeads := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(townBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	routesContent := fmt.Sprintf(`{"prefix":%q,"path":%q}`, prefix+"-", filepath.ToSlash(filepath.Join(rigName, "mayor", "rig")))
+	if err := os.WriteFile(filepath.Join(townBeads, "routes.jsonl"), []byte(routesContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func installRigOperationalBDStubWith(t *testing.T, showExit int, showStdout, showStderr string, listExit int, listStdout, listStderr string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses Unix shell script bd stub")
+	}
+
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+mode=""
+for arg in "$@"; do
+  case "$arg" in
+    version) echo "bd stub"; exit 0 ;;
+    show) mode="show" ;;
+    list) mode="list" ;;
+  esac
+done
+if [ "$mode" = "show" ]; then
+  if [ -n "${BD_STUB_SHOW_STDOUT:-}" ]; then printf '%s\n' "$BD_STUB_SHOW_STDOUT"; fi
+  if [ -n "${BD_STUB_SHOW_STDERR:-}" ]; then printf '%s\n' "$BD_STUB_SHOW_STDERR" >&2; fi
+  exit "$BD_STUB_SHOW_EXIT"
+fi
+if [ "$mode" = "list" ]; then
+  if [ -n "${BD_STUB_LIST_STDOUT:-}" ]; then printf '%s\n' "$BD_STUB_LIST_STDOUT"; fi
+  if [ -n "${BD_STUB_LIST_STDERR:-}" ]; then printf '%s\n' "$BD_STUB_LIST_STDERR" >&2; fi
+  exit "$BD_STUB_LIST_EXIT"
+fi
+echo "unexpected bd args: $*" >&2
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_STUB_SHOW_EXIT", fmt.Sprint(showExit))
+	t.Setenv("BD_STUB_SHOW_STDOUT", showStdout)
+	t.Setenv("BD_STUB_SHOW_STDERR", showStderr)
+	t.Setenv("BD_STUB_LIST_EXIT", fmt.Sprint(listExit))
+	t.Setenv("BD_STUB_LIST_STDOUT", listStdout)
+	t.Setenv("BD_STUB_LIST_STDERR", listStderr)
+}
+
+func installRigOperationalBDStub(t *testing.T, stderr string) {
+	t.Helper()
+	installRigOperationalBDStubWith(t, 1, "", stderr, 0, "[]", "")
+}
+
+// TestIsRigOperational_FailSafeOnDoltUnavailable verifies that real lookup
+// failures still fail closed when docked/parked status cannot be verified.
 func TestIsRigOperational_FailSafeOnDoltUnavailable(t *testing.T) {
 	tmpDir := t.TempDir()
-
-	// Create a minimal rig structure without a beads database
 	rigName := "testrig"
-	rigPath := filepath.Join(tmpDir, rigName)
-	if err := os.MkdirAll(rigPath, 0755); err != nil {
-		t.Fatal(err)
-	}
+	setupRigOperationalTest(t, tmpDir, rigName, "tr")
+	installRigOperationalBDStub(t, "dolt server unavailable")
 
-	// Create config.json with a prefix
-	configPath := filepath.Join(rigPath, "config.json")
-	configJSON := `{"beads": {"prefix": "tr"}}`
-	if err := os.WriteFile(configPath, []byte(configJSON), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create mayor/rig/.beads directory but NO Dolt database
-	// This simulates Dolt being down or database not accessible
-	mayorBeads := filepath.Join(rigPath, "mayor", "rig", ".beads")
-	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create town-level .beads with routes.jsonl
-	townBeads := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(townBeads, 0755); err != nil {
-		t.Fatal(err)
-	}
-	routesContent := `{"prefix":"tr-","path":"testrig/mayor/rig"}`
-	if err := os.WriteFile(filepath.Join(townBeads, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create daemon with no Dolt server running
 	d := &Daemon{
-		config: &Config{
-			TownRoot: tmpDir,
-		},
-		logger: log.New(io.Discard, "", 0), // Suppress log output
+		config: &Config{TownRoot: tmpDir},
+		logger: log.New(io.Discard, "", 0),
 	}
 
-	// When Dolt is unavailable, isRigOperational should return false
-	// (fail-safe: assume not operational rather than risk starting docked rig)
 	operational, reason := d.isRigOperational(rigName)
 	if operational {
-		t.Error("isRigOperational should return false when Dolt is unavailable (fail-safe)")
-	}
-	if reason == "" {
-		t.Error("isRigOperational should provide a reason when returning false")
+		t.Error("isRigOperational should return false when rig status lookup fails")
 	}
 	if !strings.Contains(reason, "Dolt unavailable") && !strings.Contains(reason, "cannot verify") {
 		t.Errorf("reason should mention Dolt unavailable, got: %q", reason)
+	}
+}
+
+func TestIsRigOperational_MissingRigIdentityBeadIsOperational(t *testing.T) {
+	tmpDir := t.TempDir()
+	rigName := "testrig"
+	setupRigOperationalTest(t, tmpDir, rigName, "tr")
+	installRigOperationalBDStub(t, "Issue not found: tr-rig-testrig")
+
+	d := &Daemon{
+		config: &Config{TownRoot: tmpDir},
+		logger: log.New(io.Discard, "", 0),
+	}
+
+	operational, reason := d.isRigOperational(rigName)
+	if !operational {
+		t.Fatalf("isRigOperational should allow missing identity bead; reason=%q", reason)
+	}
+}
+
+func TestIsRigOperational_NotFoundBackendErrorFailsClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	rigName := "testrig"
+	setupRigOperationalTest(t, tmpDir, rigName, "tr")
+	installRigOperationalBDStubWith(t, 1, "", "database not found: polybot", 1, "", "database not found: polybot")
+
+	d := &Daemon{
+		config: &Config{TownRoot: tmpDir},
+		logger: log.New(io.Discard, "", 0),
+	}
+
+	operational, reason := d.isRigOperational(rigName)
+	if operational {
+		t.Fatal("isRigOperational should fail closed when not-found classification is a backend error")
+	}
+	if !strings.Contains(reason, "Dolt unavailable") && !strings.Contains(reason, "cannot verify") {
+		t.Errorf("reason should mention unverifiable status, got: %q", reason)
+	}
+}
+
+func TestIsRigOperational_GlobalDockedLabel(t *testing.T) {
+	tmpDir := t.TempDir()
+	rigName := "dockedrig"
+	setupRigOperationalTest(t, tmpDir, rigName, "dr")
+	installRigOperationalBDStubWith(t, 0, `[{"id":"dr-rig-dockedrig","labels":["status:docked"]}]`, "", 0, "[]", "")
+
+	d := &Daemon{
+		config: &Config{TownRoot: tmpDir},
+		logger: log.New(io.Discard, "", 0),
+	}
+
+	operational, reason := d.isRigOperational(rigName)
+	if operational {
+		t.Fatal("isRigOperational should return false when rig bead has status:docked")
+	}
+	if reason != "rig is docked (global)" {
+		t.Errorf("reason = %q, want global docked", reason)
 	}
 }
 
@@ -797,42 +885,21 @@ func TestIsRigOperational_FailSafeOnDoltUnavailable(t *testing.T) {
 // identified as not operational.
 func TestIsRigOperational_DockedRig(t *testing.T) {
 	tmpDir := t.TempDir()
-
-	// Create rig with docked label on rig bead
 	rigName := "dockedrig"
-	rigPath := filepath.Join(tmpDir, rigName)
-	if err := os.MkdirAll(filepath.Join(rigPath, "mayor", "rig", ".beads"), 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create config.json
-	configPath := filepath.Join(rigPath, "config.json")
-	configJSON := `{"beads": {"prefix": "dr"}}`
-	if err := os.WriteFile(configPath, []byte(configJSON), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create town-level .beads with routes.jsonl
-	townBeads := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(townBeads, 0755); err != nil {
-		t.Fatal(err)
-	}
-	routesContent := `{"prefix":"dr-","path":"dockedrig/mayor/rig"}`
-	if err := os.WriteFile(filepath.Join(townBeads, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
-		t.Fatal(err)
+	if err := wisp.NewConfig(tmpDir, rigName).Set("status", "docked"); err != nil {
+		t.Fatalf("set docked status: %v", err)
 	}
 
 	d := &Daemon{
-		config: &Config{
-			TownRoot: tmpDir,
-		},
+		config: &Config{TownRoot: tmpDir},
 		logger: log.New(io.Discard, "", 0),
 	}
 
-	// Without a rig bead, should fail-safe to not operational
 	operational, reason := d.isRigOperational(rigName)
 	if operational {
-		t.Error("isRigOperational should return false when rig bead is missing")
+		t.Error("isRigOperational should return false when rig is docked")
 	}
-	t.Logf("Docked rig check returned: operational=%v, reason=%q", operational, reason)
+	if reason != "rig is docked" {
+		t.Errorf("reason = %q, want docked", reason)
+	}
 }

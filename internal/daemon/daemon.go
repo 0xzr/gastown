@@ -2618,6 +2618,18 @@ func (d *Daemon) getPatrolRigs(patrol string) []string {
 	return operational
 }
 
+func rigGlobalStatusBlockReason(issue *beads.Issue) string {
+	for _, label := range issue.Labels {
+		if label == "status:docked" {
+			return "rig is docked (global)"
+		}
+		if label == "status:parked" {
+			return "rig is parked (global)"
+		}
+	}
+	return ""
+}
+
 // isRigOperational checks if a rig is in an operational state.
 // Returns true if the rig can have agents auto-started.
 // Returns false (with reason) if the rig is parked, docked, or has auto_restart blocked/disabled.
@@ -2661,13 +2673,32 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	rigBeadsDir := beads.ResolveBeadsDir(rigPath)
 	bd := beads.NewWithBeadsDir(rigPath, rigBeadsDir)
 	if issue, err := bd.Show(rigBeadID); err == nil {
-		for _, label := range issue.Labels {
-			if label == "status:docked" {
-				return false, "rig is docked (global)"
+		if reason := rigGlobalStatusBlockReason(issue); reason != "" {
+			return false, reason
+		}
+	} else if errors.Is(err, beads.ErrNotFound) {
+		probeBD := bd
+		probeBeadsDir := rigBeadsDir
+		if routedBeadsDir := beads.ResolveRoutingTarget(d.config.TownRoot, rigBeadID, rigBeadsDir); routedBeadsDir != "" && routedBeadsDir != rigBeadsDir {
+			probeBeadsDir = routedBeadsDir
+			probeBD = beads.NewWithBeadsDir(filepath.Dir(routedBeadsDir), routedBeadsDir)
+		}
+		if _, listErr := probeBD.List(beads.ListOptions{Limit: 1}); listErr != nil {
+			d.logger.Printf("Warning: failed to verify rig beads store %s after missing rig bead %s: %v (assuming not operational)", probeBeadsDir, rigBeadID, listErr)
+			return false, "cannot verify rig status (Dolt unavailable)"
+		}
+		missingRigBead := true
+		if retryIssue, retryErr := probeBD.Show(rigBeadID); retryErr == nil {
+			missingRigBead = false
+			if reason := rigGlobalStatusBlockReason(retryIssue); reason != "" {
+				return false, reason
 			}
-			if label == "status:parked" {
-				return false, "rig is parked (global)"
-			}
+		} else if !errors.Is(retryErr, beads.ErrNotFound) {
+			d.logger.Printf("Warning: failed to recheck rig bead %s for docked/parked status after store probe: %v (assuming not operational)", rigBeadID, retryErr)
+			return false, "cannot verify rig status (Dolt unavailable)"
+		}
+		if missingRigBead {
+			d.logger.Printf("Warning: rig bead %s not found while checking docked/parked status; treating as no global status", rigBeadID)
 		}
 	} else {
 		// Log when rig bead lookup fails - this helps debug transient Dolt issues

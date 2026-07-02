@@ -28,6 +28,8 @@ func TestGetPatrolRigs_FiltersNonOperationalRigs(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0o644); err != nil {
 		t.Fatalf("write rigs.json: %v", err)
 	}
+	setupRigOperationalTest(t, townRoot, "alpha", "al")
+	installRigOperationalBDStub(t, "Issue not found: al-rig-alpha")
 
 	// Mark beta/gamma as non-operational via wisp status.
 	if err := wisp.NewConfig(townRoot, "beta").Set("status", "parked"); err != nil {
@@ -44,12 +46,9 @@ func TestGetPatrolRigs_FiltersNonOperationalRigs(t *testing.T) {
 
 	got := d.getPatrolRigs("witness")
 	slices.Sort(got)
-	// When Dolt is unavailable, isRigOperational() fails safe and returns false
-	// for all rigs (can't verify docked status). This prevents witnesses from
-	// starting for potentially docked rigs during Dolt outages.
-	want := []string{}
+	want := []string{"alpha"}
 	if !slices.Equal(got, want) {
-		t.Fatalf("getPatrolRigs() = %v, want %v (all rigs excluded when Dolt unavailable - fail-safe)", got, want)
+		t.Fatalf("getPatrolRigs() = %v, want %v", got, want)
 	}
 }
 
@@ -84,10 +83,12 @@ func TestRunMainBranchTests_ExcludesNonOperationalRigs(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0o644); err != nil {
 		t.Fatalf("write rigs.json: %v", err)
 	}
+	setupRigOperationalTest(t, townRoot, "alpha", "al")
+	installRigOperationalBDStub(t, "dolt server unavailable")
 
 	// Mark beta as parked and gamma as docked via wisp status. alpha has no
-	// wisp status; it falls through to the rig-bead lookup, which fails in
-	// the test env (no Dolt) and is excluded via the Dolt-unavailable
+	// wisp status; it falls through to the rig-bead lookup, which is stubbed
+	// to fail like a backend outage and is excluded via the Dolt-unavailable
 	// fail-safe. Together this guarantees that EVERY known rig is filtered,
 	// so the patrol hits its "no operational rigs" branch and never tries
 	// to spawn a worktree against a bare repo that does not exist.
