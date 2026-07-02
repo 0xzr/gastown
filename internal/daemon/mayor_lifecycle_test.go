@@ -154,6 +154,120 @@ func TestMayorUnhealthReason(t *testing.T) {
 	}
 }
 
+func TestEvaluateMayorCriticalMailBacklog(t *testing.T) {
+	now := time.Date(2026, 7, 2, 5, 0, 0, 0, time.UTC)
+	since := now.Add(-31 * time.Minute)
+
+	tests := []struct {
+		name          string
+		critical      int
+		threshold     int
+		since         time.Time
+		restartAfter  time.Duration
+		wantActive    bool
+		wantSinceZero bool
+		wantRestart   bool
+	}{
+		{
+			name:          "below threshold resets",
+			critical:      4,
+			threshold:     5,
+			since:         since,
+			restartAfter:  30 * time.Minute,
+			wantActive:    false,
+			wantSinceZero: true,
+			wantRestart:   false,
+		},
+		{
+			name:          "first threshold breach starts timer",
+			critical:      5,
+			threshold:     5,
+			since:         time.Time{},
+			restartAfter:  30 * time.Minute,
+			wantActive:    true,
+			wantSinceZero: false,
+			wantRestart:   false,
+		},
+		{
+			name:          "threshold breach before grace does not restart",
+			critical:      7,
+			threshold:     5,
+			since:         now.Add(-10 * time.Minute),
+			restartAfter:  30 * time.Minute,
+			wantActive:    true,
+			wantSinceZero: false,
+			wantRestart:   false,
+		},
+		{
+			name:          "threshold breach after grace restarts",
+			critical:      7,
+			threshold:     5,
+			since:         since,
+			restartAfter:  30 * time.Minute,
+			wantActive:    true,
+			wantSinceZero: false,
+			wantRestart:   true,
+		},
+		{
+			name:          "zero restart grace only alerts",
+			critical:      7,
+			threshold:     5,
+			since:         since,
+			restartAfter:  0,
+			wantActive:    true,
+			wantSinceZero: false,
+			wantRestart:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			active, nextSince, restart := evaluateMayorCriticalMailBacklog(tc.critical, tc.threshold, tc.since, now, tc.restartAfter)
+			if active != tc.wantActive {
+				t.Fatalf("active = %v, want %v", active, tc.wantActive)
+			}
+			if nextSince.IsZero() != tc.wantSinceZero {
+				t.Fatalf("nextSince zero = %v, want %v (nextSince=%v)", nextSince.IsZero(), tc.wantSinceZero, nextSince)
+			}
+			if restart != tc.wantRestart {
+				t.Fatalf("restart = %v, want %v", restart, tc.wantRestart)
+			}
+		})
+	}
+}
+
+func TestMarkMayorStartedResetsCriticalMailGrace(t *testing.T) {
+	started := time.Date(2026, 7, 2, 5, 0, 0, 0, time.UTC)
+	oldBreach := started.Add(-31 * time.Minute)
+	d := &Daemon{
+		mayorLastStarted:              started.Add(-2 * time.Hour),
+		mayorCriticalMailBacklogSince: oldBreach,
+	}
+
+	d.markMayorStarted(started)
+
+	if !d.mayorLastStarted.Equal(started) {
+		t.Fatalf("mayorLastStarted = %v, want %v", d.mayorLastStarted, started)
+	}
+	if !d.mayorCriticalMailBacklogSince.IsZero() {
+		t.Fatalf("mayorCriticalMailBacklogSince = %v, want zero", d.mayorCriticalMailBacklogSince)
+	}
+
+	active, nextSince, restart := evaluateMayorCriticalMailBacklog(7, 5, d.mayorCriticalMailBacklogSince, started.Add(3*time.Minute), 30*time.Minute)
+	if !active {
+		t.Fatalf("active = false, want true")
+	}
+	if restart {
+		t.Fatalf("restart = true, want false for a freshly started mayor")
+	}
+	if nextSince.IsZero() {
+		t.Fatalf("nextSince is zero, want a fresh grace timer")
+	}
+	if nextSince.Sub(started) != 3*time.Minute {
+		t.Fatalf("nextSince = %v, want first post-start check time", nextSince)
+	}
+}
+
 func startsWith(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }

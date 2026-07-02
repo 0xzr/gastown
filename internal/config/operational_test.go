@@ -268,6 +268,64 @@ func TestLoadOperationalConfig_WithConfig(t *testing.T) {
 	}
 }
 
+func TestMayorThresholds_Defaults(t *testing.T) {
+	t.Parallel()
+
+	var op *OperationalConfig
+	mayor := op.GetMayorConfig()
+
+	if got := mayor.HeartbeatStaleThresholdD(); got != DefaultMayorHeartbeatStaleThreshold {
+		t.Errorf("HeartbeatStaleThreshold: got %v, want %v", got, DefaultMayorHeartbeatStaleThreshold)
+	}
+	if got := mayor.CriticalMailBacklogThresholdV(); got != DefaultMayorCriticalMailBacklogThreshold {
+		t.Errorf("CriticalMailBacklogThreshold: got %d, want %d", got, DefaultMayorCriticalMailBacklogThreshold)
+	}
+	if got := mayor.CriticalMailRestartAfterD(); got != DefaultMayorCriticalMailRestartAfter {
+		t.Errorf("CriticalMailRestartAfter: got %v, want %v", got, DefaultMayorCriticalMailRestartAfter)
+	}
+	if got := mayor.MaxTokensDeadloopConsecutiveV(); got != DefaultMayorMaxTokensDeadloopConsecutive {
+		t.Errorf("MaxTokensDeadloopConsecutive: got %d, want %d", got, DefaultMayorMaxTokensDeadloopConsecutive)
+	}
+	if got := mayor.MaxTokensDeadloopWindowD(); got != DefaultMayorMaxTokensDeadloopWindow {
+		t.Errorf("MaxTokensDeadloopWindow: got %v, want %v", got, DefaultMayorMaxTokensDeadloopWindow)
+	}
+	if got := mayor.MaxTokensDeadloopRestartCooldownD(); got != DefaultMayorMaxTokensDeadloopCooldown {
+		t.Errorf("MaxTokensDeadloopRestartCooldown: got %v, want %v", got, DefaultMayorMaxTokensDeadloopCooldown)
+	}
+}
+
+func TestMayorThresholds_Overrides(t *testing.T) {
+	t.Parallel()
+
+	backlog := 9
+	deadloop := 4
+	op := &OperationalConfig{
+		Mayor: &MayorThresholds{
+			CriticalMailBacklogThreshold:     &backlog,
+			CriticalMailRestartAfter:         "45m",
+			MaxTokensDeadloopConsecutive:     &deadloop,
+			MaxTokensDeadloopWindow:          "12m",
+			MaxTokensDeadloopRestartCooldown: "1h",
+		},
+	}
+	mayor := op.GetMayorConfig()
+	if got := mayor.CriticalMailBacklogThresholdV(); got != 9 {
+		t.Errorf("CriticalMailBacklogThreshold: got %d, want 9", got)
+	}
+	if got := mayor.CriticalMailRestartAfterD(); got != 45*time.Minute {
+		t.Errorf("CriticalMailRestartAfter: got %v, want 45m", got)
+	}
+	if got := mayor.MaxTokensDeadloopConsecutiveV(); got != 4 {
+		t.Errorf("MaxTokensDeadloopConsecutive: got %d, want 4", got)
+	}
+	if got := mayor.MaxTokensDeadloopWindowD(); got != 12*time.Minute {
+		t.Errorf("MaxTokensDeadloopWindow: got %v, want 12m", got)
+	}
+	if got := mayor.MaxTokensDeadloopRestartCooldownD(); got != time.Hour {
+		t.Errorf("MaxTokensDeadloopRestartCooldown: got %v, want 1h", got)
+	}
+}
+
 func TestMailThresholds_Defaults(t *testing.T) {
 	t.Parallel()
 

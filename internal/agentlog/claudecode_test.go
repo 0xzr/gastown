@@ -1,9 +1,12 @@
 package agentlog
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestClaudeProjectDirFor(t *testing.T) {
@@ -49,6 +52,205 @@ func TestParseClaudeCodeLine_Text(t *testing.T) {
 	if ev.AgentType != "claudecode" {
 		t.Errorf("AgentType = %q, want %q", ev.AgentType, "claudecode")
 	}
+}
+
+func TestCheckClaudeMaxTokensDeadloopDetectsConsecutiveEmptyText(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workDir := filepath.Join(t.TempDir(), "mayor")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatalf("mkdir work dir: %v", err)
+	}
+	projectDirs, err := claudeProjectDirsFor(workDir)
+	if err != nil {
+		t.Fatalf("claudeProjectDirsFor: %v", err)
+	}
+	if err := os.MkdirAll(projectDirs[1], 0755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	path := filepath.Join(projectDirs[1], "session.jsonl")
+	lines := []string{
+		assistantTurn("2026-07-02T05:00:00Z", "max_tokens", ""),
+		assistantTurn("2026-07-02T05:01:00Z", "max_tokens", "   \n\t"),
+		assistantTurn("2026-07-02T05:02:00Z", "max_tokens", ""),
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		t.Fatalf("write jsonl: %v", err)
+	}
+
+	report, err := CheckClaudeMaxTokensDeadloop(workDir, 3, time.Date(2026, 7, 2, 4, 59, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("CheckClaudeMaxTokensDeadloop: %v", err)
+	}
+	if !report.Detected {
+		t.Fatalf("Detected = false, want true; report=%+v", report)
+	}
+	if report.Consecutive != 3 {
+		t.Fatalf("Consecutive = %d, want 3", report.Consecutive)
+	}
+	if report.LastPath != path {
+		t.Fatalf("LastPath = %q, want %q", report.LastPath, path)
+	}
+}
+
+func TestCheckClaudeMaxTokensDeadloopUsesConfigDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workDir := filepath.Join(t.TempDir(), "mayor")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatalf("mkdir work dir: %v", err)
+	}
+	projectDirs, err := claudeProjectDirsForConfigDirs(workDir, filepath.Join(home, "account-a"))
+	if err != nil {
+		t.Fatalf("claudeProjectDirsForConfigDirs: %v", err)
+	}
+	path := filepath.Join(projectDirs[len(projectDirs)-1], "session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	lines := []string{
+		assistantTurn("2026-07-02T05:00:00Z", "max_tokens", ""),
+		assistantTurn("2026-07-02T05:01:00Z", "max_tokens", ""),
+		assistantTurn("2026-07-02T05:02:00Z", "max_tokens", ""),
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		t.Fatalf("write jsonl: %v", err)
+	}
+
+	report, err := CheckClaudeMaxTokensDeadloop(workDir, 3, time.Date(2026, 7, 2, 4, 59, 0, 0, time.UTC), filepath.Join(home, "account-a"))
+	if err != nil {
+		t.Fatalf("CheckClaudeMaxTokensDeadloop: %v", err)
+	}
+	if !report.Detected {
+		t.Fatalf("Detected = false, want true; report=%+v", report)
+	}
+	if report.LastPath != path {
+		t.Fatalf("LastPath = %q, want %q", report.LastPath, path)
+	}
+}
+
+func TestCheckClaudeMaxTokensDeadloopScansNewestSessionOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workDir := filepath.Join(t.TempDir(), "mayor")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatalf("mkdir work dir: %v", err)
+	}
+	projectDirs, err := claudeProjectDirsFor(workDir)
+	if err != nil {
+		t.Fatalf("claudeProjectDirsFor: %v", err)
+	}
+	if err := os.MkdirAll(projectDirs[0], 0755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	oldBad := filepath.Join(projectDirs[0], "old-bad.jsonl")
+	newHealthy := filepath.Join(projectDirs[0], "new-healthy.jsonl")
+	oldLines := []string{
+		assistantTurn("2026-07-02T05:00:00Z", "max_tokens", ""),
+		assistantTurn("2026-07-02T05:01:00Z", "max_tokens", ""),
+		assistantTurn("2026-07-02T05:02:00Z", "max_tokens", ""),
+	}
+	if err := os.WriteFile(oldBad, []byte(strings.Join(oldLines, "\n")+"\n"), 0644); err != nil {
+		t.Fatalf("write old jsonl: %v", err)
+	}
+	if err := os.WriteFile(newHealthy, []byte(assistantTurn("2026-07-02T05:03:00Z", "end_turn", "I am healthy.")+"\n"), 0644); err != nil {
+		t.Fatalf("write healthy jsonl: %v", err)
+	}
+	oldTime := time.Date(2026, 7, 2, 5, 2, 0, 0, time.UTC)
+	newTime := time.Date(2026, 7, 2, 5, 3, 0, 0, time.UTC)
+	if err := os.Chtimes(oldBad, oldTime, oldTime); err != nil {
+		t.Fatalf("chtimes old: %v", err)
+	}
+	if err := os.Chtimes(newHealthy, newTime, newTime); err != nil {
+		t.Fatalf("chtimes healthy: %v", err)
+	}
+
+	report, err := CheckClaudeMaxTokensDeadloop(workDir, 3, time.Date(2026, 7, 2, 4, 59, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("CheckClaudeMaxTokensDeadloop: %v", err)
+	}
+	if report.Detected {
+		t.Fatalf("Detected = true, want false; report=%+v", report)
+	}
+	if report.LastPath != newHealthy {
+		t.Fatalf("LastPath = %q, want newest %q", report.LastPath, newHealthy)
+	}
+	if report.ScannedTurns != 1 {
+		t.Fatalf("ScannedTurns = %d, want 1", report.ScannedTurns)
+	}
+}
+
+func TestCheckClaudeMaxTokensDeadloopResetsOnText(t *testing.T) {
+	report := &MaxTokensDeadloopReport{Required: 3}
+	input := strings.Join([]string{
+		assistantTurn("2026-07-02T05:00:00Z", "max_tokens", ""),
+		assistantTurn("2026-07-02T05:01:00Z", "max_tokens", "I am still working."),
+		assistantTurn("2026-07-02T05:02:00Z", "max_tokens", ""),
+	}, "\n")
+	if err := scanClaudeMaxTokensDeadloop(strings.NewReader(input), "test.jsonl", 3, time.Time{}, report); err != nil {
+		t.Fatalf("scanClaudeMaxTokensDeadloop: %v", err)
+	}
+	if report.Detected {
+		t.Fatalf("Detected = true, want false; report=%+v", report)
+	}
+	if report.Consecutive != 1 {
+		t.Fatalf("Consecutive = %d, want 1 after reset", report.Consecutive)
+	}
+}
+
+func TestCheckClaudeMaxTokensDeadloopIgnoresOldEntries(t *testing.T) {
+	report := &MaxTokensDeadloopReport{Required: 2}
+	input := strings.Join([]string{
+		assistantTurn("2026-07-02T04:00:00Z", "max_tokens", ""),
+		assistantTurn("2026-07-02T04:01:00Z", "max_tokens", ""),
+	}, "\n")
+	since := time.Date(2026, 7, 2, 4, 30, 0, 0, time.UTC)
+	if err := scanClaudeMaxTokensDeadloop(strings.NewReader(input), "test.jsonl", 2, since, report); err != nil {
+		t.Fatalf("scanClaudeMaxTokensDeadloop: %v", err)
+	}
+	if report.ScannedTurns != 0 {
+		t.Fatalf("ScannedTurns = %d, want 0", report.ScannedTurns)
+	}
+	if report.Detected {
+		t.Fatalf("Detected = true, want false; report=%+v", report)
+	}
+}
+
+func TestCheckClaudeMaxTokensDeadloopIgnoresUnparseableTimestampsWhenBounded(t *testing.T) {
+	report := &MaxTokensDeadloopReport{Required: 2}
+	input := strings.Join([]string{
+		assistantTurn("not-a-time", "max_tokens", ""),
+		assistantTurn("", "max_tokens", ""),
+		assistantTurn("2026-07-02T05:00:00Z", "max_tokens", ""),
+	}, "\n")
+	since := time.Date(2026, 7, 2, 4, 30, 0, 0, time.UTC)
+	if err := scanClaudeMaxTokensDeadloop(strings.NewReader(input), "test.jsonl", 2, since, report); err != nil {
+		t.Fatalf("scanClaudeMaxTokensDeadloop: %v", err)
+	}
+	if report.ScannedTurns != 1 {
+		t.Fatalf("ScannedTurns = %d, want 1", report.ScannedTurns)
+	}
+	if report.Consecutive != 1 {
+		t.Fatalf("Consecutive = %d, want 1", report.Consecutive)
+	}
+	if report.Detected {
+		t.Fatalf("Detected = true, want false; report=%+v", report)
+	}
+}
+
+func assistantTurn(timestamp, stopReason, text string) string {
+	payload, _ := json.Marshal(map[string]any{
+		"type":      "assistant",
+		"timestamp": timestamp,
+		"message": map[string]any{
+			"role":        "assistant",
+			"stop_reason": stopReason,
+			"content": []map[string]any{
+				{"type": "text", "text": text},
+			},
+		},
+	})
+	return string(payload)
 }
 
 func TestParseClaudeCodeLine_ToolUse(t *testing.T) {

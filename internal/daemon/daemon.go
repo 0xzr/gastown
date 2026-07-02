@@ -21,6 +21,7 @@ import (
 
 	"github.com/gofrs/flock"
 	beadsdk "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/agentlog"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/boot"
 	agentconfig "github.com/steveyegge/gastown/internal/config"
@@ -134,6 +135,14 @@ type Daemon struct {
 
 	// mayorCriticalMailLastNotified throttles repeated critical-mail alerts.
 	mayorCriticalMailLastNotified time.Time
+
+	// mayorCriticalMailBacklogSince tracks when the Mayor first crossed the
+	// critical-mail restart threshold. Only accessed from heartbeat loop.
+	mayorCriticalMailBacklogSince time.Time
+
+	// mayorDeadloopLastRestart throttles max_tokens empty-text deadloop restarts.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	mayorDeadloopLastRestart time.Time
 
 	// startedAt is when this daemon process started. Heartbeats on disk with
 	// a timestamp older than startedAt are treated as from-before-resume, so
@@ -2057,14 +2066,20 @@ func (d *Daemon) ensureMayorRunning() {
 					d.logger.Printf("Warning: could not write Mayor heartbeat: %v", hbErr)
 				}
 				d.checkMayorNudgePoller(mgr)
-				d.checkMayorCriticalMail(cfg)
+				if d.checkMayorDeadloop(mgr, cfg) {
+					return
+				}
+				d.checkMayorCriticalMail(mgr, cfg)
 			case mayorHealthActionIdle:
 				d.mayorZombieCount = 0
 				if hbErr := mayor.Touch(townRoot, "patrol-check", tmux.SessionHealthy.String()); hbErr != nil {
 					d.logger.Printf("Warning: could not write Mayor heartbeat: %v", hbErr)
 				}
 				d.checkMayorNudgePoller(mgr)
-				d.checkMayorCriticalMail(cfg)
+				if d.checkMayorDeadloop(mgr, cfg) {
+					return
+				}
+				d.checkMayorCriticalMail(mgr, cfg)
 			}
 			return
 		}
@@ -2074,12 +2089,12 @@ func (d *Daemon) ensureMayorRunning() {
 
 	// Mayor was just started.
 	d.mayorZombieCount = 0
-	d.mayorLastStarted = time.Now()
+	d.markMayorStarted(time.Now())
 	if hbErr := mayor.Touch(townRoot, "session-started", tmux.SessionHealthy.String()); hbErr != nil {
 		d.logger.Printf("Warning: could not write Mayor heartbeat: %v", hbErr)
 	}
 	d.checkMayorNudgePoller(mgr)
-	d.checkMayorCriticalMail(cfg)
+	d.checkMayorCriticalMail(mgr, cfg)
 	d.logger.Println("Mayor started successfully")
 }
 
@@ -2165,11 +2180,69 @@ func (d *Daemon) checkMayorNudgePoller(mgr *mayor.Manager) {
 	}
 }
 
+// checkMayorDeadloop restarts the Mayor when recent Claude transcripts show a
+// max_tokens+empty-text loop. Returns true when it restarted the session.
+func (d *Daemon) checkMayorDeadloop(mgr *mayor.Manager, cfg *agentconfig.MayorThresholds) bool {
+	required := cfg.MaxTokensDeadloopConsecutiveV()
+	if required <= 0 {
+		return false
+	}
+	window := cfg.MaxTokensDeadloopWindowD()
+	since := time.Now().Add(-window)
+	if d.startedAt.After(since) {
+		since = d.startedAt
+	}
+	if !d.mayorLastStarted.IsZero() && d.mayorLastStarted.After(since) {
+		since = d.mayorLastStarted
+	}
+	// Claude transcript lookup is project-directory scoped. If a manual Claude
+	// session is run from the Mayor cwd, the newest-session rule may see that
+	// transcript; keep this detector bounded to recent supervised lifetime only.
+	configDirs := d.mayorClaudeConfigDirs()
+	report, err := agentlog.CheckClaudeMaxTokensDeadloop(filepath.Join(d.config.TownRoot, constants.DirMayor), required, since, configDirs...)
+	if err != nil {
+		d.logger.Printf("Warning: could not scan Mayor transcript for max_tokens deadloop: %v", err)
+		return false
+	}
+	if !report.Detected {
+		return false
+	}
+
+	cooldown := cfg.MaxTokensDeadloopRestartCooldownD()
+	if !d.mayorDeadloopLastRestart.IsZero() && time.Since(d.mayorDeadloopLastRestart) < cooldown {
+		d.logger.Printf("Mayor max_tokens deadloop still present (%d consecutive), restart cooldown active", report.Consecutive)
+		return false
+	}
+
+	d.mayorDeadloopLastRestart = time.Now()
+	reason := fmt.Sprintf("max_tokens empty-text deadloop: %d consecutive turns", report.Consecutive)
+	if report.LastPath != "" {
+		reason += fmt.Sprintf(" in %s", filepath.Base(report.LastPath))
+	}
+	d.restartMayor(mgr, cfg, reason)
+	return true
+}
+
+func (d *Daemon) mayorClaudeConfigDirs() []string {
+	var dirs []string
+	if configDir, _, err := agentconfig.ResolveAccountConfigDir(constants.MayorAccountsPath(d.config.TownRoot), ""); err != nil {
+		d.logger.Printf("Warning: could not resolve Mayor Claude account config dir: %v", err)
+	} else if configDir != "" {
+		dirs = append(dirs, configDir)
+	}
+	if envDir := os.Getenv("CLAUDE_CONFIG_DIR"); envDir != "" {
+		dirs = append(dirs, envDir)
+	}
+	return dirs
+}
+
 // checkMayorCriticalMail alerts when unread high-priority mail is backing up
-// for the Mayor. Alerts are throttled to avoid notification spam.
-func (d *Daemon) checkMayorCriticalMail(cfg *agentconfig.MayorThresholds) {
+// for the Mayor. If the backlog stays over threshold past the configured grace
+// period, it restarts the Mayor once and resets the timer.
+func (d *Daemon) checkMayorCriticalMail(mgr *mayor.Manager, cfg *agentconfig.MayorThresholds) {
 	threshold := cfg.CriticalMailBacklogThresholdV()
 	if threshold <= 0 {
+		d.mayorCriticalMailBacklogSince = time.Time{}
 		return
 	}
 
@@ -2178,19 +2251,51 @@ func (d *Daemon) checkMayorCriticalMail(cfg *agentconfig.MayorThresholds) {
 		d.logger.Printf("Warning: could not check Mayor critical mail backlog: %v", err)
 		return
 	}
-	if critical < threshold {
+	active, since, restart := evaluateMayorCriticalMailBacklog(
+		critical,
+		threshold,
+		d.mayorCriticalMailBacklogSince,
+		time.Now(),
+		cfg.CriticalMailRestartAfterD(),
+	)
+	if !active {
+		d.mayorCriticalMailBacklogSince = time.Time{}
 		return
 	}
+	wasFirstOverThreshold := d.mayorCriticalMailBacklogSince.IsZero()
+	d.mayorCriticalMailBacklogSince = since
 
 	const notifyCooldown = 15 * time.Minute
-	if time.Since(d.mayorCriticalMailLastNotified) < notifyCooldown {
-		return
-	}
-	d.mayorCriticalMailLastNotified = time.Now()
-
 	msg := fmt.Sprintf("Mayor has %d unread critical messages (threshold %d)", critical, threshold)
-	d.notifySlack("admin", "high", msg)
-	d.logger.Printf("ALERT: %s", msg)
+	if time.Since(d.mayorCriticalMailLastNotified) >= notifyCooldown {
+		d.mayorCriticalMailLastNotified = time.Now()
+		d.notifySlack("admin", "high", msg)
+		d.logger.Printf("ALERT: %s", msg)
+	} else if wasFirstOverThreshold {
+		d.logger.Printf("ALERT: %s", msg)
+	}
+	if restart {
+		d.mayorCriticalMailBacklogSince = time.Time{}
+		d.restartMayor(mgr, cfg, fmt.Sprintf("%s for %s", msg, cfg.CriticalMailRestartAfterD().Round(time.Second)))
+	}
+}
+
+func evaluateMayorCriticalMailBacklog(critical, threshold int, since, now time.Time, restartAfter time.Duration) (active bool, nextSince time.Time, shouldRestart bool) {
+	if threshold <= 0 || critical < threshold {
+		return false, time.Time{}, false
+	}
+	if since.IsZero() {
+		return true, now, false
+	}
+	if restartAfter <= 0 {
+		return true, since, false
+	}
+	return true, since, now.Sub(since) >= restartAfter
+}
+
+func (d *Daemon) markMayorStarted(now time.Time) {
+	d.mayorLastStarted = now
+	d.mayorCriticalMailBacklogSince = time.Time{}
 }
 
 // restartMayor performs a supervised restart of the Mayor: captures hook/mail
@@ -2218,7 +2323,7 @@ func (d *Daemon) restartMayor(mgr *mayor.Manager, cfg *agentconfig.MayorThreshol
 		d.logger.Printf("Error stopping Mayor before restart: %v", stopErr)
 	}
 
-	d.mayorLastStarted = time.Now()
+	d.markMayorStarted(time.Now())
 	if startErr := mgr.Start(""); startErr != nil {
 		d.mayorZombieCount = 0
 		attempt := &mayor.RecoveryAttempt{

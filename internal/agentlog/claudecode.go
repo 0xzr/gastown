@@ -100,6 +100,65 @@ func (a *ClaudeCodeAdapter) Watch(ctx context.Context, sessionID, workDir string
 // letter (e.g. "C:") is stripped before hashing, matching Claude Code's
 // cross-platform behavior.
 func claudeProjectDirFor(workDir string) (string, error) {
+	dirs, err := claudeProjectDirsFor(workDir)
+	if err != nil {
+		return "", err
+	}
+	return dirs[0], nil
+}
+
+func claudeProjectDirsFor(workDir string) ([]string, error) {
+	hash, err := claudeProjectHashFor(workDir)
+	if err != nil {
+		return nil, err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("getting home dir: %w", err)
+	}
+	return []string{
+		filepath.Join(home, claudeProjectsDir, hash),
+		filepath.Join(home, ".claude-anthropic", "projects", hash),
+	}, nil
+}
+
+func claudeProjectDirsForConfigDirs(workDir string, configDirs ...string) ([]string, error) {
+	dirs, err := claudeProjectDirsFor(workDir)
+	if err != nil {
+		return nil, err
+	}
+	hash, err := claudeProjectHashFor(workDir)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(dirs)+len(configDirs))
+	unique := make([]string, 0, len(dirs)+len(configDirs))
+	add := func(dir string) {
+		if dir == "" || seen[dir] {
+			return
+		}
+		seen[dir] = true
+		unique = append(unique, dir)
+	}
+	for _, dir := range dirs {
+		add(dir)
+	}
+	for _, configDir := range configDirs {
+		configDir = strings.TrimSpace(configDir)
+		if configDir == "" {
+			continue
+		}
+		if strings.HasPrefix(configDir, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				configDir = filepath.Join(home, strings.TrimPrefix(configDir, "~/"))
+			}
+		}
+		add(filepath.Join(configDir, "projects", hash))
+	}
+	return unique, nil
+}
+
+func claudeProjectHashFor(workDir string) (string, error) {
 	abs, err := filepath.Abs(workDir)
 	if err != nil {
 		return "", fmt.Errorf("resolving absolute path: %w", err)
@@ -111,12 +170,7 @@ func claudeProjectDirFor(workDir string) (string, error) {
 	if len(normalized) >= 2 && normalized[1] == ':' {
 		normalized = normalized[2:]
 	}
-	hash := strings.ReplaceAll(normalized, "/", "-")
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("getting home dir: %w", err)
-	}
-	return filepath.Join(home, claudeProjectsDir, hash), nil
+	return strings.ReplaceAll(normalized, "/", "-"), nil
 }
 
 // waitForNewestJSONL polls projectDir until a qualifying .jsonl file appears.
@@ -248,9 +302,10 @@ type ccEntry struct {
 
 // ccMessage is the message field of a ccEntry.
 type ccMessage struct {
-	Role    string      `json:"role"`
-	Content []ccContent `json:"content"`
-	Usage   *ccUsage    `json:"usage,omitempty"`
+	Role       string      `json:"role"`
+	Content    []ccContent `json:"content"`
+	Usage      *ccUsage    `json:"usage,omitempty"`
+	StopReason string      `json:"stop_reason,omitempty"`
 }
 
 // ccUsage holds Claude API token usage counts for an assistant turn.
@@ -358,4 +413,136 @@ func parseClaudeCodeLine(line, sessionID, agentType, nativeSessionID string) []A
 	}
 
 	return events
+}
+
+// MaxTokensDeadloopReport summarizes recent Claude assistant turns that ended
+// with stop_reason=max_tokens while producing no non-empty text.
+type MaxTokensDeadloopReport struct {
+	Detected     bool
+	Consecutive  int
+	Required     int
+	ScannedTurns int
+	LastPath     string
+	LastTime     time.Time
+}
+
+// CheckClaudeMaxTokensDeadloop scans the newest recent Claude Code JSONL
+// transcript for consecutive max_tokens empty-text assistant turns in workDir.
+func CheckClaudeMaxTokensDeadloop(workDir string, required int, since time.Time, configDirs ...string) (*MaxTokensDeadloopReport, error) {
+	if required <= 0 {
+		required = 1
+	}
+	report := &MaxTokensDeadloopReport{Required: required}
+	projectDirs, err := claudeProjectDirsForConfigDirs(workDir, configDirs...)
+	if err != nil {
+		return report, err
+	}
+
+	type transcriptFile struct {
+		path    string
+		modTime time.Time
+	}
+	var newest *transcriptFile
+	for _, dir := range projectDirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return report, err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			info, err := entry.Info()
+			if err == nil && !since.IsZero() && info.ModTime().Before(since) {
+				continue
+			}
+			if err != nil {
+				continue
+			}
+			candidate := transcriptFile{path: path, modTime: info.ModTime()}
+			if newest == nil || candidate.modTime.After(newest.modTime) || (candidate.modTime.Equal(newest.modTime) && candidate.path > newest.path) {
+				newest = &candidate
+			}
+		}
+	}
+	if newest == nil {
+		return report, nil
+	}
+	report.LastPath = newest.path
+	f, err := os.Open(newest.path)
+	if err != nil {
+		return report, nil
+	}
+	err = scanClaudeMaxTokensDeadloop(f, newest.path, required, since, report)
+	_ = f.Close()
+	if err != nil {
+		return report, err
+	}
+	report.Detected = report.Consecutive >= required
+	return report, nil
+}
+
+func scanClaudeMaxTokensDeadloop(r io.Reader, path string, required int, since time.Time, report *MaxTokensDeadloopReport) error {
+	reader := bufio.NewReaderSize(r, 256*1024)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			scanClaudeMaxTokensDeadloopLine(strings.TrimRight(line, "\r\n"), path, required, since, report)
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func scanClaudeMaxTokensDeadloopLine(line, path string, required int, since time.Time, report *MaxTokensDeadloopReport) {
+	if line == "" {
+		return
+	}
+	var entry ccEntry
+	if err := json.Unmarshal([]byte(line), &entry); err != nil {
+		return
+	}
+	if entry.Type != "assistant" || entry.Message == nil || entry.Message.Role != "assistant" {
+		return
+	}
+	ts := time.Time{}
+	if entry.Timestamp != "" {
+		if parsed, err := time.Parse(time.RFC3339, entry.Timestamp); err == nil {
+			ts = parsed
+		}
+	}
+	if !since.IsZero() {
+		if ts.IsZero() || ts.Before(since) {
+			return
+		}
+	}
+
+	report.ScannedTurns++
+	if entry.Message.StopReason == "max_tokens" && !claudeMessageHasNonEmptyText(entry.Message) {
+		report.Consecutive++
+		report.LastPath = path
+		report.LastTime = ts
+		if report.Consecutive >= required {
+			report.Detected = true
+		}
+		return
+	}
+	report.Consecutive = 0
+}
+
+func claudeMessageHasNonEmptyText(msg *ccMessage) bool {
+	for _, content := range msg.Content {
+		if content.Type == "text" && strings.TrimSpace(content.Text) != "" {
+			return true
+		}
+	}
+	return false
 }

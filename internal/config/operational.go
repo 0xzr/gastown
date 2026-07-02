@@ -135,6 +135,10 @@ const (
 	DefaultMayorHeartbeatVeryStaleThreshold  = 20 * time.Minute
 	DefaultMayorHungSessionThreshold         = 30 * time.Minute
 	DefaultMayorCriticalMailBacklogThreshold = 5
+	DefaultMayorCriticalMailRestartAfter     = 30 * time.Minute
+	DefaultMayorMaxTokensDeadloopConsecutive = 3
+	DefaultMayorMaxTokensDeadloopWindow      = 30 * time.Minute
+	DefaultMayorMaxTokensDeadloopCooldown    = 30 * time.Minute
 )
 
 // LoadOperationalConfig loads operational config from a town root.
@@ -873,4 +877,39 @@ func (m *MayorThresholds) CriticalMailBacklogThresholdV() int {
 		return *m.CriticalMailBacklogThreshold
 	}
 	return DefaultMayorCriticalMailBacklogThreshold
+}
+
+// CriticalMailRestartAfterD returns how long Mayor critical mail may remain
+// over threshold before supervised restart.
+func (m *MayorThresholds) CriticalMailRestartAfterD() time.Duration {
+	if m != nil {
+		return ParseDurationOrDefault(m.CriticalMailRestartAfter, DefaultMayorCriticalMailRestartAfter)
+	}
+	return DefaultMayorCriticalMailRestartAfter
+}
+
+// MaxTokensDeadloopConsecutiveV returns the number of consecutive max_tokens
+// empty-text assistant turns required before supervised restart.
+func (m *MayorThresholds) MaxTokensDeadloopConsecutiveV() int {
+	if m != nil && m.MaxTokensDeadloopConsecutive != nil {
+		return *m.MaxTokensDeadloopConsecutive
+	}
+	return DefaultMayorMaxTokensDeadloopConsecutive
+}
+
+// MaxTokensDeadloopWindowD returns the recent transcript scan window.
+func (m *MayorThresholds) MaxTokensDeadloopWindowD() time.Duration {
+	if m != nil {
+		return ParseDurationOrDefault(m.MaxTokensDeadloopWindow, DefaultMayorMaxTokensDeadloopWindow)
+	}
+	return DefaultMayorMaxTokensDeadloopWindow
+}
+
+// MaxTokensDeadloopRestartCooldownD returns the cooldown between transcript
+// deadloop-triggered Mayor restarts.
+func (m *MayorThresholds) MaxTokensDeadloopRestartCooldownD() time.Duration {
+	if m != nil {
+		return ParseDurationOrDefault(m.MaxTokensDeadloopRestartCooldown, DefaultMayorMaxTokensDeadloopCooldown)
+	}
+	return DefaultMayorMaxTokensDeadloopCooldown
 }

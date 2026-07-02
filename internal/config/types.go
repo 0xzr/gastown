@@ -554,6 +554,23 @@ type MayorThresholds struct {
 	// CriticalMailBacklogThreshold is the number of unread high/urgent messages that
 	// triggers a supervision alert. Default: 5.
 	CriticalMailBacklogThreshold *int `json:"critical_mail_backlog_threshold,omitempty"`
+
+	// CriticalMailRestartAfter is how long critical-mail backlog may remain over
+	// threshold before the daemon restarts the Mayor session. Default: "30m".
+	CriticalMailRestartAfter string `json:"critical_mail_restart_after,omitempty"`
+
+	// MaxTokensDeadloopConsecutive is the number of consecutive assistant turns
+	// ending with stop_reason=max_tokens and no non-empty text before restart.
+	// Default: 3.
+	MaxTokensDeadloopConsecutive *int `json:"max_tokens_deadloop_consecutive,omitempty"`
+
+	// MaxTokensDeadloopWindow is how far back the daemon scans Claude JSONL
+	// transcripts for max_tokens empty-text deadloops. Default: "30m".
+	MaxTokensDeadloopWindow string `json:"max_tokens_deadloop_window,omitempty"`
+
+	// MaxTokensDeadloopRestartCooldown prevents repeated restarts for the same
+	// transcript pattern. Default: "30m".
+	MaxTokensDeadloopRestartCooldown string `json:"max_tokens_deadloop_restart_cooldown,omitempty"`
 }
 
 // DefaultOperationalConfig returns an OperationalConfig with all defaults.
