@@ -834,6 +834,7 @@ func TestReworkRouteClassificationConstants(t *testing.T) {
 		{reworkRouteNeedsRework, "NEEDS_REWORK_PEER_REVIEW"},
 		{reworkRouteReviewerHold, "REVIEW_UNAVAILABLE_HOLD"},
 		{reworkRouteAmbiguous, "REWORK_ROUTE_AMBIGUOUS"},
+		{reworkRouteRejectReplay, "NEEDS_REWORK_UNCHANGED_REJECT_REPLAY"},
 	}
 	for _, tc := range cases {
 		if tc.got != tc.want {
