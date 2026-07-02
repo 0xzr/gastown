@@ -1,0 +1,36 @@
+{
+  "verdict": "FAIL",
+  "findings": [
+    {
+      "classification": "BLOCKING",
+      "citation": ".beads/config.yaml:54-56",
+      "explanation": "The commit message says the shared Dolt keys are 'for new gtviz rig', but they were added to gastown's root .beads/config.yaml instead of /home/ubuntu/gt-town/gtviz/.repo.git/.beads/config.yaml. Since the doctor check validates every .beads/ dir independently, this change does not satisfy the stated intent for the gtviz rig and alters the wrong bead's configuration."
+    },
+    {
+      "classification": "BLOCKING",
+      "citation": ".beads/config.yaml:54-56",
+      "explanation": "Setting storage.backend='dolt' and dolt.port=3307 in the gastown root config changes default storage resolution for every 'bd' invocation in the gastown worktree. This is an invasive side effect on the main repo when the stated target is a separate rig."
+    },
+    {
+      "classification": "MAJOR",
+      "citation": "diff (no test files)",
+      "explanation": "No tests were added for the new shared Dolt config. Given the doctor check has explicit expectations (storage.backend, dolt.server, dolt.port), there should be coverage that the correct .beads/config.yaml values are present and that unintended directories are not flagged."
+    },
+    {
+      "classification": "MAJOR",
+      "citation": "commit metadata",
+      "explanation": "No telemetry entry exists for this commit and no gate panel is on record, violating the process audited in gastown-cet.12.4 under the strict four-model rule."
+    },
+    {
+      "classification": "MAJOR",
+      "citation": ".beads/config.yaml:54-56",
+      "explanation": "Cross-rig port coupling is a risk: port 3307 is claimed here for gastown, but if gtviz subsequently uses the same port and backend it may connect to the wrong database or compete with the gastown Dolt server. The server key is loopback-only, so external exposure is not the concern, but the coupling itself can cause runtime misrouting."
+    },
+    {
+      "classification": "MINOR",
+      "citation": ".beads/config.yaml:54-56",
+      "explanation": "Style inconsistency: storage.backend uses a bare string while dolt.server and dolt.port are quoted. The file should use consistent scalar quoting for string values."
+    }
+  ],
+  "summary": "The change is placed in the wrong location: it modifies gastown's root .beads/config.yaml while claiming to configure the separate gtviz rig, and in doing so forces all gastown-root commands onto Dolt at port 3307. This has blocking correctness and side-effect implications. The commit also lacks tests and a gate panel, and introduces cross-rig port coupling. It should be reverted and the three keys added to /home/ubuntu/gt-town/gtviz/.repo.git/.beads/config.yaml instead, with tests and consistent quoting."
+}
