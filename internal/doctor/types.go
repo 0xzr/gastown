@@ -13,6 +13,7 @@ import (
 const (
 	CategoryCore           = "Core"
 	CategoryInfrastructure = "Infrastructure"
+	CategoryProduction     = "Production"
 	CategoryRig            = "Rig"
 	CategoryPatrol         = "Patrol"
 	CategoryConfig         = "Configuration"
@@ -24,6 +25,7 @@ const (
 var CategoryOrder = []string{
 	CategoryCore,
 	CategoryInfrastructure,
+	CategoryProduction,
 	CategoryRig,
 	CategoryPatrol,
 	CategoryConfig,

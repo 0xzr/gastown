@@ -17,6 +17,7 @@ var (
 	doctorRestartSessions bool
 	doctorNoStart         bool
 	doctorSlow            string
+	doctorProduction      bool
 )
 
 var doctorCmd = &cobra.Command{
@@ -109,6 +110,11 @@ Dolt checks:
   - dolt-server-reachable    Check dolt sql-server is reachable
   - dolt-orphaned-databases  Detect orphaned dolt databases
 
+Production checks (read-only, with --production):
+  - prod-dolt-databases        Expose configured and available production Dolt DBs
+  - prod-hardcoded-db-pollution Detect legacy hardcoded gt/mo Dolt DBs
+  - prod-umans-evidence        Read UMANS proxy service and canary/token-lint logs
+
 Patrol checks:
   - patrol-molecules-exist   Verify patrol molecules exist
   - patrol-hooks-wired       Verify daemon triggers patrols
@@ -118,6 +124,7 @@ Patrol checks:
 Use --fix to attempt automatic fixes for issues that support it.
 Use --no-start with --fix to suppress starting the daemon and agents.
 Use --rig to check a specific rig instead of the entire workspace.
+Use --production to run only the focused read-only production checks.
 Use --slow to highlight slow checks (default threshold: 1s, e.g. --slow=500ms).`,
 	RunE: runDoctor,
 }
@@ -129,6 +136,7 @@ func init() {
 	doctorCmd.Flags().BoolVar(&doctorRestartSessions, "restart-sessions", false, "Restart patrol sessions when fixing stale settings (use with --fix)")
 	doctorCmd.Flags().BoolVar(&doctorNoStart, "no-start", false, "Suppress starting daemon/agents during --fix")
 	doctorCmd.Flags().StringVar(&doctorSlow, "slow", "", "Highlight slow checks (optional threshold, default 1s)")
+	doctorCmd.Flags().BoolVar(&doctorProduction, "production", false, "Run only focused read-only production checks")
 	// Allow --slow without a value (uses default 1s)
 	doctorCmd.Flags().Lookup("slow").NoOptDefVal = "1s"
 	rootCmd.AddCommand(doctorCmd)
@@ -152,6 +160,17 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	// Create doctor and register checks
 	d := doctor.NewDoctor()
+
+	if doctorProduction {
+		if doctorFix {
+			return fmt.Errorf("--production is read-only and cannot be combined with --fix")
+		}
+		if doctorRig != "" {
+			return fmt.Errorf("--production is town-level and cannot be combined with --rig")
+		}
+		d.RegisterAll(doctor.ProductionChecks()...)
+		return runDoctorChecks(d, ctx, false, doctorVerbose, doctorSlow)
+	}
 
 	// Register workspace-level checks first (fundamental)
 	d.RegisterAll(doctor.WorkspaceChecks()...)
@@ -294,27 +313,31 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		d.RegisterAll(doctor.RigChecks()...)
 	}
 
+	return runDoctorChecks(d, ctx, doctorFix, doctorVerbose, doctorSlow)
+}
+
+func runDoctorChecks(d *doctor.Doctor, ctx *doctor.CheckContext, fix bool, verbose bool, slow string) error {
 	// Parse slow threshold (0 = disabled)
 	var slowThreshold time.Duration
-	if doctorSlow != "" {
+	if slow != "" {
 		var err error
-		slowThreshold, err = time.ParseDuration(doctorSlow)
+		slowThreshold, err = time.ParseDuration(slow)
 		if err != nil {
-			return fmt.Errorf("invalid --slow duration %q: %w", doctorSlow, err)
+			return fmt.Errorf("invalid --slow duration %q: %w", slow, err)
 		}
 	}
 
 	// Run checks with streaming output
 	fmt.Println() // Initial blank line
 	var report *doctor.Report
-	if doctorFix {
+	if fix {
 		report = d.FixStreaming(ctx, os.Stdout, slowThreshold)
 	} else {
 		report = d.RunStreaming(ctx, os.Stdout, slowThreshold)
 	}
 
 	// Print summary (checks were already printed during streaming)
-	report.PrintSummaryOnly(os.Stdout, doctorVerbose, slowThreshold)
+	report.PrintSummaryOnly(os.Stdout, verbose, slowThreshold)
 
 	// Exit with error code if there are errors
 	if report.HasErrors() {
