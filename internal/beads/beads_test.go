@@ -1093,6 +1093,44 @@ func TestRunClassifiesStdoutNotFoundAsErrNotFound(t *testing.T) {
 	}
 }
 
+func TestRunTimeoutKillsBDProcessTree(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix process-group kill regression")
+	}
+
+	bdAllowStaleMu.Lock()
+	prevPath := bdAllowStalePath
+	prevResult := bdAllowStaleResult
+	bdAllowStaleMu.Unlock()
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(func() {
+		bdAllowStaleMu.Lock()
+		bdAllowStalePath = prevPath
+		bdAllowStaleResult = prevResult
+		bdAllowStaleMu.Unlock()
+	})
+
+	stubDir := t.TempDir()
+	writeStdoutHoldingBDStub(t, stubDir)
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_BD_TIMEOUT_SEC", "1")
+
+	workDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(workDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	start := time.Now()
+	_, err := NewIsolated(workDir).List(ListOptions{Status: "open"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("List() unexpectedly succeeded")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("List() returned after %v; timeout did not kill bd's process tree promptly", elapsed)
+	}
+}
+
 func TestBDListSlowListDoesNotBlockUnrelatedList(t *testing.T) {
 	if os.Getenv("GT_BEADS_LIST_CONCURRENCY_HELPER") == "1" {
 		runBDListConcurrencyHelper(t)
@@ -1487,6 +1525,26 @@ exit 0
 
 	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
 		t.Fatalf("write stdout-not-found bd stub: %v", err)
+	}
+}
+
+func writeStdoutHoldingBDStub(t *testing.T, dir string) {
+	t.Helper()
+
+	scriptPath := filepath.Join(dir, "bd")
+	script := `#!/bin/sh
+set -eu
+if [ "${1:-}" = "--allow-stale" ]; then
+  echo "Error: unknown flag: --allow-stale" >&2
+  exit 0
+fi
+(
+  sleep 3
+) &
+sleep 10
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write stdout-holding bd stub: %v", err)
 	}
 }
 
@@ -2773,13 +2831,13 @@ func TestParseAgentBeadID(t *testing.T) {
 		{"hq-mayor", "", "mayor", "", true},                           // hq prefix town-level
 		// Prefix length is no longer constrained to 2-3 chars — both short and
 		// long prefixes are accepted as long as a hyphen follows them.
-		{"x-mayor", "", "mayor", "", true},    // 1-char prefix now parses as town-level
-		{"abcd-mayor", "", "mayor", "", true}, // 4-char prefix now parses as town-level
+		{"x-mayor", "", "mayor", "", true},                      // 1-char prefix now parses as town-level
+		{"abcd-mayor", "", "mayor", "", true},                   // 4-char prefix now parses as town-level
 		{"xyz-gastown-witness", "gastown", "witness", "", true}, // 3+ char prefix per-rig
 		// Truly invalid patterns
-		{"", "", "", "", false},           // empty string
-		{"nohyphen", "", "", "", false},    // no hyphen at all
-		{"-mayor", "", "", "", false},     // hyphen at position 0 (no prefix)
+		{"", "", "", "", false},         // empty string
+		{"nohyphen", "", "", "", false}, // no hyphen at all
+		{"-mayor", "", "", "", false},   // hyphen at position 0 (no prefix)
 	}
 
 	for _, tt := range tests {
