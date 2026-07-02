@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/refinery"
+	"github.com/steveyegge/gastown/internal/refinery/mrtelemetry"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -225,6 +227,37 @@ Examples:
 
 var refineryBlockedJSON bool
 
+var refineryTelemetryCmd = &cobra.Command{
+	Use:   "telemetry [rig]",
+	Short: "Show per-MR-attempt telemetry and per-writer-model summaries",
+	Long: `Show refinery per-MR-attempt telemetry recorded by the merge queue.
+
+By default lists recent attempt records (one per MR/rework attempt) with the
+writer model, codex verdict, failure class, and submit-to-codex-verdict time.
+Use --summary to aggregate by writer model: total attempts, first-pass Codex
+pass rate, final merge rate, rejection/rework counts, median and p95
+time-to-Codex-verdict, and excluded infra/unavailable/timeout counts.
+
+This is the data Mayor uses to compare implementer models (e.g. umans-kimi vs
+umans-glm vs m3) on the current fleet.
+
+Examples:
+  gt refinery telemetry
+  gt refinery telemetry --summary
+  gt refinery telemetry --summary --since 7d
+  gt refinery telemetry --summary --writer umans-glm
+  gt refinery telemetry --json`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runRefineryTelemetry,
+}
+
+var (
+	refineryTelemetryJSON    bool
+	refineryTelemetrySummary bool
+	refineryTelemetrySince   string
+	refineryTelemetryWriter  string
+)
+
 func init() {
 	// Start flags
 	refineryStartCmd.Flags().BoolVar(&refineryForeground, "foreground", false, "Run in foreground (default: background)")
@@ -253,6 +286,12 @@ func init() {
 	// Blocked flags
 	refineryBlockedCmd.Flags().BoolVar(&refineryBlockedJSON, "json", false, "Output as JSON")
 
+	// Telemetry flags
+	refineryTelemetryCmd.Flags().BoolVar(&refineryTelemetryJSON, "json", false, "Output as JSON")
+	refineryTelemetryCmd.Flags().BoolVar(&refineryTelemetrySummary, "summary", false, "Aggregate by writer model (per-model pass/merge/rework/latency)")
+	refineryTelemetryCmd.Flags().StringVar(&refineryTelemetrySince, "since", "", "Only include records within this window (e.g. 24h, 7d, 30d; default: all)")
+	refineryTelemetryCmd.Flags().StringVar(&refineryTelemetryWriter, "writer", "", "Filter to a single writer model")
+
 	// Add subcommands
 	refineryCmd.AddCommand(refineryStartCmd)
 	refineryCmd.AddCommand(refineryStopCmd)
@@ -265,6 +304,7 @@ func init() {
 	refineryCmd.AddCommand(refineryUnclaimedCmd)
 	refineryCmd.AddCommand(refineryReadyCmd)
 	refineryCmd.AddCommand(refineryBlockedCmd)
+	refineryCmd.AddCommand(refineryTelemetryCmd)
 
 	rootCmd.AddCommand(refineryCmd)
 }
@@ -854,4 +894,239 @@ func runRefineryBlocked(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// runRefineryTelemetry lists per-MR-attempt telemetry records or, with
+// --summary, aggregates them by writer model. It reads the append-only JSONL
+// written by the refinery's per-attempt recorder under
+// <townRoot>/.runtime/refinery-telemetry/. Filters: --since (e.g. 24h, 7d),
+// --writer (single writer model). --json emits structured output.
+//
+// This is the report command the Mayor uses to compare implementer models
+// (umans-kimi vs umans-glm vs m3) on first-pass Codex pass rate, merge rate,
+// rework count, and median/p95 time-to-Codex-verdict.
+func runRefineryTelemetry(cmd *cobra.Command, args []string) error {
+	rigName := ""
+	if len(args) > 0 {
+		rigName = args[0]
+	}
+
+	_, r, rigName, err := getRefineryManager(rigName)
+	if err != nil {
+		return err
+	}
+
+	// The Engineer wires the telemetry recorder (resolving the town root and
+	// .runtime/refinery-telemetry dir). NewEngineer is cheap and read-only
+	// here — we only use the recorder to locate JSONL files.
+	eng := refinery.NewEngineer(r)
+	recorder := eng.TelemetryRecorder()
+	if recorder == nil {
+		// Town root could not be resolved. Without a directory we have nothing
+		// to read; emit an explicit empty result rather than a bare error.
+		return emitTelemetryEmpty(rigName)
+	}
+
+	// Parse --since into a lower-bound time (applied to file mtime AND to
+	// record finalization time so both views honor the window).
+	var sinceTime time.Time
+	if refineryTelemetrySince != "" {
+		d, err := parseDuration(refineryTelemetrySince)
+		if err != nil {
+			return fmt.Errorf("invalid --since duration %q: %w", refineryTelemetrySince, err)
+		}
+		sinceTime = time.Now().Add(-d)
+	}
+
+	files, err := recorder.Files(sinceTime)
+	if err != nil {
+		return fmt.Errorf("reading telemetry files: %w", err)
+	}
+
+	if refineryTelemetrySummary {
+		opts := mrtelemetry.SummaryOptions{
+			Since:  sinceTime,
+			Writer: refineryTelemetryWriter,
+			Rig:    rigName,
+		}
+		// --writer "" with a positional rig arg would over-filter rigs whose
+		// records carry a different rig name; only apply the rig filter when
+		// the user explicitly passed a rig argument.
+		if len(args) == 0 {
+			opts.Rig = ""
+		}
+		summaries := mrtelemetry.Summarize(files, opts)
+		return emitTelemetrySummary(summaries, rigName)
+	}
+
+	// List view: load all records (filtered by --since/--writer) newest-first.
+	records := loadTelemetryRecords(files, sinceTime, refineryTelemetryWriter, rigName, len(args) > 0)
+	if refineryTelemetryJSON {
+		return emitTelemetryRecordsJSON(records)
+	}
+	return emitTelemetryRecordsText(records, rigName)
+}
+
+// emitTelemetryEmpty prints an explicit empty-state message for the case where
+// the telemetry recorder is disabled (town root unresolved) or no files exist.
+func emitTelemetryEmpty(rigName string) error {
+	if refineryTelemetryJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if refineryTelemetrySummary {
+			return enc.Encode([]mrtelemetry.WriterSummary{})
+		}
+		return enc.Encode([]mrtelemetry.AttemptRecord{})
+	}
+	label := "records"
+	if refineryTelemetrySummary {
+		label = "summaries"
+	}
+	fmt.Printf("%s No telemetry %s for '%s' (recorder disabled or no data yet)\n", style.Dim.Render("○"), label, rigName)
+	return nil
+}
+
+// loadTelemetryRecords reads all attempt records from files and applies the
+// --since, --writer, and (optionally) rig filters. The result is newest-first
+// by RecordedAt so the most recent attempts surface at the top of the list.
+// Best-effort: unreadable files are skipped.
+func loadTelemetryRecords(files []string, since time.Time, writer, rig string, filterRig bool) []mrtelemetry.AttemptRecord {
+	var out []mrtelemetry.AttemptRecord
+	for _, f := range files {
+		recs, err := mrtelemetry.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		out = append(out, recs...)
+	}
+	filtered := out[:0]
+	for _, r := range out {
+		if !since.IsZero() {
+			t := mrtelemetry.ParseTime(r.RecordedAt)
+			if t.IsZero() || t.Before(since) {
+				continue
+			}
+		}
+		if writer != "" && r.WriterModel != writer {
+			continue
+		}
+		if filterRig && rig != "" && r.Rig != rig {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	out = filtered
+	sort.Slice(out, func(i, j int) bool {
+		return mrtelemetry.ParseTime(out[i].RecordedAt).After(mrtelemetry.ParseTime(out[j].RecordedAt))
+	})
+	return out
+}
+
+// emitTelemetryRecordsJSON prints records as indented JSON.
+func emitTelemetryRecordsJSON(records []mrtelemetry.AttemptRecord) error {
+	if records == nil {
+		records = []mrtelemetry.AttemptRecord{}
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(records)
+}
+
+// emitTelemetryRecordsText prints a human-readable table of recent attempts.
+func emitTelemetryRecordsText(records []mrtelemetry.AttemptRecord, rigName string) error {
+	fmt.Printf("%s Refinery telemetry for '%s':\n\n", style.Bold.Render("📊"), rigName)
+
+	if len(records) == 0 {
+		fmt.Printf("  %s\n", style.Dim.Render("(no records)"))
+		return nil
+	}
+
+	for _, r := range records {
+		verdict := r.CodexVerdict
+		if verdict == "" {
+			verdict = "-"
+		}
+		fc := r.FailureClass
+		if fc == "" || fc == mrtelemetry.FailureClassNone {
+			fc = "-"
+		}
+		latency := "-"
+		if sub, fin := mrtelemetry.ParseTime(r.SubmittedAt), mrtelemetry.ParseTime(r.CodexReviewFinishedAt); !sub.IsZero() && !fin.IsZero() && fin.After(sub) {
+			latency = formatDuration(fin.Sub(sub))
+		}
+		writer := r.WriterModel
+		if writer == "" {
+			writer = "(unknown)"
+		}
+		fmt.Printf("  %s #%d %s\n", r.MRID, r.Attempt, style.Dim.Render(r.SourceBead))
+		fmt.Printf("    writer=%s  codex=%s  class=%s  ttv=%s  decision=%s\n",
+			writer, verdict, fc, latency, orDash(r.FinalGateDecision))
+		if r.Polecat != "" || r.Branch != "" {
+			fmt.Printf("    polecat=%s  branch=%s\n", orDash(r.Polecat), orDash(r.Branch))
+		}
+	}
+	return nil
+}
+
+// emitTelemetrySummary prints the per-writer summary table or JSON.
+func emitTelemetrySummary(summaries []mrtelemetry.WriterSummary, rigName string) error {
+	if refineryTelemetryJSON {
+		if summaries == nil {
+			summaries = []mrtelemetry.WriterSummary{}
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(summaries)
+	}
+
+	fmt.Printf("%s Per-writer telemetry summary for '%s':\n\n", style.Bold.Render("📊"), rigName)
+
+	if len(summaries) == 0 {
+		fmt.Printf("  %s\n", style.Dim.Render("(no records)"))
+		return nil
+	}
+
+	// Column layout: writer | attempts | 1st-pass% | merge% | codex P/F/U/NV | rework | median | p95 | excluded
+	fmt.Printf("  %-16s %5s %9s %8s %14s %7s %8s %8s %10s\n",
+		"writer", "attempts", "1st-pass%", "merge%", "codex P/F/U/NV", "rework", "median", "p95", "excluded")
+	fmt.Println("  " + strings.Repeat("─", 96))
+
+	for _, s := range summaries {
+		writer := s.WriterModel
+		if writer == "" {
+			writer = "(unknown)"
+		}
+		median := "-"
+		if s.MedianSubmitToCodexVerdictSec > 0 {
+			median = formatDuration(time.Duration(s.MedianSubmitToCodexVerdictSec * float64(time.Second)))
+		}
+		p95 := "-"
+		if s.P95SubmitToCodexVerdictSec > 0 {
+			p95 = formatDuration(time.Duration(s.P95SubmitToCodexVerdictSec * float64(time.Second)))
+		}
+		excluded := s.ExcludedInfraCount + s.ExcludedReviewerUnavailable + s.ExcludedTimeoutCount
+		codex := fmt.Sprintf("%d/%d/%d/%d", s.CodexPassCount, s.CodexFailCount, s.CodexUnavailableCount, s.CodexNoVerdictCount)
+		fmt.Printf("  %-16s %5d %8.1f%% %7.1f%% %14s %7d %8s %8s %10d\n",
+			writer,
+			s.TotalAttempts,
+			s.FirstPassCodexPassRate*100,
+			s.FinalMergeRate*100,
+			codex,
+			s.ReworkCount,
+			median,
+			p95,
+			excluded,
+		)
+	}
+	fmt.Printf("\n  %s codex=P/F/U/NV (Pass/Fail/Unavailable/NoVerdict); excluded=infra+unavailable+timeout\n",
+		style.Dim.Render("legend:"))
+	return nil
+}
+
+// orDash returns s if non-empty, else "-".
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
