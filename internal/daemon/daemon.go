@@ -270,12 +270,12 @@ func New(config *Config) (*Daemon, error) {
 		return nil, fmt.Errorf("creating daemon directory: %w", err)
 	}
 
-	// Open log file with rotation (100MB max, 3 backups, 7 days, compressed)
+	// Open log file with rotation (100MB max, 3 backups, 14 days, compressed)
 	logWriter := &lumberjack.Logger{
 		Filename:   config.LogFile,
 		MaxSize:    100, // megabytes
 		MaxBackups: 3,
-		MaxAge:     7, // days
+		MaxAge:     14, // days
 		Compress:   true,
 	}
 

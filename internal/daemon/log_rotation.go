@@ -22,7 +22,7 @@ const (
 
 	// staleArchiveMaxAge is the maximum age for timestamped archive files.
 	// Archives older than this are deleted by cleanStaleArchives.
-	staleArchiveMaxAge = 7 * 24 * time.Hour
+	staleArchiveMaxAge = 14 * 24 * time.Hour
 
 	// daemonDiskBudget is the maximum total size of the daemon/ directory in bytes.
 	// If exceeded, oldest .gz files are deleted until under budget.
@@ -216,7 +216,7 @@ func CleanDaemonDir(townRoot string) *CleanupResult {
 	daemonDir := filepath.Join(townRoot, "daemon")
 	result := &CleanupResult{}
 
-	// Phase 1: Remove stale timestamped archives (older than 7 days)
+	// Phase 1: Remove stale timestamped archives (older than 14 days)
 	stale, errs := cleanStaleArchives(daemonDir)
 	result.StaleRemoved = stale
 	result.Errors = append(result.Errors, errs...)

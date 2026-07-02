@@ -131,22 +131,22 @@ func TestForceRotateLogs_SkipsEmptyFiles(t *testing.T) {
 func TestCleanStaleArchives_RemovesOldFiles(t *testing.T) {
 	daemonDir := t.TempDir()
 
-	// Create a stale archive (8 days old)
+	// Create a stale archive (15 days old)
 	stalePath := filepath.Join(daemonDir, "dolt-2026-02-20T10-48-08.log.gz")
 	if err := os.WriteFile(stalePath, []byte("old data"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	staleTime := time.Now().Add(-8 * 24 * time.Hour)
+	staleTime := time.Now().Add(-15 * 24 * time.Hour)
 	if err := os.Chtimes(stalePath, staleTime, staleTime); err != nil {
 		t.Fatal(err)
 	}
 
-	// Create a fresh archive (1 day old)
+	// Create a retained archive inside the 14-day window.
 	freshPath := filepath.Join(daemonDir, "dolt-2026-02-28T23-19-42.log.gz")
 	if err := os.WriteFile(freshPath, []byte("fresh data"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	freshTime := time.Now().Add(-1 * 24 * time.Hour)
+	freshTime := time.Now().Add(-8 * 24 * time.Hour)
 	if err := os.Chtimes(freshPath, freshTime, freshTime); err != nil {
 		t.Fatal(err)
 	}
