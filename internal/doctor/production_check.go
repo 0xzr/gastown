@@ -18,7 +18,14 @@ import (
 func ProductionChecks() []Check {
 	doltDeps := defaultProductionDoltDeps()
 	return []Check{
+		newProductionDoltServiceCheck(defaultProductionServiceDeps()),
 		newProductionDoltDatabasesCheck(doltDeps),
+		newProductionDoltQueryCanaryCheck(defaultProductionBDCanaryDeps()),
+		newProductionDaemonHeartbeatCheck(defaultProductionDaemonDeps()),
+		newProductionFreeSpaceCheck(defaultProductionDiskDeps()),
+		newProductionLoadAverageCheck(defaultProductionLoadDeps()),
+		newProductionRejectLedgerCheck(defaultProductionRejectLedgerDeps()),
+		newProductionRandomDoltListenersCheck(defaultProductionDoltListenerDeps()),
 		newProductionLegacyDatabasePollutionCheck(doltDeps),
 		newProductionUMANSEvidenceCheck(defaultProductionUMANSDeps()),
 	}
@@ -351,7 +358,7 @@ func systemdUserServiceStatus(ctx context.Context, service string) (map[string]s
 	cmdCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, "systemctl", "--user", "show", service,
-		"--property=LoadState,ActiveState,SubState,Result,ExecMainPID,ExecMainStatus,NRestarts,FragmentPath,ActiveEnterTimestamp",
+		"--property=LoadState,ActiveState,SubState,Result,ExecMainPID,ExecMainStatus,NRestarts,UnitFileState,FragmentPath,ActiveEnterTimestamp",
 		"--no-pager")
 	out, err := cmd.CombinedOutput()
 	if err != nil {

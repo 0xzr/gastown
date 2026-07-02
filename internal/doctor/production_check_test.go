@@ -19,7 +19,14 @@ func TestProductionChecksRegistered(t *testing.T) {
 	}
 
 	want := []string{
+		"prod-dolt-service",
 		"prod-dolt-databases",
+		"prod-dolt-query-canary",
+		"prod-daemon-heartbeat",
+		"prod-free-space",
+		"prod-load-average",
+		"prod-reject-ledger",
+		"prod-random-dolt-listeners",
 		"prod-hardcoded-db-pollution",
 		"prod-umans-evidence",
 	}

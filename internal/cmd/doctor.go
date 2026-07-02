@@ -111,7 +111,14 @@ Dolt checks:
   - dolt-orphaned-databases  Detect orphaned dolt databases
 
 Production checks (read-only, with --production):
+  - prod-dolt-service          Verify gt-dolt.service is active and enabled
   - prod-dolt-databases        Expose configured and available production Dolt DBs
+  - prod-dolt-query-canary     Run bounded bd list latency canary
+  - prod-daemon-heartbeat      Check daemon running status and heartbeat age
+  - prod-free-space            Check town disk and /dev/shm free space
+  - prod-load-average          Check system load average
+  - prod-reject-ledger         Check reject-driver ledger footprint
+  - prod-random-dolt-listeners Count random-port Dolt sql-server listeners
   - prod-hardcoded-db-pollution Detect legacy hardcoded gt/mo Dolt DBs
   - prod-umans-evidence        Read UMANS proxy service and canary/token-lint logs
 
