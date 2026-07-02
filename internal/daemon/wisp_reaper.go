@@ -202,6 +202,49 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		mol.closeStep("reap")
 	}
 
+	// Step 2b: Clean dangling parent refs (dedicated step, runs every cycle
+	// regardless of purge candidates so the backlog drains even when retention
+	// has not expired — gastown-3bdqa).
+	danglingErrors := 0
+	var totalDanglingCleaned int
+	for _, dbName := range databases {
+		if err := reaper.ValidateDBName(dbName); err != nil {
+			continue
+		}
+		db, err := reaper.OpenDB("127.0.0.1", port, dbName, 30*time.Second, 30*time.Second)
+		if err != nil {
+			danglingErrors++
+			continue
+		}
+		if ok, _ := reaper.HasReaperSchema(db); !ok {
+			db.Close()
+			continue
+		}
+		result, err := reaper.CleanDanglingParentRefs(db, dbName, dryRun)
+		db.Close()
+		if err != nil {
+			d.logger.Printf("wisp_reaper: %s: clean-dangling error: %v", dbName, err)
+			danglingErrors++
+			continue
+		}
+		totalDanglingCleaned += result.Cleaned
+		for _, a := range result.Anomalies {
+			d.logger.Printf("wisp_reaper: %s: ANOMALY: %s", dbName, a.Message)
+		}
+		if result.Cleaned > 0 {
+			prefix := ""
+			if dryRun {
+				prefix = "would "
+			}
+			d.logger.Printf("wisp_reaper: %s: %scleaned %d dangling parent refs", dbName, prefix, result.Cleaned)
+		}
+	}
+	if danglingErrors > 0 {
+		mol.failStep("clean-dangling", fmt.Sprintf("%d databases had clean-dangling errors", danglingErrors))
+	} else {
+		mol.closeStep("clean-dangling")
+	}
+
 	// Step 3: Purge
 	purgeErrors := 0
 	for _, dbName := range databases {
@@ -331,8 +374,8 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 	if totalMoleculeSteps > 0 {
 		summary += fmt.Sprintf(" molecule_steps_closed=%d", totalMoleculeSteps)
 	}
-	summary += fmt.Sprintf(" purged=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
-		totalPurged, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
+	summary += fmt.Sprintf(" dangling_cleaned=%d purged=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
+		totalDanglingCleaned, totalPurged, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
 	d.logger.Printf("%s", summary)
 	mol.closeStep("report")
 }

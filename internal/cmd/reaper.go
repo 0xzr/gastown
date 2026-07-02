@@ -562,7 +562,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			return fmt.Errorf("invalid --stale-age: %w", err)
 		}
 
-		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalClosed, totalOpen int
+		var totalReaped, totalMoleculeSteps, totalDanglingCleaned, totalPurged, totalMailPurged, totalClosed, totalOpen int
 
 		for i, dbName := range databases {
 			if err := waitBeforeReaperDatabase(i); err != nil {
@@ -610,6 +610,18 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 				totalOpen += reapResult.OpenRemain
 			}
 
+			// Clean dangling parent refs (dedicated step, runs every cycle
+			// regardless of purge candidates — gastown-3bdqa).
+			danglingResult, err := reaper.CleanDanglingParentRefs(db, dbName, reaperDryRun)
+			if err != nil {
+				fmt.Printf("%s: clean-dangling error: %v\n", dbName, err)
+			} else {
+				totalDanglingCleaned += danglingResult.Cleaned
+				for _, a := range danglingResult.Anomalies {
+					fmt.Printf("%s: %s %s\n", dbName, style.Warning.Render("ANOMALY:"), a.Message)
+				}
+			}
+
 			// Purge
 			purgeResult, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun)
 			if err != nil {
@@ -646,6 +658,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			fmt.Printf(" (+%d closed-molecule steps)", totalMoleculeSteps)
 		}
 		fmt.Println()
+		fmt.Printf("  Dangling:  %d parent refs cleaned\n", totalDanglingCleaned)
 		fmt.Printf("  Purged:    %d wisps, %d mail\n", totalPurged, totalMailPurged)
 		fmt.Printf("  Closed:    %d stale issues\n", totalClosed)
 		fmt.Printf("  Open:      %d wisps remain\n", totalOpen)

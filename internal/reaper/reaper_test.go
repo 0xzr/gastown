@@ -449,15 +449,6 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 var fakeReaperDriverID uint64
 
 func openFakeReaperDB(t *testing.T, state *fakeReaperState) *sql.DB {
-	t.Helper()
-	driverName := fmt.Sprintf("fake_reaper_%d", atomic.AddUint64(&fakeReaperDriverID, 1))
-	sql.Register(driverName, &fakeReaperDriver{state: state})
-	db, err := sql.Open(driverName, "")
-	if err != nil {
-		t.Fatalf("open fake db: %v", err)
-	}
-	return db
-}
 
 type fakeWisp struct {
 	id        string
@@ -473,12 +464,20 @@ type fakeDep struct {
 	depType           string
 }
 
+// fakeDanglingDep models a wisp_dependencies parent-child row whose parent is
+// gone (both wisp and issue missing). CleanDanglingParentRefs deletes these.
+type fakeDanglingDep struct {
+	issueID     string // wisp_dependencies.issue_id (the child)
+	dependsOnID string // wisp_dependencies.depends_on_wisp_id (the missing parent)
+}
+
 type fakeReaperState struct {
-	mu       sync.Mutex
-	wisps    map[string]*fakeWisp
-	deps     []fakeDep
-	nextConn int
-	ops      map[int][]string
+	mu           sync.Mutex
+	wisps        map[string]*fakeWisp
+	deps         []fakeDep
+	danglingDeps []fakeDanglingDep
+	nextConn     int
+	ops          map[int][]string
 }
 
 func (s *fakeReaperState) status(id string) string {
@@ -654,7 +653,12 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM issues"):
 		return fakeCountRows(0), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisp_dependencies wd"):
-		return fakeCountRows(0), nil
+		// Count of dangling parent-child rows whose parent wisp/issue is gone.
+		// Mirrors CleanDanglingParentRefs' danglingParentCountQuery predicate.
+		c.state.mu.Lock()
+		count := len(c.state.danglingDeps)
+		c.state.mu.Unlock()
+		return fakeCountRows(count), nil
 	case strings.Contains(normalized, "SELECT w.id FROM wisps w") && strings.Contains(normalized, "created_at <"):
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
@@ -687,6 +691,25 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 			}
 		}
 		return fakeReaperResult(affected), nil
+	case strings.HasPrefix(normalized, "DELETE FROM wisp_dependencies"):
+		// CleanDanglingParentRefs batched delete. The query carries LIMIT ? as
+		// the first arg; we delete up to that many dangling rows (all match the
+		// predicate in the fake model since danglingDeps only holds gone-parent
+		// rows).
+		limit := DefaultBatchSize
+		if len(args) > 0 {
+			if n, ok := args[0].Value.(int64); ok && n > 0 {
+				limit = int(n)
+			}
+		}
+		c.state.mu.Lock()
+		removed := 0
+		for len(c.state.danglingDeps) > 0 && removed < limit {
+			c.state.danglingDeps = c.state.danglingDeps[1:]
+			removed++
+		}
+		c.state.mu.Unlock()
+		return fakeReaperResult(int64(removed)), nil
 	case normalized == "SET @@autocommit = 0" || normalized == "SET @@autocommit = 1" || normalized == "ROLLBACK" || normalized == "COMMIT" || strings.HasPrefix(normalized, "CALL DOLT_COMMIT"):
 		return fakeReaperResult(0), nil
 	default:
