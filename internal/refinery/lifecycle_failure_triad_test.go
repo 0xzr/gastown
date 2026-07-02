@@ -108,14 +108,11 @@ func TestHqTry2_StackedBranchTipOnly_MergesWithoutContainmentGuard(t *testing.T)
 	}
 }
 
-func TestHq6sdu_LocalMergeWithoutPush_ReportedAsShipped(t *testing.T) {
-	// GT 1.2.0 characterization (hq-6sdu): with auto_push disabled, the refinery
-	// performs a local squash merge and reports success. The source bead can be
-	// closed even though origin/main does not contain the merge commit.
-	//
-	// Future safe behavior: the refinery must verify that the terminal merge
-	// commit appears on the configured publication target before reporting
-	// success and closing the source bead.
+func TestHq6sdu_LocalMergeWithoutPush_NotPublished(t *testing.T) {
+	// hq-6sdu guard: with auto_push disabled, the refinery may perform a
+	// local squash merge, but it must not classify the result as published.
+	// Source bead closure is guarded later by PublishedCommit, so a local-only
+	// merge cannot be reported as externally shipped.
 	if testing.Short() {
 		t.Skip("characterization test exercises real git merge")
 	}
@@ -140,14 +137,17 @@ func TestHq6sdu_LocalMergeWithoutPush_ReportedAsShipped(t *testing.T) {
 	if result.MergeCommit == "" {
 		t.Fatal("expected a local merge commit SHA")
 	}
+	if result.PublishedCommit != "" {
+		t.Fatalf("local-only merge must not set PublishedCommit, got %s", shortSHA(result.PublishedCommit))
+	}
 
 	originMainAfter, err := g.RemoteBranchTip("origin", "main")
 	if err != nil {
 		t.Fatalf("get origin/main tip after merge: %v", err)
 	}
 
-	// The bad behavior: the merge succeeded locally but origin/main is
-	// unchanged, so the work has not actually been published.
+	// The local merge succeeded, but origin/main is unchanged; the empty
+	// PublishedCommit above is what prevents downstream shipped/source closure.
 	if originMainAfter != originMainBefore {
 		t.Fatalf("expected origin/main to remain unchanged (local-only merge), but it moved from %s to %s", shortSHA(originMainBefore), shortSHA(originMainAfter))
 	}

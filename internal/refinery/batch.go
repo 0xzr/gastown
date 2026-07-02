@@ -442,7 +442,11 @@ func (e *Engineer) fastForwardBatch(ctx context.Context, stacked []*MRInfo, targ
 	// HandleMRInfoSuccess was previously dead code (never called), causing task
 	// beads to remain open after successful merges.
 	for _, mr := range stacked {
-		mergeResult := ProcessResult{Success: true, MergeCommit: tipSHA}
+		mergeResult := ProcessResult{
+			Success:         true,
+			MergeCommit:     tipSHA,
+			PublishedCommit: tipSHA,
+		}
 		e.HandleMRInfoSuccess(mr, mergeResult)
 	}
 
