@@ -99,3 +99,53 @@ func TestIsValidMergeTarget(t *testing.T) {
 		})
 	}
 }
+
+// TestDefaultBranchValidationInvariant covers gastown-1gd (Defect 3):
+// runDone guards an unsafe --target fallback by validating the rig's
+// configured defaultBranch against isValidMergeTarget up front. The
+// misconfiguration cases (defaultBranch == rigName, defaultBranch == "")
+// must all be rejected by the predicate the upstream guard relies on, so
+// runDone bails out with a clear error instead of silently submitting an
+// MR targeting "<rig>/<rig>" or origin/. This test pins the invariant
+// the runDone guard depends on; if isValidMergeTarget ever starts accepting
+// these inputs, the guard becomes a no-op and this regression surfaces.
+func TestDefaultBranchValidationInvariant(t *testing.T) {
+	tests := []struct {
+		name          string
+		defaultBranch string
+		rigName       string
+		// wantValid reports whether isValidMergeTarget should accept the
+		// defaultBranch as a safe MR target. The runDone guard rejects
+		// only when this returns false.
+		wantValid bool
+	}{
+		{name: "main defaultBranch on standard rig is valid",
+			defaultBranch: "main", rigName: "gastown", wantValid: true},
+		{name: "custom defaultBranch distinct from rig name is valid",
+			defaultBranch: "trunk", rigName: "gastown", wantValid: true},
+		{name: "defaultBranch equal to rig name is invalid",
+			defaultBranch: "gastown", rigName: "gastown", wantValid: false},
+		{name: "origin/ prefixed rig name defaultBranch is invalid",
+			defaultBranch: "origin/gastown", rigName: "gastown", wantValid: false},
+		{name: "empty defaultBranch is invalid",
+			defaultBranch: "", rigName: "gastown", wantValid: false},
+		{name: "whitespace-only defaultBranch is invalid",
+			defaultBranch: "   ", rigName: "gastown", wantValid: false},
+		// Edge: rig with single-letter name and a default branch with
+		// the same letter would still be rejected — the equality check
+		// is full-string, not prefix-based. This guards against future
+		// refactors that might mistakenly use HasPrefix.
+		{name: "rig-name substring on a longer branch is valid",
+			defaultBranch: "gastown-main", rigName: "gastown", wantValid: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isValidMergeTarget(tt.defaultBranch, tt.rigName)
+			if got != tt.wantValid {
+				t.Fatalf("isValidMergeTarget(defaultBranch=%q, rigName=%q) = %v, want %v — runDone guard depends on this predicate to refuse an unsafe defaultBranch fallback (gastown-1gd)",
+					tt.defaultBranch, tt.rigName, got, tt.wantValid)
+			}
+		})
+	}
+}
