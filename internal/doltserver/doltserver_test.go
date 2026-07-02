@@ -315,6 +315,7 @@ func TestFindOwnedDoltTestServerCandidatesFromPS(t *testing.T) {
 		"105 /usr/bin/dolt sql-server --config=/tmp/gt/.dolt-data/config.yaml",
 		"106 dolt status /tmp/gt/.dolt-data",
 		"107 dolt sql-server --port 3307",
+		"108 /home/ubuntu/.local/bin/dolt sql-server --config /home/ubuntu/gt-town/.dolt-data/config.yaml",
 	}, "\n")
 
 	got := findOwnedDoltTestServerCandidatesFromPS(output, townRoot, dataDir)
@@ -326,6 +327,18 @@ func TestFindOwnedDoltTestServerCandidatesFromPS(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("got %v, want %v", got, want)
 		}
+	}
+}
+
+func TestIsTestTownRootRequiresTempChild(t *testing.T) {
+	if !isTestTownRoot(t.TempDir()) {
+		t.Fatal("temp child directory should be treated as a test town root")
+	}
+	if isTestTownRoot(os.TempDir()) {
+		t.Fatal("temp dir itself should not be treated as a test town root")
+	}
+	if isTestTownRoot(string(filepath.Separator)) {
+		t.Fatal("filesystem root should not be treated as a test town root")
 	}
 }
 
@@ -374,6 +387,45 @@ func TestReapOwnedTestServersHelperProcess(t *testing.T) {
 	}
 	time.Sleep(30 * time.Second)
 	os.Exit(0)
+}
+
+func TestM16InterruptDoltServerHelper(t *testing.T) {
+	if os.Getenv("GT_M16_INTERRUPT_DOLT_HELPER") != "1" {
+		t.Skip("M1.6 manual interrupt drill helper")
+	}
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skipf("dolt binary unavailable: %v", err)
+	}
+
+	port := FindFreePort(43000)
+	if port <= 0 || port == DefaultPort {
+		t.Fatalf("FindFreePort returned unsafe port %d", port)
+	}
+	t.Setenv("GT_DOLT_IGNORE_CONFIG", "1")
+	t.Setenv("GT_DOLT_HOST", "127.0.0.1")
+	t.Setenv("GT_DOLT_PORT", strconv.Itoa(port))
+
+	townRoot := t.TempDir()
+	if err := Start(townRoot); err != nil {
+		t.Fatalf("Start temp Dolt: %v", err)
+	}
+	config := DefaultConfig(townRoot)
+	data, err := os.ReadFile(config.PidFile)
+	if err != nil {
+		t.Fatalf("read temp Dolt pid file: %v", err)
+	}
+	doltPID, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatalf("parse temp Dolt pid: %v", err)
+	}
+	if infoPath := os.Getenv("GT_M16_INTERRUPT_DOLT_INFO"); infoPath != "" {
+		body := fmt.Sprintf("test_pid=%d\ndolt_pid=%d\nport=%d\ntown_root=%s\n", os.Getpid(), doltPID, port, townRoot)
+		if err := os.WriteFile(infoPath, []byte(body), 0600); err != nil {
+			t.Fatalf("write helper info: %v", err)
+		}
+	}
+
+	select {}
 }
 
 func TestIsDoltSQLServerArgs(t *testing.T) {

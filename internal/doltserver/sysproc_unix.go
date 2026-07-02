@@ -15,6 +15,12 @@ func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+// setTestProcessGroup puts a test-owned server in its own process group and
+// asks the kernel to kill it if the test binary dies abruptly.
+func setTestProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
+}
+
 // processIsAlive checks whether a process with the given PID is still running.
 func processIsAlive(pid int) bool {
 	process, err := os.FindProcess(pid)
@@ -27,4 +33,24 @@ func processIsAlive(pid int) bool {
 // gracefulTerminate sends SIGTERM for graceful shutdown on Unix.
 func gracefulTerminate(p *os.Process) error {
 	return p.Signal(syscall.SIGTERM)
+}
+
+func gracefulTerminateProcessGroup(p *os.Process) error {
+	return signalProcessGroup(p, syscall.SIGTERM)
+}
+
+func forceKillProcessGroup(p *os.Process) error {
+	return signalProcessGroup(p, syscall.SIGKILL)
+}
+
+func signalProcessGroup(p *os.Process, sig syscall.Signal) error {
+	if p == nil {
+		return os.ErrInvalid
+	}
+	if p.Pid > 0 {
+		if err := syscall.Kill(-p.Pid, sig); err == nil {
+			return nil
+		}
+	}
+	return p.Signal(sig)
 }

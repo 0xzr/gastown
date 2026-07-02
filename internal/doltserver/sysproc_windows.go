@@ -18,6 +18,10 @@ func setProcessGroup(cmd *exec.Cmd) {
 	}
 }
 
+func setTestProcessGroup(cmd *exec.Cmd) {
+	setProcessGroup(cmd)
+}
+
 // processIsAlive checks whether a process with the given PID is still running.
 func processIsAlive(pid int) bool {
 	const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -31,5 +35,13 @@ func processIsAlive(pid int) bool {
 
 // gracefulTerminate on Windows has no SIGTERM equivalent — Kill() is the only option.
 func gracefulTerminate(p *os.Process) error {
+	return p.Kill()
+}
+
+func gracefulTerminateProcessGroup(p *os.Process) error {
+	return p.Kill()
+}
+
+func forceKillProcessGroup(p *os.Process) error {
 	return p.Kill()
 }

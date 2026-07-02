@@ -1421,17 +1421,9 @@ func StopIdleMonitors(townRoot string) int {
 // owned by townRoot. This is intentionally narrower than operational cleanup:
 // tests must never kill production Dolt by port or broad process pattern.
 func ReapOwnedTestServers(townRoot string) (int, error) {
-	absRoot, err := filepath.Abs(townRoot)
+	absRoot, err := testTownRoot(townRoot)
 	if err != nil {
-		return 0, fmt.Errorf("resolving town root: %w", err)
-	}
-	absTemp, err := filepath.Abs(os.TempDir())
-	if err != nil {
-		return 0, fmt.Errorf("resolving temp dir: %w", err)
-	}
-	rel, err := filepath.Rel(absTemp, absRoot)
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
-		return 0, fmt.Errorf("refusing to reap Dolt outside temp dir: %s", absRoot)
+		return 0, err
 	}
 
 	config := DefaultConfig(absRoot)
@@ -1451,7 +1443,7 @@ func ReapOwnedTestServers(townRoot string) (int, error) {
 		if err != nil {
 			continue
 		}
-		if err := gracefulTerminate(proc); err != nil {
+		if err := gracefulTerminateProcessGroup(proc); err != nil {
 			return stopped, fmt.Errorf("terminating owned Dolt PID %d: %w", pid, err)
 		}
 		for i := 0; i < 20; i++ {
@@ -1462,13 +1454,34 @@ func ReapOwnedTestServers(townRoot string) (int, error) {
 			}
 		}
 		if processIsAlive(pid) {
-			_ = proc.Kill()
+			_ = forceKillProcessGroup(proc)
 			time.Sleep(100 * time.Millisecond)
 			stopped++
 		}
 	}
 
 	return stopped, nil
+}
+
+func isTestTownRoot(townRoot string) bool {
+	_, err := testTownRoot(townRoot)
+	return err == nil
+}
+
+func testTownRoot(townRoot string) (string, error) {
+	absRoot, err := filepath.Abs(townRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolving town root: %w", err)
+	}
+	absTemp, err := filepath.Abs(os.TempDir())
+	if err != nil {
+		return "", fmt.Errorf("resolving temp dir: %w", err)
+	}
+	rel, err := filepath.Rel(absTemp, absRoot)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("refusing to reap Dolt outside temp dir: %s", absRoot)
+	}
+	return absRoot, nil
 }
 
 func ownedDoltTestServerCandidates(townRoot string, config *Config) []int {
@@ -1908,7 +1921,11 @@ func Start(townRoot string) error {
 	// signals sent to the parent process group (e.g. SIGHUP when the caller
 	// calls syscall.Exec to become tmux) don't reach the dolt server.
 	cmd.Stdin = nil
-	setProcessGroup(cmd)
+	if isTestTownRoot(townRoot) {
+		setTestProcessGroup(cmd)
+	} else {
+		setProcessGroup(cmd)
+	}
 
 	if err := cmd.Start(); err != nil {
 		if closeErr := logFile.Close(); closeErr != nil {
