@@ -35,7 +35,7 @@ func newTestTmux(t *testing.T) *Tmux {
 	socket := fmt.Sprintf("gt-test-%d-%s", os.Getpid(), strings.ReplaceAll(t.Name(), "/", "-"))
 	tm := NewTmuxWithSocket(socket)
 	t.Cleanup(func() {
-		_ = tm.KillServer()
+		_ = tm.KillServerAndRemoveSocket()
 	})
 	return tm
 }

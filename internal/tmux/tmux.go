@@ -4,6 +4,7 @@ package tmux
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -142,6 +143,28 @@ func SocketDir() string {
 	return filepath.Join("/tmp", fmt.Sprintf("tmux-%d", os.Getuid()))
 }
 
+// SocketPath returns the full filesystem path for a tmux -L socket name.
+func SocketPath(socket string) string {
+	if socket == "" {
+		socket = "default"
+	}
+	return filepath.Join(SocketDir(), socket)
+}
+
+// RemoveSocketFile removes a tmux socket file after the server is known dead.
+// tmux kill-server often leaves the socket path behind; tests and transient
+// gate sockets must remove it explicitly so stale files do not accumulate.
+func RemoveSocketFile(socket string) error {
+	if socket == "" {
+		return nil
+	}
+	err := os.Remove(SocketPath(socket))
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
 // IsInSameSocket checks if the current process is inside a tmux session on the
 // same socket as the default town socket. Used to decide between switch-client
 // (same socket) and attach-session (different socket or outside tmux).
@@ -189,6 +212,20 @@ type Tmux struct {
 // "no server running" error instead of silently connecting to the wrong server.
 const noTownSocket = "gt-no-town-socket"
 
+const (
+	townServerOwnerValue      = "gt"
+	townServerBootstrapAnchor = "gt-tmux-anchor"
+
+	EnvTmuxOwner           = "GT_TMUX_OWNER"
+	EnvTmuxTownRoot        = "GT_TMUX_TOWN_ROOT"
+	EnvTmuxSocket          = "GT_TMUX_SOCKET"
+	EnvTmuxOrigin          = "GT_TMUX_ORIGIN"
+	EnvTmuxOriginPID       = "GT_TMUX_ORIGIN_PID"
+	EnvTmuxOriginSession   = "GT_TMUX_ORIGIN_SESSION"
+	EnvTmuxOriginStartedAt = "GT_TMUX_ORIGIN_STARTED_AT"
+	EnvTmuxOriginArgv      = "GT_TMUX_ORIGIN_ARGV"
+)
+
 // EnvAgentReady is the tmux session environment variable set by the agent's
 // SessionStart hook (gt prime --hook) to signal that the agent has started.
 // Used by WaitForCommand as a ZFC-compliant fallback for detecting wrapped
@@ -215,6 +252,11 @@ func NewTmux() *Tmux {
 // and keystroke leaks (e.g. Escape from NudgeSession hitting the user's prefix table).
 func NewTmuxWithSocket(socket string) *Tmux {
 	return &Tmux{socketName: socket}
+}
+
+// SocketName returns the tmux -L socket name targeted by this wrapper.
+func (t *Tmux) SocketName() string {
+	return t.socketName
 }
 
 // run executes a tmux command and returns stdout.
@@ -999,6 +1041,158 @@ func (t *Tmux) ServerPID() int {
 	return pid
 }
 
+// ServerInfo describes the tmux server targeted by this wrapper.
+type ServerInfo struct {
+	SocketName      string   `json:"socket_name"`
+	SocketPath      string   `json:"socket_path"`
+	PID             int      `json:"pid"`
+	Argv            string   `json:"argv,omitempty"`
+	Owner           string   `json:"owner,omitempty"`
+	TownRoot        string   `json:"town_root,omitempty"`
+	RecordedSocket  string   `json:"recorded_socket,omitempty"`
+	Origin          string   `json:"origin,omitempty"`
+	OriginPID       string   `json:"origin_pid,omitempty"`
+	OriginSession   string   `json:"origin_session,omitempty"`
+	OriginStartedAt string   `json:"origin_started_at,omitempty"`
+	OriginArgv      string   `json:"origin_argv,omitempty"`
+	Sessions        []string `json:"sessions,omitempty"`
+	RecordedAt      string   `json:"recorded_at,omitempty"`
+}
+
+// ServerInfo returns process, socket, session, and Gas Town ownership metadata
+// for the targeted tmux server.
+func (t *Tmux) ServerInfo() (*ServerInfo, error) {
+	pid := t.ServerPID()
+	if pid == 0 {
+		return nil, ErrNoServer
+	}
+	sessions, err := t.ListSessions()
+	if err != nil {
+		return nil, err
+	}
+	info := &ServerInfo{
+		SocketName: t.socketName,
+		SocketPath: SocketPath(t.socketName),
+		PID:        pid,
+		Argv:       readProcCmdline(pid),
+		Sessions:   sessions,
+		RecordedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	info.Owner = t.globalEnvValue(EnvTmuxOwner)
+	info.TownRoot = t.globalEnvValue(EnvTmuxTownRoot)
+	info.RecordedSocket = t.globalEnvValue(EnvTmuxSocket)
+	info.Origin = t.globalEnvValue(EnvTmuxOrigin)
+	info.OriginPID = t.globalEnvValue(EnvTmuxOriginPID)
+	info.OriginSession = t.globalEnvValue(EnvTmuxOriginSession)
+	info.OriginStartedAt = t.globalEnvValue(EnvTmuxOriginStartedAt)
+	info.OriginArgv = t.globalEnvValue(EnvTmuxOriginArgv)
+	return info, nil
+}
+
+func (t *Tmux) globalEnvValue(key string) string {
+	val, err := t.GetGlobalEnvironment(key)
+	if err != nil {
+		return ""
+	}
+	return val
+}
+
+func readProcCmdline(pid int) string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(strings.ReplaceAll(strings.TrimRight(string(data), "\x00"), "\x00", " "))
+}
+
+// EnsureTownServer ensures the configured town socket is backed by a deliberate
+// Gas Town tmux server. When no server exists it bootstraps one with a short
+// gt-owned anchor session, sets exit-empty off, removes the anchor, and stamps
+// ownership metadata in the server global environment. When a server already
+// exists it records adoption metadata without killing live sessions; doctor can
+// still flag bad process-origin evidence so the operator can migrate cleanly.
+func EnsureTownServer(townRoot, socket string) error {
+	if socket == "" || socket == "default" || socket == noTownSocket {
+		return fmt.Errorf("town tmux socket must be a named non-default socket, got %q", socket)
+	}
+	t := NewTmuxWithSocket(socket)
+	origin := "gt-daemon-adopt"
+	if t.ServerPID() == 0 {
+		if err := t.bootstrapTownServer(townRoot); err != nil {
+			return err
+		}
+		origin = "gt-daemon-bootstrap"
+	}
+	if err := t.SetExitEmpty(false); err != nil {
+		return fmt.Errorf("setting tmux exit-empty off for %q: %w", socket, err)
+	}
+	return t.StampTownServer(townRoot, socket, origin)
+}
+
+func (t *Tmux) bootstrapTownServer(townRoot string) error {
+	_ = t.KillSession(townServerBootstrapAnchor)
+	if _, err := t.run("new-session", "-d", "-s", townServerBootstrapAnchor, "-c", townRoot, "sleep 3600"); err != nil {
+		return fmt.Errorf("creating tmux bootstrap session on %q: %w", t.socketName, err)
+	}
+	if err := t.SetExitEmpty(false); err != nil {
+		_ = t.KillSession(townServerBootstrapAnchor)
+		return err
+	}
+	_ = t.KillSession(townServerBootstrapAnchor)
+	return nil
+}
+
+// StampTownServer records Gas Town ownership markers in tmux global env.
+func (t *Tmux) StampTownServer(townRoot, socket, origin string) error {
+	markers := map[string]string{
+		EnvTmuxOwner:    townServerOwnerValue,
+		EnvTmuxTownRoot: townRoot,
+		EnvTmuxSocket:   socket,
+	}
+	if originValue, _ := t.GetGlobalEnvironment(EnvTmuxOrigin); originValue == "" {
+		markers[EnvTmuxOrigin] = origin
+		if origin == "gt-daemon-bootstrap" {
+			markers[EnvTmuxOriginPID] = strconv.Itoa(os.Getpid())
+			markers[EnvTmuxOriginSession] = townServerBootstrapAnchor
+		} else if pid := t.ServerPID(); pid > 0 {
+			markers[EnvTmuxOriginPID] = strconv.Itoa(pid)
+			if argv := readProcCmdline(pid); argv != "" {
+				markers[EnvTmuxOriginArgv] = argv
+			}
+		}
+		markers[EnvTmuxOriginStartedAt] = time.Now().UTC().Format(time.RFC3339)
+	}
+	keys := make([]string, 0, len(markers))
+	for k := range markers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if err := t.SetGlobalEnvironment(k, markers[k]); err != nil {
+			return fmt.Errorf("stamping tmux %s: %w", k, err)
+		}
+	}
+	return nil
+}
+
+// WriteTownServerInfo writes a small read-only breadcrumb documenting the
+// production socket path and ownership metadata for operators and doctor logs.
+func WriteTownServerInfo(townRoot string, info *ServerInfo) error {
+	if info == nil {
+		return nil
+	}
+	path := filepath.Join(townRoot, constants.DirRuntime, "tmux-server.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0644)
+}
+
 // KillServer terminates the entire tmux server and all sessions.
 func (t *Tmux) KillServer() error {
 	_, err := t.run("kill-server")
@@ -1006,6 +1200,16 @@ func (t *Tmux) KillServer() error {
 		return nil // Already dead
 	}
 	return err
+}
+
+// KillServerAndRemoveSocket terminates the tmux server, then removes its
+// socket file. It is idempotent for already-dead servers.
+func (t *Tmux) KillServerAndRemoveSocket() error {
+	err := t.KillServer()
+	if err != nil {
+		return err
+	}
+	return RemoveSocketFile(t.socketName)
 }
 
 // SetExitEmpty controls the tmux exit-empty server option.

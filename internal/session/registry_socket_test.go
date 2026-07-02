@@ -80,6 +80,9 @@ func TestInitRegistry_SocketFromTownName(t *testing.T) {
 				t.Errorf("after InitRegistry(%q) with GT_TMUX_SOCKET=%q:\n  socket = %q, want %q",
 					townRoot, tt.gtTmuxSocket, got, want)
 			}
+			if expected := ExpectedTownSocketName(townRoot); expected != want {
+				t.Errorf("ExpectedTownSocketName(%q) = %q, want %q", townRoot, expected, want)
+			}
 
 			tmux.SetDefaultSocket("")
 			_ = InitRegistry(townRoot)

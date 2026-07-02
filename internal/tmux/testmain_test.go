@@ -13,10 +13,12 @@ func TestMain(m *testing.M) {
 	// Set a non-default socket name so tests never accidentally connect to the
 	// user's interactive tmux server. Any test that needs a real server must use
 	// newTestTmux(t), which supplies its own isolated socket and cleanup.
-	SetDefaultSocket("gt-test-default")
+	socket := "gt-test-default"
+	SetDefaultSocket(socket)
 
 	code := m.Run()
 
+	_ = NewTmuxWithSocket(socket).KillServerAndRemoveSocket()
 	SetDefaultSocket("")
 	os.Exit(code)
 }

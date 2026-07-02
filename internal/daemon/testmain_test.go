@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/testutil"
@@ -41,8 +40,7 @@ func TestMain(m *testing.M) {
 
 	if tmuxSocket != "" {
 		_ = exec.Command("tmux", "-L", tmuxSocket, "kill-server").Run()
-		socketPath := filepath.Join(tmux.SocketDir(), tmuxSocket)
-		_ = os.Remove(socketPath)
+		_ = tmux.RemoveSocketFile(tmuxSocket)
 	}
 	testutil.TerminateDoltContainer()
 	os.Exit(code)

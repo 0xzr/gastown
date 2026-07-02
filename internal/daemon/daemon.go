@@ -299,8 +299,14 @@ func New(config *Config) (*Daemon, error) {
 
 	// Also set GT_TOWN_ROOT in tmux global environment so run-shell subprocesses
 	// (e.g., gt cycle next/prev) can find the workspace even when CWD is $HOME.
-	// Non-fatal: tmux server may not be running yet — daemon creates sessions shortly.
 	t := tmux.NewTmux()
+	if err := tmux.EnsureTownServer(config.TownRoot, tmux.GetDefaultSocket()); err != nil {
+		logger.Printf("Warning: failed to ensure town tmux server ownership: %v", err)
+	} else if info, err := t.ServerInfo(); err == nil {
+		if err := tmux.WriteTownServerInfo(config.TownRoot, info); err != nil {
+			logger.Printf("Warning: failed to write tmux server info: %v", err)
+		}
+	}
 	if err := t.SetGlobalEnvironment("GT_TOWN_ROOT", config.TownRoot); err != nil {
 		logger.Printf("Warning: failed to set GT_TOWN_ROOT in tmux global env: %v", err)
 	}

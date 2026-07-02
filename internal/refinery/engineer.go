@@ -27,6 +27,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -36,6 +37,24 @@ func shortSHA(sha string) string {
 		return sha[:8]
 	}
 	return sha
+}
+
+var durableReviewSocketSanitizeRe = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
+func durableReviewGateTmuxSocket(branch, tree string) string {
+	token := shortSHA(strings.TrimSpace(tree))
+	if token == "" {
+		token = strings.TrimSpace(branch)
+	}
+	token = durableReviewSocketSanitizeRe.ReplaceAllString(token, "-")
+	token = strings.Trim(token, "-")
+	if token == "" {
+		token = "unknown"
+	}
+	if len(token) > 40 {
+		token = token[:40]
+	}
+	return fmt.Sprintf("gastown-refinery-%s-%d", token, os.Getpid())
 }
 
 // DefaultStaleClaimTimeout is the default duration after which a claimed MR
@@ -2153,9 +2172,15 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 	gateTimeout := e.durableReviewGateTimeout()
 	gateCtx, cancel := context.WithTimeout(ctx, gateTimeout)
 	defer cancel()
+	gateTmuxSocket := durableReviewGateTmuxSocket(branch, tree)
+	defer func() {
+		if err := tmux.NewTmuxWithSocket(gateTmuxSocket).KillServerAndRemoveSocket(); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to clean durable review tmux socket %s: %v\n", gateTmuxSocket, err)
+		}
+	}()
 
 	runCmd := exec.CommandContext(gateCtx, "sh", "-c", cmd) //nolint:gosec // G204: Review gate command is from trusted rig config
-	util.SetDetachedProcessGroup(runCmd)
+	util.SetProcessGroup(runCmd)
 	runCmd.Dir = e.workDir
 	// Expose metadata to the review gate command so it can locate the
 	// worktree, the merge candidate, and the attestation directory.
@@ -2166,6 +2191,8 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 		"GT_REVIEW_GATE_WRITER="+attestationWriter,
 		"GT_GATE_ATTEST_DIR="+e.durableReviewAttestDir(),
 		"GT_GATE_HMAC_KEY="+e.durableReviewHMACKeyPath(),
+		"GT_TMUX_SOCKET="+gateTmuxSocket,
+		"GT_TOWN_SOCKET="+gateTmuxSocket,
 	)
 	var stdout, stderr bytes.Buffer
 	runCmd.Stdout = &stdout

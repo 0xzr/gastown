@@ -656,8 +656,8 @@ func TestIntegrationMultiTownSocketIsolation(t *testing.T) {
 		tmA := tmux.NewTmuxWithSocket(socketA)
 		tmB := tmux.NewTmuxWithSocket(socketB)
 		t.Cleanup(func() {
-			tmA.KillServer()
-			tmB.KillServer()
+			_ = tmA.KillServerAndRemoveSocket()
+			_ = tmB.KillServerAndRemoveSocket()
 		})
 
 		if err := tmA.NewSessionWithCommand("ga-witness", ".", "sleep 300"); err != nil {

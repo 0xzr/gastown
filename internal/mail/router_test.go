@@ -1594,8 +1594,9 @@ func requireNotifyTestSocket(t *testing.T) string {
 	socket := fmt.Sprintf("gt-test-%s-%d", safe, os.Getpid())
 	// Pre-kill any stale server on this socket (e.g., from a crashed prior run).
 	_ = exec.Command("tmux", "-L", socket, "kill-server").Run()
+	_ = tmux.RemoveSocketFile(socket)
 	t.Cleanup(func() {
-		_ = exec.Command("tmux", "-L", socket, "kill-server").Run()
+		_ = tmux.NewTmuxWithSocket(socket).KillServerAndRemoveSocket()
 	})
 	return socket
 }

@@ -17,9 +17,10 @@ func requireTestSocket(t *testing.T) string {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
 	}
-	socket := fmt.Sprintf("gt-test-hook-%d", os.Getpid())
+	safe := strings.NewReplacer("/", "-", ".", "-").Replace(t.Name())
+	socket := fmt.Sprintf("gt-test-hook-%d-%s", os.Getpid(), safe)
 	t.Cleanup(func() {
-		_ = exec.Command("tmux", "-L", socket, "kill-server").Run()
+		_ = NewTmuxWithSocket(socket).KillServerAndRemoveSocket()
 	})
 	return socket
 }

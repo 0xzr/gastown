@@ -22,6 +22,7 @@ func ProductionChecks() []Check {
 		newProductionDoltDatabasesCheck(doltDeps),
 		newProductionDoltQueryCanaryCheck(defaultProductionBDCanaryDeps()),
 		newProductionDaemonHeartbeatCheck(defaultProductionDaemonDeps()),
+		NewProductionTmuxOwnershipCheck(),
 		newProductionFreeSpaceCheck(defaultProductionDiskDeps()),
 		newProductionLoadAverageCheck(defaultProductionLoadDeps()),
 		newProductionRejectLedgerCheck(defaultProductionRejectLedgerDeps()),

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -328,6 +329,54 @@ func TestGateCommandEnvWithOverridesExistingMetadata(t *testing.T) {
 	}
 	if got := values["GT_REVIEW_GATE_WRITER"]; len(got) != 1 || got[0] != "umans-kimi" {
 		t.Fatalf("GT_REVIEW_GATE_WRITER env = %v, want [umans-kimi]", got)
+	}
+}
+
+func TestRunDurableReviewGate_IsolatesAndCleansTmuxSocket(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+
+	createFeatureBranch(t, workDir, "feat/tmux-gate", "tmux-gate.txt", "content")
+
+	attestDir := filepath.Join(workDir, "attestations")
+	envFile := filepath.Join(workDir, "gate-env.txt")
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		AttestDir:   attestDir,
+		HMACKeyPath: keyPath,
+		Cmd: fmt.Sprintf(`printf '%%s\n%%s\n' "$GT_TMUX_SOCKET" "$GT_TOWN_SOCKET" > %s && tmux -L "$GT_TMUX_SOCKET" new-session -d -s gt-test-review sleep 30 && %s`,
+			shellQuote(envFile), hmacAttestationShellCmd(t)),
+	}
+
+	result := e.runDurableReviewGate(context.Background(), "feat/tmux-gate", "main", nil, false, "main")
+	if !result.Success {
+		t.Fatalf("expected gate success, got %+v\noutput:\n%s", result, e.output.(*bytes.Buffer).String())
+	}
+
+	data, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatalf("read env file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("env file lines = %#v, want socket and town socket", lines)
+	}
+	if lines[0] == "" || lines[0] != lines[1] {
+		t.Fatalf("GT_TMUX_SOCKET/GT_TOWN_SOCKET = %#v, want equal non-empty values", lines)
+	}
+	if !strings.HasPrefix(lines[0], "gastown-refinery-") {
+		t.Fatalf("gate socket = %q, want gastown-refinery-*", lines[0])
+	}
+	if _, err := os.Stat(tmux.SocketPath(lines[0])); !os.IsNotExist(err) {
+		t.Fatalf("gate tmux socket still exists after cleanup: %v", err)
 	}
 }
 

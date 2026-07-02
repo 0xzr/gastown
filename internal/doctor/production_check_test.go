@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestProductionChecksRegistered(t *testing.T) {
@@ -23,6 +25,7 @@ func TestProductionChecksRegistered(t *testing.T) {
 		"prod-dolt-databases",
 		"prod-dolt-query-canary",
 		"prod-daemon-heartbeat",
+		"prod-tmux-ownership",
 		"prod-free-space",
 		"prod-load-average",
 		"prod-reject-ledger",
@@ -126,6 +129,97 @@ func TestProductionLegacyDatabasePollutionCheckAllowsConfiguredProductionDBs(t *
 	}
 	if !strings.Contains(res.Message, "no legacy gt/mo") {
 		t.Fatalf("Message = %q, want gt/mo clean evidence", res.Message)
+	}
+}
+
+func TestProductionTmuxOwnershipCheckAcceptsCleanGtOwnedServer(t *testing.T) {
+	deps := productionTmuxDeps{
+		expectedSocket: func(string) string { return "gt-town-abc123" },
+		serverInfo: func(socket string) (*tmux.ServerInfo, error) {
+			if socket != "gt-town-abc123" {
+				t.Fatalf("socket = %q", socket)
+			}
+			return &tmux.ServerInfo{
+				SocketName:     socket,
+				PID:            1234,
+				Argv:           "tmux -u -L gt-town-abc123 new-session -d -s gt-tmux-anchor",
+				Owner:          "gt",
+				TownRoot:       "/town",
+				RecordedSocket: socket,
+				Origin:         "gt-daemon-bootstrap",
+				OriginSession:  "gt-tmux-anchor",
+				Sessions:       []string{"hq-mayor", "polybot-refinery"},
+			}, nil
+		},
+		countSockets: func(string) (int, []string, error) {
+			return 3, []string{"default", "gt-town-abc123", "personal"}, nil
+		},
+		socketDir: func() string { return "/tmp/tmux-test" },
+	}
+
+	res := newProductionTmuxOwnershipCheck(deps).Run(&CheckContext{TownRoot: "/town"})
+	if res.Status != StatusOK {
+		t.Fatalf("Status = %v, want OK; message=%q details=%v", res.Status, res.Message, res.Details)
+	}
+	if !strings.Contains(res.Message, "gt-owned") {
+		t.Fatalf("Message = %q, want ownership evidence", res.Message)
+	}
+}
+
+func TestProductionTmuxOwnershipCheckRejectsTestOrigin(t *testing.T) {
+	deps := productionTmuxDeps{
+		expectedSocket: func(string) string { return "gt-town-abc123" },
+		serverInfo: func(socket string) (*tmux.ServerInfo, error) {
+			return &tmux.ServerInfo{
+				SocketName:     socket,
+				PID:            1234,
+				Argv:           "tmux -u new-session -d -s gt-test-modeA-2 -c /tmp",
+				Owner:          "gt",
+				TownRoot:       "/town",
+				RecordedSocket: socket,
+				Origin:         "gt-daemon-adopt",
+				OriginPID:      "1234",
+				OriginArgv:     "tmux -u new-session -d -s gt-test-modeA-2 -c /tmp",
+			}, nil
+		},
+		countSockets: func(string) (int, []string, error) { return 2, nil, nil },
+		socketDir:    func() string { return "/tmp/tmux-test" },
+	}
+
+	res := newProductionTmuxOwnershipCheck(deps).Run(&CheckContext{TownRoot: "/town"})
+	if res.Status != StatusError {
+		t.Fatalf("Status = %v, want Error", res.Status)
+	}
+	if !detailsContain(res.Details, "test/refinery transient") {
+		t.Fatalf("Details = %#v, want bad-origin evidence", res.Details)
+	}
+}
+
+func TestProductionTmuxOwnershipCheckRejectsSocketPileup(t *testing.T) {
+	deps := productionTmuxDeps{
+		expectedSocket: func(string) string { return "gt-town-abc123" },
+		serverInfo: func(socket string) (*tmux.ServerInfo, error) {
+			return &tmux.ServerInfo{
+				SocketName:     socket,
+				PID:            1234,
+				Owner:          "gt",
+				TownRoot:       "/town",
+				RecordedSocket: socket,
+				Origin:         "gt-daemon-bootstrap",
+			}, nil
+		},
+		countSockets: func(string) (int, []string, error) {
+			return productionTmuxSocketFail, []string{"gt-town-abc123", "gt-test-a"}, nil
+		},
+		socketDir: func() string { return "/tmp/tmux-test" },
+	}
+
+	res := newProductionTmuxOwnershipCheck(deps).Run(&CheckContext{TownRoot: "/town"})
+	if res.Status != StatusError {
+		t.Fatalf("Status = %v, want Error", res.Status)
+	}
+	if !strings.Contains(res.Message, "not cleanly gt-owned") {
+		t.Fatalf("Message = %q, want dirty tmux state", res.Message)
 	}
 }
 

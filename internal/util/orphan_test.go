@@ -171,7 +171,7 @@ func tmuxSocketSession(t *testing.T, socketName, sessionName string) int {
 
 // killTmuxServer kills a tmux server by socket name.
 func killTmuxServer(socketName string) {
-	_ = exec.Command("tmux", "-L", socketName, "kill-server").Run()
+	_ = tmux.NewTmuxWithSocket(socketName).KillServerAndRemoveSocket()
 }
 
 func TestGetTmuxSessionPIDs_CrossSocket(t *testing.T) {

@@ -174,6 +174,12 @@ func townSocketName(townRoot string) string {
 	return base + "-" + suffix
 }
 
+// ExpectedTownSocketName returns the deterministic production tmux socket name
+// for a town root, ignoring GT_TMUX_SOCKET overrides used by tests/custom runs.
+func ExpectedTownSocketName(townRoot string) string {
+	return townSocketName(townRoot)
+}
+
 // LegacySocketName returns the old-format socket name (basename only, no hash)
 // used before path-based socket derivation was added. Used by gt down to clean
 // up sessions orphaned on the old socket during migration.

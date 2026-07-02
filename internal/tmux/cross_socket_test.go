@@ -3,19 +3,20 @@ package tmux
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 )
-
-var crossSocket = fmt.Sprintf("gt-test-cross-%d", os.Getpid())
 
 func newCrossTestSocket(t *testing.T) *Tmux {
 	t.Helper()
 	if !hasTmux() {
 		t.Skip("tmux not installed")
 	}
+	socketSuffix := strings.NewReplacer("/", "-", ".", "-").Replace(t.Name())
+	crossSocket := fmt.Sprintf("gt-test-cross-%d-%s", os.Getpid(), socketSuffix)
 	tm := NewTmuxWithSocket(crossSocket)
 	t.Cleanup(func() {
-		_ = tm.KillServer()
+		_ = tm.KillServerAndRemoveSocket()
 	})
 	return tm
 }
