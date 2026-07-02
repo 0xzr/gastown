@@ -19,9 +19,10 @@ import (
 )
 
 const (
-	productionCommandTimeout = 2 * time.Second
-	productionBDListTimeout  = 5 * time.Second
-	productionBDListSlow     = 4 * time.Second
+	productionCommandTimeout   = 2 * time.Second
+	productionDoltQuerySamples = 20
+	productionDoltQueryTimeout = 5 * time.Second
+	productionDoltQuerySlowP95 = 500 * time.Millisecond
 
 	productionDaemonHeartbeatWarn = 15 * time.Minute
 	productionDaemonHeartbeatFail = 30 * time.Minute
@@ -150,35 +151,36 @@ func formatServiceStatusDetail(service string, status map[string]string) string 
 	)
 }
 
-type productionBDCanaryResult struct {
-	Elapsed       time.Duration
-	OutputBytes   int
-	OutputPreview string
-	Err           error
+type productionDoltQueryCanaryResult struct {
+	SampleCount int
+	Min         time.Duration
+	P95         time.Duration
+	Max         time.Duration
+	Err         error
 }
 
-type productionBDCanaryDeps struct {
-	runList func(context.Context, string) productionBDCanaryResult
+type productionDoltQueryCanaryDeps struct {
+	runP95 func(context.Context, string, int) productionDoltQueryCanaryResult
 }
 
-func defaultProductionBDCanaryDeps() productionBDCanaryDeps {
-	return productionBDCanaryDeps{runList: runBDListCanary}
+func defaultProductionDoltQueryCanaryDeps() productionDoltQueryCanaryDeps {
+	return productionDoltQueryCanaryDeps{runP95: runDoltQueryP95Canary}
 }
 
 type ProductionDoltQueryCanaryCheck struct {
 	BaseCheck
-	deps productionBDCanaryDeps
+	deps productionDoltQueryCanaryDeps
 }
 
 func NewProductionDoltQueryCanaryCheck() *ProductionDoltQueryCanaryCheck {
-	return newProductionDoltQueryCanaryCheck(defaultProductionBDCanaryDeps())
+	return newProductionDoltQueryCanaryCheck(defaultProductionDoltQueryCanaryDeps())
 }
 
-func newProductionDoltQueryCanaryCheck(deps productionBDCanaryDeps) *ProductionDoltQueryCanaryCheck {
+func newProductionDoltQueryCanaryCheck(deps productionDoltQueryCanaryDeps) *ProductionDoltQueryCanaryCheck {
 	return &ProductionDoltQueryCanaryCheck{
 		BaseCheck: BaseCheck{
 			CheckName:        "prod-dolt-query-canary",
-			CheckDescription: "Run a bounded read-only bd list canary and report latency",
+			CheckDescription: "Run bounded direct SQL latency samples against production Dolt",
 			CheckCategory:    CategoryProduction,
 		},
 		deps: deps,
@@ -186,26 +188,25 @@ func newProductionDoltQueryCanaryCheck(deps productionBDCanaryDeps) *ProductionD
 }
 
 func (c *ProductionDoltQueryCanaryCheck) Run(ctx *CheckContext) *CheckResult {
-	res := c.deps.runList(context.Background(), ctx.TownRoot)
-	status := classifyBDCanary(res.Elapsed, res.Err)
+	res := c.deps.runP95(context.Background(), ctx.TownRoot, productionDoltQuerySamples)
+	status := classifyDoltQueryCanary(res.P95, res.Err)
 	details := []string{
-		"Command: bd --readonly list --limit=1 --json --flat",
-		"Latency: " + res.Elapsed.Round(time.Millisecond).String(),
-		fmt.Sprintf("Output bytes: %d", res.OutputBytes),
-	}
-	if res.OutputPreview != "" {
-		details = append(details, "Output preview: "+res.OutputPreview)
+		"Query: SELECT active_branch()",
+		fmt.Sprintf("Samples: %d", res.SampleCount),
+		"p95: " + formatLatencyDuration(res.P95),
+		"min: " + formatLatencyDuration(res.Min),
+		"max: " + formatLatencyDuration(res.Max),
 	}
 	if res.Err != nil {
 		details = append(details, "Error: "+res.Err.Error())
 	}
 
-	message := "bd list canary OK"
+	message := "direct SQL p95 OK"
 	if status == StatusWarning {
-		message = "bd list canary slow"
+		message = "direct SQL p95 slow"
 	}
 	if status == StatusError {
-		message = "bd list canary failed"
+		message = "direct SQL canary failed"
 	}
 	return &CheckResult{
 		Name:    c.Name(),
@@ -215,35 +216,87 @@ func (c *ProductionDoltQueryCanaryCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 }
 
-func runBDListCanary(ctx context.Context, townRoot string) productionBDCanaryResult {
-	cmdCtx, cancel := context.WithTimeout(ctx, productionBDListTimeout)
+func runDoltQueryP95Canary(ctx context.Context, townRoot string, sampleCount int) productionDoltQueryCanaryResult {
+	queryCtx, cancel := context.WithTimeout(ctx, productionDoltQueryTimeout)
 	defer cancel()
+	return runDoltQueryP95CanaryWith(queryCtx, townRoot, sampleCount, doltserver.MeasureQueryLatencyContext)
+}
 
-	start := time.Now()
-	cmd := exec.CommandContext(cmdCtx, "bd", "--readonly", "list", "--limit=1", "--json", "--flat")
-	cmd.Dir = townRoot
-	out, err := cmd.CombinedOutput()
-	elapsed := time.Since(start)
-	if errors.Is(cmdCtx.Err(), context.DeadlineExceeded) {
-		err = fmt.Errorf("bd list timed out after %s", productionBDListTimeout)
+func runDoltQueryP95CanaryWith(ctx context.Context, townRoot string, sampleCount int, measure func(context.Context, string) (time.Duration, error)) productionDoltQueryCanaryResult {
+	if sampleCount <= 0 {
+		sampleCount = productionDoltQuerySamples
 	}
-
-	return productionBDCanaryResult{
-		Elapsed:       elapsed,
-		OutputBytes:   len(out),
-		OutputPreview: trimCommandOutput(string(out), 300),
-		Err:           err,
+	samples := make([]time.Duration, 0, sampleCount)
+	for i := 0; i < sampleCount; i++ {
+		select {
+		case <-ctx.Done():
+			min, p95, max := summarizeLatencySamples(samples)
+			return productionDoltQueryCanaryResult{
+				SampleCount: len(samples),
+				Min:         min,
+				P95:         p95,
+				Max:         max,
+				Err:         formatDoltQueryCanaryContextErr(ctx),
+			}
+		default:
+		}
+		elapsed, err := measure(ctx, townRoot)
+		if err != nil {
+			min, p95, max := summarizeLatencySamples(samples)
+			if ctx.Err() != nil {
+				err = formatDoltQueryCanaryContextErr(ctx)
+			}
+			return productionDoltQueryCanaryResult{
+				SampleCount: len(samples),
+				Min:         min,
+				P95:         p95,
+				Max:         max,
+				Err:         err,
+			}
+		}
+		samples = append(samples, elapsed)
+	}
+	min, p95, max := summarizeLatencySamples(samples)
+	return productionDoltQueryCanaryResult{
+		SampleCount: len(samples),
+		Min:         min,
+		P95:         p95,
+		Max:         max,
 	}
 }
 
-func classifyBDCanary(elapsed time.Duration, err error) CheckStatus {
+func formatDoltQueryCanaryContextErr(ctx context.Context) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("direct SQL canary timed out after %s: %w", productionDoltQueryTimeout, ctx.Err())
+	}
+	return ctx.Err()
+}
+
+func summarizeLatencySamples(samples []time.Duration) (time.Duration, time.Duration, time.Duration) {
+	if len(samples) == 0 {
+		return 0, 0, 0
+	}
+	sorted := append([]time.Duration(nil), samples...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	p95Index := (95*len(sorted)+99)/100 - 1
+	return sorted[0], sorted[p95Index], sorted[len(sorted)-1]
+}
+
+func classifyDoltQueryCanary(p95 time.Duration, err error) CheckStatus {
 	if err != nil {
 		return StatusError
 	}
-	if elapsed >= productionBDListSlow {
+	if p95 >= productionDoltQuerySlowP95 {
 		return StatusWarning
 	}
 	return StatusOK
+}
+
+func formatLatencyDuration(d time.Duration) string {
+	if d > 0 && d < time.Millisecond {
+		return d.Round(time.Microsecond).String()
+	}
+	return d.Round(time.Millisecond).String()
 }
 
 type productionDaemonSnapshot struct {

@@ -113,7 +113,7 @@ Dolt checks:
 Production checks (read-only, with --production):
   - prod-dolt-service          Verify gt-dolt.service is active and enabled
   - prod-dolt-databases        Expose configured and available production Dolt DBs
-  - prod-dolt-query-canary     Run bounded bd list latency canary
+  - prod-dolt-query-canary     Run bounded direct SQL latency samples
   - prod-daemon-heartbeat      Check daemon running status and heartbeat age
   - prod-tmux-ownership        Verify production tmux server ownership and socket count
   - prod-free-space            Check town disk and /dev/shm free space

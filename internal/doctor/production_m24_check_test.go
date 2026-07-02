@@ -41,9 +41,17 @@ func TestParseSystemctlShowOutputAndClassifyDoltService(t *testing.T) {
 }
 
 func TestProductionDoltQueryCanaryCheckClassifiesLatencyAndErrors(t *testing.T) {
-	check := newProductionDoltQueryCanaryCheck(productionBDCanaryDeps{
-		runList: func(context.Context, string) productionBDCanaryResult {
-			return productionBDCanaryResult{Elapsed: 42 * time.Millisecond, OutputBytes: 2}
+	check := newProductionDoltQueryCanaryCheck(productionDoltQueryCanaryDeps{
+		runP95: func(_ context.Context, _ string, samples int) productionDoltQueryCanaryResult {
+			if samples != productionDoltQuerySamples {
+				t.Fatalf("samples = %d, want %d", samples, productionDoltQuerySamples)
+			}
+			return productionDoltQueryCanaryResult{
+				SampleCount: samples,
+				Min:         1 * time.Millisecond,
+				P95:         42 * time.Millisecond,
+				Max:         50 * time.Millisecond,
+			}
 		},
 	})
 	res := check.Run(&CheckContext{TownRoot: "/town"})
@@ -51,9 +59,9 @@ func TestProductionDoltQueryCanaryCheckClassifiesLatencyAndErrors(t *testing.T) 
 		t.Fatalf("fast canary status = %v, want OK", res.Status)
 	}
 
-	check = newProductionDoltQueryCanaryCheck(productionBDCanaryDeps{
-		runList: func(context.Context, string) productionBDCanaryResult {
-			return productionBDCanaryResult{Elapsed: productionBDListSlow}
+	check = newProductionDoltQueryCanaryCheck(productionDoltQueryCanaryDeps{
+		runP95: func(context.Context, string, int) productionDoltQueryCanaryResult {
+			return productionDoltQueryCanaryResult{SampleCount: 20, P95: productionDoltQuerySlowP95}
 		},
 	})
 	res = check.Run(&CheckContext{TownRoot: "/town"})
@@ -61,14 +69,59 @@ func TestProductionDoltQueryCanaryCheckClassifiesLatencyAndErrors(t *testing.T) 
 		t.Fatalf("slow canary status = %v, want Warning", res.Status)
 	}
 
-	check = newProductionDoltQueryCanaryCheck(productionBDCanaryDeps{
-		runList: func(context.Context, string) productionBDCanaryResult {
-			return productionBDCanaryResult{Elapsed: time.Second, Err: errors.New("bd failed")}
+	check = newProductionDoltQueryCanaryCheck(productionDoltQueryCanaryDeps{
+		runP95: func(context.Context, string, int) productionDoltQueryCanaryResult {
+			return productionDoltQueryCanaryResult{SampleCount: 3, P95: time.Second, Err: errors.New("sql failed")}
 		},
 	})
 	res = check.Run(&CheckContext{TownRoot: "/town"})
 	if res.Status != StatusError {
 		t.Fatalf("failed canary status = %v, want Error", res.Status)
+	}
+}
+
+func TestSummarizeLatencySamplesUsesP95Index(t *testing.T) {
+	samples := make([]time.Duration, 0, 20)
+	for i := 20; i >= 1; i-- {
+		samples = append(samples, time.Duration(i)*time.Millisecond)
+	}
+	min, p95, max := summarizeLatencySamples(samples)
+	if min != time.Millisecond || p95 != 19*time.Millisecond || max != 20*time.Millisecond {
+		t.Fatalf("summary = min %s p95 %s max %s, want 1ms 19ms 20ms", min, p95, max)
+	}
+
+	samples = samples[:0]
+	for i := 0; i < 19; i++ {
+		samples = append(samples, 10*time.Millisecond)
+	}
+	samples = append(samples, 2*time.Second)
+	_, p95, max = summarizeLatencySamples(samples)
+	if p95 != 10*time.Millisecond || max != 2*time.Second {
+		t.Fatalf("summary with one outlier = p95 %s max %s, want p95 10ms max 2s", p95, max)
+	}
+
+	min, p95, max = summarizeLatencySamples(nil)
+	if min != 0 || p95 != 0 || max != 0 {
+		t.Fatalf("empty summary = min %s p95 %s max %s, want zeroes", min, p95, max)
+	}
+}
+
+func TestRunDoltQueryP95CanaryRespectsOverallContext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	res := runDoltQueryP95CanaryWith(ctx, "/town", productionDoltQuerySamples, func(ctx context.Context, _ string) (time.Duration, error) {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	})
+	if res.Err == nil || !errors.Is(res.Err, context.DeadlineExceeded) {
+		t.Fatalf("Err = %v, want context deadline exceeded", res.Err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("canary did not respect overall timeout; elapsed %s", elapsed)
+	}
+	if res.SampleCount != 0 {
+		t.Fatalf("SampleCount = %d, want 0", res.SampleCount)
 	}
 }
 

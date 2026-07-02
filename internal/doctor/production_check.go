@@ -20,7 +20,7 @@ func ProductionChecks() []Check {
 	return []Check{
 		newProductionDoltServiceCheck(defaultProductionServiceDeps()),
 		newProductionDoltDatabasesCheck(doltDeps),
-		newProductionDoltQueryCanaryCheck(defaultProductionBDCanaryDeps()),
+		newProductionDoltQueryCanaryCheck(defaultProductionDoltQueryCanaryDeps()),
 		newProductionDaemonHeartbeatCheck(defaultProductionDaemonDeps()),
 		NewProductionTmuxOwnershipCheck(),
 		newProductionFreeSpaceCheck(defaultProductionDiskDeps()),

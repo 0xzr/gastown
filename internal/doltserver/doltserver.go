@@ -4278,6 +4278,10 @@ func doltSQLWithRecovery(townRoot, rigDB, query string) error {
 // Uses a direct TCP connection via the Go MySQL driver to measure actual query
 // latency, not subprocess startup time.
 func MeasureQueryLatency(townRoot string) (time.Duration, error) {
+	return MeasureQueryLatencyContext(context.Background(), townRoot)
+}
+
+func MeasureQueryLatencyContext(ctx context.Context, townRoot string) (time.Duration, error) {
 	config := DefaultConfig(townRoot)
 
 	dsn := fmt.Sprintf("%s@tcp(%s:%d)/", config.User, config.EffectiveHost(), config.Port)
@@ -4290,11 +4294,11 @@ func MeasureQueryLatency(townRoot string) (time.Duration, error) {
 	db.SetConnMaxLifetime(5 * time.Second)
 	db.SetMaxOpenConns(1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	start := time.Now()
-	var branch string
+	var branch sql.NullString
 	err = db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&branch)
 	elapsed := time.Since(start)
 
