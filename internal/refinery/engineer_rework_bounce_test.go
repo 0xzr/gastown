@@ -83,6 +83,22 @@ func TestReworkBounceReason_NeedsReworkFallbackClassifiesAsPeerReview(t *testing
 	}
 }
 
+func TestReworkBounceReason_RejectReplayDominatesMixedText(t *testing.T) {
+	mr := &MRInfo{ID: "mr-m12-replay", Branch: "feat/replay"}
+	class, reason := reworkBounceReason(mr, "unchanged_tree_reject_replay",
+		`durable review gate failed: {"decision":"REJECT","phase":"reject-replay","reason":"apply conflict: codex failed with blockers","replayed":true,"replay_count":2}`,
+		true)
+	if class != reworkRouteRejectReplay {
+		t.Fatalf("class=%q want %q (reason=%q)", class, reworkRouteRejectReplay, reason)
+	}
+	if !strings.HasPrefix(reason, "NEEDS_REWORK_UNCHANGED_REJECT_REPLAY:") {
+		t.Errorf("reason must start with NEEDS_REWORK_UNCHANGED_REJECT_REPLAY:, got %q", reason)
+	}
+	if !strings.Contains(reason, "do not resubmit the same tree") {
+		t.Errorf("reason must tell worker not to resubmit same tree, got %q", reason)
+	}
+}
+
 // TestReworkBounceReason_MixedPeerReviewAndCapMarkersAreAmbiguous is the
 // DIRECT regression for the gastown-p3w (wus rejection) Codex BLOCKING
 // finding: reworkBounceReason must NOT return REVIEW_UNAVAILABLE_HOLD as

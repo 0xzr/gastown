@@ -82,6 +82,38 @@ func TestDoMerge_DurableReviewGate_CommandFailure_BlocksMerge(t *testing.T) {
 	}
 }
 
+func TestDoMerge_DurableReviewGate_RejectReplayRoutesToRework(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		Cmd:         `printf '%s\n' '{"decision":"REJECT","phase":"validate","reason":"run-all-gates.sh failed","replayed":true,"replay_count":2}'; exit 1`,
+		HMACKeyPath: keyPath,
+	}
+
+	createFeatureBranch(t, workDir, "feat/gate-replay", "feature.txt", "feature content")
+
+	result := e.doMerge(context.Background(), "feat/gate-replay", "main", "gt-test", nil)
+	if result.Success {
+		t.Fatal("expected merge to fail when durable review gate replays a prior reject")
+	}
+	if !result.NeedsRework {
+		t.Fatalf("expected NeedsRework=true for reject replay, got %+v", result)
+	}
+	if result.ReviewerRejectionCause != "unchanged_tree_reject_replay" {
+		t.Errorf("ReviewerRejectionCause=%q want unchanged_tree_reject_replay", result.ReviewerRejectionCause)
+	}
+	if !strings.Contains(result.Error, "replay_count") {
+		t.Errorf("expected replay marker in result error, got: %s", result.Error)
+	}
+
+	_ = g
+}
+
 // TestDoMerge_DurableReviewGate_PassesWithoutAttestation_BlocksMerge proves
 // that a durable review gate command exiting 0 is not enough: the merge only
 // proceeds if the command also produced an HMAC attestation for the merge

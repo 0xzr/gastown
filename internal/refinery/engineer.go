@@ -406,10 +406,14 @@ const DefaultReworkRouterTimeout = 2 * time.Minute
 //   - REWORK_ROUTE_AMBIGUOUS: both peer-review failure markers and cap markers
 //     were observed, or neither matched. The router cannot classify safely;
 //     escalate to Mayor for human judgment.
+//   - NEEDS_REWORK_UNCHANGED_REJECT_REPLAY: the durable gate skipped validation
+//     for a tree already present in the reject ledger. This is terminal until
+//     the worker submits a different tree.
 const (
 	reworkRouteNeedsRework  = "NEEDS_REWORK_PEER_REVIEW"
 	reworkRouteReviewerHold = "REVIEW_UNAVAILABLE_HOLD"
 	reworkRouteAmbiguous    = "REWORK_ROUTE_AMBIGUOUS"
+	reworkRouteRejectReplay = "NEEDS_REWORK_UNCHANGED_REJECT_REPLAY"
 )
 
 // NewEngineer creates a new Engineer for the given rig.
@@ -2191,6 +2195,14 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 			errMsg = fmt.Sprintf("%s: %s", errMsg, cap)
 		}
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED (%v) - %s\n", elapsed.Truncate(time.Millisecond), errMsg)
+		if durableGateRejectReplay(output) {
+			return ProcessResult{
+				Success:                false,
+				NeedsRework:            true,
+				ReviewerRejectionCause: "unchanged_tree_reject_replay",
+				Error:                  errMsg,
+			}
+		}
 		return ProcessResult{
 			Success:     false,
 			TestsFailed: true,
@@ -2554,6 +2566,9 @@ func (e *Engineer) handleReviewerRejection(mr *MRInfo, result ProcessResult) {
 	nudgeTarget := fmt.Sprintf("%s/%s", e.rig.Name, polecatName)
 	var nudgeMsg string
 	switch routeClass {
+	case reworkRouteRejectReplay:
+		nudgeMsg = fmt.Sprintf("UNCHANGED_TREE_REJECT_REPLAY: branch=%s issue=%s cause=%s error=%s — the same candidate tree was already rejected; make substantive changes and submit a different tree, do NOT resubmit the same tree",
+			mr.Branch, mr.SourceIssue, cause, result.Error)
 	case reworkRouteReviewerHold:
 		nudgeMsg = fmt.Sprintf("REVIEW_UNAVAILABLE_HOLD: branch=%s issue=%s cause=%s error=%s — reviewer tooling/cap deferral; do NOT resubmit until reviewer availability changes",
 			mr.Branch, mr.SourceIssue, cause, result.Error)
@@ -2751,6 +2766,14 @@ func reworkBounceReason(mr *MRInfo, cause, errMsg string, isPeerReviewRejection 
 		branch = mr.Branch
 	}
 
+	if durableGateRejectReplay(cause + " " + errMsg) {
+		return reworkRouteRejectReplay, fmt.Sprintf(
+			"NEEDS_REWORK_UNCHANGED_REJECT_REPLAY: reject_replay replay_count marker observed "+
+				"(cause=%s error=%q branch=%s). The candidate tree was already rejected; "+
+				"route to bounded rework and do not resubmit the same tree.",
+			cause, errMsg, branch)
+	}
+
 	// Reviewer unavailable / cap deferral / no-verdict / quorum -- NOT
 	// source code rework. The markers are stored in their normalized
 	// (space-separated) form so the haystack's normalized form matches
@@ -2847,6 +2870,17 @@ func matchAnyMarker(haystack string, markers []string) bool {
 		}
 	}
 	return false
+}
+
+func durableGateRejectReplay(text string) bool {
+	haystack := strings.ToLower(strings.ReplaceAll(text, " ", ""))
+	return strings.Contains(haystack, `"phase":"reject-replay"`) ||
+		strings.Contains(haystack, "phase=reject-replay") ||
+		strings.Contains(haystack, "reject-replay") ||
+		strings.Contains(haystack, "reject_replay") ||
+		strings.Contains(haystack, "rejectreplay") ||
+		strings.Contains(haystack, `"replayed":true`) ||
+		strings.Contains(haystack, "replay_count")
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.
