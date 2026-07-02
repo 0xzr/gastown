@@ -20,8 +20,8 @@ import (
 
 const (
 	productionCommandTimeout = 2 * time.Second
-	productionBDListTimeout  = 3 * time.Second
-	productionBDListSlow     = 1500 * time.Millisecond
+	productionBDListTimeout  = 5 * time.Second
+	productionBDListSlow     = 4 * time.Second
 
 	productionDaemonHeartbeatWarn = 15 * time.Minute
 	productionDaemonHeartbeatFail = 30 * time.Minute
@@ -299,6 +299,10 @@ func (c *ProductionDaemonHeartbeatCheck) Run(ctx *CheckContext) *CheckResult {
 
 	now := c.deps.now()
 	status := classifyDaemonHeartbeat(snap.Running, snap.LastHeartbeat, now)
+	startedAge := nonNegativeSub(now, snap.StartedAt)
+	if snap.Running && snap.LastHeartbeat.IsZero() && !snap.StartedAt.IsZero() && startedAge < productionDaemonHeartbeatWarn {
+		status = StatusOK
+	}
 	details := []string{
 		fmt.Sprintf("Running: %t", snap.Running),
 		fmt.Sprintf("PID: %d", snap.PID),
@@ -316,6 +320,8 @@ func (c *ProductionDaemonHeartbeatCheck) Run(ctx *CheckContext) *CheckResult {
 	message := "daemon heartbeat fresh"
 	if !snap.Running {
 		message = "daemon is not running"
+	} else if snap.LastHeartbeat.IsZero() && status == StatusOK {
+		message = "daemon recently started; heartbeat pending"
 	} else if snap.LastHeartbeat.IsZero() {
 		message = "daemon heartbeat missing"
 	} else if status == StatusWarning {

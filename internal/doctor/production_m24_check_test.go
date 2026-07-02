@@ -96,6 +96,29 @@ func TestClassifyDaemonHeartbeat(t *testing.T) {
 	}
 }
 
+func TestProductionDaemonHeartbeatCheckAllowsFreshStartupWithoutHeartbeat(t *testing.T) {
+	now := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	check := newProductionDaemonHeartbeatCheck(productionDaemonDeps{
+		now: func() time.Time { return now },
+		snapshot: func(string) (productionDaemonSnapshot, error) {
+			return productionDaemonSnapshot{
+				Running:        true,
+				PID:            1234,
+				StartedAt:      now.Add(-30 * time.Second),
+				HeartbeatCount: 0,
+			}, nil
+		},
+	})
+
+	res := check.Run(&CheckContext{TownRoot: "/town"})
+	if res.Status != StatusOK {
+		t.Fatalf("fresh startup without heartbeat status = %v, want OK; message=%q details=%v", res.Status, res.Message, res.Details)
+	}
+	if !strings.Contains(res.Message, "heartbeat pending") {
+		t.Fatalf("message = %q, want startup grace explanation", res.Message)
+	}
+}
+
 func TestProductionSpaceClassifiers(t *testing.T) {
 	if got := classifyProductionRootSpace(diskInfo(2*1024*1024*1024, 10*1024*1024*1024, 80)); got != StatusOK {
 		t.Fatalf("root OK classified as %v, want OK", got)
