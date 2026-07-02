@@ -446,9 +446,100 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	}
 }
 
+// TestCleanDanglingParentRefs_PositivePath exercises the real deletion path:
+// dry-run count, batched DELETE, pinned-connection commit sequence, and final
+// state. This covers the gap flagged in the codex review of gastown-wisp-5k1
+// (prior tests only source-grepped the implementation and the fake DB returned
+// zero dangling rows). gastown-3bdqa.
+func TestCleanDanglingParentRefs_PositivePath(t *testing.T) {
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"child-1": {id: "child-1", status: "open", issueType: "task"},
+			"child-2": {id: "child-2", status: "open", issueType: "task"},
+			"child-3": {id: "child-3", status: "open", issueType: "task"},
+		},
+		// Three dangling parent-child rows whose parent wisp is gone.
+		danglingDeps: []fakeDanglingDep{
+			{issueID: "child-1", dependsOnID: "purged-parent-1"},
+			{issueID: "child-2", dependsOnID: "purged-parent-2"},
+			{issueID: "child-3", dependsOnID: "purged-parent-3"},
+		},
+		ops: map[int][]string{},
+	}
+
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Dry-run: reports count, mutates nothing.
+	before := len(state.danglingDeps)
+	dryRun, err := CleanDanglingParentRefs(db, "testdb", true)
+	if err != nil {
+		t.Fatalf("dry-run CleanDanglingParentRefs: %v", err)
+	}
+	if dryRun.Cleaned != 3 {
+		t.Fatalf("dry-run Cleaned = %d, want 3", dryRun.Cleaned)
+	}
+	if got := len(state.danglingDeps); got != before {
+		t.Fatalf("dry-run mutated danglingDeps: before=%d after=%d", before, got)
+	}
+
+	// Real run: deletes all dangling rows and runs the commit sequence on a
+	// single pinned connection.
+	preOps := state.opCounts()
+	realRun, err := CleanDanglingParentRefs(db, "testdb", false)
+	if err != nil {
+		t.Fatalf("real CleanDanglingParentRefs: %v", err)
+	}
+	if realRun.Cleaned != 3 {
+		t.Fatalf("real Cleaned = %d, want 3", realRun.Cleaned)
+	}
+	if got := len(state.danglingDeps); got != 0 {
+		t.Fatalf("real run left %d danglingDeps, want 0", got)
+	}
+	if len(realRun.Anomalies) != 0 {
+		t.Fatalf("real run reported anomalies, want none: %#v", realRun.Anomalies)
+	}
+
+	// Verify the whole autocommit/DELETE/COMMIT/DOLT_COMMIT sequence ran on ONE
+	// pinned connection (the codex BLOCKING finding: *sql.DB may otherwise
+	// spread the statements across pooled connections).
+	realOps := state.opsSince(preOps)
+	if len(realOps) != 1 {
+		t.Fatalf("real CleanDanglingParentRefs used %d connections, want 1: %#v", len(realOps), realOps)
+	}
+	for connID, ops := range realOps {
+		assertOpsContainInOrder(t, ops,
+			"EXEC SET @@autocommit = 0",
+			"EXEC DELETE FROM wisp_dependencies",
+			"EXEC COMMIT",
+			"EXEC CALL DOLT_COMMIT",
+			"EXEC SET @@autocommit = 1",
+		)
+		t.Logf("real CleanDanglingParentRefs used pinned connection %d", connID)
+	}
+
+	// Second real run: backlog drained, no work, no commit sequence.
+	drained, err := CleanDanglingParentRefs(db, "testdb", false)
+	if err != nil {
+		t.Fatalf("drained CleanDanglingParentRefs: %v", err)
+	}
+	if drained.Cleaned != 0 {
+		t.Fatalf("drained Cleaned = %d, want 0", drained.Cleaned)
+	}
+}
+
 var fakeReaperDriverID uint64
 
 func openFakeReaperDB(t *testing.T, state *fakeReaperState) *sql.DB {
+	t.Helper()
+	driverName := fmt.Sprintf("fake_reaper_%d", atomic.AddUint64(&fakeReaperDriverID, 1))
+	sql.Register(driverName, &fakeReaperDriver{state: state})
+	db, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("open fake db: %v", err)
+	}
+	return db
+}
 
 type fakeWisp struct {
 	id        string
