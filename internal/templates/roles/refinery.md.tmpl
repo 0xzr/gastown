@@ -263,21 +263,23 @@ GT_REVIEW_GATE_WORKTREE="$PWD" \
 GT_REVIEW_GATE_BRANCH="<polecat-branch>" \
 GT_REVIEW_GATE_TARGET="<merge-target>" \
 GT_REVIEW_GATE_WRITER="$WRITER" \
+GT_RIG="{{ .RigName }}" \
 GT_GATE_ATTEST_DIR="/home/ubuntu/.gt-gate-attestations" \
 GT_GATE_HMAC_KEY="/home/ubuntu/.gt-gate-hmac-key" \
 GT_REFINERY_RUN_ALL_GATES_FALLBACK="/home/ubuntu/gt-town/{{ .RigName }}/mayor/rig/scripts/run-all-gates.sh" \
-METASWARM_ADAPTERS="/home/ubuntu/gt-town/polybot/refinery/rig/.metaswarm/adapters" \
   /home/ubuntu/gastown-spike/dropin/refinery-gate.sh --worktree "$PWD" --writer "$WRITER" --timeout 1800
 
-python3 - "$MERGE_TREE" "$WRITER" "/home/ubuntu/.gt-gate-hmac-key" "/home/ubuntu/.gt-gate-attestations/$MERGE_TREE" <<'PY'
+REPO_ID=$(git config --get remote.origin.url 2>/dev/null || git rev-parse --show-toplevel)
+REPO_KEY=$(printf '%s' "$REPO_ID" | sha256sum | awk '{print substr($1,1,16)}')
+python3 - "$MERGE_TREE" "$WRITER" "{{ .RigName }}" "$REPO_KEY" "/home/ubuntu/.gt-gate-hmac-key" "/home/ubuntu/.gt-gate-attestations/{{ .RigName }}/$REPO_KEY/$MERGE_TREE" <<'PY'
 import hashlib, hmac, pathlib, sys
-tree, writer, key_path, token_path = sys.argv[1:5]
+tree, writer, rig, repo_key, key_path, token_path = sys.argv[1:7]
 writer = writer.strip().lower() or "unknown"
 if writer.startswith("codex-"):
     writer = "codex"
 key = pathlib.Path(key_path).read_bytes().rstrip(b"\r\n")
 actual = bytes.fromhex(pathlib.Path(token_path).read_text().strip())
-payload = f"gastown-durable-review-v1\ntree={tree}\nwriter={writer}\n".encode()
+payload = f"gastown-durable-review-v2\nrig={rig}\nrepo={repo_key}\ntree={tree}\nwriter={writer}\n".encode()
 expected = hmac.new(key, payload, hashlib.sha256).digest()
 if not hmac.compare_digest(actual, expected):
     raise SystemExit("durable review HMAC attestation mismatch")

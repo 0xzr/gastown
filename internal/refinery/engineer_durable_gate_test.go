@@ -185,7 +185,7 @@ func TestDoMerge_DurableReviewGate_WritesAttestation_AllowsMerge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve merge-candidate tree: %v", err)
 	}
-	attestationPath := filepath.Join(attestDir, tree)
+	attestationPath := e.durableReviewAttestationPath(tree)
 	if _, err := os.Stat(attestationPath); err != nil {
 		t.Errorf("expected attestation file %s to exist: %v", attestationPath, err)
 	}
@@ -412,7 +412,10 @@ func TestDoMerge_DurableReviewGate_InvalidAttestation_BlocksMerge(t *testing.T) 
 	if err != nil {
 		t.Fatalf("resolve merge-candidate tree: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(attestDir, tree), []byte("not-a-valid-hmac-token"), 0644); err != nil {
+	if err := os.MkdirAll(filepath.Dir(e.durableReviewAttestationPath(tree)), 0755); err != nil {
+		t.Fatalf("create scoped attest dir: %v", err)
+	}
+	if err := os.WriteFile(e.durableReviewAttestationPath(tree), []byte("not-a-valid-hmac-token"), 0644); err != nil {
 		t.Fatalf("write invalid attestation: %v", err)
 	}
 	mustRun(t, workDir, "git", "reset", "--hard", "HEAD~1")
@@ -590,8 +593,13 @@ func TestDoMerge_DurableReviewGate_SymlinkAttestation_BlocksMerge(t *testing.T) 
 		t.Fatalf("resolve merge-candidate tree: %v", err)
 	}
 	realToken := filepath.Join(t.TempDir(), tree)
-	writeHMACTokenTo(t, realToken, keyPath, tree, "unknown")
-	if err := os.Symlink(realToken, filepath.Join(attestDir, tree)); err != nil {
+	if err := os.WriteFile(realToken, []byte("not-used"), 0644); err != nil {
+		t.Fatalf("write symlink target: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(e.durableReviewAttestationPath(tree)), 0755); err != nil {
+		t.Fatalf("create scoped attest dir: %v", err)
+	}
+	if err := os.Symlink(realToken, e.durableReviewAttestationPath(tree)); err != nil {
 		t.Fatalf("create attestation symlink: %v", err)
 	}
 	mustRun(t, workDir, "git", "reset", "--hard", "HEAD~1")
@@ -840,7 +848,7 @@ func TestDoMerge_DurableReviewGate_LegacyFallback_ReusesPostSquashGate(t *testin
 	if err != nil {
 		t.Fatalf("resolve merge-candidate tree: %v", err)
 	}
-	attestationPath := filepath.Join(attestDir, tree)
+	attestationPath := e.durableReviewAttestationPath(tree)
 	if _, err := os.Stat(attestationPath); err != nil {
 		t.Errorf("expected fallback attestation file %s to exist: %v", attestationPath, err)
 	}
@@ -1086,7 +1094,17 @@ func writeTownMarker(t *testing.T, townRoot string) {
 
 func writeHMACToken(t *testing.T, attestDir, keyPath, tree, writer string) {
 	t.Helper()
-	writeHMACTokenTo(t, filepath.Join(attestDir, tree), keyPath, tree, writer)
+	repoIdentity := testAttestationRepoIdentity(t, attestDir)
+	writeHMACTokenTo(t, filepath.Join(attestDir, durableReviewPathComponent("test-rig"), durableReviewRepoKey(repoIdentity), tree), keyPath, tree, writer)
+}
+
+func testAttestationRepoIdentity(t *testing.T, attestDir string) string {
+	t.Helper()
+	workDir := filepath.Dir(attestDir)
+	if out, err := runWithError(workDir, "git", "config", "--get", "remote.origin.url"); err == nil && strings.TrimSpace(out) != "" {
+		return strings.TrimSpace(out)
+	}
+	return workDir
 }
 
 // writeHMACTokenTo writes a durable-review HMAC attestation for tree by
@@ -1101,15 +1119,18 @@ func writeHMACToken(t *testing.T, attestDir, keyPath, tree, writer string) {
 // CombinedOutput cannot block forever (gastown-zcl).
 func writeHMACTokenTo(t *testing.T, outPath, keyPath, tree, writer string) {
 	t.Helper()
+	attestRoot := filepath.Dir(filepath.Dir(filepath.Dir(outPath)))
 	ctx, cancel := context.WithTimeout(context.Background(), testHMACAttestationTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", hmacAttestationShellCmd(t)) //nolint:gosec // G204: test helper only
 	util.SetProcessGroup(cmd)
 	cmd.WaitDelay = testHMACAttestationTimeout
 	cmd.Env = append(os.Environ(),
-		"GT_GATE_ATTEST_DIR="+filepath.Dir(outPath),
+		"GT_GATE_ATTEST_DIR="+attestRoot,
 		"GT_GATE_HMAC_KEY="+keyPath,
 		"GT_REVIEW_GATE_WRITER="+writer,
+		"GT_REVIEW_GATE_RIG=test-rig",
+		"GT_REVIEW_GATE_REPO="+testAttestationRepoIdentity(t, attestRoot),
 		"GT_HMAC_ATTESTATION_TREE="+tree,
 	)
 	out, err := cmd.CombinedOutput()
@@ -1131,7 +1152,7 @@ func shellQuote(s string) string {
 
 func hmacAttestationShellCmd(t *testing.T) string {
 	t.Helper()
-	return fmt.Sprintf(`mkdir -p "$GT_GATE_ATTEST_DIR" && tree="${GT_HMAC_ATTESTATION_TREE:-$(git rev-parse HEAD^{tree})}" && GT_HMAC_ATTESTATION_HELPER=1 %s -test.run=TestHMACAttestationHelper -- "$tree" > "$GT_GATE_ATTEST_DIR/$tree"`, shellQuote(os.Args[0]))
+	return fmt.Sprintf(`tree="${GT_HMAC_ATTESTATION_TREE:-$(git rev-parse HEAD^{tree})}" && rig="${GT_REVIEW_GATE_RIG:-unknown}" && repo="${GT_REVIEW_GATE_REPO:-$(git config --get remote.origin.url 2>/dev/null || git rev-parse --show-toplevel)}" && repo_key="$(printf '%%s' "$repo" | sha256sum | awk '{print substr($1,1,16)}')" && mkdir -p "$GT_GATE_ATTEST_DIR/$rig/$repo_key" && GT_HMAC_ATTESTATION_HELPER=1 %s -test.run=TestHMACAttestationHelper -- "$tree" > "$GT_GATE_ATTEST_DIR/$rig/$repo_key/$tree"`, shellQuote(os.Args[0]))
 }
 
 func TestHMACAttestationHelper(t *testing.T) {
@@ -1162,7 +1183,9 @@ func TestHMACAttestationHelper(t *testing.T) {
 	}
 	key = bytes.TrimRight(key, "\r\n")
 	writer := os.Getenv("GT_REVIEW_GATE_WRITER")
-	fmt.Println(hex.EncodeToString(expectedDurableReviewAttestationWithKey(key, tree, writer)))
+	rigName := os.Getenv("GT_REVIEW_GATE_RIG")
+	repoIdentity := os.Getenv("GT_REVIEW_GATE_REPO")
+	fmt.Println(hex.EncodeToString(expectedDurableReviewAttestationWithKey(key, tree, writer, rigName, repoIdentity)))
 	os.Exit(0)
 }
 

@@ -40,6 +40,7 @@ func shortSHA(sha string) string {
 }
 
 var durableReviewSocketSanitizeRe = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+var durableReviewPathComponentRe = regexp.MustCompile(`[^a-zA-Z0-9_.-]+`)
 
 func durableReviewGateTmuxSocket(branch, tree string) string {
 	token := shortSHA(strings.TrimSpace(tree))
@@ -55,6 +56,21 @@ func durableReviewGateTmuxSocket(branch, tree string) string {
 		token = token[:40]
 	}
 	return fmt.Sprintf("gastown-refinery-%s-%d", token, os.Getpid())
+}
+
+func durableReviewPathComponent(value string) string {
+	value = strings.TrimSpace(value)
+	value = durableReviewPathComponentRe.ReplaceAllString(value, "_")
+	value = strings.Trim(value, ".")
+	if value == "" {
+		return "unknown"
+	}
+	return value
+}
+
+func durableReviewRepoKey(repoIdentity string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(repoIdentity)))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 // DefaultStaleClaimTimeout is the default duration after which a claimed MR
@@ -1995,13 +2011,45 @@ func (e *Engineer) durableReviewGateTimeout() time.Duration {
 	return DefaultDurableReviewGateTimeout
 }
 
-// durableReviewAttestationPath returns the path to the HMAC attestation file
-// for a given tree hash, if an attestation directory is configured.
+// durableReviewAttestationPath returns the scoped path to the HMAC attestation
+// file for a given tree hash. Scope includes rig and repository identity so a
+// same-tree/same-writer token cannot be replayed across rigs or repos.
 func (e *Engineer) durableReviewAttestationPath(tree string) string {
 	if tree == "" {
 		return ""
 	}
-	return filepath.Join(e.durableReviewAttestDir(), tree)
+	return filepath.Join(
+		e.durableReviewAttestDir(),
+		durableReviewPathComponent(e.durableReviewRigIdentity()),
+		e.durableReviewRepoKey(),
+		tree,
+	)
+}
+
+func (e *Engineer) durableReviewRigIdentity() string {
+	if e != nil && e.rig != nil {
+		return e.rig.Name
+	}
+	return "unknown"
+}
+
+func (e *Engineer) durableReviewRepoIdentity() string {
+	if e != nil && e.rig != nil && strings.TrimSpace(e.rig.GitURL) != "" {
+		return strings.TrimSpace(e.rig.GitURL)
+	}
+	if e != nil && e.git != nil {
+		if origin, err := e.git.RemoteURL("origin"); err == nil && strings.TrimSpace(origin) != "" {
+			return strings.TrimSpace(origin)
+		}
+	}
+	if e != nil && strings.TrimSpace(e.workDir) != "" {
+		return strings.TrimSpace(e.workDir)
+	}
+	return "unknown"
+}
+
+func (e *Engineer) durableReviewRepoKey() string {
+	return durableReviewRepoKey(e.durableReviewRepoIdentity())
 }
 
 func durableReviewAttestationWriter(writer string) string {
@@ -2012,17 +2060,23 @@ func durableReviewAttestationWriter(writer string) string {
 	return writer
 }
 
-func durableReviewAttestationPayload(tree, writer string) []byte {
-	return []byte(fmt.Sprintf("gastown-durable-review-v1\ntree=%s\nwriter=%s\n", tree, durableReviewAttestationWriter(writer)))
+func durableReviewAttestationPayload(tree, writer, rigName, repoIdentity string) []byte {
+	return []byte(fmt.Sprintf(
+		"gastown-durable-review-v2\nrig=%s\nrepo=%s\ntree=%s\nwriter=%s\n",
+		durableReviewPathComponent(rigName),
+		durableReviewRepoKey(repoIdentity),
+		tree,
+		durableReviewAttestationWriter(writer),
+	))
 }
 
 // expectedDurableReviewAttestation returns the HMAC token expected for a tree
 // reviewed under the given writer identity. Binding the writer prevents an
 // all-four unknown-writer attestation from being replayed as a known-writer
 // three-peer attestation, or vice versa.
-func expectedDurableReviewAttestationWithKey(key []byte, tree, writer string) []byte {
+func expectedDurableReviewAttestationWithKey(key []byte, tree, writer, rigName, repoIdentity string) []byte {
 	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write(durableReviewAttestationPayload(tree, writer))
+	_, _ = mac.Write(durableReviewAttestationPayload(tree, writer, rigName, repoIdentity))
 	return mac.Sum(nil)
 }
 
@@ -2058,7 +2112,7 @@ func (e *Engineer) hasDurableReviewAttestation(key []byte, writer string) (bool,
 	if err != nil {
 		return false, tree, fmt.Errorf("invalid HMAC attestation token at %s: %w", path, err)
 	}
-	expected := expectedDurableReviewAttestationWithKey(key, tree, writer)
+	expected := expectedDurableReviewAttestationWithKey(key, tree, writer, e.durableReviewRigIdentity(), e.durableReviewRepoIdentity())
 	return hmac.Equal(actual, expected), tree, nil
 }
 
@@ -2189,6 +2243,9 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 		"GT_REVIEW_GATE_BRANCH="+branch,
 		"GT_REVIEW_GATE_TARGET="+target,
 		"GT_REVIEW_GATE_WRITER="+attestationWriter,
+		"GT_REVIEW_GATE_RIG="+e.durableReviewRigIdentity(),
+		"GT_REVIEW_GATE_REPO="+e.durableReviewRepoIdentity(),
+		"GT_RIG="+e.durableReviewRigIdentity(),
 		"GT_GATE_ATTEST_DIR="+e.durableReviewAttestDir(),
 		"GT_GATE_HMAC_KEY="+e.durableReviewHMACKeyPath(),
 		"GT_TMUX_SOCKET="+gateTmuxSocket,
