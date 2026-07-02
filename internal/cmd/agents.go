@@ -692,12 +692,24 @@ func buildCollisionReport(townRoot string) (*CollisionReport, error) {
 	if err != nil {
 		sessions = []string{} // Continue even if tmux not running
 	}
+	sessionIDs, err := t.ListSessionIDs()
+	if err != nil {
+		sessionIDs = map[string]string{}
+	}
 
 	// Filter to Gas Town sessions
 	var gtSessions []string
+	activeSessions := make(map[string]bool)
 	for _, s := range sessions {
 		if session.IsKnownSession(s) {
 			gtSessions = append(gtSessions, s)
+			activeSessions[s] = true
+			if id := sessionIDs[s]; id != "" {
+				activeSessions[id] = true
+			}
+			if paneID, err := t.GetPaneID(s); err == nil && paneID != "" {
+				activeSessions[paneID] = true
+			}
 		}
 	}
 	report.TotalSessions = len(gtSessions)
@@ -712,7 +724,14 @@ func buildCollisionReport(townRoot string) (*CollisionReport, error) {
 
 	// Check each lock for issues
 	for workerDir, lockInfo := range locks {
+		expectedSession := guessSessionFromWorkerDir(workerDir, townRoot)
+		sessionFound := (expectedSession != "" && activeSessions[expectedSession]) ||
+			(lockInfo.SessionID != "" && activeSessions[lockInfo.SessionID])
+
 		if lockInfo.IsStale() {
+			if sessionFound {
+				continue
+			}
 			report.StaleLocks++
 			report.Issues = append(report.Issues, CollisionIssue{
 				Type:      "stale",
@@ -725,16 +744,8 @@ func buildCollisionReport(townRoot string) (*CollisionReport, error) {
 		}
 
 		// Check if the locked session exists in tmux
-		expectedSession := guessSessionFromWorkerDir(workerDir, townRoot)
 		if expectedSession != "" {
-			found := false
-			for _, s := range gtSessions {
-				if s == expectedSession {
-					found = true
-					break
-				}
-			}
-			if !found {
+			if !sessionFound {
 				// Lock exists but session doesn't - potential orphan or collision
 				report.Collisions++
 				report.Issues = append(report.Issues, CollisionIssue{

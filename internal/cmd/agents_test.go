@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,8 +10,11 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/lock"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -73,6 +77,82 @@ func TestAgentsListCmd_StillRegistered(t *testing.T) {
 func TestAgentsCmd_ShortDescription(t *testing.T) {
 	if agentsCmd.Short == "Switch between Gas Town agent sessions" {
 		t.Error("agentsCmd.Short still describes popup menu behavior; should describe listing")
+	}
+}
+
+func TestBuildCollisionReport_DeadPIDLiveSessionNotStale(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tmux integration test is Unix-only")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+
+	setupCmdTestRegistry(t)
+
+	socketName := fmt.Sprintf("gt-test-agents-check-%d", os.Getpid())
+	sessionName := session.PolecatSessionName(session.PrefixFor("gastown"), "rust")
+	if err := exec.Command("tmux", "-L", socketName, "new-session", "-d", "-s", sessionName, "sleep", "60").Run(); err != nil {
+		t.Fatalf("create tmux session: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "-L", socketName, "kill-server").Run()
+		_ = os.Remove(filepath.Join(tmux.SocketDir(), socketName))
+	})
+
+	origSocket := tmux.GetDefaultSocket()
+	tmux.SetDefaultSocket(socketName)
+	t.Cleanup(func() { tmux.SetDefaultSocket(origSocket) })
+
+	paneIDOut, err := exec.Command("tmux", "-L", socketName, "display-message", "-t", sessionName, "-p", "#{pane_id}").Output()
+	if err != nil {
+		t.Fatalf("read pane id: %v", err)
+	}
+	paneID := strings.TrimSpace(string(paneIDOut))
+
+	townRoot := t.TempDir()
+	workerDir := filepath.Join(townRoot, "gastown", "polecats", "rust", "gastown")
+	runtimeDir := filepath.Join(workerDir, ".runtime")
+	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	info := lock.LockInfo{
+		PID:        999999999,
+		AcquiredAt: time.Now(),
+		SessionID:  paneID,
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runtimeDir, "agent.lock"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// This lock path cannot be mapped to a Gas Town session name by
+	// guessSessionFromWorkerDir. It proves lockInfo.SessionID is matched
+	// against the live pane ID directly.
+	paneOnlyDir := filepath.Join(townRoot, "unmapped", "worker")
+	paneOnlyRuntimeDir := filepath.Join(paneOnlyDir, ".runtime")
+	if err := os.MkdirAll(paneOnlyRuntimeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(paneOnlyRuntimeDir, "agent.lock"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := buildCollisionReport(townRoot)
+	if err != nil {
+		t.Fatalf("buildCollisionReport: %v", err)
+	}
+	if report.TotalLocks != 2 {
+		t.Fatalf("TotalLocks = %d, want 2", report.TotalLocks)
+	}
+	if report.StaleLocks != 0 {
+		t.Fatalf("StaleLocks = %d, want 0; issues=%+v", report.StaleLocks, report.Issues)
+	}
+	if len(report.Issues) != 0 {
+		t.Fatalf("Issues = %+v, want none", report.Issues)
 	}
 }
 

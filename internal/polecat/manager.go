@@ -2000,12 +2000,21 @@ func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) boo
 	if townRoot != "" {
 		stale, exists := IsSessionHeartbeatStale(townRoot, sessionName)
 		if exists {
-			return stale
+			if !stale {
+				return false
+			}
+			// A stale heartbeat is not enough to prove the agent is dead:
+			// long model turns can keep the pane process alive without running
+			// a gt command that refreshes the heartbeat. Fall through to the
+			// PID probe before declaring the session dead.
 		}
 		// No heartbeat file — fall through to PID-based check for backward compatibility.
 	}
 
 	// Fallback: PID signal probing (legacy, for sessions without heartbeat support).
+	if t == nil {
+		return false
+	}
 	pidStr, err := t.GetPanePID(sessionName)
 	if err != nil {
 		// Tmux query failed — could be permission denied, server busy, etc.
@@ -2042,7 +2051,11 @@ func isSessionProcessAlive(t *tmux.Tmux, sessionName string, townRoot string) (b
 	if townRoot != "" {
 		stale, exists := IsSessionHeartbeatStale(townRoot, sessionName)
 		if exists {
-			return !stale, nil
+			if !stale {
+				return true, nil
+			}
+			// Stale heartbeat is inconclusive; verify the pane process before
+			// treating a live session as dead.
 		}
 		// No heartbeat file — fall through to PID-based check.
 	}

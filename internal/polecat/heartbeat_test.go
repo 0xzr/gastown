@@ -3,9 +3,13 @@ package polecat
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
+
+	tmuxpkg "github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestTouchAndReadSessionHeartbeat(t *testing.T) {
@@ -184,7 +188,7 @@ func TestIsSessionProcessDead_HeartbeatFresh(t *testing.T) {
 	}
 }
 
-func TestIsSessionProcessDead_HeartbeatStale(t *testing.T) {
+func TestIsSessionProcessDead_HeartbeatStaleWithoutTmuxIsInconclusive(t *testing.T) {
 	townRoot := t.TempDir()
 	sessionName := "gt-test-hb-dead"
 
@@ -200,8 +204,50 @@ func TestIsSessionProcessDead_HeartbeatStale(t *testing.T) {
 	}
 
 	dead := isSessionProcessDead(nil, sessionName, townRoot)
-	if !dead {
-		t.Error("expected dead=true for session with stale heartbeat")
+	if dead {
+		t.Error("expected dead=false for stale heartbeat without PID confirmation")
+	}
+}
+
+func TestIsSessionProcessLiveness_StaleHeartbeatLiveTmuxPane(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tmux integration test is Unix-only")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+
+	townRoot := t.TempDir()
+	socketName := "gt-test-hb-live-" + time.Now().Format("150405.000000000")
+	sessionName := "gt-test-hb-live"
+	if err := exec.Command("tmux", "-L", socketName, "new-session", "-d", "-s", sessionName, "sleep", "60").Run(); err != nil {
+		t.Fatalf("create tmux session: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "-L", socketName, "kill-server").Run()
+		_ = os.Remove(filepath.Join(tmuxpkg.SocketDir(), socketName))
+	})
+
+	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-10 * time.Minute).UTC()
+	data := []byte(`{"timestamp":"` + oldTime.Format(time.RFC3339Nano) + `"}`)
+	if err := os.WriteFile(filepath.Join(dir, sessionName+".json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tmx := tmuxpkg.NewTmuxWithSocket(socketName)
+	if dead := isSessionProcessDead(tmx, sessionName, townRoot); dead {
+		t.Fatal("expected dead=false for stale heartbeat with live tmux pane")
+	}
+	alive, err := isSessionProcessAlive(tmx, sessionName, townRoot)
+	if err != nil {
+		t.Fatalf("isSessionProcessAlive error: %v", err)
+	}
+	if !alive {
+		t.Fatal("expected alive=true for stale heartbeat with live tmux pane")
 	}
 }
 
@@ -240,8 +286,8 @@ func TestIsSessionProcessAlive_FreshHeartbeat(t *testing.T) {
 	}
 }
 
-// TestIsSessionProcessAlive_StaleHeartbeat verifies a stale heartbeat is
-// classified as not alive (gastown-9rl).
+// TestIsSessionProcessAlive_StaleHeartbeat verifies a stale heartbeat alone is
+// classified as not alive until the PID fallback confirms liveness.
 func TestIsSessionProcessAlive_StaleHeartbeat(t *testing.T) {
 	townRoot := t.TempDir()
 	sessionName := "gt-test-alive-stale"
