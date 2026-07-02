@@ -17,6 +17,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -98,22 +99,14 @@ func (c *Curator) Start() error {
 	c.startOnce.Do(func() {
 		eventsPath := filepath.Join(c.townRoot, events.EventsFile)
 
-		// Open events file, creating if needed
-		file, err := os.OpenFile(eventsPath, os.O_RDONLY|os.O_CREATE, 0600)
+		file, lineOccurrences, err := openEventsFileAtEnd(eventsPath)
 		if err != nil {
-			c.startErr = fmt.Errorf("opening events file: %w", err)
-			return
-		}
-
-		// Seek to end to only process new events
-		if _, err := file.Seek(0, io.SeekEnd); err != nil {
-			_ = file.Close() //nolint:gosec // G104: best effort cleanup on error
-			c.startErr = fmt.Errorf("seeking to end: %w", err)
+			c.startErr = err
 			return
 		}
 
 		c.wg.Add(1)
-		go c.run(file)
+		go c.run(eventsPath, file, lineOccurrences)
 	})
 	return c.startErr
 }
@@ -124,15 +117,158 @@ func (c *Curator) Stop() {
 	c.wg.Wait()
 }
 
+func openEventsFileAtEnd(eventsPath string) (*os.File, map[string]int, error) {
+	fl := flock.New(eventsPath + ".lock")
+	if err := fl.RLock(); err != nil {
+		return nil, nil, fmt.Errorf("acquiring events read lock: %w", err)
+	}
+	defer fl.Unlock() //nolint:errcheck // best-effort unlock
+
+	file, err := os.OpenFile(eventsPath, os.O_RDONLY|os.O_CREATE, 0600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening events file: %w", err)
+	}
+	lineOccurrences, err := countEventLineOccurrences(file)
+	if err != nil {
+		_ = file.Close() //nolint:gosec // G104: best effort cleanup on error
+		return nil, nil, err
+	}
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		_ = file.Close() //nolint:gosec // G104: best effort cleanup on error
+		return nil, nil, fmt.Errorf("seeking to end: %w", err)
+	}
+	return file, lineOccurrences, nil
+}
+
+func openEventsFileAtStart(eventsPath string) (*os.File, error) {
+	file, err := os.OpenFile(eventsPath, os.O_RDONLY|os.O_CREATE, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("opening events file: %w", err)
+	}
+	return file, nil
+}
+
+func countEventLineOccurrences(file *os.File) (map[string]int, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seeking events file to start: %w", err)
+	}
+	occurrences := make(map[string]int)
+	reader := bufio.NewReader(file)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			normalized := normalizeRawEventLine(line)
+			if _, ok := parseRawEventLine(normalized); ok {
+				occurrences[normalized]++
+			}
+		}
+		if err == io.EOF {
+			return occurrences, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("counting event line occurrences: %w", err)
+		}
+	}
+}
+
+func eventsFileReplaced(eventsPath string, file *os.File) (bool, error) {
+	pathInfo, err := os.Stat(eventsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return true, nil
+	}
+	if !os.SameFile(pathInfo, fileInfo) {
+		return true, nil
+	}
+	offset, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return true, nil
+	}
+	return pathInfo.Size() < offset, nil
+}
+
+type rawEventCursor struct {
+	line           string
+	lineOccurrence int
+	timestamp      time.Time
+	valid          bool
+}
+
+func normalizeRawEventLine(line string) string {
+	return strings.TrimRight(line, "\r\n")
+}
+
+func cursorFromRawEvent(line string, event events.Event) rawEventCursor {
+	cursor := rawEventCursor{
+		line:  normalizeRawEventLine(line),
+		valid: true,
+	}
+	if ts, err := time.Parse(time.RFC3339, event.Timestamp); err == nil {
+		cursor.timestamp = ts
+	}
+	return cursor
+}
+
+func markCursorOccurrence(cursor rawEventCursor, occurrences map[string]int) rawEventCursor {
+	if !cursor.valid || cursor.line == "" {
+		return cursor
+	}
+	occurrences[cursor.line]++
+	cursor.lineOccurrence = occurrences[cursor.line]
+	return cursor
+}
+
+func rawEventLineAfterCursor(line string, cursor rawEventCursor) bool {
+	if !cursor.valid || cursor.timestamp.IsZero() {
+		return false
+	}
+	var event events.Event
+	if err := json.Unmarshal([]byte(line), &event); err != nil {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, event.Timestamp)
+	if err != nil {
+		return false
+	}
+	return ts.After(cursor.timestamp)
+}
+
+func parseRawEventLine(line string) (events.Event, bool) {
+	line = normalizeRawEventLine(line)
+	if line == "" {
+		return events.Event{}, false
+	}
+	var rawEvent events.Event
+	if err := json.Unmarshal([]byte(line), &rawEvent); err != nil {
+		return events.Event{}, false
+	}
+	return rawEvent, true
+}
+
 // run is the main curator loop.
 // ZFC: No in-memory state to clean up - state is derived from the events file.
-func (c *Curator) run(file *os.File) {
+func (c *Curator) run(eventsPath string, file *os.File, lineOccurrences map[string]int) {
 	defer c.wg.Done()
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 
 	reader := bufio.NewReader(file)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+	cursor := rawEventCursor{
+		timestamp: time.Now().UTC(),
+		valid:     true,
+	}
+	if lineOccurrences == nil {
+		lineOccurrences = make(map[string]int)
+	}
 
 	for {
 		select {
@@ -146,35 +282,108 @@ func (c *Curator) run(file *os.File) {
 				if err != nil {
 					break // No more data available
 				}
-				c.processLine(line)
+				if next, ok := c.processLine(line); ok {
+					cursor = markCursorOccurrence(next, lineOccurrences)
+				}
 			}
+			replaced, err := eventsFileReplaced(eventsPath, file)
+			if err != nil {
+				log.Printf("warning: checking events file rotation: %v", err)
+				continue
+			}
+			if !replaced {
+				continue
+			}
+			newFile, err := openEventsFileAtStart(eventsPath)
+			if err != nil {
+				log.Printf("warning: reopening events file after rotation: %v", err)
+				continue
+			}
+			_ = file.Close()
+			file = newFile
+			reader = bufio.NewReader(file)
+			cursor, lineOccurrences = c.replayEventsAfterCursor(reader, cursor, lineOccurrences)
 		}
 	}
 }
 
+func (c *Curator) replayEventsAfterCursor(reader *bufio.Reader, cursor rawEventCursor, previousOccurrences map[string]int) (rawEventCursor, map[string]int) {
+	nextCursor := cursor
+	useMarker := cursor.valid && cursor.line != ""
+	var lines []string
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			lines = append(lines, normalizeRawEventLine(line))
+		}
+		if err != nil {
+			break
+		}
+	}
+	start := -1
+	if useMarker {
+		matches := 0
+		occurrence := cursor.lineOccurrence
+		if occurrence <= 0 {
+			occurrence = 1
+		}
+		for i, line := range lines {
+			if line == cursor.line {
+				matches++
+				if matches == occurrence {
+					start = i + 1
+					break
+				}
+			}
+		}
+	}
+	lineOccurrences := make(map[string]int, len(lines))
+	for i, line := range lines {
+		rawEvent, ok := parseRawEventLine(line)
+		if ok {
+			lineOccurrences[line]++
+		}
+		if start >= 0 {
+			if i < start {
+				continue
+			}
+		} else if lineOccurrences[line] <= previousOccurrences[line] && !rawEventLineAfterCursor(line, cursor) {
+			continue
+		}
+		if ok {
+			c.processEvent(&rawEvent)
+			nextCursor = cursorFromRawEvent(line, rawEvent)
+			nextCursor.lineOccurrence = lineOccurrences[line]
+		}
+	}
+	return nextCursor, lineOccurrences
+}
+
 // processLine processes a single line from the events file.
-func (c *Curator) processLine(line string) {
-	if line == "" || line == "\n" {
-		return
+func (c *Curator) processLine(line string) (rawEventCursor, bool) {
+	line = normalizeRawEventLine(line)
+	rawEvent, ok := parseRawEventLine(line)
+	if !ok {
+		return rawEventCursor{}, false // Skip malformed lines
 	}
+	cursor := cursorFromRawEvent(line, rawEvent)
+	c.processEvent(&rawEvent)
+	return cursor, true
+}
 
-	var rawEvent events.Event
-	if err := json.Unmarshal([]byte(line), &rawEvent); err != nil {
-		return // Skip malformed lines
-	}
-
+func (c *Curator) processEvent(rawEvent *events.Event) {
 	// Filter by visibility - only process feed-visible events
 	if rawEvent.Visibility != events.VisibilityFeed && rawEvent.Visibility != events.VisibilityBoth {
 		return
 	}
 
 	// Apply deduplication and aggregation
-	if c.shouldDedupe(&rawEvent) {
+	if c.shouldDedupe(rawEvent) {
 		return
 	}
 
 	// Write to feed
-	c.writeFeedEvent(&rawEvent)
+	c.writeFeedEvent(rawEvent)
 }
 
 // shouldDedupe checks if an event should be deduplicated.

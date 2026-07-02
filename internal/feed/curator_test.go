@@ -606,6 +606,235 @@ func TestCurator_ConcurrentStartIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestCurator_ReopensEventsFileAfterRotation(t *testing.T) {
+	tmpDir := t.TempDir()
+	eventsPath := filepath.Join(tmpDir, events.EventsFile)
+	feedPath := filepath.Join(tmpDir, FeedFile)
+	if err := os.WriteFile(eventsPath, []byte{}, 0644); err != nil {
+		t.Fatalf("creating events file: %v", err)
+	}
+
+	curator := NewCurator(tmpDir)
+	if err := curator.Start(); err != nil {
+		t.Fatalf("starting curator: %v", err)
+	}
+	defer curator.Stop()
+
+	time.Sleep(150 * time.Millisecond)
+	stamp := time.Now().UTC().Format(time.RFC3339)
+	retainedEvent := events.Event{
+		Timestamp:  stamp,
+		Source:     "gt",
+		Type:       events.TypeDone,
+		Actor:      "earlier-retained",
+		Payload:    map[string]interface{}{"bead": "retained"},
+		Visibility: events.VisibilityFeed,
+	}
+	beforeEvent := events.Event{
+		Timestamp:  stamp,
+		Source:     "gt",
+		Type:       events.TypeDone,
+		Actor:      "before-rotation",
+		Payload:    map[string]interface{}{"bead": "before"},
+		Visibility: events.VisibilityFeed,
+	}
+	retainedData, _ := json.Marshal(retainedEvent)
+	beforeData, _ := json.Marshal(beforeEvent)
+	preRotation := append(append(append([]byte{}, retainedData...), '\n'), beforeData...)
+	preRotation = append(preRotation, '\n')
+	if err := os.WriteFile(eventsPath, preRotation, 0644); err != nil {
+		t.Fatalf("writing pre-rotation event: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		feedContent, err := os.ReadFile(feedPath)
+		if err == nil && strings.Contains(string(feedContent), "earlier-retained") && strings.Contains(string(feedContent), "before-rotation") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	feedContent, err := os.ReadFile(feedPath)
+	if err != nil || !strings.Contains(string(feedContent), "earlier-retained") || !strings.Contains(string(feedContent), "before-rotation") {
+		t.Fatalf("feed did not include pre-rotation event; err=%v content=%q", err, string(feedContent))
+	}
+
+	afterEvent := events.Event{
+		Timestamp:  stamp,
+		Source:     "gt",
+		Type:       events.TypeDone,
+		Actor:      "rotated-actor",
+		Payload:    map[string]interface{}{"bead": "rotated"},
+		Visibility: events.VisibilityFeed,
+	}
+	afterData, _ := json.Marshal(afterEvent)
+	replacementPath := filepath.Join(tmpDir, ".events.jsonl.tmp")
+	replacement := append(append(append([]byte{}, retainedData...), '\n'), beforeData...)
+	replacement = append(replacement, '\n')
+	replacement = append(replacement, afterData...)
+	replacement = append(replacement, '\n')
+	if err := os.WriteFile(replacementPath, replacement, 0644); err != nil {
+		t.Fatalf("writing replacement events file: %v", err)
+	}
+	rotatedPath := filepath.Join(tmpDir, ".events.jsonl.rotated")
+	if err := os.Rename(eventsPath, rotatedPath); err != nil {
+		t.Fatalf("rotating events file: %v", err)
+	}
+	if err := os.Rename(replacementPath, eventsPath); err != nil {
+		t.Fatalf("installing replacement events file: %v", err)
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		feedContent, err := os.ReadFile(feedPath)
+		if err == nil && strings.Contains(string(feedContent), "rotated-actor") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	feedContent, _ = os.ReadFile(feedPath)
+	if !strings.Contains(string(feedContent), "rotated-actor") {
+		t.Fatalf("feed did not include event appended after rotation; content=%q", string(feedContent))
+	}
+	countLines := func(needle string) int {
+		count := 0
+		for _, line := range strings.Split(strings.TrimSpace(string(feedContent)), "\n") {
+			if strings.Contains(line, needle) {
+				count++
+			}
+		}
+		return count
+	}
+	if got := countLines("earlier-retained"); got != 1 {
+		t.Fatalf("earlier retained event count = %d, want 1; content=%q", got, string(feedContent))
+	}
+	if got := countLines("before-rotation"); got != 1 {
+		t.Fatalf("marker event count = %d, want 1; content=%q", got, string(feedContent))
+	}
+}
+
+func TestCurator_QuietRotationDoesNotReplayRetainedHistory(t *testing.T) {
+	tmpDir := t.TempDir()
+	eventsPath := filepath.Join(tmpDir, events.EventsFile)
+	feedPath := filepath.Join(tmpDir, FeedFile)
+	historicalEvent := events.Event{
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		Source:     "gt",
+		Type:       events.TypeDone,
+		Actor:      "historical-retained",
+		Payload:    map[string]interface{}{"bead": "old"},
+		Visibility: events.VisibilityFeed,
+	}
+	historicalData, _ := json.Marshal(historicalEvent)
+	if err := os.WriteFile(eventsPath, append(historicalData, '\n'), 0644); err != nil {
+		t.Fatalf("creating historical events file: %v", err)
+	}
+
+	curator := NewCurator(tmpDir)
+	if err := curator.Start(); err != nil {
+		t.Fatalf("starting curator: %v", err)
+	}
+	defer curator.Stop()
+
+	time.Sleep(150 * time.Millisecond)
+	replacementPath := filepath.Join(tmpDir, ".events.jsonl.tmp")
+	if err := os.WriteFile(replacementPath, append(historicalData, '\n'), 0644); err != nil {
+		t.Fatalf("writing replacement events file: %v", err)
+	}
+	rotatedPath := filepath.Join(tmpDir, ".events.jsonl.rotated")
+	if err := os.Rename(eventsPath, rotatedPath); err != nil {
+		t.Fatalf("rotating events file: %v", err)
+	}
+	if err := os.Rename(replacementPath, eventsPath); err != nil {
+		t.Fatalf("installing replacement events file: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	feedContent, _ := os.ReadFile(feedPath)
+	if strings.Contains(string(feedContent), "historical-retained") {
+		t.Fatalf("quiet rotation replayed retained history; content=%q", string(feedContent))
+	}
+}
+
+func TestCurator_ReplayProcessesDuplicateRawLineAfterCursor(t *testing.T) {
+	tmpDir := t.TempDir()
+	eventsPath := filepath.Join(tmpDir, events.EventsFile)
+	feedPath := filepath.Join(tmpDir, FeedFile)
+	duplicateEvent := events.Event{
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		Source:     "gt",
+		Type:       events.TypeSling,
+		Actor:      "duplicate-cursor",
+		Payload:    map[string]interface{}{"bead": "dup", "target": "lane"},
+		Visibility: events.VisibilityFeed,
+	}
+	duplicateData, _ := json.Marshal(duplicateEvent)
+	if err := os.WriteFile(eventsPath, append(duplicateData, '\n'), 0644); err != nil {
+		t.Fatalf("creating pre-start duplicate event: %v", err)
+	}
+
+	curator := NewCurator(tmpDir)
+	if err := curator.Start(); err != nil {
+		t.Fatalf("starting curator: %v", err)
+	}
+	defer curator.Stop()
+
+	time.Sleep(150 * time.Millisecond)
+	f, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("opening events file for cursor append: %v", err)
+	}
+	if _, err := f.Write(append(duplicateData, '\n')); err != nil {
+		_ = f.Close()
+		t.Fatalf("writing cursor event: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("closing cursor append: %v", err)
+	}
+	waitForFeedLineCount(t, feedPath, "duplicate-cursor", 1)
+
+	replacementPath := filepath.Join(tmpDir, ".events.jsonl.tmp")
+	replacement := append(append(append([]byte{}, duplicateData...), '\n'), duplicateData...)
+	replacement = append(replacement, '\n')
+	replacement = append(replacement, duplicateData...)
+	replacement = append(replacement, '\n')
+	if err := os.WriteFile(replacementPath, replacement, 0644); err != nil {
+		t.Fatalf("writing replacement events file: %v", err)
+	}
+	rotatedPath := filepath.Join(tmpDir, ".events.jsonl.rotated")
+	if err := os.Rename(eventsPath, rotatedPath); err != nil {
+		t.Fatalf("rotating events file: %v", err)
+	}
+	if err := os.Rename(replacementPath, eventsPath); err != nil {
+		t.Fatalf("installing replacement events file: %v", err)
+	}
+
+	waitForFeedLineCount(t, feedPath, "duplicate-cursor", 2)
+}
+
+func waitForFeedLineCount(t *testing.T, feedPath, needle string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		content, err := os.ReadFile(feedPath)
+		if err == nil && countFeedLinesContaining(content, needle) == want {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	content, _ := os.ReadFile(feedPath)
+	t.Fatalf("feed line count for %q = %d, want %d; content=%q", needle, countFeedLinesContaining(content, needle), want, string(content))
+}
+
+func countFeedLinesContaining(content []byte, needle string) int {
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(content)), "\n") {
+		if strings.Contains(line, needle) {
+			count++
+		}
+	}
+	return count
+}
+
 // TestCurator_ConcurrentFeedReadWrite verifies that concurrent reads and
 // writes to the feed file don't race. The in-process feedMu mutex
 // coordinates goroutines within the same process, while flock coordinates
