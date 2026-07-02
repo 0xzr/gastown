@@ -122,10 +122,16 @@ func (c *ProductionRigInventoryCheck) Run(ctx *CheckContext) *CheckResult {
 			dirStatus = "missing"
 		}
 
-		configStatus := "present"
+		identityConfig := "present"
 		if info, err := os.Stat(filepath.Join(rigDir, "config.json")); err != nil || info.IsDir() {
+			identityConfig = "missing"
+		}
+		settingsConfig := "present"
+		if info, err := os.Stat(config.RigSettingsPath(rigDir)); err != nil || info.IsDir() {
+			settingsConfig = "missing"
+		}
+		if identityConfig == "missing" && settingsConfig == "missing" {
 			status = maxStatus(status, StatusWarning)
-			configStatus = "missing"
 		}
 
 		witness := runtimeSessionStatus(c.deps.hasSession, session.WitnessSessionName(prefix))
@@ -143,8 +149,8 @@ func (c *ProductionRigInventoryCheck) Run(ctx *CheckContext) *CheckResult {
 			status = maxStatus(status, StatusWarning)
 		}
 
-		line := fmt.Sprintf("Rig %s: prefix=%s witness=%s refinery=%s polecats=%d crew=%d dir=%s config=%s",
-			name, prefix, witness, refinery, polecats, crew, dirStatus, configStatus)
+		line := fmt.Sprintf("Rig %s: prefix=%s witness=%s refinery=%s polecats=%d crew=%d dir=%s identity_config=%s settings_config=%s",
+			name, prefix, witness, refinery, polecats, crew, dirStatus, identityConfig, settingsConfig)
 		if polecatErr != nil {
 			line += " polecat_count_error=" + polecatErr.Error()
 		}

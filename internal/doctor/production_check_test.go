@@ -124,6 +124,36 @@ func TestProductionRigInventoryCheckWarnsOnStoppedRuntime(t *testing.T) {
 	}
 }
 
+func TestProductionRigInventoryCheckAllowsSettingsOnlyLegacyRig(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "gastown", "settings"), 0o755); err != nil {
+		t.Fatalf("mkdir settings: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "gastown", "settings", "config.json"), []byte(`{"type":"rig-settings"}`), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	deps := productionRigInventoryDeps{
+		loadRigs: func(string) (map[string]config.RigEntry, string, error) {
+			return map[string]config.RigEntry{
+				"gastown": {BeadsConfig: &config.BeadsConfig{Prefix: "gastown"}},
+			}, filepath.Join(root, "mayor", "rigs.json"), nil
+		},
+		hasSession: func(name string) (bool, error) {
+			return name == "gastown-witness" || name == "gastown-refinery", nil
+		},
+		countDirs:    func(string) (int, error) { return 0, nil },
+		schedulerMax: func(string) (int, error) { return 3, nil },
+	}
+
+	res := newProductionRigInventoryCheck(deps).Run(&CheckContext{TownRoot: root})
+	if res.Status != StatusOK {
+		t.Fatalf("Status = %v, want OK; message=%q details=%v", res.Status, res.Message, res.Details)
+	}
+	if !detailsContain(res.Details, "identity_config=missing settings_config=present") {
+		t.Fatalf("Details = %#v, want legacy settings-only evidence", res.Details)
+	}
+}
+
 func TestProductionDoltDatabasesCheckReportsConfiguredProductionDatabases(t *testing.T) {
 	deps := productionDoltDeps{
 		configuredDatabases: func(root string) []string {
