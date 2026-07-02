@@ -1746,6 +1746,97 @@ func TestSyncGuardWithUncommittedChanges(t *testing.T) {
 	}
 }
 
+func TestRunDonePreSubmitStaticChecksRejectsDiffCheckFailures(t *testing.T) {
+	dir := t.TempDir()
+	testRunGit(t, dir, "init")
+	testRunGit(t, dir, "config", "user.email", "test@example.com")
+	testRunGit(t, dir, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	testRunGit(t, dir, "add", ".")
+	testRunGit(t, dir, "commit", "-m", "initial")
+	testRunGit(t, dir, "branch", "-M", "main")
+	testRunGit(t, dir, "checkout", "-b", "polecat/test")
+	if err := os.WriteFile(filepath.Join(dir, "bad.txt"), []byte("ok\nbad trailing \n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	testRunGit(t, dir, "add", ".")
+	testRunGit(t, dir, "commit", "-m", "add bad whitespace")
+
+	err := runDonePreSubmitStaticChecks(gitpkg.NewGit(dir), "main")
+	if err == nil {
+		t.Fatal("expected pre-submit static check failure")
+	}
+	got := err.Error()
+	for _, want := range []string{"pre-submit static check failed", "bad.txt:2", "trailing whitespace"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("error missing %q:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(got, "+bad trailing \n") {
+		t.Fatalf("error did not preserve diff-check context line trailing space:\n%q", got)
+	}
+}
+
+func TestRunDonePreSubmitStaticChecksPassesCleanRange(t *testing.T) {
+	dir := t.TempDir()
+	testRunGit(t, dir, "init")
+	testRunGit(t, dir, "config", "user.email", "test@example.com")
+	testRunGit(t, dir, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	testRunGit(t, dir, "add", ".")
+	testRunGit(t, dir, "commit", "-m", "initial")
+	testRunGit(t, dir, "branch", "-M", "main")
+	testRunGit(t, dir, "checkout", "-b", "polecat/test")
+	if err := os.WriteFile(filepath.Join(dir, "good.txt"), []byte("ok\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	testRunGit(t, dir, "add", ".")
+	testRunGit(t, dir, "commit", "-m", "add clean file")
+
+	if err := runDonePreSubmitStaticChecks(gitpkg.NewGit(dir), "main"); err != nil {
+		t.Fatalf("runDonePreSubmitStaticChecks: %v", err)
+	}
+}
+
+func TestRunDonePreSubmitStaticChecksUsesMergeTarget(t *testing.T) {
+	dir := t.TempDir()
+	testRunGit(t, dir, "init")
+	testRunGit(t, dir, "config", "user.email", "test@example.com")
+	testRunGit(t, dir, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	testRunGit(t, dir, "add", ".")
+	testRunGit(t, dir, "commit", "-m", "initial")
+	testRunGit(t, dir, "branch", "-M", "main")
+
+	testRunGit(t, dir, "checkout", "-b", "feature-base")
+	if err := os.WriteFile(filepath.Join(dir, "base.txt"), []byte("bad base whitespace \n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	testRunGit(t, dir, "add", ".")
+	testRunGit(t, dir, "commit", "-m", "feature base has legacy whitespace")
+
+	testRunGit(t, dir, "checkout", "-b", "polecat/test")
+	if err := os.WriteFile(filepath.Join(dir, "good.txt"), []byte("ok\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	testRunGit(t, dir, "add", ".")
+	testRunGit(t, dir, "commit", "-m", "add clean work")
+
+	g := gitpkg.NewGit(dir)
+	if err := runDonePreSubmitStaticChecks(g, "feature-base"); err != nil {
+		t.Fatalf("target feature-base should ignore pre-existing target whitespace: %v", err)
+	}
+	if err := runDonePreSubmitStaticChecks(g, "main"); err == nil {
+		t.Fatal("target main should include feature-base whitespace and fail")
+	}
+}
+
 func testRunGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	fullArgs := append([]string{"-c", "protocol.file.allow=always"}, args...)

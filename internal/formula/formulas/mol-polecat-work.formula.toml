@@ -456,9 +456,29 @@ If rebase conflicts:
 - Re-run the build to ensure the resolution is correct
 - If stuck, mail Witness
 
-**2. Run the full gate suite on the rebased result:**
+**2. Run the fast static submit gate:**
 
-Run ALL configured gates (not just targeted tests — this is the full verification):
+```bash
+base="$(git merge-base HEAD origin/{{base_branch}})"
+git diff --check "$base"..HEAD
+```
+
+This catches whitespace errors and committed conflict markers in the submitted
+range. `gt done` enforces the same check before it submits; fix any listed
+file:line output before continuing.
+
+**3. Run the full gate suite on the rebased result:**
+
+Run ALL configured gates (not just targeted tests — this is the full verification).
+For Rust repos, this must include `cargo fmt --check`, `cargo clippy` with
+warnings denied, and tests. If the rig has not configured those commands, run
+these defaults before continuing:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
 
 If build_command is set:
 ```bash
@@ -482,11 +502,11 @@ If test_command is set:
 
 Empty commands mean "not configured" — skip silently.
 
-**3. If any gate fails after rebase:**
+**4. If any gate fails after rebase:**
 - Fix the issue, commit, and re-run from step 1
 - Do NOT proceed with --pre-verified if gates failed
 
-**4. If all gates pass:**
+**5. If all gates pass:**
 You will use `gt done --pre-verified` in the next step. This tells the refinery
 that you ran the full gate suite on a rebased branch, enabling fast-path merge.
 

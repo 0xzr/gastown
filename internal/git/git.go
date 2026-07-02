@@ -2523,6 +2523,41 @@ func (g *Git) DiffStat(rangeSpec string) (string, error) {
 	return g.run("diff", "--stat", rangeSpec)
 }
 
+// DiffCheck runs `git diff --check` for whitespace errors and conflict markers
+// in the given diff range (e.g., "<merge-base>..HEAD").
+func (g *Git) DiffCheck(rangeSpec string) (string, error) {
+	args := []string{"diff", "--check", rangeSpec}
+	if err := g.guardUnsafeTownRootMutation(args); err != nil {
+		return "", err
+	}
+	if g.gitDir != "" {
+		args = append([]string{"--git-dir=" + g.gitDir}, args...)
+	}
+
+	cmd := exec.Command("git", args...)
+	util.SetDetachedProcessGroup(cmd)
+	if g.workDir != "" {
+		cmd.Dir = g.workDir
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return "", &GitError{
+			Command: "diff",
+			Args:    args,
+			Stdout:  stdout.String(),
+			Stderr:  stderr.String(),
+			Err:     err,
+		}
+	}
+
+	return stdout.String(), nil
+}
+
 // For example, CommitsAhead("main", "feature") returns how many commits
 // are on feature that are not on main.
 func (g *Git) CommitsAhead(base, branch string) (int, error) {

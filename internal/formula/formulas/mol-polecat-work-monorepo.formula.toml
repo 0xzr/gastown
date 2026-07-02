@@ -542,7 +542,28 @@ git rebase origin/{{base_branch}}
 
 If rebase conflicts: resolve carefully. If stuck, mail Witness.
 
-**2. Run the full gate suite on the rebased result (pre-verify):**
+**2. Run the fast static submit gate:**
+
+```bash
+base="$(git merge-base HEAD origin/{{base_branch}})"
+git diff --check "$base"..HEAD
+```
+
+This catches whitespace errors and committed conflict markers in the submitted
+range. `gt done` enforces the same check before it submits; fix any listed
+file:line output before continuing.
+
+**3. Run the full gate suite on the rebased result (pre-verify):**
+
+For Rust repos, this must include `cargo fmt --check`, `cargo clippy` with
+warnings denied, and tests. If the rig has not configured those commands, run
+these defaults before continuing:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
 
 If build_command is set: run {{build_command}}
 If typecheck_command is set: run {{typecheck_command}}
@@ -551,12 +572,12 @@ If test_command is set: run {{test_command}}
 
 Skip any empty/unconfigured commands silently.
 
-**3. If all gates pass, submit to merge queue:**
+**4. If all gates pass, submit to merge queue:**
 ```bash
 gt done --pre-verified --target {{base_branch}}
 ```
 
-**4. If gates fail:** fix, commit, re-rebase, re-run gates. Do NOT submit broken code.
+**5. If gates fail:** fix, commit, re-rebase, re-run gates. Do NOT submit broken code.
 
 **What happens next (not your concern):**
 - Refinery merges your work into {{base_branch}} (the feature branch)

@@ -145,6 +145,117 @@ func cleanupStatusAfterSuccessfulPush(status string) string {
 	return status
 }
 
+func runDonePreSubmitStaticChecks(g *git.Git, targetBranch string) error {
+	targetBranch = canonicalMergeTarget(targetBranch)
+	if targetBranch == "" {
+		targetBranch = "main"
+	}
+	baseRef := "origin/" + targetBranch
+	if _, err := g.Rev(baseRef); err != nil {
+		baseRef = targetBranch
+	}
+
+	mergeBase, err := g.MergeBase(baseRef, "HEAD")
+	if err != nil && baseRef != targetBranch {
+		mergeBase, err = g.MergeBase(targetBranch, "HEAD")
+	}
+	if err != nil {
+		return fmt.Errorf("pre-submit static check: determine merge-base with %s: %w", targetBranch, err)
+	}
+
+	rangeSpec := mergeBase + "..HEAD"
+	if _, err := g.DiffCheck(rangeSpec); err != nil {
+		details := gitCommandOutput(err)
+		if details == "" {
+			details = err.Error()
+		}
+		return fmt.Errorf("pre-submit static check failed: git diff --check %s reported whitespace errors or conflict markers:\n%s\nFix the listed lines before running gt done", rangeSpec, details)
+	}
+	return nil
+}
+
+func gitCommandOutput(err error) string {
+	var gitErr *git.GitError
+	if !errors.As(err, &gitErr) {
+		return ""
+	}
+	return gitErr.Stdout + gitErr.Stderr
+}
+
+func resolveDoneMRTarget(cwd, townRoot, rigName, defaultBranch, issueID string, g *git.Git) (string, *beads.Beads, *beads.Issue) {
+	target := defaultBranch
+	explicitTarget := false
+
+	// 1. Explicit --target flag (highest priority — polecat knows its base branch).
+	// This is the most reliable path: the formula passes {{base_branch}} directly,
+	// avoiding any dependency on bd.Show() or Dolt availability.
+	if doneTarget != "" {
+		target = doneTarget
+		explicitTarget = true
+		fmt.Printf("  Target branch: %s (from --target flag)\n", target)
+	}
+
+	var bd *beads.Beads
+	var sourceIssue *beads.Issue
+	if issueID != "" {
+		resolvedBeads := beads.ResolveBeadsDir(cwd)
+		if beads.IsLocalBeadsDir(cwd, resolvedBeads) {
+			fmt.Fprintf(os.Stderr, "WARNING: beads resolved to local dir %s (no shared-beads redirect)\n", resolvedBeads)
+			fmt.Fprintf(os.Stderr, "  MR beads written here will be invisible to the Refinery — run 'gt polecat repair' to fix\n")
+		}
+		bd = beads.NewWithBeadsDir(cwd, resolvedBeads)
+		if issue, err := bd.Show(issueID); err == nil {
+			sourceIssue = issue
+		}
+	}
+
+	// 2. Check for --base-branch override in formula vars (stored on bead at sling time).
+	// Fallback for polecats dispatched before --target flag existed, or when
+	// the formula doesn't pass --target explicitly.
+	if !explicitTarget && target == defaultBranch && sourceIssue != nil {
+		if af := beads.ParseAttachmentFields(sourceIssue); af != nil {
+			if bb := extractFormulaVar(af.FormulaVars, "base_branch"); bb != "" && bb != defaultBranch {
+				target = bb
+				fmt.Printf("  Target branch override: %s (from formula_vars)\n", target)
+			}
+		}
+	} else if !explicitTarget && target == defaultBranch && sourceIssue == nil && issueID != "" {
+		// sourceIssue is nil — bd.Show(issueID) failed earlier.
+		// This is the silent failure path that caused 150+ procedure beads to
+		// target main instead of feat/contract-review-procedure.
+		style.PrintWarning("could not load source issue %s for target branch detection (Dolt/beads lookup failed) — using default branch %s", issueID, defaultBranch)
+	}
+
+	// 3. Auto-detect integration branch from epic hierarchy (if enabled).
+	// Only overrides if no explicit target was set above.
+	if !explicitTarget && target == defaultBranch && bd != nil {
+		refineryEnabled := true
+		settingsPath := filepath.Join(townRoot, rigName, "settings", "config.json")
+		if settings, err := config.LoadRigSettings(settingsPath); err == nil && settings.MergeQueue != nil {
+			refineryEnabled = settings.MergeQueue.IsRefineryIntegrationEnabled()
+		}
+		if refineryEnabled {
+			autoTarget, err := beads.DetectIntegrationBranch(bd, g, issueID)
+			if err == nil && autoTarget != "" {
+				target = autoTarget
+			}
+		}
+	}
+
+	// Guard (hq-faz): the MR target must never resolve to the rig name itself.
+	target = canonicalMergeTarget(target)
+	if !isValidMergeTarget(target, rigName) {
+		style.PrintWarning("resolved MR target %q is not a valid merge target (matches rig name %q) — falling back to %s", target, rigName, defaultBranch)
+		if explicitTarget {
+			style.PrintWarning("the --target flag produced an invalid target; verify your base branch before resubmitting")
+		}
+		target = defaultBranch
+		explicitTarget = false
+	}
+
+	return target, bd, sourceIssue
+}
+
 func init() {
 	doneCmd.Flags().StringVar(&doneIssue, "issue", "", "Source issue ID (default: parse from branch name)")
 	doneCmd.Flags().IntVarP(&donePriority, "priority", "p", -1, "Override priority (0-4, default: inherit from issue)")
@@ -582,6 +693,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	var doneErrors []string
 	var convoyInfo *ConvoyInfo // Populated if issue is tracked by a convoy
 	if exitType == ExitCompleted {
+		target := defaultBranch
+		var bd *beads.Beads
+		var sourceIssueForNoMerge *beads.Issue
+
 		if branch == defaultBranch || branch == "master" {
 			return fmt.Errorf("cannot submit %s/master branch to merge queue", defaultBranch)
 		}
@@ -740,6 +855,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			goto notifyWitness
 		}
 
+		target, bd, sourceIssueForNoMerge = resolveDoneMRTarget(cwd, townRoot, rigName, defaultBranch, issueID, g)
+
 		// Branch contamination preflight: check if branch is significantly behind
 		// the effective target branch, which indicates the branch may contain stale merge-base
 		// artifacts that will pollute the PR diff. (GH#2220)
@@ -748,7 +865,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// the auto-rebase below) sees the current state of origin. Without this,
 		// the local view of origin/<base> may be stale and we'd skip a rebase that
 		// is actually needed.
-		contaminationBase := doneContaminationBaseRef(defaultBranch, doneTarget)
+		contaminationBase := "origin/" + target
 		if fetchErr := g.Fetch("origin"); fetchErr != nil {
 			style.PrintWarning("could not fetch origin before contamination check: %v (proceeding with local refs)", fetchErr)
 		}
@@ -787,6 +904,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if stripped := stripOverlayCLAUDEmd(g, defaultBranch); stripped {
 			// Recalculate commits ahead since we added a cleanup commit
 			aheadCount, _ = g.CommitsAhead("origin/"+defaultBranch, "HEAD")
+		}
+
+		if err := runDonePreSubmitStaticChecks(g, target); err != nil {
+			return err
 		}
 
 		// Determine merge strategy from convoy (gt-myofa.3)
@@ -983,18 +1104,22 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			return fmt.Errorf("cannot determine source issue from branch '%s'; use --issue to specify", branch)
 		}
 
-		// Initialize beads — warn if resolved to a local .beads/ (no redirect).
-		// Without a redirect, MR beads are invisible to the Refinery.
-		resolvedBeads := beads.ResolveBeadsDir(cwd)
-		if beads.IsLocalBeadsDir(cwd, resolvedBeads) {
-			fmt.Fprintf(os.Stderr, "WARNING: beads resolved to local dir %s (no shared-beads redirect)\n", resolvedBeads)
-			fmt.Fprintf(os.Stderr, "  MR beads written here will be invisible to the Refinery — run 'gt polecat repair' to fix\n")
+		if bd == nil {
+			// Initialize beads — warn if resolved to a local .beads/ (no redirect).
+			// Without a redirect, MR beads are invisible to the Refinery.
+			resolvedBeads := beads.ResolveBeadsDir(cwd)
+			if beads.IsLocalBeadsDir(cwd, resolvedBeads) {
+				fmt.Fprintf(os.Stderr, "WARNING: beads resolved to local dir %s (no shared-beads redirect)\n", resolvedBeads)
+				fmt.Fprintf(os.Stderr, "  MR beads written here will be invisible to the Refinery — run 'gt polecat repair' to fix\n")
+			}
+			bd = beads.NewWithBeadsDir(cwd, resolvedBeads)
 		}
-		bd := beads.NewWithBeadsDir(cwd, resolvedBeads)
 
 		// Check for no_merge flag - if set, skip merge queue and notify for review
-		sourceIssueForNoMerge, err := bd.Show(issueID)
-		if err == nil {
+		if sourceIssueForNoMerge == nil {
+			sourceIssueForNoMerge, _ = bd.Show(issueID)
+		}
+		if sourceIssueForNoMerge != nil {
 			attachmentFields := beads.ParseAttachmentFields(sourceIssueForNoMerge)
 			if attachmentFields != nil && attachmentFields.NoMerge {
 				fmt.Printf("%s No-merge mode: skipping merge queue\n", style.Bold.Render("→"))
@@ -1034,7 +1159,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						}
 					}
 					// Add diff stat for quick review context
-					if diffStat, diffErr := g.DiffStat(defaultBranch + "..." + branch); diffErr == nil && diffStat != "" {
+					if diffStat, diffErr := g.DiffStat(target + "..." + branch); diffErr == nil && diffStat != "" {
 						prBodyBuilder.WriteString("## Changes\n\n```\n")
 						prBodyBuilder.WriteString(diffStat)
 						prBodyBuilder.WriteString("```\n\n")
@@ -1043,7 +1168,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					prBodyBuilder.WriteString(fmt.Sprintf("*Polecat: %s | Issue: %s*\n", worker, issueID))
 					prBody := prBodyBuilder.String()
 					ghCmd := exec.CommandContext(context.Background(), "gh", "pr", "create",
-						"--base", defaultBranch,
+						"--base", target,
 						"--head", branch,
 						"--title", prTitle,
 						"--body", prBody,
@@ -1177,71 +1302,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 				goto notifyWitness
 			}
-		}
-
-		// Determine target branch for the MR.
-		// Priority: explicit --target flag > formula_vars base_branch > integration branch auto-detect > rig default.
-		target := defaultBranch
-		explicitTarget := false
-
-		// 1. Explicit --target flag (highest priority — polecat knows its base branch).
-		// This is the most reliable path: the formula passes {{base_branch}} directly,
-		// avoiding any dependency on bd.Show() or Dolt availability.
-		if doneTarget != "" {
-			target = doneTarget
-			explicitTarget = true
-			fmt.Printf("  Target branch: %s (from --target flag)\n", target)
-		}
-
-		// 2. Check for --base-branch override in formula vars (stored on bead at sling time).
-		// Fallback for polecats dispatched before --target flag existed, or when
-		// the formula doesn't pass --target explicitly.
-		if !explicitTarget && target == defaultBranch && sourceIssueForNoMerge != nil {
-			if af := beads.ParseAttachmentFields(sourceIssueForNoMerge); af != nil {
-				if bb := extractFormulaVar(af.FormulaVars, "base_branch"); bb != "" && bb != defaultBranch {
-					target = bb
-					fmt.Printf("  Target branch override: %s (from formula_vars)\n", target)
-				}
-			}
-		} else if !explicitTarget && target == defaultBranch && sourceIssueForNoMerge == nil && issueID != "" {
-			// sourceIssueForNoMerge is nil — bd.Show(issueID) failed earlier.
-			// This is the silent failure path that caused 150+ procedure beads to
-			// target main instead of feat/contract-review-procedure.
-			style.PrintWarning("could not load source issue %s for target branch detection (Dolt/beads lookup failed) — using default branch %s", issueID, defaultBranch)
-		}
-
-		// 3. Auto-detect integration branch from epic hierarchy (if enabled).
-		// Only overrides if no explicit target was set above.
-		if !explicitTarget && target == defaultBranch {
-			refineryEnabled := true
-			settingsPath := filepath.Join(townRoot, rigName, "settings", "config.json")
-			if settings, err := config.LoadRigSettings(settingsPath); err == nil && settings.MergeQueue != nil {
-				refineryEnabled = settings.MergeQueue.IsRefineryIntegrationEnabled()
-			}
-			if refineryEnabled {
-				autoTarget, err := beads.DetectIntegrationBranch(bd, g, issueID)
-				if err == nil && autoTarget != "" {
-					target = autoTarget
-				}
-			}
-		}
-
-		// Guard (hq-faz): the MR target must never resolve to the rig name
-		// itself. A malformed formula_vars base_branch, a stale restored hook,
-		// or a misparsed integration branch can yield the rig name as the
-		// target, producing an MR that advertises "<rig>/<rig>" and confuses
-		// the refinery. Reject it and fall back to the configured default
-		// branch with a warning rather than submitting a malformed MR. The
-		// explicit --issue / restored hook is still honored for issue
-		// attribution; only an invalid *target* is rejected here.
-		target = canonicalMergeTarget(target)
-		if !isValidMergeTarget(target, rigName) {
-			style.PrintWarning("resolved MR target %q is not a valid merge target (matches rig name %q) — falling back to %s", target, rigName, defaultBranch)
-			if explicitTarget {
-				style.PrintWarning("the --target flag produced an invalid target; verify your base branch before resubmitting")
-			}
-			target = defaultBranch
-			explicitTarget = false
 		}
 
 		// Get source issue for priority inheritance

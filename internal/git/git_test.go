@@ -626,6 +626,38 @@ func TestRev(t *testing.T) {
 	}
 }
 
+func TestDiffCheckReportsWhitespaceAndConflictMarkers(t *testing.T) {
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+	runGitTestCmd(t, dir, "branch", "-M", "main")
+	base, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev HEAD: %v", err)
+	}
+
+	runGitTestCmd(t, dir, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(dir, "bad.txt"), []byte("ok\nbad trailing \n<<<<<<< HEAD\n"), 0644); err != nil {
+		t.Fatalf("write bad file: %v", err)
+	}
+	runGitTestCmd(t, dir, "add", ".")
+	runGitTestCmd(t, dir, "commit", "-m", "add bad file")
+
+	_, err = g.DiffCheck(base + "..HEAD")
+	if err == nil {
+		t.Fatal("DiffCheck unexpectedly passed")
+	}
+	var gitErr *GitError
+	if !errors.As(err, &gitErr) {
+		t.Fatalf("expected GitError, got %T: %v", err, err)
+	}
+	output := gitErr.Stdout + "\n" + gitErr.Stderr
+	for _, want := range []string{"bad.txt:2", "trailing whitespace", "bad.txt:3", "conflict marker"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("DiffCheck output missing %q:\n%s", want, output)
+		}
+	}
+}
+
 func TestFetchBranch(t *testing.T) {
 	// Create a "remote" repo
 	remoteDir := t.TempDir()
