@@ -65,13 +65,12 @@ func BdSupportsAllowStaleWithEnv(env []string) bool {
 	}
 
 	bdAllowStaleMu.Lock()
-	cachedPath := bdAllowStalePath
-	cachedResult := bdAllowStaleResult
-	bdAllowStaleMu.Unlock()
-
-	if cachedPath == bdPath {
+	if bdAllowStalePath == bdPath {
+		cachedResult := bdAllowStaleResult
+		bdAllowStaleMu.Unlock()
 		return cachedResult
 	}
+	bdAllowStaleMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), bdAllowStaleProbeTimeout)
 	defer cancel()
@@ -85,21 +84,19 @@ func BdSupportsAllowStaleWithEnv(env []string) bool {
 	cmd.Stdout = &combinedOut
 	cmd.Stderr = &combinedOut
 	err = cmd.Run()
-	// bd v0.60+ exits 0 even on unknown flags, printing the error to stderr.
-	// Check output for "unknown flag" to detect lack of support. Treat probe
-	// errors/timeouts as unsupported so higher-level commands fail closed
-	// instead of hanging on a wedged bd subprocess.
 	probeOut := strings.TrimSpace(combinedOut.String())
-	supported := err == nil && probeOut != "" && !strings.Contains(probeOut, "unknown flag")
-
-	bdAllowStaleMu.Lock()
-	if bdAllowStalePath != bdPath {
+	unknownFlag := strings.Contains(probeOut, "unknown flag")
+	// bd v0.60+ exits 0 even on unknown flags, printing the error to stderr.
+	// Cache definitive support/unsupported results, but do not cache transient
+	// probe failures such as timeouts or Dolt startup errors.
+	supported := err == nil && probeOut != "" && !unknownFlag
+	if supported || unknownFlag {
+		bdAllowStaleMu.Lock()
 		bdAllowStalePath = bdPath
 		bdAllowStaleResult = supported
+		bdAllowStaleMu.Unlock()
 	}
-	result := bdAllowStaleResult
-	bdAllowStaleMu.Unlock()
-	return result
+	return supported
 }
 
 // MaybePrependAllowStale prepends --allow-stale to args if bd supports it.

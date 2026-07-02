@@ -14,6 +14,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
+)
+
+const (
+	mergeSlotLabel = "gt:merge-slot"
+	mergeSlotTitle = "merge-slot"
 )
 
 // MergeSlotStatus represents the result of checking a merge slot.
@@ -64,18 +71,41 @@ func mergeSlotStatusFromIssue(issue *Issue) *MergeSlotStatus {
 	}
 }
 
-// getMergeSlotBead finds the merge slot bead (label=gt:merge-slot).
+// getMergeSlotBead finds the merge slot bead (label=gt:merge-slot, title=merge-slot).
 // Returns ErrNotFound if no slot bead exists.
 func (b *Beads) getMergeSlotBead() (*Issue, error) {
-	issues, err := b.List(ListOptions{Label: "gt:merge-slot"})
+	issues, err := b.List(ListOptions{Label: mergeSlotLabel})
 	if err != nil {
 		return nil, fmt.Errorf("listing merge slot beads: %w", err)
 	}
-	if len(issues) == 0 {
+
+	var matches []*Issue
+	for _, issue := range issues {
+		if issue.Title == mergeSlotTitle {
+			matches = append(matches, issue)
+		}
+	}
+	if len(matches) == 0 {
 		return nil, ErrNotFound
 	}
+	if len(matches) > 1 {
+		ids := make([]string, 0, len(matches))
+		for _, issue := range matches {
+			ids = append(ids, issue.ID)
+		}
+		sort.Strings(ids)
+		return nil, fmt.Errorf("ambiguous merge slot beads with title %q and label %q: %s", mergeSlotTitle, mergeSlotLabel, strings.Join(ids, ", "))
+	}
+
 	// Show the bead to get its full Description (list output may be truncated).
-	return b.Show(issues[0].ID)
+	issue, err := b.Show(matches[0].ID)
+	if err != nil {
+		return nil, err
+	}
+	if issue.Title != mergeSlotTitle {
+		return nil, ErrNotFound
+	}
+	return issue, nil
 }
 
 // MergeSlotCreate creates the merge slot bead for the current rig.
@@ -84,8 +114,8 @@ func (b *Beads) getMergeSlotBead() (*Issue, error) {
 func (b *Beads) MergeSlotCreate() (string, error) {
 	initial, _ := json.Marshal(mergeSlotData{})
 	issue, err := b.Create(CreateOptions{
-		Title:       "merge-slot",
-		Labels:      []string{"gt:merge-slot"},
+		Title:       mergeSlotTitle,
+		Labels:      []string{mergeSlotLabel},
 		Description: string(initial),
 	})
 	if err != nil {

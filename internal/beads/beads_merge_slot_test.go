@@ -143,6 +143,10 @@ func TestMergeSlotStatusFromIssue(t *testing.T) {
 //     and is held by another actor; `bd update` fails. Used to verify
 //     MergeSlotAcquire surfaces a waiter-add update failure instead of
 //     silently dropping the waiter.
+//   - "title-filter"     : a wrong-title bead and an exact merge-slot bead
+//     both carry the merge-slot label; lookup must select the exact title.
+//   - "title-ambiguous"  : two exact-title merge-slot beads exist; lookup
+//     must fail instead of choosing one arbitrarily.
 func installMockBDMergeSlotRecorder(t *testing.T) (logPath, stateFile string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -182,6 +186,14 @@ case "$cmd" in
     exit 0
     ;;
   list)
+    if [ "$(cat "$STATE" 2>/dev/null)" = "title-filter" ]; then
+      printf '[{"id":"gt-merge-slot-wrong","title":"merge-slot backup","status":"open","labels":["gt:merge-slot"]},{"id":"gt-merge-slot-exact","title":"merge-slot","status":"open","labels":["gt:merge-slot"]}]\n'
+      exit 0
+    fi
+    if [ "$(cat "$STATE" 2>/dev/null)" = "title-ambiguous" ]; then
+      printf '[{"id":"gt-merge-slot-a","title":"merge-slot","status":"open","labels":["gt:merge-slot"]},{"id":"gt-merge-slot-b","title":"merge-slot","status":"open","labels":["gt:merge-slot"]}]\n'
+      exit 0
+    fi
     if [ "$(cat "$STATE" 2>/dev/null)" = "create-dup" ] || [ "$(cat "$STATE" 2>/dev/null)" = "create-corrupt" ]; then
       # Slot exists because another caller created it.
       printf '[{"id":"gt-merge-slot-existing","title":"merge-slot","status":"open","labels":["gt:merge-slot"]}]\n'
@@ -198,6 +210,16 @@ case "$cmd" in
     exit 0
     ;;
   show)
+    if [ "$(cat "$STATE" 2>/dev/null)" = "title-filter" ]; then
+      if [ "$2" = "gt-merge-slot-exact" ]; then
+        printf '[{"id":"gt-merge-slot-exact","title":"merge-slot","status":"open","description":"{}","labels":["gt:merge-slot"]}]\n'
+        exit 0
+      fi
+      if [ "$2" = "gt-merge-slot-wrong" ]; then
+        printf '[{"id":"gt-merge-slot-wrong","title":"merge-slot backup","status":"open","description":"{}","labels":["gt:merge-slot"]}]\n'
+        exit 0
+      fi
+    fi
     if [ "$(cat "$STATE" 2>/dev/null)" = "create-dup" ]; then
       printf '[{"id":"gt-merge-slot-existing","title":"merge-slot","status":"open","description":"{}","labels":["gt:merge-slot"]}]\n'
       exit 0
@@ -242,6 +264,49 @@ esac
 	t.Setenv("MOCK_BD_LOG", logPath)
 	t.Setenv("MOCK_BD_SLOT_STATE_FILE", stateFile)
 	return logPath, stateFile
+}
+
+func TestGetMergeSlotBead_SelectsExactMergeSlotTitle(t *testing.T) {
+	_, stateFile := installMockBDMergeSlotRecorder(t)
+	setMockBDState(t, stateFile, "title-filter")
+
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	bd := NewIsolated(tmpDir)
+	issue, err := bd.getMergeSlotBead()
+	if err != nil {
+		t.Fatalf("getMergeSlotBead(): %v", err)
+	}
+	if issue.ID != "gt-merge-slot-exact" {
+		t.Fatalf("getMergeSlotBead() ID = %q, want gt-merge-slot-exact", issue.ID)
+	}
+}
+
+func TestGetMergeSlotBead_AmbiguousExactTitleErrors(t *testing.T) {
+	_, stateFile := installMockBDMergeSlotRecorder(t)
+	setMockBDState(t, stateFile, "title-ambiguous")
+
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	bd := NewIsolated(tmpDir)
+	issue, err := bd.getMergeSlotBead()
+	if err == nil {
+		t.Fatalf("expected ambiguity error, got issue=%+v", issue)
+	}
+	if issue != nil {
+		t.Errorf("expected nil issue on ambiguity, got %+v", issue)
+	}
+	for _, want := range []string{"ambiguous merge slot beads", "gt-merge-slot-a", "gt-merge-slot-b"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("getMergeSlotBead() error = %q, want it to contain %q", err, want)
+		}
+	}
 }
 
 func setMockBDState(t *testing.T, stateFile, value string) {

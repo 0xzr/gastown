@@ -1028,6 +1028,71 @@ func TestBdSupportsAllowStale_TimeoutTreatsProbeAsUnsupported(t *testing.T) {
 	}
 }
 
+func TestBdSupportsAllowStale_ReprobesAfterTransientFailure(t *testing.T) {
+	bdAllowStaleMu.Lock()
+	prevPath := bdAllowStalePath
+	prevResult := bdAllowStaleResult
+	bdAllowStaleMu.Unlock()
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(func() {
+		bdAllowStaleMu.Lock()
+		bdAllowStalePath = prevPath
+		bdAllowStaleResult = prevResult
+		bdAllowStaleMu.Unlock()
+	})
+
+	stubDir := t.TempDir()
+	statePath := filepath.Join(stubDir, "allow-stale-probe-count")
+	writeFlakyAllowStaleBDStub(t, stubDir)
+
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MOCK_ALLOW_STALE_PROBE_STATE", statePath)
+
+	if BdSupportsAllowStale() {
+		t.Fatal("expected first transient probe failure to report no --allow-stale support")
+	}
+	if !BdSupportsAllowStale() {
+		t.Fatal("expected second probe to recover and report --allow-stale support")
+	}
+
+	count, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read probe count: %v", err)
+	}
+	if strings.TrimSpace(string(count)) != "2" {
+		t.Fatalf("probe count = %q, want 2", strings.TrimSpace(string(count)))
+	}
+}
+
+func TestRunClassifiesStdoutNotFoundAsErrNotFound(t *testing.T) {
+	bdAllowStaleMu.Lock()
+	prevPath := bdAllowStalePath
+	prevResult := bdAllowStaleResult
+	bdAllowStaleMu.Unlock()
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(func() {
+		bdAllowStaleMu.Lock()
+		bdAllowStalePath = prevPath
+		bdAllowStaleResult = prevResult
+		bdAllowStaleMu.Unlock()
+	})
+
+	stubDir := t.TempDir()
+	writeStdoutNotFoundBDStub(t, stubDir)
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(workDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	b := NewIsolated(workDir)
+	_, err := b.run("show", "gt-missing", "--json")
+	if err != ErrNotFound {
+		t.Fatalf("run(show missing) error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestBDListSlowListDoesNotBlockUnrelatedList(t *testing.T) {
 	if os.Getenv("GT_BEADS_LIST_CONCURRENCY_HELPER") == "1" {
 		runBDListConcurrencyHelper(t)
@@ -1331,6 +1396,97 @@ exit 0
 
 	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
 		t.Fatalf("write hanging bd stub: %v", err)
+	}
+}
+
+func writeFlakyAllowStaleBDStub(t *testing.T, dir string) {
+	t.Helper()
+
+	var scriptPath, script string
+	if runtime.GOOS == "windows" {
+		scriptPath = filepath.Join(dir, "bd.bat")
+		script = `@echo off
+setlocal enableextensions
+set state=%MOCK_ALLOW_STALE_PROBE_STATE%
+set count=0
+if exist "%state%" set /p count=<"%state%"
+set /a count=%count%+1
+> "%state%" echo %count%
+if "%1"=="--allow-stale" if "%2"=="version" (
+  if "%count%"=="1" (
+    echo temporary dolt error 1>&2
+    exit /b 1
+  )
+  echo bd test
+  exit /b 0
+)
+echo unexpected args: %* 1>&2
+exit /b 2
+`
+	} else {
+		scriptPath = filepath.Join(dir, "bd")
+		script = `#!/bin/sh
+set -eu
+state="$MOCK_ALLOW_STALE_PROBE_STATE"
+count=0
+if [ -f "$state" ]; then
+  count="$(cat "$state")"
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$state"
+if [ "${1:-}" = "--allow-stale" ] && [ "${2:-}" = "version" ]; then
+  if [ "$count" = "1" ]; then
+    echo "temporary dolt error" >&2
+    exit 1
+  fi
+  echo "bd test"
+  exit 0
+fi
+echo "unexpected args: $*" >&2
+exit 2
+`
+	}
+
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write flaky bd stub: %v", err)
+	}
+}
+
+func writeStdoutNotFoundBDStub(t *testing.T, dir string) {
+	t.Helper()
+
+	var scriptPath, script string
+	if runtime.GOOS == "windows" {
+		scriptPath = filepath.Join(dir, "bd.bat")
+		script = `@echo off
+setlocal enableextensions
+if "%1"=="--allow-stale" (
+  echo Error: unknown flag: --allow-stale 1>&2
+  exit /b 0
+)
+if "%1"=="show" (
+  echo {"error":"no issues found matching gt-missing"}
+  exit /b 1
+)
+exit /b 0
+`
+	} else {
+		scriptPath = filepath.Join(dir, "bd")
+		script = `#!/bin/sh
+if [ "${1:-}" = "--allow-stale" ]; then
+  echo "Error: unknown flag: --allow-stale" >&2
+  exit 0
+fi
+if [ "${1:-}" = "show" ]; then
+  printf '{"error":"no issues found matching gt-missing"}\n'
+  exit 1
+fi
+exit 0
+`
+	}
+
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write stdout-not-found bd stub: %v", err)
 	}
 }
 
