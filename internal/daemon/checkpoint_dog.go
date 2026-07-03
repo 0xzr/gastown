@@ -173,13 +173,15 @@ func checkpointWIPBranchName(polecatName string) string {
 }
 
 // isProtectedCheckpointBranch reports whether branch is the repository default
-// branch on which WIP checkpoints are forbidden.
+// branch on which WIP checkpoints are forbidden. If the default branch cannot
+// be resolved, the branch is treated as protected (fail-closed) so that a
+// WIP checkpoint is never committed when the remote default is unreachable.
 func isProtectedCheckpointBranch(workDir, branch string) bool {
 	if branch == "" {
-		return false
+		return true
 	}
 	defaultBranch := checkpointDefaultBranch(workDir)
-	return defaultBranch != "" && branch == defaultBranch
+	return defaultBranch == "" || branch == defaultBranch
 }
 
 // ensureCheckpointBranch returns the branch that should receive the WIP
@@ -191,13 +193,17 @@ func (d *Daemon) ensureCheckpointBranch(workDir, polecatName string) (string, er
 	if current == "" {
 		return "", fmt.Errorf("could not determine current branch")
 	}
-	if !isProtectedCheckpointBranch(workDir, current) {
-		return current, nil
-	}
 
+	// Resolve the default branch before checking protection. If the default
+	// branch is unknown, fail closed rather than allowing a WIP checkpoint to
+	// land on what might be the default branch.
 	defaultBranch := checkpointDefaultBranch(workDir)
 	if defaultBranch == "" {
 		return "", fmt.Errorf("could not determine default branch")
+	}
+
+	if !isProtectedCheckpointBranch(workDir, current) {
+		return current, nil
 	}
 
 	wip := checkpointWIPBranchName(polecatName)

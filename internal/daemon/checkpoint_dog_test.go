@@ -208,6 +208,24 @@ func TestIsGitWorktree(t *testing.T) {
 	}
 }
 
+// checkpointTestRepoNoOrigin creates a temporary git repository with an initial
+// commit on "main" and no remote "origin". This simulates the state where the
+// remote default branch cannot be resolved.
+func checkpointTestRepoNoOrigin(t *testing.T) (workDir string, polecatName string) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	polecatName = "opal"
+	workDir = filepath.Join(tmpDir, "work")
+
+	runCheckpointCmd(t, tmpDir, "git", "init", "--initial-branch=main", workDir)
+	runCheckpointCmd(t, workDir, "git", "config", "user.email", "test@test.com")
+	runCheckpointCmd(t, workDir, "git", "config", "user.name", "Test")
+	checkpointWriteFile(t, workDir, "README.md", "# Test\n")
+	runCheckpointCmd(t, workDir, "git", "add", ".")
+	runCheckpointCmd(t, workDir, "git", "commit", "-m", "initial commit")
+	return workDir, polecatName
+}
+
 // checkpointTestRepo creates a temporary git repository with an initial commit
 // on a branch named "main" and a remote "origin" pointing to a bare repo.
 func checkpointTestRepo(t *testing.T) (workDir string, polecatName string) {
@@ -307,5 +325,57 @@ func TestCheckpointWorktree_OnFeatureBranch_KeepsCurrentBranch(t *testing.T) {
 	}
 	if msg := checkpointHeadMessage(t, workDir); msg != "WIP: checkpoint (auto)" {
 		t.Errorf("expected WIP checkpoint message, got %q", msg)
+	}
+}
+
+func TestIsProtectedCheckpointBranch_DefaultResolutionFails_IsProtected(t *testing.T) {
+	workDir, _ := checkpointTestRepoNoOrigin(t)
+
+	// With no origin, checkpointDefaultBranch returns "". The branch must be
+	// treated as protected (fail-closed), not as unprotected (fail-open).
+	if !isProtectedCheckpointBranch(workDir, "main") {
+		t.Error("expected main to be protected when default branch cannot be resolved")
+	}
+}
+
+func TestEnsureCheckpointBranch_NoOrigin_ReturnsError(t *testing.T) {
+	workDir, polecatName := checkpointTestRepoNoOrigin(t)
+
+	d := &Daemon{logger: log.New(os.Stdout, "", 0)}
+	_, err := d.ensureCheckpointBranch(workDir, polecatName)
+	if err == nil {
+		t.Fatal("expected error when default branch cannot be resolved")
+	}
+	if !strings.Contains(err.Error(), "could not determine default branch") {
+		t.Errorf("expected default-branch error, got: %v", err)
+	}
+}
+
+func TestCheckpointWorktree_NoOrigin_DoesNotCommitOnDefault(t *testing.T) {
+	workDir, polecatName := checkpointTestRepoNoOrigin(t)
+
+	d := &Daemon{logger: log.New(os.Stdout, "", 0)}
+
+	// Dirty the worktree while on main with no origin.
+	checkpointWriteFile(t, workDir, "feature.go", "package main\n")
+
+	if got := checkpointHeadBranch(t, workDir); got != "main" {
+		t.Fatalf("expected to start on main, got %q", got)
+	}
+
+	// The checkpoint must be refused, not committed directly to main.
+	if d.checkpointWorktree(workDir, "gastown", polecatName) {
+		t.Fatal("expected checkpoint to be refused when default branch is unreachable")
+	}
+
+	// main must remain clean (no WIP commit).
+	if msg := checkpointHeadMessage(t, workDir); msg != "initial commit" {
+		t.Errorf("main was polluted by WIP commit; got message %q", msg)
+	}
+
+	// The staged changes should still be present (not committed).
+	statusOut := runCheckpointCmd(t, workDir, "git", "status", "--porcelain")
+	if !strings.Contains(statusOut, "feature.go") {
+		t.Errorf("expected feature.go to remain staged/uncommitted, got status:\n%s", statusOut)
 	}
 }
