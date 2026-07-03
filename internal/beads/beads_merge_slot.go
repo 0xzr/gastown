@@ -41,6 +41,14 @@ type mergeSlotData struct {
 // parseMergeSlotData decodes the merge slot state from a bead's Description field.
 // It returns an error when the description is present but not valid JSON, so
 // callers can distinguish "slot is empty" from "slot data is corrupted".
+// ErrMergeSlotCorrupt marks a merge-slot bead whose description JSON cannot be
+// parsed. It is a SENTINEL (errors.Is) so callers can distinguish unrecoverable
+// corruption — which must fail CLOSED, because the slot's serialization guarantee
+// is void — from transient infra errors (dolt timeout, etc.) that may fail open.
+// It is wrapped at the corruption-producing boundaries (MergeSlotEnsureExists and
+// MergeSlotAcquire); the human-readable message is unchanged.
+var ErrMergeSlotCorrupt = errors.New("corrupt merge slot data")
+
 func parseMergeSlotData(issue *Issue) (mergeSlotData, error) {
 	if issue.Description == "" {
 		return mergeSlotData{}, nil
@@ -154,7 +162,9 @@ func (b *Beads) MergeSlotAcquire(holder string, addWaiter bool) (*MergeSlotStatu
 
 	data, err := parseMergeSlotData(issue)
 	if err != nil {
-		return nil, fmt.Errorf("acquiring merge slot: %w", err)
+		// A parse failure here is slot corruption — mark it typed (ErrMergeSlotCorrupt)
+		// so the acquire path is fail-closable too, while keeping the parse detail.
+		return nil, fmt.Errorf("acquiring merge slot: %w: %v", ErrMergeSlotCorrupt, err)
 	}
 
 	if data.Holder != "" && data.Holder != holder {
@@ -283,8 +293,11 @@ func (b *Beads) MergeSlotEnsureExists() (string, error) {
 	}
 	if status.Error != "" {
 		// Slot exists but its description could not be parsed. Surface the
-		// corruption instead of returning a slot with unusable data.
-		return "", fmt.Errorf("ensuring merge slot: corrupt merge slot data: %s", status.Error)
+		// corruption as a typed error (ErrMergeSlotCorrupt) so callers can fail
+		// CLOSED on corruption rather than fail open as they would for a transient
+		// error. %w on the sentinel renders "corrupt merge slot data" — the
+		// human-readable message is unchanged.
+		return "", fmt.Errorf("ensuring merge slot: %w: %s", ErrMergeSlotCorrupt, status.Error)
 	}
 	return status.ID, nil
 }

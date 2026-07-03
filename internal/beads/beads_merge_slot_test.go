@@ -1,6 +1,7 @@
 package beads
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -412,6 +413,11 @@ func TestMergeSlotEnsureExists_CreateFailsAndSlotCorrupt(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "parsing merge slot data") {
 		t.Errorf("expected error to wrap parse error, got: %v", err)
+	}
+	// The corruption must be typed so refinery conflict-resolution can fail CLOSED
+	// on it (vs fail-open on a transient error) — gastown-cnbbp.
+	if !errors.Is(err, ErrMergeSlotCorrupt) {
+		t.Errorf("expected errors.Is(err, ErrMergeSlotCorrupt) to be true, got: %v", err)
 	}
 }
 

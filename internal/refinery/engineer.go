@@ -3112,15 +3112,28 @@ func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, _ ProcessResult
 	slotID, err := e.mergeSlotEnsureExists()
 	slotHolder := "" // tracks acquired slot for cleanup on error
 	if err != nil {
+		if errors.Is(err, beads.ErrMergeSlotCorrupt) {
+			// Corruption is NOT a transient infra error: proceeding without the slot
+			// would run conflict resolution UNGATED (fail-open on the serialization
+			// gate, allowing concurrent resolution). Fail CLOSED — defer this MR until
+			// an operator repairs the corrupt slot bead. Deferral mirrors the
+			// slot-held path below (return "", nil): the MR stays queued and retries.
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Merge slot data is CORRUPT (%v); deferring conflict resolution for MR %s until the slot bead is repaired (fail-closed)\n", err, mr.ID)
+			return "", nil
+		}
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not ensure merge slot: %v\n", err)
-		// Continue anyway - slot is optional for now
+		// Continue anyway - slot is optional for now (transient infra error)
 	} else {
 		// Try to acquire the merge slot
 		holder := e.rig.Name + "/refinery"
 		status, err := e.mergeSlotAcquire(holder, false)
 		if err != nil {
+			if errors.Is(err, beads.ErrMergeSlotCorrupt) {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Merge slot data is CORRUPT (%v); deferring conflict resolution for MR %s until the slot bead is repaired (fail-closed)\n", err, mr.ID)
+				return "", nil
+			}
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not acquire merge slot: %v\n", err)
-			// Continue anyway - slot is optional
+			// Continue anyway - slot is optional (transient infra error)
 		} else if status == nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: merge slot returned nil status\n")
 			// Continue anyway - slot is optional

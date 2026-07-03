@@ -84,6 +84,55 @@ func setupSessionBranchTestRepo(t *testing.T) (string, *git.Git) {
 	return workDir, repoGit
 }
 
+func TestAgentCapped(t *testing.T) {
+	dir := t.TempDir()
+
+	// Missing .capped-agents file => nothing is capped (best-effort).
+	if capped, _ := agentCapped(dir, "m3"); capped {
+		t.Fatal("missing .capped-agents must not report any agent as capped")
+	}
+
+	// Real-world shape: comment lines, a blank line, then a capped agent.
+	content := "# Dynamic outage caps only.\n# m3 RETIRED (operator)\n\nm3\n"
+	if err := os.WriteFile(filepath.Join(dir, ".capped-agents"), []byte(content), 0o644); err != nil {
+		t.Fatalf("writing .capped-agents: %v", err)
+	}
+
+	if capped, reason := agentCapped(dir, "m3"); !capped {
+		t.Fatalf("m3 must be reported capped when listed; reason=%q", reason)
+	}
+	// An agent that is NOT listed must not be capped...
+	if capped, _ := agentCapped(dir, "umans-glm"); capped {
+		t.Fatal("umans-glm must not be capped when it is not listed")
+	}
+	// ...and comment text must never be treated as a capped agent name.
+	if capped, _ := agentCapped(dir, "RETIRED"); capped {
+		t.Fatal("comment content must not match a capped agent")
+	}
+}
+
+func TestSetAssignedAgentRejectsCapped(t *testing.T) {
+	// A capped/retired agent must be rejected BEFORE any resolution or bead write.
+	// townRoot = filepath.Dir(rig.Path); the .capped-agents there lists m3.
+	townRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(townRoot, ".capped-agents"), []byte("# operator caps\nm3\n"), 0o644); err != nil {
+		t.Fatalf("writing .capped-agents: %v", err)
+	}
+	r := &rig.Rig{Name: "gastown", Path: filepath.Join(townRoot, "gastown")}
+	m := NewSessionManager(tmux.NewTmux(), r)
+
+	old, err := m.SetAssignedAgent("Toast", "m3", false)
+	if err == nil {
+		t.Fatal("SetAssignedAgent must reject a capped/retired agent")
+	}
+	if !strings.Contains(err.Error(), "capped/retired") {
+		t.Errorf("expected a capped/retired rejection, got: %v", err)
+	}
+	if old != "" {
+		t.Errorf("no previous value should be reported when rejected pre-mutation, got %q", old)
+	}
+}
+
 func TestSessionName(t *testing.T) {
 	setupTestRegistryForSession(t)
 

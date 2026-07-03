@@ -233,21 +233,35 @@ When your work is done, follow this checklist — **step 4 is REQUIRED**:
 ⚠️ **DO NOT commit code that does not COMPILE. Fix build errors first.**
 
 The Refinery runs the authoritative full gate (tests + vet + review) on your MR and will
-**bounce it back to you for rework** if anything fails. So you do NOT need to — and should
-NOT — run the full `go test ./...` suite yourself: it is slow (it spins up test containers) and
-the Refinery re-runs it anyway. Just make sure your change **compiles**.
+**bounce it back to you for rework** if anything fails. You do NOT need to — and should
+NOT — run the full suite yourself: the full `go test ./...` spins up test containers, the
+full cargo workspace blows the lane build budget, and the Refinery re-runs it anyway either
+way. But "it compiles" is NOT
+enough: most rework bounces are a fast gate or a focused test the Refinery caught that you
+could have caught in ~2 minutes. Run the fast self-check AND the reviewer-lens pass below.
 
 ```
-[ ] 1. Fast self-check — COMPILE ONLY (do NOT run the full test suite):
-       - npm projects: npm run lint on the files you changed
-       - Go projects:  go build ./...    (compile-check; the Refinery owns `go test`/`go vet`)
-[ ] 2. Stage changes:     git add <files>
-[ ] 3. Commit changes:    git commit -m "msg (issue-id)"
-[ ] 4. Self-clean:        gt done   ← MANDATORY FINAL STEP
+[ ] 1. Fast self-check — REQUIRED before every commit (fast subset, NOT the full suite):
+       - If scripts/run-all-gates.sh exists:  bash scripts/run-all-gates.sh --fast-only   (must pass; ~2-3 min)
+       - Rust:  cargo test -p <each crate you touched>     (focused — NEVER the full workspace)
+       - Go:    go build ./...   AND   go test <the package(s) you changed>   (focused, NOT ./...)
+       - npm:   npm run lint on the files you changed
+       - If you ADDED tests: run exactly those and confirm they FAIL before your fix / PASS after
+         (a test that still passes when the code under it is deleted does not count).
+[ ] 2. Reviewer-lens self-review of your diff BEFORE `gt done` — the Refinery's codex
+       reviewer rejects on these exact classes, so check them yourself FIRST:
+       [ ] every new piece of state is cleared/reset on ALL exit paths (error, suppressed, terminal/early return)
+       [ ] every new behavior has a test that would FAIL without your change
+       [ ] edge cases at the boundaries you touched (empty / stale / missing data, first tick, re-entry)
+       [ ] no dead code, no unrelated diff hunks that grow the blast radius
+[ ] 3. Stage changes:     git add <files>
+[ ] 4. Commit changes:    git commit -m "msg (issue-id)"
+[ ] 5. Self-clean:        gt done   ← MANDATORY FINAL STEP
 ```
 
-**The compile check is required; the full test gate is the Refinery's job — don't duplicate it.**
-Worktrees may not trigger pre-commit hooks, so run the compile check manually before every commit.
+**The fast self-check + reviewer-lens pass are required. The FULL test suite (containers)
+stays the Refinery's job — do not run `go test ./...` or the full cargo workspace yourself.**
+Worktrees may not trigger pre-commit hooks, so run the checks manually before every commit.
 
 **Project-specific gates:** Read CLAUDE.md and AGENTS.md in the repo root for
 the project's definition of done. Many projects require a specific test harness

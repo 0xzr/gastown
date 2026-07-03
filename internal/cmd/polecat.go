@@ -137,6 +137,27 @@ Examples:
 	RunE: runPolecatStatus,
 }
 
+var polecatSetAgentCmd = &cobra.Command{
+	Use:   "set-agent <rig>/<polecat> <agent>",
+	Short: "Re-pin a polecat's model (assigned_agent) for its next start/restart",
+	Long: `Durably set the model a polecat runs on by writing assigned_agent on its
+identity bead.
+
+At session start the model is resolved as:
+  --agent override  >  persisted assigned_agent (the identity bead)  >  rig/town default
+so a plain restart re-uses the persisted pin, and changing the rig/town default does
+NOT re-model an existing lane. This command changes that durable pin. The new agent is
+validated against the runtime config BEFORE it is written, so a lane cannot be pinned to
+a retired/unknown model that would silently downgrade or hard-fail its next start.
+
+Takes effect on the polecat's NEXT start/restart, not a live session mid-flight.
+
+Examples:
+  gt polecat set-agent polybot/rust umans-glm`,
+	Args: cobra.ExactArgs(2),
+	RunE: runPolecatSetAgent,
+}
+
 var (
 	polecatStatusJSON                    bool
 	polecatGitStateJSON                  bool
@@ -148,6 +169,7 @@ var (
 	polecatCheckRecoveryReconcileCleanup bool
 	polecatPoolInitDryRun                bool
 	polecatPoolInitSize                  int
+	polecatSetAgentForce                 bool
 )
 
 var polecatGCCmd = &cobra.Command{
@@ -338,6 +360,8 @@ func init() {
 	// Status flags
 	polecatStatusCmd.Flags().BoolVar(&polecatStatusJSON, "json", false, "Output as JSON")
 
+	polecatSetAgentCmd.Flags().BoolVar(&polecatSetAgentForce, "force", false, "Pin even a capped/retired or unresolvable agent (dangerous — can wedge or silently downgrade the next start)")
+
 	// Git-state flags
 	polecatGitStateCmd.Flags().BoolVar(&polecatGitStateJSON, "json", false, "Output as JSON")
 
@@ -372,6 +396,7 @@ func init() {
 	polecatCmd.AddCommand(polecatAddCmd)
 	polecatCmd.AddCommand(polecatRemoveCmd)
 	polecatCmd.AddCommand(polecatStatusCmd)
+	polecatCmd.AddCommand(polecatSetAgentCmd)
 	polecatCmd.AddCommand(polecatGitStateCmd)
 	polecatCmd.AddCommand(polecatCheckRecoveryCmd)
 	polecatCmd.AddCommand(polecatGCCmd)
@@ -723,6 +748,37 @@ type PolecatStatus struct {
 	Windows        int           `json:"windows,omitempty"`
 	CreatedAt      string        `json:"created_at,omitempty"`
 	LastActivity   string        `json:"last_activity,omitempty"`
+}
+
+func runPolecatSetAgent(cmd *cobra.Command, args []string) error {
+	rigName, polecatName, err := parseAddress(args[0])
+	if err != nil {
+		return err
+	}
+	agent := strings.TrimSpace(args[1])
+	if agent == "" {
+		return fmt.Errorf("agent must not be empty")
+	}
+	_, r, err := getPolecatManager(rigName)
+	if err != nil {
+		return err
+	}
+	sm := polecat.NewSessionManager(tmux.NewTmux(), r)
+	old, err := sm.SetAssignedAgent(polecatName, agent, polecatSetAgentForce)
+	if err != nil {
+		return err
+	}
+	if old == agent {
+		fmt.Printf("%s/%s already pinned to %s; nothing to do\n", rigName, polecatName, agent)
+		return nil
+	}
+	oldStr := old
+	if oldStr == "" {
+		oldStr = "<unset>"
+	}
+	fmt.Printf("%s/%s assigned_agent: %s -> %s (takes effect on next start/restart)\n",
+		rigName, polecatName, oldStr, agent)
+	return nil
 }
 
 func runPolecatStatus(cmd *cobra.Command, args []string) error {

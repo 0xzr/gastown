@@ -539,6 +539,70 @@ func (m *SessionManager) persistAssignedAgent(polecat, agent string) {
 	}
 }
 
+// agentCapped reports whether the agent is listed in the town's .capped-agents
+// file — the operator's signal that a model is disabled/retired (e.g. after m3
+// retirement). Lines starting with '#' are comments. Best-effort: a missing or
+// unreadable file means "not capped".
+func agentCapped(townRoot, agent string) (bool, string) {
+	data, err := os.ReadFile(filepath.Join(townRoot, ".capped-agents"))
+	if err != nil {
+		return false, ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if line == agent {
+			return true, "listed in .capped-agents"
+		}
+	}
+	return false, ""
+}
+
+// SetAssignedAgent durably re-pins the polecat's model (assigned_agent) on its
+// identity bead so the NEXT start/restart runs that model. Model resolution at
+// start is: --agent override > persisted assigned_agent > rig/town default (see
+// resolveAgent), so a plain restart re-uses this pin and changing the rig/town
+// default does NOT re-model an existing lane. The new agent MUST resolve to a real
+// runtime config BEFORE we persist (the same resolution start uses), so a lane can
+// never be pinned to a retired/unknown model that would silently downgrade (the
+// persisted path warns + falls back) or hard-fail (an explicit --agent) its next
+// start. Returns the previous pin (may be empty). Does not touch a live session;
+// the change takes effect on the next start/restart.
+func (m *SessionManager) SetAssignedAgent(polecat, agent string, force bool) (string, error) {
+	polecat = strings.TrimSpace(polecat)
+	agent = strings.TrimSpace(agent)
+	if polecat == "" || agent == "" {
+		return "", fmt.Errorf("polecat and agent are required")
+	}
+	townRoot := filepath.Dir(m.rig.Path)
+	if !force {
+		// Reject a model the operator has capped/retired (e.g. m3). A retired model
+		// often still has a resolvable config, so ResolveAgentConfigWithOverride alone
+		// would not catch it — the town-level .capped-agents file is the signal.
+		if capped, reason := agentCapped(townRoot, agent); capped {
+			return "", fmt.Errorf("agent %q is capped/retired (%s); refusing to pin (use --force to override)", agent, reason)
+		}
+		// Reject an unresolvable/unknown model: this is the same resolution gt session
+		// start uses, so a value that passes here cannot wedge the next start.
+		if _, _, err := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, agent); err != nil {
+			return "", fmt.Errorf("agent %q does not resolve to a runtime config; refusing to pin an unresolvable model (use --force to override): %w", agent, err)
+		}
+	}
+	agentID := m.agentBeadIDForSession(polecat)
+	bd := beads.New(m.rig.Path).ForAgentBead()
+	_, fields, err := bd.GetAgentBead(agentID)
+	if err != nil || fields == nil {
+		return "", fmt.Errorf("no identity bead for polecat %q in rig %q: %w", polecat, m.rig.Name, err)
+	}
+	old := strings.TrimSpace(fields.AssignedAgent)
+	if err := bd.UpdateAgentAssignedAgent(agentID, agent); err != nil {
+		return old, fmt.Errorf("persisting assigned_agent=%s for %s: %w", agent, polecat, err)
+	}
+	return old, nil
+}
+
 // readHookBead returns the bead ID currently hooked to this polecat, as stored
 // in the polecat's agent bead. It mirrors ReadPersistedAssignedAgent: best-
 // effort and non-fatal, because session start must degrade gracefully when
