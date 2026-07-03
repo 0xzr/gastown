@@ -104,9 +104,16 @@ type SessionStartOptions struct {
 	RuntimeConfigDir string
 
 	// Agent is the agent override for this polecat session (e.g., "codex", "gemini").
+	// It takes precedence over the persisted assigned_agent and the rig/town default.
 	// If set, GT_AGENT is written to the tmux session environment table so that
 	// IsAgentAlive and waitForPolecatReady read the correct process names.
 	Agent string
+
+	// WarnIfDefaultFallback, when true, emits a warning if the effective agent
+	// falls back to the rig/town default because no explicit --agent was passed
+	// and no persisted assignment exists. Used by gt session restart to surface
+	// model-drift risk without duplicating the persisted-agent lookup.
+	WarnIfDefaultFallback bool
 }
 
 // SessionInfo contains information about a running polecat session.
@@ -509,7 +516,7 @@ func readModelAssignment(townRoot, bead string) string {
 //     agent bead (gastown-hkd).
 func (m *SessionManager) ReadPersistedAssignedAgent(polecat string) string {
 	agentID := m.agentBeadIDForSession(polecat)
-	bd := beads.New(m.rig.Path).ForAgentBead()
+	bd := m.agentBeads()
 	_, fields, err := bd.GetAgentBead(agentID)
 	if err != nil || fields == nil {
 		return ""
@@ -526,6 +533,43 @@ func (m *SessionManager) ReadPersistedAssignedAgent(polecat string) string {
 	}
 	townRoot := filepath.Dir(m.rig.Path)
 	return readModelAssignment(townRoot, hookBead)
+}
+
+// ResolveEffectiveAgent determines the agent this session will run, enforcing
+// the precedence chain: explicit --agent > persisted assigned_agent > rig/town
+// default. It returns the resolved runtime config, the selected agent name,
+// and an error. An invalid persisted agent fails closed (returns an error) so
+// silent model rotation cannot occur on restart (gastown-hkd).
+func (m *SessionManager) ResolveEffectiveAgent(polecat string, opts SessionStartOptions) (*config.RuntimeConfig, string, error) {
+	townRoot := filepath.Dir(m.rig.Path)
+
+	// 1. Explicit --agent override wins unconditionally. This is the escalation
+	// rotation path and must not be blocked by a stale persisted value.
+	if opts.Agent != "" {
+		rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, opts.Agent)
+		if err != nil {
+			return nil, "", fmt.Errorf("resolving --agent %q: %w", opts.Agent, err)
+		}
+		return rc, rc.ResolvedAgent, nil
+	}
+
+	// 2. Persisted assigned_agent from a previous session.
+	if persisted := m.ReadPersistedAssignedAgent(polecat); persisted != "" {
+		rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, persisted)
+		if err != nil {
+			return nil, "", fmt.Errorf("invalid persisted assigned_agent %q for %s/%s: %w",
+				persisted, m.rig.Name, polecat, err)
+		}
+		return rc, rc.ResolvedAgent, nil
+	}
+
+	// 3. Default role agent.
+	rc := config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
+	if opts.WarnIfDefaultFallback {
+		style.PrintWarning("no model assignment recovered for %s/%s; using default role agent %q",
+			m.rig.Name, polecat, rc.ResolvedAgent)
+	}
+	return rc, rc.ResolvedAgent, nil
 }
 
 // persistAssignedAgent stores the runtime agent this session is running so the
@@ -627,52 +671,24 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	}
 
 	// Resolve runtime config for the agent that will actually run in this session.
-	// When an explicit --agent override is provided (e.g., "codex"), use it to resolve
-	// the correct agent config. Without this, ResolveRoleAgentConfig returns the default
-	// role agent (usually Claude), causing WaitForRuntimeReady to poll for the wrong
-	// prompt prefix and all fallback/nudge logic to use incorrect agent capabilities.
-	// This was the root cause of gt-1j3m: Codex polecats sat idle because the startup
-	// sequence used Claude's ReadyPromptPrefix ("❯ ") to detect readiness in a Codex
-	// session, timing out instead of using Codex's delay-based readiness.
+	// Centralized resolution enforces the precedence chain:
+	// explicit --agent > previously persisted assigned_agent > rig/town default.
+	// An invalid persisted agent now fails closed instead of silently rotating
+	// the polecat to a different model (gastown-hkd).
+	runtimeConfig, effectiveAgent, err := m.ResolveEffectiveAgent(polecat, opts)
+	if err != nil {
+		return fmt.Errorf("resolving effective agent: %w", err)
+	}
 	townRoot := filepath.Dir(m.rig.Path)
-	var runtimeConfig *config.RuntimeConfig
-	// effectiveAgent is the agent this session will actually run, accounting
-	// for model preservation on start/restart (hq-juu / hq-t7t). Priority:
-	// explicit --agent override > previously persisted assigned_agent > rig/town
-	// default. Without this, gt session restart reverts a codex/gemini polecat
-	// to the rig default (claude), silently changing the assigned model.
-	effectiveAgent := opts.Agent
-	if effectiveAgent == "" {
-		if persisted := m.ReadPersistedAssignedAgent(polecat); persisted != "" {
-			effectiveAgent = persisted
-		}
-	}
-	if effectiveAgent != "" {
-		rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, effectiveAgent)
-		if err != nil {
-			// An invalid persisted agent must not wedge session start: fall back
-			// to the default role agent and warn so the operator can fix it.
-			if opts.Agent != "" {
-				return fmt.Errorf("resolving agent config for %s: %w", effectiveAgent, err)
-			}
-			style.PrintWarning("persisted assigned_agent %q could not be resolved, falling back to default: %v", effectiveAgent, err)
-			effectiveAgent = ""
-			runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
-		} else {
-			runtimeConfig = rc
-		}
-	} else {
-		runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
-	}
 
 	// Persist the agent this session is running so the next start/restart can
 	// restore it. Best-effort: a write failure must not block session creation.
 	// opts.Agent (explicit override/escalation rotation) wins over the prior
 	// persisted value — that is how an escalation path intentionally rotates
 	// the model.
-	resolvedAgent := effectiveAgent
-	if resolvedAgent == "" {
-		resolvedAgent = runtimeConfig.ResolvedAgent
+	resolvedAgent := runtimeConfig.ResolvedAgent
+	if effectiveAgent != "" {
+		resolvedAgent = effectiveAgent
 	}
 	m.persistAssignedAgent(polecat, resolvedAgent)
 
