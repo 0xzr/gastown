@@ -211,6 +211,77 @@ func TestCollectExistingMoleculesFiltersClosedMolecules(t *testing.T) {
 	}
 }
 
+func TestPartitionMoleculesByResolution(t *testing.T) {
+	prev := resolveExistingMoleculeFn
+	t.Cleanup(func() { resolveExistingMoleculeFn = prev })
+
+	tests := []struct {
+		name          string
+		molecules     []string
+		resolvedSet   map[string]bool
+		wantResolved  []string
+		wantStale     []string
+	}{
+		{
+			name:         "all resolved",
+			molecules:    []string{"bd-wisp-a", "bd-wisp-b"},
+			resolvedSet:  map[string]bool{"bd-wisp-a": true, "bd-wisp-b": true},
+			wantResolved: []string{"bd-wisp-a", "bd-wisp-b"},
+			wantStale:    nil,
+		},
+		{
+			name:         "all stale",
+			molecules:    []string{"bd-wisp-a", "bd-wisp-b"},
+			resolvedSet:  map[string]bool{},
+			wantResolved: nil,
+			wantStale:    []string{"bd-wisp-a", "bd-wisp-b"},
+		},
+		{
+			name:         "mixed resolved and stale",
+			molecules:    []string{"bd-wisp-live", "bd-wisp-dead"},
+			resolvedSet:  map[string]bool{"bd-wisp-live": true},
+			wantResolved: []string{"bd-wisp-live"},
+			wantStale:    []string{"bd-wisp-dead"},
+		},
+		{
+			name:         "empty input",
+			molecules:    []string{},
+			resolvedSet:  map[string]bool{},
+			wantResolved: nil,
+			wantStale:    nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolveExistingMoleculeFn = func(_, molID string) (string, bool) {
+				if tt.resolvedSet[molID] {
+					return "in_progress", true
+				}
+				return "", false
+			}
+
+			resolved, stale := partitionMoleculesByResolution(t.TempDir(), tt.molecules)
+			if len(resolved) != len(tt.wantResolved) {
+				t.Fatalf("resolved = %v, want %v", resolved, tt.wantResolved)
+			}
+			for i := range resolved {
+				if resolved[i] != tt.wantResolved[i] {
+					t.Errorf("resolved[%d] = %q, want %q", i, resolved[i], tt.wantResolved[i])
+				}
+			}
+			if len(stale) != len(tt.wantStale) {
+				t.Fatalf("stale = %v, want %v", stale, tt.wantStale)
+			}
+			for i := range stale {
+				if stale[i] != tt.wantStale[i] {
+					t.Errorf("stale[%d] = %q, want %q", i, stale[i], tt.wantStale[i])
+				}
+			}
+		})
+	}
+}
+
 func TestIsSlingConfigError(t *testing.T) {
 	tests := []struct {
 		name string

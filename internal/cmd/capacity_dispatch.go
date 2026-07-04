@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -708,9 +709,57 @@ func isDaemonDispatch() bool {
 	return os.Getenv("GT_DAEMON") == "1"
 }
 
+// permanentFailureClass returns a non-empty class label if the dispatch error is a
+// permanent failure that should not be retried. The recognized permanent classes are:
+//   - cross-rig prefix dispatch refused (capacity.ErrCrossRigPrefix)
+//   - respawn limit reached for a bead
+//   - bead has existing molecule(s) that cannot be auto-burned
+//
+// These failures will recur identically on every retry, so the scheduler should
+// park/evict the queue entry on first occurrence instead of consuming head-of-queue
+// capacity until the circuit breaker trips.
+func permanentFailureClass(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	switch {
+	case errors.Is(err, capacity.ErrCrossRigPrefix):
+		return "cross-rig-prefix"
+	case strings.Contains(msg, "respawn limit reached"):
+		return "respawn-limit"
+	case strings.Contains(msg, "has existing molecule(s)"):
+		return "existing-molecule"
+	}
+	return ""
+}
+
 // recordDispatchFailure increments the dispatch failure counter on the sling context bead.
+// Permanent dispatch failures are parked immediately (no retries) and the context is
+// closed with a reason that records the failure class.
 func recordDispatchFailure(townBeads *beads.Beads, b capacity.PendingBead, dispatchErr error) {
 	if b.Context == nil {
+		return
+	}
+
+	// Permanent dispatch failures: park the context immediately on first
+	// occurrence. These failures are deterministic and will not heal by retrying,
+	// so keeping them at the head of the queue starves all other dispatch.
+	if class := permanentFailureClass(dispatchErr); class != "" {
+		b.Context.DispatchFailures = maxDispatchFailures
+		b.Context.LastFailure = dispatchErr.Error()
+
+		if err := townBeads.UpdateSlingContextFields(b.ID, b.Context); err != nil {
+			fmt.Printf("  %s Failed to record permanent dispatch failure for %s: %v\n",
+				style.Warning.Render("⚠"), b.ID, err)
+		}
+		if err := townBeads.CloseSlingContext(b.ID, "parked-"+class); err != nil {
+			fmt.Printf("  %s Failed to park permanent-failure context %s: %v\n",
+				style.Warning.Render("⚠"), b.ID, err)
+			return
+		}
+		fmt.Printf("  %s Context %s (work: %s) parked permanently: %s\n",
+			style.Warning.Render("⚠"), b.ID, b.WorkBeadID, class)
 		return
 	}
 

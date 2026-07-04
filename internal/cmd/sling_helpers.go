@@ -221,6 +221,37 @@ func collectExistingMolecules(info *beadInfo) []string {
 	return molecules
 }
 
+// resolveExistingMolecule returns the status of a molecule wisp and whether it is
+// still active (resolves and is not closed/tombstone). A non-existent or closed
+// wisp is treated as stale and should be burned rather than blocking dispatch.
+var resolveExistingMoleculeFn = resolveExistingMolecule
+
+func resolveExistingMolecule(townRoot, molID string) (string, bool) {
+	info, err := getBeadInfoFromTownRoot(townRoot, molID)
+	if err != nil {
+		return "", false
+	}
+	if info.Status == "closed" || info.Status == "tombstone" {
+		return info.Status, false
+	}
+	return info.Status, true
+}
+
+// partitionMoleculesByResolution splits molecule IDs into resolved (active) and
+// stale (non-existent or closed) sets. Stale molecules should be burned before
+// dispatch so that a dangling attached_molecule reference does not wedge the
+// scheduler with "has existing molecule(s)".
+func partitionMoleculesByResolution(townRoot string, molecules []string) (resolved, stale []string) {
+	for _, molID := range molecules {
+		if _, ok := resolveExistingMoleculeFn(townRoot, molID); ok {
+			resolved = append(resolved, molID)
+		} else {
+			stale = append(stale, molID)
+		}
+	}
+	return resolved, stale
+}
+
 // burnExistingMolecules burns all molecule wisps attached to a bead.
 // Order: force-close descendants → detach from bead → remove dep bonds → force-close roots.
 // Matches nukeCleanupMolecules pattern. Returns an error if detach fails, since

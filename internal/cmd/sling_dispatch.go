@@ -208,22 +208,37 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	if params.FormulaName != "" {
 		existingMolecules := collectExistingMolecules(info)
 		if len(existingMolecules) > 0 {
-			// Auto-burn when bead is unassigned (molecules are definitionally stale),
-			// or when the assigned agent's session is dead. This unblocks the daemon's
-			// stranded convoy scan which never passes --force.
-			stale := params.Force ||
-				(info.Assignee == "" && (info.Status == "open" || info.Status == "in_progress")) ||
-				(info.Assignee != "" && isHookedAgentDeadFn(info.Assignee))
-			if stale {
-				fmt.Printf("  %s Burning %d stale molecule(s): %s\n",
-					style.Warning.Render("⚠"), len(existingMolecules), strings.Join(existingMolecules, ", "))
-				if err := burnExistingMolecules(existingMolecules, params.BeadID, townRoot); err != nil {
-					result.ErrMsg = fmt.Sprintf("burn failed: %v", err)
-					return result, fmt.Errorf("burning stale molecules: %w", err)
+			// Auto-burn molecule references that no longer resolve (dangling
+			// attached_molecule after reaper purge, or already closed wisps). These
+			// should not block dispatch.
+			resolvedMolecules, staleMolecules := partitionMoleculesByResolution(townRoot, existingMolecules)
+			if len(staleMolecules) > 0 {
+				fmt.Printf("  %s Burning %d stale molecule reference(s): %s\n",
+					style.Warning.Render("⚠"), len(staleMolecules), strings.Join(staleMolecules, ", "))
+				if err := burnExistingMolecules(staleMolecules, params.BeadID, townRoot); err != nil {
+					result.ErrMsg = fmt.Sprintf("burn stale molecules failed: %v", err)
+					return result, fmt.Errorf("burning stale molecule references on %s: %w", params.BeadID, err)
 				}
-			} else {
-				result.ErrMsg = "has existing molecule(s)"
-				return result, fmt.Errorf("bead %s has existing molecule(s) (use --force)", params.BeadID)
+			}
+
+			if len(resolvedMolecules) > 0 {
+				// Auto-burn when bead is unassigned (molecules are definitionally stale),
+				// or when the assigned agent's session is dead. This unblocks the daemon's
+				// stranded convoy scan which never passes --force.
+				stale := params.Force ||
+					(info.Assignee == "" && (info.Status == "open" || info.Status == "in_progress")) ||
+					(info.Assignee != "" && isHookedAgentDeadFn(info.Assignee))
+				if stale {
+					fmt.Printf("  %s Burning %d stale molecule(s): %s\n",
+						style.Warning.Render("⚠"), len(resolvedMolecules), strings.Join(resolvedMolecules, ", "))
+					if err := burnExistingMolecules(resolvedMolecules, params.BeadID, townRoot); err != nil {
+						result.ErrMsg = fmt.Sprintf("burn failed: %v", err)
+						return result, fmt.Errorf("burning stale molecules: %w", err)
+					}
+				} else {
+					result.ErrMsg = "has existing molecule(s)"
+					return result, fmt.Errorf("bead %s has existing molecule(s) (use --force)", params.BeadID)
+				}
 			}
 		}
 	}
