@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // routingTestCounter generates unique prefixes for each routing test to isolate
@@ -143,6 +144,9 @@ func initBeadsDBWithPrefix(t *testing.T, dir, prefix string) {
 	}
 	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
+	// bd init --server may start a transient dolt sql-server. Put it in its
+	// own process group so test interruption cleans up the child.
+	util.SetProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bd init failed in %s: %v\n%s", dir, err, output)
 	}

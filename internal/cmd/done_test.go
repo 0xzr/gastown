@@ -12,6 +12,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // TestDoneUsesResolveBeadsDir verifies that the done command correctly uses
@@ -381,6 +382,9 @@ func TestFindHookedBeadForAgent(t *testing.T) {
 			// Initialize the beads database
 			cmd := exec.Command("bd", "init", "--prefix", "test", "--quiet")
 			cmd.Dir = tmpDir
+			// bd init may start a transient dolt sql-server. Put it in its own
+			// process group so test interruption cleans up the child.
+			util.SetProcessGroup(cmd)
 			if output, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("bd init: %v\n%s", err, output)
 			}
