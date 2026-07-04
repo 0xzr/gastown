@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // RigIsGitRepoCheck verifies the rig has a valid mayor/rig git clone.
@@ -1069,6 +1070,10 @@ func (c *BeadsRedirectCheck) Fix(ctx *CheckContext) error {
 		cmd := exec.Command("bd", initArgs...)
 		cmd.Dir = rigPath
 		cmd.Env = bdEnv
+		// bd init --server may start a transient dolt sql-server if the central
+		// server is not reachable. Put it in its own process group so signals
+		// don't strand an orphaned dolt child.
+		util.SetProcessGroup(cmd)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			// bd might not be installed — create config.yaml via shared helper.
 			if writeErr := beads.EnsureConfigYAML(rigBeadsDir, prefix); writeErr != nil {
