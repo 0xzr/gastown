@@ -106,7 +106,8 @@ fi
 # fallback. source_bead is the recovery signal added by gastown-dg1.
 probe_hook_show() {
   local tgt="$1"
-  timeout 2 gt hook show "$tgt" --json 2>/dev/null || true
+  local hook_show_timeout="${GT_DONE_HOOK_SHOW_TIMEOUT:-5}"
+  timeout "$hook_show_timeout" gt hook show "$tgt" --json 2>/dev/null || true
 }
 
 hook_json="$(probe_hook_show "$TARGET")"
