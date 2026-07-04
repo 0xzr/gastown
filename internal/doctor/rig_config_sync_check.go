@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // RigConfigSyncCheck verifies that all registered rigs have a config.json file,
@@ -433,6 +434,10 @@ func (c *RigConfigSyncCheck) Fix(ctx *CheckContext) error {
 			"BEADS_DIR="+beadsDir,
 			"BEADS_DOLT_SERVER_DATABASE="+rigName,
 		)
+		// bd init --server may start a transient dolt sql-server (e.g. when
+		// provisioning a missing database). Move it into its own process group
+		// so signals/cancellation don't strand an orphaned dolt server child.
+		util.SetProcessGroup(cmd)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("could not initialize Dolt DB for %s: %w\n%s", rigName, err, string(output))
 		}
