@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -965,6 +966,38 @@ func TestCommandsInherited_NoGitRoot(t *testing.T) {
 
 	if commandsInherited(dir) {
 		t.Error("commandsInherited() = true, want false when no .git ancestor found")
+	}
+}
+
+func TestCommandsInherited_IgnoresStrayAncestorGitAboveTownRoot(t *testing.T) {
+	// Regression: a stray .git above the town root (observed in the wild as a
+	// leftover /tmp/.git above t.TempDir()) must not break inheritance for role
+	// dirs inside the workspace. The town root bounds the .git search; a .git
+	// outside the workspace is not a repo boundary that breaks command
+	// inheritance. Without the bound, commandsInherited returns false and every
+	// role dir gets redundant command provisioning (duplicate slash commands).
+	//
+	// Build a fully self-controlled hierarchy so the test does not depend on
+	// (or pollute) the shared test temp root that backs t.TempDir().
+	ancestor := t.TempDir()
+	townRoot := filepath.Join(ancestor, "town")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(townRoot, "mayor", "town.json"),
+		[]byte(`{"type":"town"}`), 0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	// Plant a stray .git in the ancestor (above the town root).
+	if err := os.Mkdir(filepath.Join(ancestor, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if !commandsInherited(mayorDir) {
+		t.Error("commandsInherited() = false, want true for role dir under town root with stray ancestor .git")
 	}
 }
 

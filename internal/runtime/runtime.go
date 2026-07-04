@@ -129,7 +129,14 @@ func commandsInherited(workDir string) bool {
 		return false
 	}
 
-	gitRoot := gitRootOf(workDir)
+	// Bound the search at the town root: a stray .git above the workspace
+	// (e.g. a leftover /tmp/.git, or a .git in a parent directory) is not a
+	// repo boundary that breaks inheritance. Claude Code's path traversal is
+	// itself workspace-bounded, so ancestor .git entries outside the town root
+	// are irrelevant here. Without this bound, such a stray .git would make
+	// commandsInherited return false and trigger redundant command provisioning
+	// (duplicate slash commands) for every role dir in the workspace.
+	gitRoot := gitRootOf(workDir, townRoot)
 	if gitRoot != "" && !samePath(gitRoot, townRoot) {
 		return false
 	}
@@ -146,11 +153,25 @@ func samePath(a, b string) bool {
 }
 
 // gitRootOf walks up from dir to find the nearest ancestor directory containing
-// a .git entry (file or directory). Returns empty string if none found.
-func gitRootOf(dir string) string {
+// a .git entry (file or directory), stopping at stop (inclusive). The stop bound
+// prevents a stray .git above the workspace boundary (e.g. a leftover /tmp/.git)
+// from being mistaken for a repo boundary inside the workspace. Returns empty
+// string if none found within the bounded range.
+func gitRootOf(dir, stop string) string {
+	bound := ""
+	if stop != "" {
+		if abs, err := filepath.Abs(stop); err == nil {
+			bound = filepath.Clean(abs)
+		}
+	}
 	for d := dir; ; d = filepath.Dir(d) {
 		if _, err := os.Stat(filepath.Join(d, ".git")); err == nil {
 			return d
+		}
+		if bound != "" {
+			if abs, err := filepath.Abs(d); err == nil && filepath.Clean(abs) == bound {
+				return ""
+			}
 		}
 		parent := filepath.Dir(d)
 		if parent == d {
