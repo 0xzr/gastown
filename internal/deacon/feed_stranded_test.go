@@ -1,8 +1,10 @@
 package deacon
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -217,5 +219,272 @@ func TestSaveFeedStrandedState_CreatesDirectory(t *testing.T) {
 	stateFile := FeedStrandedStateFile(tmpDir)
 	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
 		t.Fatal("state file not created")
+	}
+}
+
+// --- hq-ozt3s: bounded failure + title-var tests ---
+
+func TestFeedDogSlingArgs_IncludesTitleVar(t *testing.T) {
+	args := feedDogSlingArgs("hq-cv-abc1")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--var convoy=hq-cv-abc1") {
+		t.Errorf("missing convoy var, args=%v", args)
+	}
+	// The title var is the workaround for the beads cook.go root-title bug:
+	// without a non-empty title, `bd mol wisp` fails with "title is required".
+	if !strings.Contains(joined, "--var title=Convoy feed: hq-cv-abc1") {
+		t.Errorf("missing non-empty title var, args=%v", args)
+	}
+}
+
+func TestConvoyFeedState_RecordFailure(t *testing.T) {
+	s := &ConvoyFeedState{ConvoyID: "hq-cv-test"}
+	if s.FailureCount != 0 {
+		t.Errorf("initial FailureCount = %d, want 0", s.FailureCount)
+	}
+	s.RecordFailure("boom")
+	if s.FailureCount != 1 {
+		t.Errorf("after RecordFailure, FailureCount = %d, want 1", s.FailureCount)
+	}
+	if s.LastFailureMsg != "boom" {
+		t.Errorf("LastFailureMsg = %q, want %q", s.LastFailureMsg, "boom")
+	}
+	if s.LastFailureTime.IsZero() {
+		t.Error("LastFailureTime should be set after RecordFailure")
+	}
+	s.RecordFailure("boom2")
+	if s.FailureCount != 2 {
+		t.Errorf("after second RecordFailure, FailureCount = %d, want 2", s.FailureCount)
+	}
+}
+
+func TestConvoyFeedState_RecordFeedResetsFailures(t *testing.T) {
+	s := &ConvoyFeedState{ConvoyID: "hq-cv-test"}
+	s.RecordFailure("boom")
+	s.RecordFailure("boom2")
+	if s.FailureCount != 2 {
+		t.Fatalf("precondition FailureCount = %d, want 2", s.FailureCount)
+	}
+	s.RecordFeed()
+	if s.FailureCount != 0 {
+		t.Errorf("after RecordFeed, FailureCount = %d, want 0", s.FailureCount)
+	}
+	if s.LastFailureMsg != "" {
+		t.Errorf("after RecordFeed, LastFailureMsg = %q, want empty", s.LastFailureMsg)
+	}
+	if !s.LastFailureTime.IsZero() {
+		t.Error("after RecordFeed, LastFailureTime should be zeroed")
+	}
+	if s.FeedCount != 1 {
+		t.Errorf("after RecordFeed, FeedCount = %d, want 1", s.FeedCount)
+	}
+}
+
+func TestConvoyFeedState_IsInFailureBackoff(t *testing.T) {
+	s := &ConvoyFeedState{ConvoyID: "hq-cv-test"}
+	// No failures → not in backoff
+	if s.IsInFailureBackoff(10 * time.Minute) {
+		t.Error("zero failures should not be in backoff")
+	}
+	// Recent failure → in backoff
+	s.RecordFailure("boom")
+	if !s.IsInFailureBackoff(10 * time.Minute) {
+		t.Error("recent failure should be in backoff")
+	}
+	// Old failure → not in backoff
+	s.LastFailureTime = time.Now().Add(-20 * time.Minute)
+	if s.IsInFailureBackoff(10 * time.Minute) {
+		t.Error("old failure should not be in backoff")
+	}
+}
+
+// stubDispatcher captures dispatch calls and lets the test control success/failure.
+type stubDispatcher struct {
+	calls     []string
+	fail      bool
+	failCount int // number of times to fail before succeeding
+}
+
+func (s *stubDispatcher) dispatch(townRoot, convoyID string) error {
+	s.calls = append(s.calls, convoyID)
+	if s.fail || (s.failCount > 0 && len(s.calls) <= s.failCount) {
+		return fmt.Errorf("simulated wisp-creation failure")
+	}
+	return nil
+}
+
+// withStubs swaps the package-level func vars for a test and restores them.
+func withStubs(dispatch func(townRoot, convoyID string) error, clear func(townRoot, convoyID string), stranded []StrandedConvoy, fn func()) {
+	origDispatch, origClear, origFind := dispatchFeedDogFn, clearDogsWorkingOnFeedFn, findStrandedConvoysFn
+	defer func() {
+		dispatchFeedDogFn = origDispatch
+		clearDogsWorkingOnFeedFn = origClear
+		findStrandedConvoysFn = origFind
+	}()
+	if dispatch != nil {
+		dispatchFeedDogFn = dispatch
+	}
+	if clear != nil {
+		clearDogsWorkingOnFeedFn = clear
+	}
+	if stranded != nil {
+		findStrandedConvoysFn = func(string) ([]StrandedConvoy, error) { return stranded, nil }
+	}
+	fn()
+}
+
+func feedableConvoy(id string) []StrandedConvoy {
+	return []StrandedConvoy{
+		{ID: id, Title: "test convoy", TrackedCount: 1, ReadyCount: 1, ReadyIssues: []string{"gt-xyz"}},
+	}
+}
+
+// TestFeedStranded_RecordsFailureNotFeed verifies that a dispatch failure
+// records a failure (not a feed), increments FailureCount, and does not loop
+// within a single invocation. Regression for hq-ozt3s.
+func TestFeedStranded_RecordsFailureNotFeed(t *testing.T) {
+	tmpDir := t.TempDir()
+	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
+
+	disp := &stubDispatcher{fail: true}
+	clearCalls := 0
+	clear := func(string, string) { clearCalls++ }
+
+	withStubs(disp.dispatch, clear, feedableConvoy("hq-cv-fail1"), func() {
+		result := FeedStranded(tmpDir, 3, time.Minute, 0, 0)
+		if result.Fed != 0 {
+			t.Errorf("Fed = %d, want 0 on dispatch failure", result.Fed)
+		}
+		if result.Errors != 1 {
+			t.Errorf("Errors = %d, want 1", result.Errors)
+		}
+		if len(disp.calls) != 1 {
+			t.Errorf("dispatch called %d times, want 1 (no within-cycle retry)", len(disp.calls))
+		}
+		if clearCalls != 1 {
+			t.Errorf("defensive dog clear called %d times, want 1", clearCalls)
+		}
+	})
+
+	// State should reflect the failure, not a feed.
+	state, err := LoadFeedStrandedState(tmpDir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	cs := state.Convoys["hq-cv-fail1"]
+	if cs == nil {
+		t.Fatal("expected convoy state recorded")
+	}
+	if cs.FailureCount != 1 {
+		t.Errorf("FailureCount = %d, want 1", cs.FailureCount)
+	}
+	if cs.FeedCount != 0 {
+		t.Errorf("FeedCount = %d, want 0 on failure", cs.FeedCount)
+	}
+	if cs.LastFailureMsg == "" {
+		t.Error("LastFailureMsg should be recorded")
+	}
+}
+
+// TestFeedStranded_FailureBackoffSkipsRetry verifies that a convoy with a
+// recent failure is skipped (not redispatched) until the backoff window
+// expires. Regression for the infinite-loop half of hq-ozt3s.
+func TestFeedStranded_FailureBackoffSkipsRetry(t *testing.T) {
+	tmpDir := t.TempDir()
+	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
+
+	// Pre-seed state: one recent failure.
+	state := &FeedStrandedState{Convoys: map[string]*ConvoyFeedState{
+		"hq-cv-fail2": {ConvoyID: "hq-cv-fail2", FailureCount: 1, LastFailureTime: time.Now()},
+	}}
+	if err := SaveFeedStrandedState(tmpDir, state); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	disp := &stubDispatcher{fail: true}
+	withStubs(disp.dispatch, func(string, string) {}, feedableConvoy("hq-cv-fail2"), func() {
+		result := FeedStranded(tmpDir, 3, time.Minute, time.Hour, 5)
+		if result.Fed != 0 || result.Errors != 0 {
+			t.Errorf("Fed=%d Errors=%d, want 0/0 (backoff should skip dispatch)", result.Fed, result.Errors)
+		}
+		if result.Skipped != 1 {
+			t.Errorf("Skipped = %d, want 1", result.Skipped)
+		}
+		if len(disp.calls) != 0 {
+			t.Errorf("dispatch called %d times, want 0 during backoff", len(disp.calls))
+		}
+	})
+}
+
+// TestFeedStranded_ParksAfterMaxFailures verifies that a convoy at the
+// maxFailures cap is surfaced as needs_attention and NOT redispatched.
+func TestFeedStranded_ParksAfterMaxFailures(t *testing.T) {
+	tmpDir := t.TempDir()
+	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
+
+	state := &FeedStrandedState{Convoys: map[string]*ConvoyFeedState{
+		"hq-cv-fail3": {ConvoyID: "hq-cv-fail3", FailureCount: 3, LastFailureTime: time.Now().Add(-time.Hour), LastFailureMsg: "prev boom"},
+	}}
+	if err := SaveFeedStrandedState(tmpDir, state); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	disp := &stubDispatcher{}
+	clearCalls := 0
+	withStubs(disp.dispatch, func(string, string) { clearCalls++ }, feedableConvoy("hq-cv-fail3"), func() {
+		result := FeedStranded(tmpDir, 3, time.Minute, time.Minute, 3)
+		if result.Fed != 0 {
+			t.Errorf("Fed = %d, want 0 (parked convoy not dispatched)", result.Fed)
+		}
+		if result.NeedsAttention != 1 {
+			t.Errorf("NeedsAttention = %d, want 1 (parked convoy surfaced)", result.NeedsAttention)
+		}
+		if len(disp.calls) != 0 {
+			t.Errorf("dispatch called %d times, want 0 for parked convoy", len(disp.calls))
+		}
+		if clearCalls != 0 {
+			t.Errorf("defensive clear called %d times, want 0 for parked convoy", clearCalls)
+		}
+		found := false
+		for _, d := range result.Details {
+			if d.ConvoyID == "hq-cv-fail3" && d.Action == "needs_attention" && strings.Contains(d.Message, "prev boom") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected needs_attention detail surfacing last failure msg; got %+v", result.Details)
+		}
+	})
+}
+
+// TestFeedStranded_SuccessResetsFailures verifies a successful feed after
+// failures resets the failure counter so a transient burst doesn't park the
+// convoy permanently.
+func TestFeedStranded_SuccessResetsFailures(t *testing.T) {
+	tmpDir := t.TempDir()
+	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
+
+	state := &FeedStrandedState{Convoys: map[string]*ConvoyFeedState{
+		"hq-cv-fail4": {ConvoyID: "hq-cv-fail4", FailureCount: 2, LastFailureTime: time.Now().Add(-time.Hour), LastFailureMsg: "old boom"},
+	}}
+	if err := SaveFeedStrandedState(tmpDir, state); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	disp := &stubDispatcher{} // succeeds
+	withStubs(disp.dispatch, func(string, string) {}, feedableConvoy("hq-cv-fail4"), func() {
+		result := FeedStranded(tmpDir, 3, time.Minute, time.Minute, 3)
+		if result.Fed != 1 {
+			t.Errorf("Fed = %d, want 1", result.Fed)
+		}
+	})
+
+	loaded, _ := LoadFeedStrandedState(tmpDir)
+	cs := loaded.Convoys["hq-cv-fail4"]
+	if cs.FailureCount != 0 {
+		t.Errorf("FailureCount = %d after success, want 0 (reset)", cs.FailureCount)
+	}
+	if cs.LastFailureMsg != "" {
+		t.Errorf("LastFailureMsg = %q after success, want empty", cs.LastFailureMsg)
 	}
 }

@@ -1591,7 +1591,7 @@ func runDeaconFeedStranded(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	result := deacon.FeedStranded(townRoot, feedStrandedMaxFeeds, feedStrandedCooldown)
+	result := deacon.FeedStranded(townRoot, feedStrandedMaxFeeds, feedStrandedCooldown, 0, 0)
 
 	// JSON output
 	if feedStrandedJSON {
