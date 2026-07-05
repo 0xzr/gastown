@@ -3102,6 +3102,82 @@ exit /b 0
 	}
 }
 
+func TestUpdateBeadDescriptionFallsBackToTownRouting(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir town .beads: %v", err)
+	}
+	rigDir := filepath.Join(townRoot, "polybot")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+	routes := strings.Join([]string{
+		`{"prefix":"polybot-","path":"polybot"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	logPath := filepath.Join(townRoot, "bd.log")
+	bdScript := `#!/bin/sh
+echo "CMD:$* PWD:$(pwd) BEADS_DIR:${BEADS_DIR:-}" >> "${BD_LOG}"
+case "${BEADS_DIR:-}" in
+  *"/polybot/.beads")
+    echo "no issues found matching the provided IDs" >&2
+    exit 1
+    ;;
+esac
+exit 0
+`
+	bdScriptWindows := `@echo off
+setlocal enableextensions
+echo CMD:%* PWD:%CD% BEADS_DIR:%BEADS_DIR%>>"%BD_LOG%"
+echo %BEADS_DIR% | findstr /C:"\polybot\.beads" >nul
+if %ERRORLEVEL%==0 (
+  echo no issues found matching the provided IDs 1>&2
+  exit /b 1
+)
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+
+	t.Setenv("BD_LOG", logPath)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatalf("chdir townRoot: %v", err)
+	}
+
+	if err := updateSlingBeadDescription("polybot-optiv", "new description"); err != nil {
+		t.Fatalf("updateBeadDescription: %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd log: %v", err)
+	}
+	logText := string(logBytes)
+	if !strings.Contains(logText, "update polybot-optiv --description=new description") {
+		t.Fatalf("missing description update in log:\n%s", logText)
+	}
+	if !strings.Contains(logText, filepath.Join("polybot", ".beads")) {
+		t.Fatalf("first update should use pinned rig BEADS_DIR:\n%s", logText)
+	}
+	if !strings.Contains(logText, "BEADS_DIR:\n") {
+		t.Fatalf("fallback update should use town routing without BEADS_DIR:\n%s", logText)
+	}
+}
+
 func TestBuildSlingFieldUpdatesIncludesConvoyFields(t *testing.T) {
 	got := buildSlingFieldUpdates(
 		"mayor",

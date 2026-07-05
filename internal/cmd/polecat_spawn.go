@@ -389,6 +389,13 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 	// Start session
 	t := tmux.NewTmux()
 	polecatSessMgr := polecat.NewSessionManager(t, r)
+	polecatDir := filepath.Join(r.Path, "polecats", s.PolecatName)
+	if info, statErr := os.Stat(polecatDir); statErr != nil || !info.IsDir() {
+		return "", fmt.Errorf("spawned polecat missing before session start: %s (clone=%s, stat=%v)", polecatDir, s.ClonePath, statErr)
+	}
+	if err := verifyWorktreeExists(s.ClonePath); err != nil {
+		return "", fmt.Errorf("spawned polecat worktree missing before session start: %s: %w", s.ClonePath, err)
+	}
 
 	fmt.Printf("Starting session for %s/%s...\n", s.RigName, s.PolecatName)
 	startOpts := polecat.SessionStartOptions{

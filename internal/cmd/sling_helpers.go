@@ -588,15 +588,39 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 		return nil
 	}
 
-	if err := BdCmd("update", beadID, "--description="+newDesc).
-		Dir(resolveBeadDir(beadID)).
-		StripBeadsDir().
-		WithAutoCommit().
-		Run(); err != nil {
+	if err := updateSlingBeadDescription(beadID, newDesc); err != nil {
 		return fmt.Errorf("updating bead description: %w", err)
 	}
 
 	return nil
+}
+
+func updateSlingBeadDescription(beadID, description string) error {
+	args := []string{"update", beadID, "--description=" + description}
+	err := BdCmd(args...).
+		Dir(resolveBeadDir(beadID)).
+		StripBeadsDir().
+		WithAutoCommit().
+		Run()
+	if err == nil {
+		return nil
+	}
+
+	townRoot, rootErr := workspace.FindFromCwdOrError()
+	if rootErr != nil || townRoot == "" {
+		return err
+	}
+
+	routedErr := BdCmd(args...).
+		Dir(townRoot).
+		WithRouting().
+		WithAutoCommit().
+		Run()
+	if routedErr == nil {
+		return nil
+	}
+
+	return fmt.Errorf("pinned update failed: %w; routed retry failed: %w", err, routedErr)
 }
 
 // injectStartPrompt sends a prompt to the target pane to start working.
