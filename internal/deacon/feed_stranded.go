@@ -412,14 +412,16 @@ func FeedStranded(townRoot string, maxPerCycle int, cooldown, failureBackoff tim
 		}
 
 		// Dispatch dog to feed the convoy
-		if err := dispatchFeedDogFn(townRoot, convoy.ID); err != nil {
+		failedAssignment, err := dispatchFeedDogFn(townRoot, convoy.ID)
+		if err != nil {
 			msg := fmt.Sprintf("failed to dispatch feed dog: %v", err)
 			convoyState.RecordFailure(msg)
 			// Defensive cleanup: the sling subprocess clears its own dog on
 			// failure, but an interruption mid-sling (or a future regression)
-			// can leave a dog marked working on mol-convoy-feed with no live
-			// wisp. Clear any such dog so the lane is not stranded. See hq-ozt3s.
-			clearDogsWorkingOnFeedFn(townRoot, convoy.ID)
+			// can leave its dog marked working on mol-convoy-feed with no live
+			// wisp. Only clear the exact assignment observed from this sling.
+			// See hq-ozt3s.
+			clearDogWorkingOnFeedFn(townRoot, failedAssignment)
 			result.Errors++
 			action := "error"
 			if convoyState.FailureCount >= maxFailures {
@@ -471,15 +473,21 @@ func closeEmptyConvoy(townRoot, convoyID string) error {
 	return cmd.Run()
 }
 
+type feedDogAssignment struct {
+	name          string
+	workStartedAt time.Time
+}
+
 // dispatchFeedDogFn is the dispatch function used by FeedStranded. It is a
 // package-level variable so tests can stub it without spawning real gt/sling
 // subprocesses. Mirrors the cleanupFailedDogFormulaWispFn pattern in
 // sling_formula.go.
 var dispatchFeedDogFn = dispatchFeedDog
 
-// clearDogsWorkingOnFeedFn clears any dog left working on mol-convoy-feed after
-// a failed dispatch. Stubbed in tests so they don't touch real dog state.
-var clearDogsWorkingOnFeedFn = clearDogsWorkingOnFeed
+// clearDogWorkingOnFeedFn clears the dog assignment left working on
+// mol-convoy-feed after a failed dispatch. Stubbed in tests so they don't touch
+// real dog state.
+var clearDogWorkingOnFeedFn = clearDogWorkingOnFeed
 
 // findStrandedConvoysFn is the stranded-convoy finder used by FeedStranded.
 // Stubbed in tests so FeedStranded can be exercised without spawning gt.
@@ -505,43 +513,88 @@ func feedDogSlingArgs(convoyID string) []string {
 // `bd mol wisp` fails validation with "title is required", failing the sling at
 // the "Creating wisp..." step. Passing a non-empty title sidesteps this without
 // touching the formula (which would re-break GH#1133) or beads. See hq-ozt3s.
-func dispatchFeedDog(townRoot, convoyID string) error {
+func dispatchFeedDog(townRoot, convoyID string) (*feedDogAssignment, error) {
+	before := feedDogAssignments(townRoot)
+
 	cmd := exec.Command("gt", feedDogSlingArgs(convoyID)...)
 	cmd.Dir = townRoot
 	cmd.Env = deaconMutationRoutingEnv(townRoot)
 	util.SetDetachedProcessGroup(cmd)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return failedFeedDogAssignment(townRoot, before), err
+	}
+	return nil, nil
 }
 
-// clearDogsWorkingOnFeed clears any dog whose current work assignment is
-// mol-convoy-feed. The sling subprocess already clears its own dog on failure
-// via cleanupDelayedDogFormulaFailure, but an interruption mid-sling (or a
-// future regression) can leave a dog marked working with no live wisp. This is
-// a defensive sweep so a failed feed does not strand a dog lane. It only acts
-// on dogs whose Work exactly matches the formula name, so dogs doing other work
-// are never touched.
-func clearDogsWorkingOnFeed(townRoot, convoyID string) {
+func feedDogManager(townRoot string) (*dog.Manager, error) {
 	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")
 	rigsConfig, err := config.LoadRigsConfig(rigsConfigPath)
 	if err != nil {
-		// Best-effort: if rigs config can't be loaded there's nothing safe to do.
-		return
+		return nil, err
 	}
-	mgr := dog.NewManager(townRoot, rigsConfig)
+	return dog.NewManager(townRoot, rigsConfig), nil
+}
+
+func feedDogAssignments(townRoot string) map[string]time.Time {
+	mgr, err := feedDogManager(townRoot)
+	if err != nil {
+		return nil
+	}
 	dogs, err := mgr.List()
 	if err != nil {
-		return
+		return nil
 	}
+	assignments := make(map[string]time.Time)
 	for _, d := range dogs {
 		if d == nil || d.State != dog.StateWorking {
 			continue
 		}
 		if d.Work == constants.MolConvoyFeed {
-			_ = mgr.ClearWork(d.Name)
+			assignments[d.Name] = d.WorkStartedAt
 		}
 	}
+	return assignments
+}
+
+func failedFeedDogAssignment(townRoot string, before map[string]time.Time) *feedDogAssignment {
+	if before == nil {
+		return nil
+	}
+	after := feedDogAssignments(townRoot)
+	if after == nil {
+		return nil
+	}
+
+	var failed *feedDogAssignment
+	for name, startedAt := range after {
+		if previous, ok := before[name]; ok && previous.Equal(startedAt) {
+			continue
+		}
+		if failed != nil {
+			return nil
+		}
+		failed = &feedDogAssignment{name: name, workStartedAt: startedAt}
+	}
+	return failed
+}
+
+// clearDogWorkingOnFeed clears the exact dog work assignment left by a failed
+// feed sling. The sling subprocess already clears its own dog on failure via
+// cleanupDelayedDogFormulaFailure, but an interruption mid-sling (or a future
+// regression) can leave a dog marked working with no live wisp. This defensive
+// cleanup uses the same compare-and-clear guard so an unrelated or newer
+// mol-convoy-feed assignment is not marked idle.
+func clearDogWorkingOnFeed(townRoot string, assignment *feedDogAssignment) {
+	if assignment == nil || assignment.name == "" {
+		return
+	}
+	mgr, err := feedDogManager(townRoot)
+	if err != nil {
+		return
+	}
+	_, _ = mgr.ClearWorkIfMatches(assignment.name, constants.MolConvoyFeed, assignment.workStartedAt)
 }
 
 // PruneFeedStrandedState removes entries for convoys that are no longer open.

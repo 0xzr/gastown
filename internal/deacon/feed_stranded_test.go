@@ -300,32 +300,33 @@ func TestConvoyFeedState_IsInFailureBackoff(t *testing.T) {
 
 // stubDispatcher captures dispatch calls and lets the test control success/failure.
 type stubDispatcher struct {
-	calls     []string
-	fail      bool
-	failCount int // number of times to fail before succeeding
+	calls            []string
+	fail             bool
+	failCount        int // number of times to fail before succeeding
+	failedAssignment *feedDogAssignment
 }
 
-func (s *stubDispatcher) dispatch(townRoot, convoyID string) error {
+func (s *stubDispatcher) dispatch(townRoot, convoyID string) (*feedDogAssignment, error) {
 	s.calls = append(s.calls, convoyID)
 	if s.fail || (s.failCount > 0 && len(s.calls) <= s.failCount) {
-		return fmt.Errorf("simulated wisp-creation failure")
+		return s.failedAssignment, fmt.Errorf("simulated wisp-creation failure")
 	}
-	return nil
+	return nil, nil
 }
 
 // withStubs swaps the package-level func vars for a test and restores them.
-func withStubs(dispatch func(townRoot, convoyID string) error, clear func(townRoot, convoyID string), stranded []StrandedConvoy, fn func()) {
-	origDispatch, origClear, origFind := dispatchFeedDogFn, clearDogsWorkingOnFeedFn, findStrandedConvoysFn
+func withStubs(dispatch func(townRoot, convoyID string) (*feedDogAssignment, error), clear func(townRoot string, assignment *feedDogAssignment), stranded []StrandedConvoy, fn func()) {
+	origDispatch, origClear, origFind := dispatchFeedDogFn, clearDogWorkingOnFeedFn, findStrandedConvoysFn
 	defer func() {
 		dispatchFeedDogFn = origDispatch
-		clearDogsWorkingOnFeedFn = origClear
+		clearDogWorkingOnFeedFn = origClear
 		findStrandedConvoysFn = origFind
 	}()
 	if dispatch != nil {
 		dispatchFeedDogFn = dispatch
 	}
 	if clear != nil {
-		clearDogsWorkingOnFeedFn = clear
+		clearDogWorkingOnFeedFn = clear
 	}
 	if stranded != nil {
 		findStrandedConvoysFn = func(string) ([]StrandedConvoy, error) { return stranded, nil }
@@ -346,9 +347,12 @@ func TestFeedStranded_RecordsFailureNotFeed(t *testing.T) {
 	tmpDir := t.TempDir()
 	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
 
-	disp := &stubDispatcher{fail: true}
+	disp := &stubDispatcher{
+		fail:             true,
+		failedAssignment: &feedDogAssignment{name: "feed-dog", workStartedAt: time.Now()},
+	}
 	clearCalls := 0
-	clear := func(string, string) { clearCalls++ }
+	clear := func(string, *feedDogAssignment) { clearCalls++ }
 
 	withStubs(disp.dispatch, clear, feedableConvoy("hq-cv-fail1"), func() {
 		result := FeedStranded(tmpDir, 3, time.Minute, 0, 0)
@@ -386,6 +390,42 @@ func TestFeedStranded_RecordsFailureNotFeed(t *testing.T) {
 	}
 }
 
+// TestFeedStranded_FailedDispatchDoesNotClearUnrelatedFeedDog verifies that
+// failed feed cleanup only targets the assignment reported by the failed sling.
+func TestFeedStranded_FailedDispatchDoesNotClearUnrelatedFeedDog(t *testing.T) {
+	tmpDir := t.TempDir()
+	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
+
+	owned := &feedDogAssignment{name: "failed-feed-dog", workStartedAt: time.Now()}
+	unrelated := &feedDogAssignment{name: "live-feed-dog", workStartedAt: owned.workStartedAt.Add(-time.Minute)}
+	workingFeedDogs := map[string]*feedDogAssignment{
+		owned.name:     owned,
+		unrelated.name: unrelated,
+	}
+
+	disp := &stubDispatcher{fail: true, failedAssignment: owned}
+	clear := func(_ string, assignment *feedDogAssignment) {
+		if assignment == nil {
+			t.Fatal("expected failed sling assignment")
+		}
+		delete(workingFeedDogs, assignment.name)
+	}
+
+	withStubs(disp.dispatch, clear, feedableConvoy("hq-cv-fail-owned"), func() {
+		result := FeedStranded(tmpDir, 3, time.Minute, 0, 0)
+		if result.Errors != 1 {
+			t.Errorf("Errors = %d, want 1", result.Errors)
+		}
+	})
+
+	if _, ok := workingFeedDogs[owned.name]; ok {
+		t.Fatalf("owned failed feed dog %q was not cleared", owned.name)
+	}
+	if _, ok := workingFeedDogs[unrelated.name]; !ok {
+		t.Fatalf("unrelated feed dog %q was cleared", unrelated.name)
+	}
+}
+
 // TestFeedStranded_FailureBackoffSkipsRetry verifies that a convoy with a
 // recent failure is skipped (not redispatched) until the backoff window
 // expires. Regression for the infinite-loop half of hq-ozt3s.
@@ -402,7 +442,7 @@ func TestFeedStranded_FailureBackoffSkipsRetry(t *testing.T) {
 	}
 
 	disp := &stubDispatcher{fail: true}
-	withStubs(disp.dispatch, func(string, string) {}, feedableConvoy("hq-cv-fail2"), func() {
+	withStubs(disp.dispatch, func(string, *feedDogAssignment) {}, feedableConvoy("hq-cv-fail2"), func() {
 		result := FeedStranded(tmpDir, 3, time.Minute, time.Hour, 5)
 		if result.Fed != 0 || result.Errors != 0 {
 			t.Errorf("Fed=%d Errors=%d, want 0/0 (backoff should skip dispatch)", result.Fed, result.Errors)
@@ -431,7 +471,7 @@ func TestFeedStranded_ParksAfterMaxFailures(t *testing.T) {
 
 	disp := &stubDispatcher{}
 	clearCalls := 0
-	withStubs(disp.dispatch, func(string, string) { clearCalls++ }, feedableConvoy("hq-cv-fail3"), func() {
+	withStubs(disp.dispatch, func(string, *feedDogAssignment) { clearCalls++ }, feedableConvoy("hq-cv-fail3"), func() {
 		result := FeedStranded(tmpDir, 3, time.Minute, time.Minute, 3)
 		if result.Fed != 0 {
 			t.Errorf("Fed = %d, want 0 (parked convoy not dispatched)", result.Fed)
@@ -472,7 +512,7 @@ func TestFeedStranded_SuccessResetsFailures(t *testing.T) {
 	}
 
 	disp := &stubDispatcher{} // succeeds
-	withStubs(disp.dispatch, func(string, string) {}, feedableConvoy("hq-cv-fail4"), func() {
+	withStubs(disp.dispatch, func(string, *feedDogAssignment) {}, feedableConvoy("hq-cv-fail4"), func() {
 		result := FeedStranded(tmpDir, 3, time.Minute, time.Minute, 3)
 		if result.Fed != 1 {
 			t.Errorf("Fed = %d, want 1", result.Fed)
