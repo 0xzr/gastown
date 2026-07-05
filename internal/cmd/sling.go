@@ -1006,7 +1006,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	}
 	defer assigneeUnlock()
 	hookDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
-	if err := hookBeadWithRetryFn(beadID, targetAgent, hookDir); err != nil {
+	if err := hookBeadWithRetryWithTownRootFn(beadID, targetAgent, hookDir, townRoot); err != nil {
 		rollbackSpawnedPolecat("Hook failed")
 		return err
 	}

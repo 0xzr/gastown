@@ -923,3 +923,42 @@ exit /b 0
 		t.Fatalf("error message should mention parse failure and fallback: %v", err)
 	}
 }
+
+func TestBondFormulaDirectReportsStderrAndCWD(t *testing.T) {
+	townRoot := t.TempDir()
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+
+	bdScript := `#!/bin/sh
+echo "direct bond exploded" >&2
+exit 1
+`
+	bdScriptWindows := `@echo off
+echo direct bond exploded 1>&2
+exit /b 1
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	workDir := filepath.Join(townRoot, "polybot")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatalf("mkdir workDir: %v", err)
+	}
+
+	_, err := bondFormulaDirect("mol-polecat-work", "polybot-riskm", workDir, townRoot, []string{"feature=test", "issue=polybot-riskm"})
+	if err == nil {
+		t.Fatal("bondFormulaDirect error = nil, want failure")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "direct bond exploded") {
+		t.Fatalf("error missing stderr: %v", err)
+	}
+	if !strings.Contains(msg, "cwd: "+workDir) {
+		t.Fatalf("error missing cwd: %v", err)
+	}
+	if !strings.Contains(msg, "mol bond mol-polecat-work polybot-riskm") {
+		t.Fatalf("error missing bond args: %v", err)
+	}
+}

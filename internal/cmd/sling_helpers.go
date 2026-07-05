@@ -1068,13 +1068,15 @@ func bondFormulaDirect(formulaName, beadID, formulaWorkDir, townRoot string, var
 	for _, variable := range vars {
 		bondArgs = append(bondArgs, "--var", variable)
 	}
+	var stderr strings.Builder
 	bondOut, err := BdCmd(bondArgs...).
 		Dir(formulaWorkDir).
 		WithAutoCommit().
 		WithGTRoot(townRoot).
+		Stderr(&stderr).
 		Output()
 	if err != nil {
-		return "", fmt.Errorf("%w (args: %s)", err, strings.Join(bondArgs, " "))
+		return "", fmt.Errorf("%w (args: %s, cwd: %s, stderr: %s)", err, strings.Join(bondArgs, " "), formulaWorkDir, strings.TrimSpace(stderr.String()))
 	}
 
 	rootID := parseBondSpawnRootID(bondOut, formulaName, beadID, "")
