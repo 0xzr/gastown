@@ -104,7 +104,7 @@ directory.
 - For direct-mode merges to the resolved default target, local tests or polecat pre-verification are not enough.
 - After the local merge creates the exact candidate tree and before any push, run `/home/ubuntu/gastown-spike/dropin/refinery-gate.sh` against the merged worktree.
 - Pass the model that wrote the source bead as `--writer`; recover it from `assigned_agent:` in the MR's `agent_bead`, then from `$GT_TOWN_ROOT/.runtime/model-assignments/<source-issue>.json`. If still unknown, pass `unknown`, which requires all four core reviewers.
-- The durable gate can legitimately outlive a Claude/Codex Bash tool call. Do not rely on the tool timeout. Start the gate detached with `nohup`, write `GATE_EXIT=<rc>` to a log, and use later short Bash calls to poll the process/log/attestation until the gate finishes. Never wrap the gate in `timeout`, `head`, `tail`, or a pipeline that can mask or kill `refinery-gate.sh` before it writes `gate_complete`.
+- The durable gate can legitimately outlive a Claude/Codex Bash tool call. Do not rely on the tool timeout. Start the gate detached with `setsid nohup` (hq-616v9: `nohup` alone leaves the gate in the tool call's process group, and the agent harness kills that whole group when the call returns — every gate died with an empty log and no attestation), write `GATE_EXIT=<rc>` to a log, and use later short Bash calls to poll the process/log/attestation until the gate finishes. Never wrap the gate in `timeout`, `head`, `tail`, or a pipeline that can mask or kill `refinery-gate.sh` before it writes `gate_complete`.
 - Do not push unless the gate exits 0 and `/home/ubuntu/.gt-gate-attestations/<tree>` verifies against `/home/ubuntu/.gt-gate-hmac-key` for `git rev-parse HEAD^{tree}` and that writer.
 - If the gate fails, inspect its JSON/telemetry/logs before classifying it. Reviewer/tooling unavailability is deferred review, not a code rejection.
 
@@ -281,7 +281,7 @@ GT_RIG="{{ .RigName }}" \
 GT_GATE_ATTEST_DIR="/home/ubuntu/.gt-gate-attestations" \
 GT_GATE_HMAC_KEY="/home/ubuntu/.gt-gate-hmac-key" \
 GT_REFINERY_RUN_ALL_GATES_FALLBACK="/home/ubuntu/gt-town/{{ .RigName }}/mayor/rig/scripts/run-all-gates.sh" \
-  nohup bash -c '
+  setsid nohup bash -c '
     /home/ubuntu/gastown-spike/dropin/refinery-gate.sh --worktree "$1" --writer "$2" --timeout 1800
     rc=$?
     printf "GATE_EXIT=%s\n" "$rc"
