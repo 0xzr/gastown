@@ -3023,6 +3023,85 @@ exit /b 0
 	}
 }
 
+func TestHookBeadWithRetryFallsBackToTownRouting(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir town .beads: %v", err)
+	}
+	hookDir := filepath.Join(townRoot, "polybot")
+	if err := os.MkdirAll(filepath.Join(hookDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir hook .beads: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	logPath := filepath.Join(townRoot, "bd.log")
+	bdScript := `#!/bin/sh
+echo "CMD:$* PWD:$(pwd) BEADS_DIR:${BEADS_DIR:-}" >> "${BD_LOG}"
+cmd="$1"
+shift || true
+case "$cmd" in
+  update)
+    case "${BEADS_DIR:-}" in
+      *"/polybot/.beads")
+        echo "no issues found matching the provided IDs" >&2
+        exit 1
+        ;;
+    esac
+    exit 0
+    ;;
+  show)
+    echo '[{"title":"Test issue","status":"hooked","assignee":"polybot/polecats/nitro","description":""}]'
+    exit 0
+    ;;
+esac
+exit 0
+`
+	bdScriptWindows := `@echo off
+setlocal enableextensions
+echo CMD:%* PWD:%CD% BEADS_DIR:%BEADS_DIR%>>"%BD_LOG%"
+set "cmd=%1"
+if "%cmd%"=="update" (
+  echo %BEADS_DIR% | findstr /C:"\polybot\.beads" >nul
+  if %ERRORLEVEL%==0 (
+    echo no issues found matching the provided IDs 1>&2
+    exit /b 1
+  )
+  exit /b 0
+)
+if "%cmd%"=="show" (
+  echo [{^"title^":^"Test issue^",^"status^":^"hooked^",^"assignee^":^"polybot/polecats/nitro^",^"description^":^"^"}]
+  exit /b 0
+)
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+
+	t.Setenv("BD_LOG", logPath)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := hookBeadWithRetryWithTownRoot("polybot-pseud", "polybot/polecats/nitro", hookDir, townRoot); err != nil {
+		t.Fatalf("hookBeadWithRetryWithTownRoot: %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd log: %v", err)
+	}
+	logText := string(logBytes)
+	if !strings.Contains(logText, "update polybot-pseud --status=hooked --assignee=polybot/polecats/nitro") {
+		t.Fatalf("missing hook update in log:\n%s", logText)
+	}
+	if !strings.Contains(logText, "BEADS_DIR:"+filepath.Join(hookDir, ".beads")) {
+		t.Fatalf("first update should use pinned hook dir:\n%s", logText)
+	}
+	if !strings.Contains(logText, "PWD:"+townRoot+" BEADS_DIR:") {
+		t.Fatalf("fallback update should use town routing without BEADS_DIR:\n%s", logText)
+	}
+}
+
 func TestBuildSlingFieldUpdatesIncludesConvoyFields(t *testing.T) {
 	got := buildSlingFieldUpdates(
 		"mayor",

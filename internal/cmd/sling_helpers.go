@@ -1262,14 +1262,12 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 
 	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		out, err := BdCmd("update", beadID, "--status=hooked", "--assignee="+targetAgent).
-			Dir(hookDir).
-			WithAutoCommit().
-			CombinedOutput()
+		out, hookUpdateDir, hookUpdateRouted, err := updateHookedBead(beadID, targetAgent, hookDir, townRoot)
 		if err != nil {
 			if len(out) > 0 {
 				err = fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 			}
+			err = fmt.Errorf("%w (cwd=%s routed=%t)", err, hookUpdateDir, hookUpdateRouted)
 			lastErr = err
 			// Fail fast on config/init errors — retrying won't help (gt-2ra)
 			if isSlingConfigError(err) {
@@ -1301,8 +1299,8 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 		}
 
 		if verifyInfo.Status != "hooked" || verifyInfo.Assignee != targetAgent {
-			lastErr = fmt.Errorf("hook did not stick: status=%s, assignee=%s (expected hooked, %s)",
-				verifyInfo.Status, verifyInfo.Assignee, targetAgent)
+			lastErr = fmt.Errorf("hook did not stick: status=%s, assignee=%s (expected hooked, %s; update cwd=%s routed=%t)",
+				verifyInfo.Status, verifyInfo.Assignee, targetAgent, hookUpdateDir, hookUpdateRouted)
 			if attempt < maxRetries {
 				backoff := slingBackoff(attempt, baseBackoff, maxBackoff)
 				fmt.Printf("%s %v, retrying in %v...\n", style.Warning.Render("⚠"), lastErr, backoff)
@@ -1316,6 +1314,39 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 	}
 
 	return nil
+}
+
+func updateHookedBead(beadID, targetAgent, hookDir, townRoot string) ([]byte, string, bool, error) {
+	args := []string{"update", beadID, "--status=hooked", "--assignee=" + targetAgent}
+	out, err := BdCmd(args...).
+		Dir(hookDir).
+		WithAutoCommit().
+		CombinedOutput()
+	if err == nil || townRoot == "" {
+		return out, hookDir, false, err
+	}
+
+	routedOut, routedErr := BdCmd(args...).
+		Dir(townRoot).
+		WithRouting().
+		WithAutoCommit().
+		CombinedOutput()
+	if routedErr == nil {
+		return routedOut, townRoot, true, nil
+	}
+
+	combined := strings.TrimSpace(string(out))
+	routedCombined := strings.TrimSpace(string(routedOut))
+	if routedCombined != "" {
+		if combined != "" {
+			combined += "; "
+		}
+		combined += "routed retry: " + routedCombined
+	}
+	if combined != "" {
+		routedErr = fmt.Errorf("%w: %s", routedErr, combined)
+	}
+	return routedOut, townRoot, true, fmt.Errorf("pinned update failed: %w; routed retry failed: %w", err, routedErr)
 }
 
 var hookBeadWithRetryFn = hookBeadWithRetry
