@@ -129,7 +129,10 @@ func TestAgentIssueListArgsUseLiveAgentLabel(t *testing.T) {
 	if !slices.Contains(args, "--label=gt:agent") {
 		t.Fatalf("agentIssueListArgs() = %v, want --label=gt:agent", args)
 	}
-	for _, forbidden := range []string{"--type=agent", "--include-infra"} {
+	if !slices.Contains(args, "--include-infra") {
+		t.Fatalf("agentIssueListArgs() = %v, want --include-infra so issue_type=agent role beads are visible", args)
+	}
+	for _, forbidden := range []string{"--type=agent"} {
 		if slices.Contains(args, forbidden) {
 			t.Fatalf("agentIssueListArgs() = %v, must not include %s", args, forbidden)
 		}

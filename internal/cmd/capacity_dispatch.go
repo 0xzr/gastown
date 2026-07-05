@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -333,10 +334,30 @@ func beadsForContextRecord(rec slingContextRecord) *beads.Beads {
 	return beads.NewWithBeadsDir(rec.workDir, rec.beadsDir)
 }
 
+func newRigUnavailableChecker(townRoot string) func(string) (bool, string) {
+	type cachedState struct {
+		blocked bool
+		reason  string
+	}
+	cache := make(map[string]cachedState)
+	return func(rigName string) (bool, string) {
+		if rigName == "" {
+			return false, ""
+		}
+		if cached, ok := cache[rigName]; ok {
+			return cached.blocked, cached.reason
+		}
+		blocked, reason := IsRigParkedOrDocked(townRoot, rigName)
+		cache[rigName] = cachedState{blocked: blocked, reason: reason}
+		return blocked, reason
+	}
+}
+
 // cleanupStaleContexts closes invalid and stale sling context beads.
 // Called explicitly before the dispatch cycle to separate cleanup from querying.
 func cleanupStaleContexts(townRoot string) {
 	contexts := listAllSlingContextRecords(townRoot)
+	rigUnavailable := newRigUnavailableChecker(townRoot)
 
 	// First pass: close invalid and circuit-broken contexts, collect work bead IDs
 	// that need status checks for stale detection.
@@ -350,6 +371,10 @@ func cleanupStaleContexts(townRoot string) {
 		}
 		if fields.DispatchFailures >= maxDispatchFailures {
 			_ = beadsForContextRecord(ctx).CloseSlingContext(ctx.issue.ID, "circuit-broken")
+			continue
+		}
+		if blocked, reason := rigUnavailable(fields.TargetRig); blocked {
+			_ = beadsForContextRecord(ctx).CloseSlingContext(ctx.issue.ID, "target-rig-"+reason)
 			continue
 		}
 		staleCheckContexts = append(staleCheckContexts, ctx)
@@ -379,6 +404,10 @@ func cleanupStaleContexts(townRoot string) {
 		info, found := workBeadInfo[fields.WorkBeadID]
 		if found && (info.Status == "hooked" || info.Status == "closed" || info.Status == "tombstone") {
 			_ = beadsForContextRecord(ctx).CloseSlingContext(ctx.issue.ID, "stale-work-bead")
+			continue
+		}
+		if found && capacity.IsAgentBead(info.Labels) {
+			_ = beadsForContextRecord(ctx).CloseSlingContext(ctx.issue.ID, "agent-control-bead")
 		}
 	}
 }
@@ -485,6 +514,7 @@ func getReadySlingContexts(townRoot string) ([]capacity.PendingBead, error) {
 	// Sort by EnqueuedAt for deterministic deduplication: when concurrent
 	// scheduleBead calls create multiple contexts for the same work bead,
 	// the oldest context always wins.
+	rigUnavailable := newRigUnavailableChecker(townRoot)
 	sort.Slice(allContexts, func(i, j int) bool {
 		fi := beads.ParseSlingContextFields(allContexts[i].issue.Description)
 		fj := beads.ParseSlingContextFields(allContexts[j].issue.Description)
@@ -524,12 +554,23 @@ func getReadySlingContexts(townRoot string) ([]capacity.PendingBead, error) {
 		}
 		seenWork[fields.WorkBeadID] = true
 
+		if blocked, reason := rigUnavailable(fields.TargetRig); blocked {
+			fmt.Fprintf(os.Stderr, "%s dispatch_skip reason=target_rig_%s bead=%s target_rig=%s\n",
+				style.Dim.Render("○"), reason, fields.WorkBeadID, fields.TargetRig)
+			continue
+		}
+
 		// Defensive filter: messaging beads (gt:message / gt:handoff /
 		// gt:merge-request) must never reach a rig polecat. Log the skip so
 		// the gap is observable and operators can chase the upstream cause.
 		workLabels := info.Labels
 		if capacity.IsMessagingBead(workLabels) {
 			fmt.Fprintf(os.Stderr, "%s dispatch_skip reason=messaging_label bead=%s labels=%v\n",
+				style.Dim.Render("○"), fields.WorkBeadID, workLabels)
+			continue
+		}
+		if capacity.IsAgentBead(workLabels) {
+			fmt.Fprintf(os.Stderr, "%s dispatch_skip reason=agent_label bead=%s labels=%v\n",
 				style.Dim.Render("○"), fields.WorkBeadID, workLabels)
 			continue
 		}
@@ -708,6 +749,36 @@ func isDaemonDispatch() bool {
 	return os.Getenv("GT_DAEMON") == "1"
 }
 
+const dispatchFailureCloseReasonAgentStartup = "agent-startup-failed"
+
+func shouldCloseContextAfterDispatchFailure(b capacity.PendingBead, dispatchErr error) (bool, string) {
+	if dispatchErr == nil || b.Context == nil || strings.TrimSpace(b.Context.Agent) == "" {
+		return false, ""
+	}
+
+	msg := strings.ToLower(dispatchErr.Error())
+	for _, marker := range []string{
+		"startup failed",
+		"failed to start",
+		"start failed",
+		"failed to launch",
+		"launch failed",
+		"spawn failed",
+		"session start",
+		"unknown agent",
+		"agent not found",
+		"agent unavailable",
+		"model unavailable",
+		"exited before ready",
+		"exited immediately",
+	} {
+		if strings.Contains(msg, marker) {
+			return true, dispatchFailureCloseReasonAgentStartup
+		}
+	}
+	return false, ""
+}
+
 // recordDispatchFailure increments the dispatch failure counter on the sling context bead.
 func recordDispatchFailure(townBeads *beads.Beads, b capacity.PendingBead, dispatchErr error) {
 	if b.Context == nil {
@@ -716,6 +787,20 @@ func recordDispatchFailure(townBeads *beads.Beads, b capacity.PendingBead, dispa
 
 	b.Context.DispatchFailures++
 	b.Context.LastFailure = dispatchErr.Error()
+
+	if closeNow, reason := shouldCloseContextAfterDispatchFailure(b, dispatchErr); closeNow {
+		if err := townBeads.UpdateSlingContextFields(b.ID, b.Context); err != nil {
+			fmt.Printf("  %s Failed to record dispatch failure for %s: %v\n",
+				style.Warning.Render("⚠"), b.ID, err)
+		}
+		if err := townBeads.CloseSlingContext(b.ID, reason); err != nil {
+			fmt.Printf("  %s Failed to close stale explicit-agent context %s: %v\n",
+				style.Warning.Render("⚠"), b.ID, err)
+		}
+		fmt.Printf("  %s Context %s (work: %s, agent: %s) closed after startup failure; next scheduler/model-mix pass must create a fresh context\n",
+			style.Warning.Render("⚠"), b.ID, b.WorkBeadID, b.Context.Agent)
+		return
+	}
 
 	if err := townBeads.UpdateSlingContextFields(b.ID, b.Context); err != nil {
 		fmt.Printf("  %s Failed to record dispatch failure for %s: %v\n",

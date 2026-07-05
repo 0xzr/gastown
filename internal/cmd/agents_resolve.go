@@ -205,11 +205,10 @@ func listAgentIssues(db *beads.Beads) ([]*beads.Issue, error) {
 }
 
 func agentIssueListArgs() []string {
-	// Agent beads are currently task-typed durable issues with the gt:agent
-	// label; wisps are loaded separately below. Query by label so existing
-	// live agent beads are visible, and avoid --include-infra so this issue
-	// pass cannot collide with wisp rows that share an ID.
-	return []string{"list", "--label=gt:agent", "--status=all", "--json", "--flat", "--no-pager", "--limit=0"}
+	// Agent beads are durable gt:agent-labeled issues. Some historical rows
+	// were issue_type=agent and are hidden unless --include-infra is present.
+	// Wisps are loaded separately below; this pass is still label-scoped.
+	return []string{"list", "--label=gt:agent", "--include-infra", "--status=all", "--json", "--flat", "--no-pager", "--limit=0"}
 }
 
 func agentBeadMatches(issue *beads.Issue, role, rig string) bool {

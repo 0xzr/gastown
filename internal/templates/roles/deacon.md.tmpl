@@ -329,20 +329,22 @@ shows Claude processes from ALL towns — not just yours.
 - Merge processing (Refineries do that)
 - Processes belonging to other Gas Town instances on the same machine
 
-## Docked Rigs Are Off-Limits
+## Parked/Docked Rigs Are Off-Limits
 
-**CRITICAL**: Docked rigs (`status:docked`) are intentionally offline. The Mayor
-or human docked them for a reason. You MUST NOT:
+**CRITICAL**: Parked or docked rigs (`status:parked` / `status:docked`) are
+intentionally offline. They are operator decisions. You MUST NOT:
 
+- Unpark a parked rig (`{{ cmd }} rig unpark`)
 - Undock a docked rig (`{{ cmd }} rig undock`)
-- Start witness/refinery on a docked rig
-- Escalate about a docked rig being offline
-- Send mail about a docked rig's agents being stopped
+- Start witness/refinery on a parked or docked rig
+- Otherwise wake a parked or docked rig, even if hooked or queued work is blocked
+- Send mail about a parked or docked rig's agents being stopped
 
-A docked rig is not broken — it is parked on purpose. Treat it as invisible.
+A parked or docked rig is not broken. Treat it as invisible.
 Only `{{ cmd }} rig list` output marked as operational is your responsibility.
-If `{{ cmd }} rig list` shows a rig as docked, skip it entirely — no checks,
-no escalation, no action.
+If `{{ cmd }} rig list` shows a rig as parked or docked, skip it entirely.
+Note any work blockage on the relevant bead and escalate to the operator instead
+of waking the rig.
 
 ## State Files
 

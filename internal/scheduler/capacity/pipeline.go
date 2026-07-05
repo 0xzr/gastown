@@ -49,6 +49,7 @@ const (
 	LabelMessage      = "gt:message"
 	LabelHandoff      = "gt:handoff"
 	LabelMergeRequest = "gt:merge-request"
+	LabelAgent        = "gt:agent"
 )
 
 // IsMessagingBead reports whether the bead is an inter-agent communication
@@ -59,6 +60,17 @@ func IsMessagingBead(labels []string) bool {
 	for _, l := range labels {
 		switch l {
 		case LabelMessage, LabelHandoff, LabelMergeRequest:
+			return true
+		}
+	}
+	return false
+}
+
+// IsAgentBead reports whether the bead represents GT runtime identity/state.
+// Agent beads are control-plane records, not polecat work.
+func IsAgentBead(labels []string) bool {
+	for _, l := range labels {
+		if l == LabelAgent {
 			return true
 		}
 	}

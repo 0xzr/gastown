@@ -2,9 +2,13 @@ package cmd
 
 import (
 	"fmt"
+	"os"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/refinery"
+	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -18,6 +22,19 @@ const RigStatusKey = "status"
 // RigStatusParked is the value indicating a rig is parked.
 const RigStatusParked = "parked"
 
+const (
+	RigParkedAtKey     = "parked_at"
+	RigParkedByKey     = "parked_by"
+	RigParkedReasonKey = "parked_reason"
+	RigParkedOperator  = "operator"
+	RigParkedLabel     = "status:parked"
+)
+
+var (
+	rigParkReason       string
+	rigUnparkAsOperator bool
+)
+
 var rigParkCmd = &cobra.Command{
 	Use:   "park <rig>...",
 	Short: "Park one or more rigs (stops agents, daemon won't auto-restart)",
@@ -26,7 +43,8 @@ var rigParkCmd = &cobra.Command{
 Parking a rig:
   - Stops the witness if running
   - Stops the refinery if running
-  - Sets status=parked in the wisp layer (local/ephemeral)
+  - Sets status=parked in the wisp layer with park ownership metadata
+  - Adds status:parked to the rig identity bead when beads is healthy
   - The daemon respects this status and won't auto-restart agents
 
 This is a Level 1 (local/ephemeral) operation:
@@ -47,9 +65,13 @@ var rigUnparkCmd = &cobra.Command{
 	Long: `Unpark rigs to resume normal operation.
 
 Unparking a rig:
-  - Removes the parked status from the wisp layer
+  - Removes parked status and park ownership metadata from the wisp layer
+  - Removes status:parked from the rig identity bead when beads is healthy
   - Allows the daemon to auto-restart agents
   - Does NOT automatically start agents (use 'gt rig start' for that)
+
+Agent sessions may not unpark operator-owned parks. Use --operator only when a
+human is intentionally running this command from inside an agent-context shell.
 
 Examples:
   gt rig unpark gastown
@@ -59,6 +81,9 @@ Examples:
 }
 
 func init() {
+	rigParkCmd.Flags().StringVar(&rigParkReason, "reason", "", "Optional reason recorded with the parked state")
+	rigUnparkCmd.Flags().BoolVar(&rigUnparkAsOperator, "operator", false, "Human-only override for unparking an operator-owned park from an agent-context shell")
+
 	rigCmd.AddCommand(rigParkCmd)
 	rigCmd.AddCommand(rigUnparkCmd)
 }
@@ -67,7 +92,7 @@ func runRigPark(cmd *cobra.Command, args []string) error {
 	var errs []error
 
 	for _, rigName := range args {
-		if err := parkOneRig(rigName); err != nil {
+		if err := parkOneRig(rigName, rigParkReason); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", rigName, err))
 		}
 	}
@@ -82,7 +107,7 @@ func runRigPark(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func parkOneRig(rigName string) error {
+func parkOneRig(rigName, reason string) error {
 	// Get rig and town root
 	townRoot, r, err := getRig(rigName)
 	if err != nil {
@@ -123,17 +148,39 @@ func parkOneRig(rigName string) error {
 
 	// Set parked status in wisp layer
 	wispCfg := wisp.NewConfig(townRoot, rigName)
-	if err := wispCfg.Set(RigStatusKey, RigStatusParked); err != nil {
-		return fmt.Errorf("setting parked status: %w", err)
+	parkedAt := time.Now().UTC().Format(time.RFC3339)
+	if err := setParkedWispState(wispCfg, parkedAt, parkOwnerFromEnv(), reason); err != nil {
+		return err
+	}
+
+	if err := addPersistentParkedLabel(r); err != nil {
+		fmt.Printf("  %s WARNING: could not persist parked label %s: %v\n",
+			style.Warning.Render("!"), RigParkedLabel, err)
 	}
 
 	// Output
-	fmt.Printf("%s Rig %s parked (local only)\n", style.Success.Render("✓"), rigName)
+	fmt.Printf("%s Rig %s parked\n", style.Success.Render("✓"), rigName)
 	for _, msg := range stoppedAgents {
 		fmt.Printf("  %s\n", msg)
 	}
 	fmt.Printf("  Daemon will not auto-restart\n")
 
+	return nil
+}
+
+func setParkedWispState(wispCfg *wisp.Config, parkedAt, parkedBy, reason string) error {
+	if err := wispCfg.Set(RigStatusKey, RigStatusParked); err != nil {
+		return fmt.Errorf("setting parked status: %w", err)
+	}
+	if err := wispCfg.Set(RigParkedAtKey, parkedAt); err != nil {
+		return fmt.Errorf("setting parked_at: %w", err)
+	}
+	if err := wispCfg.Set(RigParkedByKey, parkedBy); err != nil {
+		return fmt.Errorf("setting parked_by: %w", err)
+	}
+	if err := wispCfg.Set(RigParkedReasonKey, reason); err != nil {
+		return fmt.Errorf("setting parked_reason: %w", err)
+	}
 	return nil
 }
 
@@ -158,15 +205,25 @@ func runRigUnpark(cmd *cobra.Command, args []string) error {
 
 func unparkOneRig(rigName string) error {
 	// Get rig and town root
-	townRoot, _, err := getRig(rigName)
+	townRoot, r, err := getRig(rigName)
 	if err != nil {
 		return err
 	}
 
-	// Remove parked status from wisp layer
 	wispCfg := wisp.NewConfig(townRoot, rigName)
-	if err := wispCfg.Unset(RigStatusKey); err != nil {
-		return fmt.Errorf("clearing parked status: %w", err)
+	parkedBy := parkOwnerOrOperator(wispCfg.GetString(RigParkedByKey))
+	if shouldRefuseOperatorOwnedUnpark(os.Getenv("GT_ROLE"), parkedBy, rigUnparkAsOperator) {
+		return operatorOwnedParkRefusal(rigName, wispCfg.GetString(RigParkedAtKey), wispCfg.GetString(RigParkedReasonKey))
+	}
+
+	// Remove parked status from wisp layer
+	if err := clearParkedWispState(wispCfg); err != nil {
+		return err
+	}
+
+	if err := removePersistentParkedLabel(r); err != nil {
+		fmt.Printf("  %s WARNING: could not remove parked label %s: %v\n",
+			style.Warning.Render("!"), RigParkedLabel, err)
 	}
 
 	fmt.Printf("%s Rig %s unparked\n", style.Success.Render("✓"), rigName)
@@ -174,6 +231,98 @@ func unparkOneRig(rigName string) error {
 	fmt.Printf("  Use '%s' to start agents immediately\n", style.Dim.Render("gt rig start "+rigName))
 
 	return nil
+}
+
+func clearParkedWispState(wispCfg *wisp.Config) error {
+	for _, key := range []string{RigStatusKey, RigParkedAtKey, RigParkedByKey, RigParkedReasonKey} {
+		if err := wispCfg.Unset(key); err != nil {
+			return fmt.Errorf("clearing %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
+func parkOwnerFromEnv() string {
+	return parkOwnerOrOperator(os.Getenv("GT_ROLE"))
+}
+
+func parkOwnerOrOperator(owner string) string {
+	if owner == "" {
+		return RigParkedOperator
+	}
+	return owner
+}
+
+func shouldRefuseOperatorOwnedUnpark(callerRole, parkedBy string, operatorOverride bool) bool {
+	if operatorOverride {
+		return false
+	}
+	return callerRole != "" && parkOwnerOrOperator(parkedBy) == RigParkedOperator
+}
+
+func operatorOwnedParkRefusal(rigName, parkedAt, reason string) error {
+	msg := fmt.Sprintf("rig %s was parked by the operator", rigName)
+	if parkedAt != "" {
+		msg += " at " + parkedAt
+	}
+	if reason != "" {
+		msg += " (reason: " + reason + ")"
+	}
+	msg += "; leave a note on the relevant bead and escalate to the operator instead of unparking. The operator can unpark from a normal shell, or use 'gt rig unpark --operator " + rigName + "' when intentionally running from an agent-context shell"
+	return fmt.Errorf("%s", msg)
+}
+
+func addPersistentParkedLabel(r *rig.Rig) error {
+	bd, rigBeadID, err := rigIdentityBeadClient(r)
+	if err != nil {
+		return err
+	}
+
+	prefix := "gt"
+	if r.Config != nil && r.Config.Prefix != "" {
+		prefix = r.Config.Prefix
+	}
+	rigBead, err := bd.EnsureRigBead(r.Name, &beads.RigFields{
+		Repo:   r.GitURL,
+		Prefix: prefix,
+		State:  beads.RigStateActive,
+	})
+	if err != nil {
+		return err
+	}
+
+	if rigBead.ID != "" {
+		rigBeadID = rigBead.ID
+	}
+	return bd.Update(rigBeadID, beads.UpdateOptions{
+		AddLabels: []string{RigParkedLabel},
+	})
+}
+
+func removePersistentParkedLabel(r *rig.Rig) error {
+	bd, rigBeadID, err := rigIdentityBeadClient(r)
+	if err != nil {
+		return err
+	}
+	if _, err := bd.Show(rigBeadID); err != nil {
+		return err
+	}
+	return bd.Update(rigBeadID, beads.UpdateOptions{
+		RemoveLabels: []string{RigParkedLabel},
+	})
+}
+
+func rigIdentityBeadClient(r *rig.Rig) (*beads.Beads, string, error) {
+	if r == nil {
+		return nil, "", fmt.Errorf("nil rig")
+	}
+	prefix := "gt"
+	if r.Config != nil && r.Config.Prefix != "" {
+		prefix = r.Config.Prefix
+	}
+	beadsDir := beads.ResolveBeadsDir(r.Path)
+	bd := beads.NewWithBeadsDir(r.Path, beadsDir)
+	return bd, beads.RigBeadIDWithPrefix(prefix, r.Name), nil
 }
 
 // IsRigParked checks if a rig is parked.

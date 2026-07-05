@@ -254,6 +254,28 @@ func TestIsMessagingBead(t *testing.T) {
 	}
 }
 
+func TestIsAgentBead(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels []string
+		want   bool
+	}{
+		{"gt:agent alone", []string{"gt:agent"}, true},
+		{"gt:agent with state label", []string{"idle:2", "gt:agent"}, true},
+		{"message label is not agent", []string{"gt:message"}, false},
+		{"sling-context label is not agent", []string{"gt:sling-context"}, false},
+		{"empty slice", []string{}, false},
+		{"nil slice", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsAgentBead(tt.labels); got != tt.want {
+				t.Errorf("IsAgentBead(%v) = %v, want %v", tt.labels, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFilterMessagingBeads(t *testing.T) {
 	beads := []PendingBead{
 		{ID: "ctx-1", WorkBeadID: "gt-1", Labels: []string{"area/dog"}},

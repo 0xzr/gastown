@@ -390,6 +390,7 @@ func listScheduledBeads(townRoot string) []scheduledBeadInfo {
 	workBeadInfo := batchFetchBeadInfoByIDs(townRoot, workBeadIDs)
 
 	seenWork := make(map[string]bool)
+	rigUnavailable := newRigUnavailableChecker(townRoot)
 	var result []scheduledBeadInfo
 	for _, ctx := range allContexts {
 		fields := beads.ParseSlingContextFields(ctx.Description)
@@ -408,6 +409,10 @@ func listScheduledBeads(townRoot string) []scheduledBeadInfo {
 		}
 		seenWork[fields.WorkBeadID] = true
 
+		if blocked, _ := rigUnavailable(fields.TargetRig); blocked {
+			continue
+		}
+
 		// Get work bead info for title/status from batch-fetched map
 		title := ctx.Title
 		status := "open"
@@ -417,6 +422,9 @@ func listScheduledBeads(townRoot string) []scheduledBeadInfo {
 			status = info.Status
 			// Skip if work bead is hooked/closed
 			if status == "hooked" || status == "closed" || status == "tombstone" {
+				continue
+			}
+			if capacity.IsAgentBead(info.Labels) {
 				continue
 			}
 		}

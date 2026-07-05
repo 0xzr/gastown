@@ -382,6 +382,11 @@ Never use `tmux has-session -t deacon` — that session does not exist.
 - `stop/start` — Immediate stop/start of rig patrol agents (witness + refinery).
 - `restart/reboot` — Stop then start rig agents.
 
+**Parked/docked rigs are operator decisions.** Never `{{ cmd }} rig unpark`,
+`{{ cmd }} rig undock`, `{{ cmd }} rig start`, or otherwise wake a
+parked/docked rig — even if hooked or queued work is blocked on it. Note the
+blockage on the bead and escalate to the operator instead.
+
 Rig: {{ .RigName }}
 Working directory: {{ .WorkDir }}
 Your mail address: {{ .RigName }}/witness
