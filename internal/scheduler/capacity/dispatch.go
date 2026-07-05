@@ -23,6 +23,10 @@ func (e *ErrOnSuccessFailed) Unwrap() error { return e.Err }
 // resolves `gt-` prefixes (gt-el4 / gastownhall/gastown#3800).
 var ErrCrossRigPrefix = errors.New("cross-rig prefix dispatch refused")
 
+// ErrDispatchSkipped marks an intentional non-dispatch. It is not counted as
+// a failure and does not invoke OnFailure.
+var ErrDispatchSkipped = errors.New("dispatch skipped")
+
 // BeadIDPrefix returns the prefix of a bead ID — the substring before the
 // first '-'. Returns "" if the ID has no dash.
 //
@@ -120,6 +124,10 @@ func (c *DispatchCycle) Run() (DispatchReport, error) {
 	for i, b := range plan.ToDispatch {
 		if c.Validate != nil {
 			if err := c.Validate(b); err != nil {
+				if errors.Is(err, ErrDispatchSkipped) {
+					report.Skipped++
+					continue
+				}
 				report.Failed++
 				if c.OnFailure != nil {
 					c.OnFailure(b, err)
@@ -129,6 +137,10 @@ func (c *DispatchCycle) Run() (DispatchReport, error) {
 		}
 
 		if err := c.Execute(b); err != nil {
+			if errors.Is(err, ErrDispatchSkipped) {
+				report.Skipped++
+				continue
+			}
 			report.Failed++
 			if c.OnFailure != nil {
 				c.OnFailure(b, err)

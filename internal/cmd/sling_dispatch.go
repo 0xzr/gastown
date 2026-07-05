@@ -165,6 +165,11 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		return result, fmt.Errorf("bead %s is deferred (use --force to override)", params.BeadID)
 	}
 
+	if err := checkOpenMRDispatchGuard(townRoot, beadsDir, params.BeadID); err != nil {
+		result.ErrMsg = err.Error()
+		return result, err
+	}
+
 	if params.RigName != "" {
 		if err := verifyBeadExistsInTargetRigDatabase(params.BeadID, params.RigName, townRoot); err != nil {
 			result.ErrMsg = err.Error()
