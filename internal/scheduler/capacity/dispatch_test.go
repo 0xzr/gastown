@@ -366,6 +366,54 @@ func TestDispatchCycle_Run_ValidateRefusesCrossRigPrefix(t *testing.T) {
 	}
 }
 
+func TestDispatchCycle_Run_ValidateSkipDoesNotFail(t *testing.T) {
+	executed := []string{}
+	failureCalled := false
+
+	cycle := &DispatchCycle{
+		AvailableCapacity: func() (int, error) { return 100, nil },
+		QueryPending: func() ([]PendingBead, error) {
+			return []PendingBead{
+				{ID: "ctx-a", WorkBeadID: "gt-open"},
+				{ID: "ctx-b", WorkBeadID: "gt-ready"},
+			}, nil
+		},
+		Validate: func(b PendingBead) error {
+			if b.WorkBeadID == "gt-open" {
+				return ErrDispatchSkipped
+			}
+			return nil
+		},
+		Execute: func(b PendingBead) error {
+			executed = append(executed, b.WorkBeadID)
+			return nil
+		},
+		OnSuccess: func(b PendingBead) error { return nil },
+		OnFailure: func(b PendingBead, err error) { failureCalled = true },
+		BatchSize: 10,
+	}
+
+	report, err := cycle.Run()
+	if err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+	if report.Dispatched != 1 {
+		t.Errorf("Dispatched = %d, want 1", report.Dispatched)
+	}
+	if report.Failed != 0 {
+		t.Errorf("Failed = %d, want 0", report.Failed)
+	}
+	if report.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1", report.Skipped)
+	}
+	if failureCalled {
+		t.Fatal("OnFailure called for skipped dispatch")
+	}
+	if len(executed) != 1 || executed[0] != "gt-ready" {
+		t.Errorf("Execute should run only for gt-ready, got %v", executed)
+	}
+}
+
 func TestDispatchCycle_Run_SpawnDelay(t *testing.T) {
 	start := time.Now()
 	cycle := &DispatchCycle{

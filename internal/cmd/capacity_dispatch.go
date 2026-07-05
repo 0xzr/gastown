@@ -675,6 +675,21 @@ func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, esc
 		return capacity.ErrCrossRigPrefix
 	}
 
+	if err := checkOpenMRDispatchGuard(townRoot, filepath.Join(townRoot, ".beads"), b.WorkBeadID); err != nil {
+		if isSlingSkip(err) {
+			fmt.Fprintf(os.Stderr, "%s dispatch_skip reason=open_mr bead=%s target_rig=%s: %v\n",
+				style.Dim.Render("○"), b.WorkBeadID, b.TargetRig, err)
+			if escalate {
+				if closeErr := beadsForPendingContext(townRoot, b).CloseSlingContext(b.ID, "open-mr"); closeErr != nil {
+					fmt.Fprintf(os.Stderr, "%s Warning: could not close skipped context %s for %s: %v\n",
+						style.Dim.Render("⚠"), b.ID, b.WorkBeadID, closeErr)
+				}
+			}
+			return fmt.Errorf("%w: %v", capacity.ErrDispatchSkipped, err)
+		}
+		return err
+	}
+
 	// Model-mix caps guard (gastown-cet.16.2). When caps are active and the
 	// scheduler is configured to require explicit agent assignment, refuse to
 	// dispatch queued beads that lack a durable model assignment. Native

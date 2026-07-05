@@ -421,6 +421,10 @@ exit /b 0
 			assertTargetRig("metadata update", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
 		case strings.Contains(args, "update "+newBeadID) && strings.Contains(args, "--description="):
 			assertTargetRig("description update", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
+		case strings.Contains(args, "list --json --status=open --label=gt:merge-request"):
+			assertTargetRig("merge-request list", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
+		case strings.Contains(args, "sql --json") && strings.Contains(args, "gt:merge-request"):
+			assertTargetRig("merge-request sql", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
 		case args == "--version" || strings.HasPrefix(args, "version") || strings.Contains(args, " version") || strings.HasPrefix(args, "formula ") || strings.Contains(args, "show gt-rig-") || strings.Contains(args, "show mol-"):
 			// Explicitly exempt non-target-bead lookups; every gt-new123 operation
 			// above must still prove it is pinned to the gastown database.

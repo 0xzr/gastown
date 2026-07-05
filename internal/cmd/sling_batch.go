@@ -114,6 +114,7 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		beadID  string
 		polecat string
 		success bool
+		skipped bool
 		errMsg  string
 	}
 	results := make([]batchResult, 0, len(beadIDs))
@@ -184,6 +185,11 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 			if result != nil {
 				polecatName = result.PolecatName
 			}
+			if isSlingSkip(err) {
+				results = append(results, batchResult{beadID: beadID, polecat: polecatName, skipped: true, errMsg: errMsg})
+				fmt.Printf("  %s %s\n", style.Dim.Render("○"), errMsg)
+				continue
+			}
 			results = append(results, batchResult{beadID: beadID, polecat: polecatName, success: false, errMsg: errMsg})
 			fmt.Printf("  %s %s\n", style.Dim.Render("✗"), errMsg)
 			continue
@@ -206,21 +212,28 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 
 	// Print summary
 	successCount := 0
+	skippedCount := 0
 	for _, r := range results {
 		if r.success {
 			successCount++
+		} else if r.skipped {
+			skippedCount++
 		}
 	}
 
-	fmt.Printf("\n%s Batch sling complete: %d/%d succeeded\n", style.Bold.Render("📊"), successCount, len(beadIDs))
-	if successCount < len(beadIDs) {
+	fmt.Printf("\n%s Batch sling complete: %d/%d succeeded", style.Bold.Render("📊"), successCount, len(beadIDs))
+	if skippedCount > 0 {
+		fmt.Printf(", %d skipped", skippedCount)
+	}
+	fmt.Println()
+	if successCount+skippedCount < len(beadIDs) {
 		for _, r := range results {
-			if !r.success {
+			if !r.success && !r.skipped {
 				fmt.Printf("  %s %s: %s\n", style.Dim.Render("✗"), r.beadID, r.errMsg)
 			}
 		}
 	}
-	if successCount == 0 && len(beadIDs) > 0 {
+	if successCount == 0 && len(beadIDs) > skippedCount {
 		return fmt.Errorf("batch sling failed: 0/%d succeeded", len(beadIDs))
 	}
 

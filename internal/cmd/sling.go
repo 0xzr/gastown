@@ -634,6 +634,14 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		return fmt.Errorf("refusing to sling deferred bead %s: %q\nDeferred work should not consume polecat slots. Use --force to override", beadID, info.Title)
 	}
 
+	if err := checkOpenMRDispatchGuard(townRoot, townBeadsDir, beadID); err != nil {
+		if isSlingSkip(err) {
+			fmt.Println(err.Error())
+			return nil
+		}
+		return err
+	}
+
 	originalStatus := info.Status
 	originalAssignee := info.Assignee
 	force := slingForce // local copy to avoid mutating package-level flag
