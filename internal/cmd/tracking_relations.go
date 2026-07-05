@@ -70,7 +70,7 @@ func fallbackTrackingRelation(townRoot, trackerID, issueID string, add bool, sto
 		args = []string{"dep", "remove", trackerID, issueID, "--type=tracks"}
 	}
 
-	if out, err := BdCmd(args...).Dir(townRoot).WithAutoCommit().StripBeadsDir().CombinedOutput(); err != nil {
+	if out, err := BdCmd(args...).Dir(townRoot).WithAutoCommit().WithRouting().CombinedOutput(); err != nil {
 		output := strings.TrimSpace(string(out))
 		if output == "" {
 			return fmt.Errorf("tracking relation via store failed: %w; fallback bd path failed: %w", storeErr, err)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -455,6 +456,41 @@ func batchFetchBeadInfoByIDs(townRoot string, ids []string) map[string]beadStatu
 					Labels: item.Labels,
 				}
 			}
+		}
+	}
+
+	// Some routed source beads are visible from the town root but not from the
+	// database selected by their prefix when BEADS_DIR is pinned. Retry only the
+	// misses through bd's town-root routing path so deferred scheduling matches
+	// direct sling validation without reintroducing full-db scans.
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, found := result[id]; found {
+			continue
+		}
+		out, err := bdShowBeadRoutedCmdFromTownRoot(townRoot, id).Stderr(io.Discard).Output()
+		if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+			continue
+		}
+		var items []struct {
+			ID     string   `json:"id"`
+			Status string   `json:"status"`
+			Title  string   `json:"title"`
+			Labels []string `json:"labels"`
+		}
+		if err := json.Unmarshal(out, &items); err != nil || len(items) == 0 {
+			continue
+		}
+		item := items[0]
+		if item.ID == "" {
+			item.ID = id
+		}
+		result[item.ID] = beadStatusInfo{
+			Status: item.Status,
+			Title:  item.Title,
+			Labels: item.Labels,
 		}
 	}
 	return result
