@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -119,6 +121,31 @@ func TestHookRejectsNonBeadArg(t *testing.T) {
 				t.Errorf("runHook(%q) error = %q, want it to point at --help", arg, err.Error())
 			}
 		})
+	}
+}
+
+func TestHookAlreadyAppliedRecognizesDesiredState(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
+		t.Fatalf("mkdir town beads: %v", err)
+	}
+
+	binDir := t.TempDir()
+	script := `#!/usr/bin/env sh
+if [ "$1" = "show" ]; then
+  printf '[{"id":"polybot-termn","status":"hooked","assignee":"polybot/polecats/guzzle","title":"ready","description":""}]'
+  exit 0
+fi
+exit 1
+`
+	writeBDStub(t, binDir, script, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if !hookAlreadyApplied(townRoot, "polybot-termn", "polybot/polecats/guzzle") {
+		t.Fatal("expected matching hooked bead to count as already applied")
+	}
+	if hookAlreadyApplied(townRoot, "polybot-termn", "polybot/polecats/nitro") {
+		t.Fatal("wrong assignee should not count as already applied")
 	}
 }
 

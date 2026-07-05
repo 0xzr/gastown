@@ -37,6 +37,9 @@ func TestFallbackTrackingRelationUsesTownRouting(t *testing.T) {
 	if err := os.MkdirAll(townBeads, 0o755); err != nil {
 		t.Fatalf("mkdir town beads: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(townBeads, "routes.jsonl"), []byte(`{"prefix":"polybot-","path":"polybot"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
 
 	binDir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "bd.log")
@@ -57,7 +60,7 @@ exit 0
 	}
 
 	log := readTestFile(t, logPath)
-	if !strings.Contains(log, "BEADS_DIR= ARGS=dep add hq-wisp-ctx polybot-optiv --type=tracks") {
+	if !strings.Contains(log, "BEADS_DIR= ARGS=dep add hq-wisp-ctx external:polybot:polybot-optiv --type=tracks") {
 		t.Fatalf("fallback did not route through town root without BEADS_DIR; log:\n%s", log)
 	}
 }

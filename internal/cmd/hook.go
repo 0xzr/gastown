@@ -387,11 +387,11 @@ func runHook(_ *cobra.Command, args []string) error {
 	const hookBackoffMax = 10 * time.Second
 	var lastHookErr error
 	for attempt := 1; attempt <= hookMaxRetries; attempt++ {
-		if err := BdCmd("update", beadID, "--status=hooked", "--assignee="+agentID).
-			Dir(resolveBeadDir(beadID)).
-			StripBeadsDir().
-			WithAutoCommit().
-			Run(); err != nil {
+		_, _, _, err := updateHookedBead(beadID, agentID, resolveBeadDir(beadID), townRoot)
+		if err != nil {
+			if hookAlreadyApplied(townRoot, beadID, agentID) {
+				break
+			}
 			lastHookErr = err
 			if attempt < hookMaxRetries {
 				backoff := slingBackoff(attempt, hookBaseBackoff, hookBackoffMax)
@@ -441,6 +441,11 @@ func runHook(_ *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func hookAlreadyApplied(townRoot, beadID, agentID string) bool {
+	info, err := getBeadInfoFromTownRoot(townRoot, beadID)
+	return err == nil && info.Status == "hooked" && info.Assignee == agentID
 }
 
 // checkPinnedBeadComplete checks if a pinned bead's attached molecule is 100% complete.
