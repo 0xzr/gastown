@@ -17,7 +17,7 @@ func TestValidateAcceptsGitDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := Validate(root, IntegrityOptions{Require: true}); err != nil {
+	if err := Validate(root, IntegrityOptions{TownRoot: root, Require: true}); err != nil {
 		t.Fatalf("Validate() error = %v, want nil", err)
 	}
 }
@@ -28,7 +28,7 @@ func TestValidateRejectsPartialGitDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := Validate(root, IntegrityOptions{Require: true})
+	err := Validate(root, IntegrityOptions{TownRoot: root, Require: true})
 	if !errors.Is(err, ErrIntegrityViolation) {
 		t.Fatalf("Validate() error = %v, want ErrIntegrityViolation", err)
 	}
@@ -39,7 +39,7 @@ func TestValidateAcceptsLinkedWorktreeGitfile(t *testing.T) {
 	gitdir := filepath.Join(root, "repo.git", "worktrees", "alpha")
 	writeLinkedWorktree(t, root, gitdir, true)
 
-	if err := Validate(filepath.Join(root, "nested"), IntegrityOptions{Require: true}); err != nil {
+	if err := Validate(filepath.Join(root, "nested"), IntegrityOptions{TownRoot: root, Require: true}); err != nil {
 		t.Fatalf("Validate() error = %v, want nil", err)
 	}
 }
@@ -47,16 +47,23 @@ func TestValidateAcceptsLinkedWorktreeGitfile(t *testing.T) {
 func TestValidateRejectsMissingRequiredMetadata(t *testing.T) {
 	root := t.TempDir()
 
-	err := Validate(root, IntegrityOptions{Require: true})
+	err := Validate(root, IntegrityOptions{TownRoot: root, Require: true})
 	if !errors.Is(err, ErrIntegrityViolation) {
 		t.Fatalf("Validate() error = %v, want ErrIntegrityViolation", err)
 	}
 }
 
 func TestValidateAllowsMissingOptionalMetadata(t *testing.T) {
-	root := t.TempDir()
+	parent := t.TempDir()
+	if err := os.Mkdir(filepath.Join(parent, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(parent, "town")
+	if err := os.Mkdir(root, 0755); err != nil {
+		t.Fatal(err)
+	}
 
-	if err := Validate(root, IntegrityOptions{}); err != nil {
+	if err := Validate(root, IntegrityOptions{TownRoot: root}); err != nil {
 		t.Fatalf("Validate() error = %v, want nil", err)
 	}
 }
@@ -67,7 +74,7 @@ func TestValidateRejectsMalformedGitfile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := Validate(root, IntegrityOptions{Require: true})
+	err := Validate(root, IntegrityOptions{TownRoot: root, Require: true})
 	if !errors.Is(err, ErrIntegrityViolation) {
 		t.Fatalf("Validate() error = %v, want ErrIntegrityViolation", err)
 	}
@@ -80,7 +87,7 @@ func TestValidateRejectsMissingGitdirTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := Validate(root, IntegrityOptions{Require: true})
+	err := Validate(root, IntegrityOptions{TownRoot: root, Require: true})
 	if !errors.Is(err, ErrIntegrityViolation) {
 		t.Fatalf("Validate() error = %v, want ErrIntegrityViolation", err)
 	}
@@ -91,7 +98,7 @@ func TestValidateRejectsPartialGitdirMetadata(t *testing.T) {
 	gitdir := filepath.Join(root, "repo.git", "worktrees", "alpha")
 	writeLinkedWorktree(t, root, gitdir, false)
 
-	err := Validate(root, IntegrityOptions{Require: true})
+	err := Validate(root, IntegrityOptions{TownRoot: root, Require: true})
 	if !errors.Is(err, ErrIntegrityViolation) {
 		t.Fatalf("Validate() error = %v, want ErrIntegrityViolation", err)
 	}
