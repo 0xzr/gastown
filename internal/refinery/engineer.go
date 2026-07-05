@@ -2506,6 +2506,12 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 		"GT_REVIEW_GATE_BRANCH="+branch,
 		"GT_REVIEW_GATE_TARGET="+target,
 		"GT_REVIEW_GATE_WRITER="+attestationWriter,
+		// The runner supervises via SetProcessGroup + kill(-pid) on
+		// timeout/cancel. refinery-gate.sh setsid-re-execs itself when it
+		// thinks the agent recipe launched it (hq-616v9), which would escape
+		// this process group and orphan the gate past our deadline.
+		// GT_GATE_DETACHED tells the script it is already supervised.
+		"GT_GATE_DETACHED=1",
 		"GT_REVIEW_GATE_RIG="+e.durableReviewRigIdentity(),
 		"GT_REVIEW_GATE_REPO="+e.durableReviewRepoIdentity(),
 		"GT_RIG="+e.durableReviewRigIdentity(),

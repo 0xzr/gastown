@@ -253,7 +253,8 @@ git merge --ff-only temp
 # exact merged tree before pushing. Use the source polecat's writer model, not
 # the refinery model; use unknown only if the writer cannot be recovered.
 # If invoking this from an agent Bash tool, do not hold a single tool call open
-# for the whole gate. Start it detached with nohup, return from the tool, then
+# for the whole gate. Start it detached with setsid nohup (a new session — the
+# harness kills the tool call's process group on return), return from the tool, then
 # run exactly the poll/verify/push block below in short follow-up Bash calls.
 # Do not pipe through tail/head or wrap the gate in timeout.
 MERGE_TREE=$(git rev-parse 'HEAD^{tree}')
