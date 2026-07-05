@@ -44,8 +44,7 @@
       "enabled": true,
       "interval": "5m",
       "rigs": [
-        "gastown",
-        "polybot"
+        "gastown"
       ]
     },
     "scheduled_maintenance": {
