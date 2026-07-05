@@ -73,6 +73,238 @@ func durableReviewRepoKey(repoIdentity string) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
+const (
+	durableReviewRunnerStartEvent    = "durable_gate_runner_start"
+	durableReviewRunnerTerminalEvent = "durable_gate_runner_terminal"
+	durableReviewRunnerExcerptLimit  = 500
+)
+
+type durableReviewRunnerRecord struct {
+	TS            string `json:"ts,omitempty"`
+	Event         string `json:"event"`
+	RunID         string `json:"run_id,omitempty"`
+	PID           int    `json:"pid,omitempty"`
+	Worktree      string `json:"worktree,omitempty"`
+	Rig           string `json:"rig,omitempty"`
+	Repo          string `json:"repo,omitempty"`
+	Branch        string `json:"branch,omitempty"`
+	Target        string `json:"target,omitempty"`
+	Writer        string `json:"writer,omitempty"`
+	Tree          string `json:"tree,omitempty"`
+	Status        string `json:"status,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	GateExit      string `json:"gate_exit,omitempty"`
+	ExitCode      *int   `json:"exit_code,omitempty"`
+	Signal        string `json:"signal,omitempty"`
+	TimedOut      bool   `json:"timed_out,omitempty"`
+	Terminal      bool   `json:"terminal,omitempty"`
+	StartedAt     string `json:"started_at,omitempty"`
+	DeadlineAt    string `json:"deadline_at,omitempty"`
+	DurationMS    int64  `json:"duration_ms,omitempty"`
+	Error         string `json:"error,omitempty"`
+	OutputExcerpt string `json:"output_excerpt,omitempty"`
+}
+
+func durableReviewRunnerRunID(tree string, now time.Time) string {
+	token := shortSHA(strings.TrimSpace(tree))
+	if token == "" {
+		token = "unknown"
+	}
+	return fmt.Sprintf("%s-%d-%d", durableReviewPathComponent(token), os.Getpid(), now.UnixNano())
+}
+
+func durableReviewIntPtr(v int) *int {
+	return &v
+}
+
+func durableReviewOutputExcerpt(output string) string {
+	output = strings.TrimSpace(output)
+	if len(output) <= durableReviewRunnerExcerptLimit {
+		return output
+	}
+	return output[:durableReviewRunnerExcerptLimit] + "..."
+}
+
+func durableReviewCommandFailureDetails(runErr error, ctxErr error) (reason string, exitCode *int, signalName string, timedOut bool, gateExit string) {
+	if runErr == nil {
+		return "command-exit-zero", nil, "", false, "0"
+	}
+	if errors.Is(ctxErr, context.DeadlineExceeded) {
+		return "timeout", nil, "", true, "timeout"
+	}
+	if errors.Is(ctxErr, context.Canceled) {
+		return "context-canceled", nil, "", false, "canceled"
+	}
+
+	var execErr *exec.Error
+	if errors.As(runErr, &execErr) {
+		return "startup-failure", nil, "", false, "startup-failure"
+	}
+
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		reason, exitCode, signalName, gateExit := durableReviewExitErrorDetails(exitErr)
+		return reason, exitCode, signalName, false, gateExit
+	}
+
+	return "exec-failure", nil, "", false, "unknown"
+}
+
+func (e *Engineer) durableReviewTelemetryDir() string {
+	if dir := strings.TrimSpace(os.Getenv("GT_REFINERY_TELEMETRY_DIR")); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		home = "."
+	}
+	return filepath.Join(home, "gt-town", ".runtime", "refinery-telemetry")
+}
+
+func (e *Engineer) durableReviewTelemetryFile(now time.Time) string {
+	return filepath.Join(e.durableReviewTelemetryDir(), "refinery-gate-"+now.UTC().Format("20060102")+".jsonl")
+}
+
+func (e *Engineer) durableReviewPendingDir() string {
+	return filepath.Join(e.durableReviewTelemetryDir(), "pending")
+}
+
+func (e *Engineer) durableReviewRunnerBaseRecord(runID, event, branch, target, tree, writer string, now time.Time) durableReviewRunnerRecord {
+	return durableReviewRunnerRecord{
+		TS:       now.UTC().Format(time.RFC3339),
+		Event:    event,
+		RunID:    runID,
+		PID:      os.Getpid(),
+		Worktree: e.workDir,
+		Rig:      e.durableReviewRigIdentity(),
+		Repo:     e.durableReviewRepoIdentity(),
+		Branch:   branch,
+		Target:   target,
+		Writer:   writer,
+		Tree:     tree,
+	}
+}
+
+func (e *Engineer) appendDurableReviewRunnerRecord(record durableReviewRunnerRecord) bool {
+	now := time.Now()
+	if strings.TrimSpace(record.TS) == "" {
+		record.TS = now.UTC().Format(time.RFC3339)
+	}
+	if record.PID == 0 {
+		record.PID = os.Getpid()
+	}
+
+	path := e.durableReviewTelemetryFile(now)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		if e.output != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to create durable review telemetry dir: %v\n", err)
+		}
+		return false
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		if e.output != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to open durable review telemetry file %s: %v\n", path, err)
+		}
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	if err := json.NewEncoder(f).Encode(record); err != nil {
+		if e.output != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to write durable review telemetry file %s: %v\n", path, err)
+		}
+		return false
+	}
+	return true
+}
+
+func (e *Engineer) writeDurableReviewRunnerPendingRecord(record durableReviewRunnerRecord) string {
+	if strings.TrimSpace(record.RunID) == "" {
+		return ""
+	}
+	dir := e.durableReviewPendingDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		if e.output != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to create durable review pending dir: %v\n", err)
+		}
+		return ""
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		if e.output != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to marshal durable review pending record: %v\n", err)
+		}
+		return ""
+	}
+	path := filepath.Join(dir, durableReviewPathComponent(record.RunID)+".json")
+	if err := os.WriteFile(path, append(data, '\n'), 0644); err != nil {
+		if e.output != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to write durable review pending record %s: %v\n", path, err)
+		}
+		return ""
+	}
+	return path
+}
+
+func (e *Engineer) completeDurableReviewRunnerPending(path string) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) && e.output != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to remove durable review pending record %s: %v\n", path, err)
+	}
+}
+
+func (e *Engineer) reconcileStaleDurableReviewGateRuns(now time.Time) {
+	entries, err := os.ReadDir(e.durableReviewPendingDir())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		if e.output != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to read durable review pending dir: %v\n", err)
+		}
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(e.durableReviewPendingDir(), entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if e.output != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to read durable review pending record %s: %v\n", path, err)
+			}
+			continue
+		}
+		var record durableReviewRunnerRecord
+		if err := json.Unmarshal(data, &record); err != nil {
+			if e.output != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to parse durable review pending record %s: %v\n", path, err)
+			}
+			continue
+		}
+		deadline, err := time.Parse(time.RFC3339, strings.TrimSpace(record.DeadlineAt))
+		if err != nil || now.UTC().Before(deadline) {
+			continue
+		}
+		record.TS = now.UTC().Format(time.RFC3339)
+		record.Event = durableReviewRunnerTerminalEvent
+		record.Status = "defer"
+		record.Reason = "orphan-parent-death"
+		record.GateExit = "orphan-parent-death"
+		record.Terminal = true
+		record.Error = "durable review gate runner did not emit a terminal record before its deadline"
+		if startedAt, err := time.Parse(time.RFC3339, strings.TrimSpace(record.StartedAt)); err == nil {
+			record.DurationMS = now.UTC().Sub(startedAt).Milliseconds()
+		}
+		if e.appendDurableReviewRunnerRecord(record) {
+			_ = os.Remove(path)
+		}
+	}
+}
+
 // DefaultStaleClaimTimeout is the default duration after which a claimed MR
 // is considered abandoned and eligible for re-claim. This is conservative
 // to avoid re-claiming MRs that are legitimately processing long test suites.
@@ -2156,24 +2388,48 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 	}
 
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate required for %s\n", target)
+	e.reconcileStaleDurableReviewGateRuns(time.Now())
+
+	emitTerminal := func(runID, tree, writer, status, reason, gateExit, errText, output string, elapsed time.Duration, exitCode *int, signalName string, timedOut bool) bool {
+		now := time.Now()
+		if strings.TrimSpace(runID) == "" {
+			runID = durableReviewRunnerRunID(tree, now)
+		}
+		record := e.durableReviewRunnerBaseRecord(runID, durableReviewRunnerTerminalEvent, branch, target, tree, writer, now)
+		record.Status = status
+		record.Reason = reason
+		record.GateExit = gateExit
+		record.ExitCode = exitCode
+		record.Signal = signalName
+		record.TimedOut = timedOut
+		record.Terminal = true
+		record.DurationMS = elapsed.Milliseconds()
+		record.Error = errText
+		record.OutputExcerpt = durableReviewOutputExcerpt(output)
+		return e.appendDurableReviewRunnerRecord(record)
+	}
 
 	// Fail closed immediately if no review gate command is configured.
 	cmd := e.durableReviewGateCmd()
 	if cmd == "" {
 		_, _ = fmt.Fprintln(e.output, "[Engineer] Durable review gate FAILED - no command configured")
+		errMsg := "durable review gate required but no command configured"
+		emitTerminal("", "", "", "defer", "startup-failure", "startup-failure", errMsg, "", 0, nil, "", false)
 		return ProcessResult{
 			Success:     false,
 			TestsFailed: true,
-			Error:       "durable review gate required but no command configured",
+			Error:       errMsg,
 		}
 	}
 	key, err := e.readDurableReviewHMACKey()
 	if err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED - HMAC key check failed: %v\n", err)
+		errMsg := fmt.Sprintf("durable review HMAC key check failed: %v", err)
+		emitTerminal("", "", "", "defer", "hmac-key-check-failed", "startup-failure", errMsg, "", 0, nil, "", false)
 		return ProcessResult{
 			Success:     false,
 			TestsFailed: true,
-			Error:       fmt.Sprintf("durable review HMAC key check failed: %v", err),
+			Error:       errMsg,
 		}
 	}
 
@@ -2188,17 +2444,21 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 	}
 	if empty, err := e.isEmptyReviewDiff(branch, diffBase); err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED - could not determine diff state: %v\n", err)
+		errMsg := fmt.Sprintf("durable review gate could not determine diff state: %v", err)
+		emitTerminal("", "", "", "defer", "diff-state-error", "startup-failure", errMsg, "", 0, nil, "", false)
 		return ProcessResult{
 			Success:     false,
 			TestsFailed: true,
-			Error:       fmt.Sprintf("durable review gate could not determine diff state: %v", err),
+			Error:       errMsg,
 		}
 	} else if empty {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED - empty diff (no changes between branch and review base %s); refusing to grant attestation on zero-content review\n", diffBase)
+		errMsg := "durable review gate: empty diff (no changes between branch and review base); degenerate PASS on empty diff is not a valid attestation (gastown-cet.12.4)"
+		emitTerminal("", "", "", "defer", "empty-diff", "startup-failure", errMsg, "", 0, nil, "", false)
 		return ProcessResult{
 			Success:     false,
 			TestsFailed: true,
-			Error:       "durable review gate: empty diff (no changes between branch and review base); degenerate PASS on empty diff is not a valid attestation (gastown-cet.12.4)",
+			Error:       errMsg,
 		}
 	}
 
@@ -2210,14 +2470,17 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 	// different writer does not satisfy this check.
 	attested, tree, err := e.hasDurableReviewAttestation(key, attestationWriter)
 	if err != nil {
+		errMsg := fmt.Sprintf("durable review attestation check failed: %v", err)
+		emitTerminal("", "", attestationWriter, "defer", "attestation-check-failed", "startup-failure", errMsg, "", 0, nil, "", false)
 		return ProcessResult{
 			Success:     false,
 			TestsFailed: true,
-			Error:       fmt.Sprintf("durable review attestation check failed: %v", err),
+			Error:       errMsg,
 		}
 	}
 	if attested {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review attestation present for tree %s (writer=%s); skipping gate\n", shortSHA(tree), attestationWriter)
+		emitTerminal("", tree, attestationWriter, "pass", "existing-attestation", "0", "", "", 0, nil, "", false)
 		return ProcessResult{Success: true}
 	}
 
@@ -2256,6 +2519,14 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 	runCmd.Stderr = &stderr
 
 	start := time.Now()
+	runID := durableReviewRunnerRunID(tree, start)
+	startRecord := e.durableReviewRunnerBaseRecord(runID, durableReviewRunnerStartEvent, branch, target, tree, attestationWriter, start)
+	startRecord.Status = "running"
+	startRecord.StartedAt = start.UTC().Format(time.RFC3339)
+	startRecord.DeadlineAt = start.Add(gateTimeout).UTC().Format(time.RFC3339)
+	e.appendDurableReviewRunnerRecord(startRecord)
+	pendingPath := e.writeDurableReviewRunnerPendingRecord(startRecord)
+
 	runErr := runCmd.Run()
 	elapsed := time.Since(start)
 	output := strings.TrimSpace(stdout.String())
@@ -2272,11 +2543,16 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 			errMsg = fmt.Sprintf("durable review gate timed out after %v", gateTimeout)
 		}
 		if output != "" {
-			cap := output
-			if len(cap) > 500 {
-				cap = cap[:500] + "..."
-			}
-			errMsg = fmt.Sprintf("%s: %s", errMsg, cap)
+			errMsg = fmt.Sprintf("%s: %s", errMsg, durableReviewOutputExcerpt(output))
+		}
+		reason, exitCode, signalName, timedOut, gateExit := durableReviewCommandFailureDetails(runErr, gateCtx.Err())
+		status := "defer"
+		if durableGateRejectReplay(output) {
+			status = "rework"
+			reason = "reject-replay"
+		}
+		if emitTerminal(runID, tree, attestationWriter, status, reason, gateExit, errMsg, output, elapsed, exitCode, signalName, timedOut) {
+			e.completeDurableReviewRunnerPending(pendingPath)
 		}
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review gate FAILED (%v) - %s\n", elapsed.Truncate(time.Millisecond), errMsg)
 		if durableGateRejectReplay(output) {
@@ -2301,21 +2577,32 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 	// durable proof that reviewers actually ran.
 	attested, tree, err = e.hasDurableReviewAttestation(key, attestationWriter)
 	if err != nil {
+		errMsg := fmt.Sprintf("durable review gate passed but attestation check failed: %v", err)
+		if emitTerminal(runID, tree, attestationWriter, "defer", "attestation-check-failed", "0", errMsg, output, elapsed, nil, "", false) {
+			e.completeDurableReviewRunnerPending(pendingPath)
+		}
 		return ProcessResult{
 			Success:     false,
 			TestsFailed: true,
-			Error:       fmt.Sprintf("durable review gate passed but attestation check failed: %v", err),
+			Error:       errMsg,
 		}
 	}
 	if !attested {
+		errMsg := fmt.Sprintf("durable review gate passed but HMAC attestation missing for tree %s at %s", tree, e.durableReviewAttestationPath(tree))
+		if emitTerminal(runID, tree, attestationWriter, "defer", "missing-attestation", "0", errMsg, output, elapsed, nil, "", false) {
+			e.completeDurableReviewRunnerPending(pendingPath)
+		}
 		return ProcessResult{
 			Success:     false,
 			TestsFailed: true,
-			Error:       fmt.Sprintf("durable review gate passed but HMAC attestation missing for tree %s at %s", tree, e.durableReviewAttestationPath(tree)),
+			Error:       errMsg,
 		}
 	}
 
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Durable review attestation recorded for tree %s\n", shortSHA(tree))
+	if emitTerminal(runID, tree, attestationWriter, "pass", "attested", "0", "", output, elapsed, nil, "", false) {
+		e.completeDurableReviewRunnerPending(pendingPath)
+	}
 	return ProcessResult{Success: true}
 }
 

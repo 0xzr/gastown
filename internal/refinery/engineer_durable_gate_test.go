@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -80,6 +81,151 @@ func TestDoMerge_DurableReviewGate_CommandFailure_BlocksMerge(t *testing.T) {
 	}
 	if !strings.Contains(result.Error, "reviewer rejection: missing tests") {
 		t.Errorf("expected gate error output in result, got: %s", result.Error)
+	}
+}
+
+func TestRunDurableReviewGate_PreTrapZeroOutputExitWritesTerminalRecord(t *testing.T) {
+	telemetryDir := t.TempDir()
+	t.Setenv("GT_REFINERY_TELEMETRY_DIR", telemetryDir)
+
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		Cmd:         `exit 17`,
+		HMACKeyPath: keyPath,
+	}
+
+	createFeatureBranch(t, workDir, "feat/pretrap-exit", "feature.txt", "feature content")
+
+	result := e.runDurableReviewGate(context.Background(), "feat/pretrap-exit", "main", nil, false, "main")
+	if result.Success {
+		t.Fatal("expected durable review gate to fail on pre-trap exit")
+	}
+
+	record := requireDurableReviewTerminalRecord(t, telemetryDir, "exec-failure")
+	if record.ExitCode == nil || *record.ExitCode != 17 {
+		t.Fatalf("terminal exit_code = %v, want 17", record.ExitCode)
+	}
+	if record.GateExit != "17" {
+		t.Fatalf("terminal gate_exit = %q, want 17", record.GateExit)
+	}
+	if record.OutputExcerpt != "" {
+		t.Fatalf("terminal output excerpt = %q, want empty zero-output record", record.OutputExcerpt)
+	}
+	if record.Status != "defer" {
+		t.Fatalf("terminal status = %q, want defer", record.Status)
+	}
+}
+
+func TestRunDurableReviewGate_SignalWritesTerminalRecord(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("signal semantics are platform-specific")
+	}
+	telemetryDir := t.TempDir()
+	t.Setenv("GT_REFINERY_TELEMETRY_DIR", telemetryDir)
+
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		Cmd:         `kill -TERM $$`,
+		HMACKeyPath: keyPath,
+	}
+
+	createFeatureBranch(t, workDir, "feat/signal-exit", "feature.txt", "feature content")
+
+	result := e.runDurableReviewGate(context.Background(), "feat/signal-exit", "main", nil, false, "main")
+	if result.Success {
+		t.Fatal("expected durable review gate to fail when wrapper is signaled")
+	}
+
+	record := requireDurableReviewTerminalRecord(t, telemetryDir, "signal")
+	if record.Signal == "" {
+		t.Fatalf("terminal signal is empty in %+v", record)
+	}
+	if record.GateExit != record.Signal {
+		t.Fatalf("terminal gate_exit = %q, want signal %q", record.GateExit, record.Signal)
+	}
+	if record.Status != "defer" {
+		t.Fatalf("terminal status = %q, want defer", record.Status)
+	}
+}
+
+func TestRunDurableReviewGate_MissingAttestationWritesTerminalRecord(t *testing.T) {
+	telemetryDir := t.TempDir()
+	t.Setenv("GT_REFINERY_TELEMETRY_DIR", telemetryDir)
+
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		Cmd:         `printf '%s\n' "wrapper exited before writing attestation"`,
+		HMACKeyPath: keyPath,
+	}
+
+	createFeatureBranch(t, workDir, "feat/missing-terminal-attest", "feature.txt", "feature content")
+
+	result := e.runDurableReviewGate(context.Background(), "feat/missing-terminal-attest", "main", nil, false, "main")
+	if result.Success {
+		t.Fatal("expected durable review gate to fail without attestation")
+	}
+
+	record := requireDurableReviewTerminalRecord(t, telemetryDir, "missing-attestation")
+	if record.GateExit != "0" {
+		t.Fatalf("terminal gate_exit = %q, want 0", record.GateExit)
+	}
+	if !strings.Contains(record.Error, "HMAC attestation missing") {
+		t.Fatalf("terminal error = %q, want missing attestation evidence", record.Error)
+	}
+	if !strings.Contains(record.OutputExcerpt, "wrapper exited before writing attestation") {
+		t.Fatalf("terminal output excerpt = %q, want wrapper output", record.OutputExcerpt)
+	}
+}
+
+func TestReconcileStaleDurableReviewGateRunWritesParentDeathTerminalRecord(t *testing.T) {
+	telemetryDir := t.TempDir()
+	t.Setenv("GT_REFINERY_TELEMETRY_DIR", telemetryDir)
+
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	started := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	record := e.durableReviewRunnerBaseRecord("stale-run", durableReviewRunnerStartEvent, "feat/orphan", "main", "deadbeef", "umans-kimi", started)
+	record.Status = "running"
+	record.StartedAt = started.Format(time.RFC3339)
+	record.DeadlineAt = started.Add(time.Minute).Format(time.RFC3339)
+
+	pendingPath := e.writeDurableReviewRunnerPendingRecord(record)
+	if pendingPath == "" {
+		t.Fatal("expected pending record path")
+	}
+
+	e.reconcileStaleDurableReviewGateRuns(started.Add(2 * time.Minute))
+
+	terminal := requireDurableReviewTerminalRecord(t, telemetryDir, "orphan-parent-death")
+	if terminal.RunID != "stale-run" {
+		t.Fatalf("terminal run_id = %q, want stale-run", terminal.RunID)
+	}
+	if terminal.GateExit != "orphan-parent-death" {
+		t.Fatalf("terminal gate_exit = %q, want orphan-parent-death", terminal.GateExit)
+	}
+	if terminal.Status != "defer" {
+		t.Fatalf("terminal status = %q, want defer", terminal.Status)
+	}
+	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
+		t.Fatalf("pending record still exists after reconcile: %v", err)
 	}
 }
 
@@ -1144,6 +1290,49 @@ func writeHMACTokenTo(t *testing.T, outPath, keyPath, tree, writer string) {
 		}
 		t.Fatal(msg)
 	}
+}
+
+func readDurableReviewRunnerRecords(t *testing.T, telemetryDir string) []durableReviewRunnerRecord {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(telemetryDir, "refinery-gate-*.jsonl"))
+	if err != nil {
+		t.Fatalf("glob telemetry files: %v", err)
+	}
+	if len(matches) == 0 {
+		t.Fatalf("expected durable review telemetry file in %s", telemetryDir)
+	}
+	var records []durableReviewRunnerRecord
+	for _, path := range matches {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read telemetry file %s: %v", path, err)
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var record durableReviewRunnerRecord
+			if err := json.Unmarshal([]byte(line), &record); err != nil {
+				t.Fatalf("parse telemetry line %s: %v\nline: %s", path, err, line)
+			}
+			records = append(records, record)
+		}
+	}
+	return records
+}
+
+func requireDurableReviewTerminalRecord(t *testing.T, telemetryDir, reason string) durableReviewRunnerRecord {
+	t.Helper()
+	records := readDurableReviewRunnerRecords(t, telemetryDir)
+	for i := len(records) - 1; i >= 0; i-- {
+		record := records[i]
+		if record.Event == durableReviewRunnerTerminalEvent && record.Terminal && record.Reason == reason {
+			return record
+		}
+	}
+	t.Fatalf("expected terminal durable review record with reason %q, got %+v", reason, records)
+	return durableReviewRunnerRecord{}
 }
 
 func shellQuote(s string) string {
