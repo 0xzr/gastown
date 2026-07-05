@@ -962,3 +962,60 @@ exit /b 1
 		t.Fatalf("error missing bond args: %v", err)
 	}
 }
+
+func TestBondFormulaDirectRetriesWithTownRouting(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir town .beads: %v", err)
+	}
+
+	workDir := filepath.Join(townRoot, "polybot")
+	if err := os.MkdirAll(filepath.Join(workDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir workDir .beads: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	logPath := filepath.Join(townRoot, "bd.log")
+	bdScript := `#!/bin/sh
+echo "PWD:$(pwd) BEADS_DIR:${BEADS_DIR:-}" >> "${BD_LOG}"
+case "${BEADS_DIR:-}" in
+  *"/polybot/.beads")
+    exit 1
+    ;;
+esac
+echo '{"result_id":"polybot-riskm","id_mapping":{"mol-polecat-work":"hq-wisp-routed"}}'
+`
+	bdScriptWindows := `@echo off
+echo PWD:%CD% BEADS_DIR:%BEADS_DIR%>>"%BD_LOG%"
+echo %BEADS_DIR% | findstr /C:"\polybot\.beads" >nul
+if %ERRORLEVEL%==0 exit /b 1
+echo {^"result_id^":^"polybot-riskm^",^"id_mapping^":{^"mol-polecat-work^":^"hq-wisp-routed^"}}
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+	t.Setenv("BD_LOG", logPath)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	rootID, err := bondFormulaDirect("mol-polecat-work", "polybot-riskm", workDir, townRoot, []string{"feature=test", "issue=polybot-riskm"})
+	if err != nil {
+		t.Fatalf("bondFormulaDirect: %v", err)
+	}
+	if rootID != "hq-wisp-routed" {
+		t.Fatalf("rootID = %q, want hq-wisp-routed", rootID)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	logContent := string(logBytes)
+	if !strings.Contains(logContent, "BEADS_DIR:"+filepath.Join(workDir, ".beads")) {
+		t.Fatalf("first attempt should pin rig BEADS_DIR:\n%s", logContent)
+	}
+	if !strings.Contains(logContent, "PWD:"+townRoot+" BEADS_DIR:") {
+		t.Fatalf("routed retry should run from town root without BEADS_DIR:\n%s", logContent)
+	}
+}

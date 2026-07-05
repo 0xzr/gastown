@@ -1068,15 +1068,19 @@ func bondFormulaDirect(formulaName, beadID, formulaWorkDir, townRoot string, var
 	for _, variable := range vars {
 		bondArgs = append(bondArgs, "--var", variable)
 	}
-	var stderr strings.Builder
-	bondOut, err := BdCmd(bondArgs...).
-		Dir(formulaWorkDir).
-		WithAutoCommit().
-		WithGTRoot(townRoot).
-		Stderr(&stderr).
-		Output()
+
+	bondOut, stderr, err := runFormulaBondDirect(bondArgs, formulaWorkDir, townRoot, false)
 	if err != nil {
-		return "", fmt.Errorf("%w (args: %s, cwd: %s, stderr: %s)", err, strings.Join(bondArgs, " "), formulaWorkDir, strings.TrimSpace(stderr.String()))
+		pinnedErr := fmt.Errorf("%w (args: %s, cwd: %s, stderr: %s)", err, strings.Join(bondArgs, " "), formulaWorkDir, stderr)
+		if townRoot == "" {
+			return "", pinnedErr
+		}
+
+		routedOut, routedStderr, routedErr := runFormulaBondDirect(bondArgs, townRoot, townRoot, true)
+		if routedErr != nil {
+			return "", fmt.Errorf("%w; routed retry failed: %w (args: %s, cwd: %s, stderr: %s)", pinnedErr, routedErr, strings.Join(bondArgs, " "), townRoot, routedStderr)
+		}
+		bondOut = routedOut
 	}
 
 	rootID := parseBondSpawnRootID(bondOut, formulaName, beadID, "")
@@ -1084,6 +1088,20 @@ func bondFormulaDirect(formulaName, beadID, formulaWorkDir, townRoot string, var
 		return "", fmt.Errorf("direct bond output missing spawned root id (output: %s)", trimJSONForError(bondOut))
 	}
 	return rootID, nil
+}
+
+func runFormulaBondDirect(bondArgs []string, dir, townRoot string, routing bool) ([]byte, string, error) {
+	var stderr strings.Builder
+	cmd := BdCmd(bondArgs...).
+		Dir(dir).
+		WithAutoCommit().
+		WithGTRoot(townRoot).
+		Stderr(&stderr)
+	if routing {
+		cmd.WithRouting()
+	}
+	bondOut, err := cmd.Output()
+	return bondOut, strings.TrimSpace(stderr.String()), err
 }
 
 // parseBondSpawnRootID extracts the spawned molecule root from bd mol bond JSON.
