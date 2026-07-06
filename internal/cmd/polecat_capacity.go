@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -177,6 +178,17 @@ func polecatCapacitySnapshotForTownNoCleanup(townRoot string) (polecatCapacitySn
 		if _, err := os.Stat(rigPath); err != nil {
 			continue
 		}
+
+		// Lanes belonging to parked or docked rigs are intentionally offline and
+		// must not consume town-wide capacity slots. Without this exclusion,
+		// stopped polecats on a parked/docked rig hold recovery slots forever and
+		// starve dispatch across active rigs (gastown-67e8z).
+		if blocked, reason := IsRigParkedOrDocked(townRoot, rigName); blocked {
+			fmt.Fprintf(os.Stderr, "%s capacity_skip reason=rig_%s rig=%s\n",
+				style.Dim.Render("○"), reason, rigName)
+			continue
+		}
+
 		polecatNames, err := listPolecatDirectoryNames(rigPath)
 		if err != nil {
 			return snapshot, fmt.Errorf("listing polecat dirs for %s capacity: %w", rigName, err)
