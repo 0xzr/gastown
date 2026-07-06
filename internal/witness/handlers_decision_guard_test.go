@@ -144,6 +144,48 @@ func TestHandleMergeFailed_ResumeDoesNotHoldRework(t *testing.T) {
 	}
 }
 
+// TestHandleMergeFailed_StaleDecisionOnClosedBead_SkipsEmit verifies that a
+// MERGE_FAILED for a closed/merged bead with a lingering Mayor decision does
+// not emit a REWORK_DEFERRED notice. The decision is stale and the rework path
+// is no longer relevant (gastown-okmd0).
+func TestHandleMergeFailed_StaleDecisionOnClosedBead_SkipsEmit(t *testing.T) {
+	stubDecisionForBead(t, &mayor.Decision{
+		BeadID: "polybot-uiu",
+		Type:   mayor.DecisionHold,
+	})
+
+	orig := bdForMergeFailedStatus
+	bdForMergeFailedStatus = &BdCli{
+		Exec: func(workDir string, args ...string) (string, error) {
+			return `[{"status":"closed"}]`, nil
+		},
+		Run: func(workDir string, args ...string) error { return nil },
+	}
+	t.Cleanup(func() { bdForMergeFailedStatus = orig })
+
+	msg := &mail.Message{
+		ID:      "m6",
+		Subject: "MERGE_FAILED rust",
+		Body: strings.Join([]string{
+			"Branch: polecat/rust/polybot-uiu",
+			"Issue: polybot-uiu",
+			"FailureType: peer-review",
+			"Error: rejected",
+		}, "\n"),
+	}
+
+	result := HandleMergeFailed("/tmp/test-stale", "polybot", msg, nil)
+	if !result.Handled {
+		t.Fatal("expected Handled=true")
+	}
+	if !strings.Contains(result.Action, "stale") {
+		t.Errorf("expected Action to report stale decision, got %q", result.Action)
+	}
+	if strings.Contains(result.Action, "not nudged") && !strings.Contains(result.Action, "stale") {
+		t.Errorf("expected stale reason in Action, got %q", result.Action)
+	}
+}
+
 func TestHandleMergeFailed_NoIssueID_SkipsGuard(t *testing.T) {
 	// A MERGE_FAILED without an Issue field has no decision key. The guard is
 	// skipped entirely and the normal path runs. We assert the guard was never

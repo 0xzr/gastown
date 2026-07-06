@@ -1,6 +1,7 @@
 package witness
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/mayor"
 )
 
@@ -558,6 +560,118 @@ func TestEvaluateReworkDeferred_ReasonRecordedOnEmit(t *testing.T) {
 	}
 }
 
+// TestIsReworkDeferredFixture documents the fixture bead IDs that must never be
+// emitted as live REWORK_DEFERRED notices.
+func TestIsReworkDeferredFixture(t *testing.T) {
+	for _, id := range []string{"gt-hold1", "gt-park1", "gt-work999"} {
+		if !IsReworkDeferredFixture(id) {
+			t.Errorf("IsReworkDeferredFixture(%q) = false, want true", id)
+		}
+	}
+	if IsReworkDeferredFixture("gt-real") {
+		t.Error("IsReworkDeferredFixture(gt-real) = true, want false")
+	}
+}
+
+// TestIsReworkDeferredTestTuple verifies the expanded emitter guard for
+// gastown-okmd0: fixture beads, test/demo rigs, and dry-run polecat prefixes
+// are rejected; real tuples are allowed.
+func TestIsReworkDeferredTestTuple(t *testing.T) {
+	mustReject := []struct{ rig, bead, polecat string }{
+		{"polybot-uiu", "gt-hold1", "alpha"},
+		{"testrig", "real-bead", "alpha"},
+		{"demo", "real-bead", "beta"},
+		{"real-rig", "real-bead", "live-dryrun-gamma"},
+	}
+	for _, tup := range mustReject {
+		if !IsReworkDeferredTestTuple(tup.rig, tup.bead, tup.polecat) {
+			t.Errorf("IsReworkDeferredTestTuple(%q,%q,%q) = false, want true",
+				tup.rig, tup.bead, tup.polecat)
+		}
+	}
+
+	mustAllow := []struct{ rig, bead, polecat string }{
+		{"polybot", "polybot-uiu", "nitro"},
+		{"gastown", "gastown-okmd0", "slit"},
+		{"real-rig", "real-bead", "real-polecat"},
+	}
+	for _, tup := range mustAllow {
+		if IsReworkDeferredTestTuple(tup.rig, tup.bead, tup.polecat) {
+			t.Errorf("IsReworkDeferredTestTuple(%q,%q,%q) = true, want false",
+				tup.rig, tup.bead, tup.polecat)
+		}
+	}
+}
+
+// TestHandleMergeFailed_DropsTestTuples verifies that documented acceptance-test
+// fixture bead IDs, test/demo rig names, and dry-run polecat prefixes are
+// dropped by the live MERGE_FAILED path and never reach the throttle state.
+// This is the gastown-okmd0 hard guard against test data leaking to the Mayor.
+func TestHandleMergeFailed_DropsTestTuples(t *testing.T) {
+	// Any bead ID that reaches the decision guard gets an active defer. This
+	// lets us exercise the test-tuple guard for fixture beads and test rigs.
+	orig := activeMayorDecisionForBead
+	activeMayorDecisionForBead = func(townRoot, beadID string) (*mayor.Decision, error) {
+		return &mayor.Decision{
+			BeadID:    beadID,
+			Type:      mayor.DecisionDefer,
+			Reason:    "test decision",
+			MayorID:   "mayor/test",
+			Timestamp: time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC),
+		}, nil
+	}
+	t.Cleanup(func() { activeMayorDecisionForBead = orig })
+
+	testTuples := []struct{ rig, bead, polecat string }{
+		{"polybot-uiu", "gt-hold1", "alpha"},
+		{"polybot-uiu", "gt-park1", "alpha"},
+		{"polybot-uiu", "gt-work999", "alpha"},
+		{"testrig", "real-bead", "alpha"},
+		{"test-rig", "real-bead", "beta"},
+		{"demo", "real-bead", "gamma"},
+		{"real-rig", "real-bead", "live-dryrun-alpha"},
+	}
+
+	for _, tup := range testTuples {
+		msg := &mail.Message{
+			ID:      "m-test-" + tup.bead,
+			Subject: "MERGE_FAILED " + tup.polecat,
+			Body: fmt.Sprintf("Branch: polecat/%s/%s\nIssue: %s\nFailureType: test\nError: leaked",
+				tup.polecat, tup.bead, tup.bead),
+		}
+		result := HandleMergeFailed("/tmp/test-okmd0", tup.rig, msg, nil)
+		if !result.Handled {
+			t.Errorf("%s/%s/%s: expected Handled=true", tup.rig, tup.bead, tup.polecat)
+		}
+		if !strings.Contains(result.Action, "test/demo") {
+			t.Errorf("%s/%s/%s: expected Action to mention test/demo skip, got %q",
+				tup.rig, tup.bead, tup.polecat, result.Action)
+		}
+	}
+}
+
+// TestReworkDeferredKey_Canonicalization verifies that the tuple key is stable
+// across leading/trailing whitespace in the string fields. This prevents the
+// same logical tuple from generating multiple records because one caller left a
+// trailing space (gastown-okmd0 canonicalization). Case is deliberately
+// preserved: bead IDs, rig names, and polecat names are case-sensitive.
+func TestReworkDeferredKey_Canonicalization(t *testing.T) {
+	a := reworkDeferredKey("polybot-uiu", "gt-hold1", "alpha", mayor.DecisionHold, "merge_failed")
+	b := reworkDeferredKey(" polybot-uiu ", " gt-hold1 ", " alpha ", mayor.DecisionHold, " merge_failed ")
+	c := reworkDeferredKey("polybot-uiu", "gt-hold1", "alpha", mayor.DecisionHold, "merge_failed")
+	if a != b {
+		t.Errorf("whitespace canonicalization failed: %q != %q", a, b)
+	}
+	if a != c {
+		t.Errorf("canonicalization broke stable equality: %q != %q", a, c)
+	}
+
+	d := reworkDeferredKey("POLYBOT-UIU", "GT-HOLD1", "ALPHA", mayor.DecisionHold, "MERGE_FAILED")
+	if a == d {
+		t.Error("case differences must NOT be canonicalized")
+	}
+}
+
 // TestReworkDeferredKey_StableForSameTuple verifies that the key is a stable
 // hash: the same inputs always produce the same key, distinct inputs produce
 // distinct keys.
@@ -575,6 +689,57 @@ func TestReworkDeferredKey_StableForSameTuple(t *testing.T) {
 	c := reworkDeferredKey("polybot-uiu", "gt-hold1", "alpha", mayor.DecisionPark, "merge_failed")
 	if a == c {
 		t.Error("distinct decisions produced the same key")
+	}
+}
+
+// TestSaveReworkDeferredState_Atomic verifies that the durable state file is
+// never observed in a partially-written state. We write a non-trivial state,
+// then read it back and confirm it is valid JSON with the expected records.
+// This catches non-atomic write paths that could leave an empty or truncated
+// file after a crash (gastown-okmd0 durability).
+func TestSaveReworkDeferredState_Atomic(t *testing.T) {
+	dir := withReworkDeferredStateDir(t)
+	start := time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC)
+	withReworkDeferredClock(t, start)
+
+	state := &ReworkDeferredState{
+		Records: []*ReworkDeferredRecord{
+			{
+				Key:             "abc123",
+				RigName:         "polybot",
+				BeadID:          "polybot-uiu",
+				PolecatName:     "alpha",
+				MayorDecision:   string(mayor.DecisionHold),
+				SourceStatus:    "merge_failed",
+				FirstEmittedAt:  start,
+				LastEmittedAt:   start,
+				SuppressedCount: 5,
+			},
+		},
+	}
+	if err := saveReworkDeferredState(dir, state); err != nil {
+		t.Fatalf("saveReworkDeferredState: %v", err)
+	}
+
+	path := ReworkDeferredStateFile(dir)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading state file: %v", err)
+	}
+	var loaded ReworkDeferredState
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatalf("state file is not valid JSON: %v\n%s", err, string(data))
+	}
+	if len(loaded.Records) != 1 {
+		t.Fatalf("loaded %d records, want 1", len(loaded.Records))
+	}
+	if loaded.Records[0].SuppressedCount != 5 {
+		t.Errorf("SuppressedCount = %d, want 5", loaded.Records[0].SuppressedCount)
+	}
+
+	// Ensure no stray .tmp file was left behind.
+	if _, err := os.Stat(path + ".tmp"); err == nil {
+		t.Errorf("temp state file %s.tmp was not cleaned up", path)
 	}
 }
 

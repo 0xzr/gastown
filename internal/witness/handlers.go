@@ -521,6 +521,32 @@ func HandleMergeFailed(workDir, rigName string, msg *mail.Message, router *mail.
 			trRoot = workDir
 		}
 		if decision, dErr := activeMayorDecisionForBead(trRoot, payload.IssueID); dErr == nil && decision != nil {
+			// Guard: do not emit REWORK_DEFERRED for documented test/demo/fixture
+			// tuples. These reach the live path from misrouted test data or stale
+			// MERGE_FAILED mails and must not spam the Mayor (gastown-okmd0).
+			if IsReworkDeferredTestTuple(rigName, payload.IssueID, payload.PolecatName) {
+				fmt.Fprintf(os.Stderr,
+					"witness: skipping REWORK_DEFERRED for test/demo tuple %s/%s bead=%s (Mayor %s decision)\n",
+					rigName, payload.PolecatName, payload.IssueID, decision.Type)
+				result.Handled = true
+				result.Action = fmt.Sprintf("rework nudge for %s held: test/demo tuple on %s skipped (Mayor %s decision)",
+					payload.PolecatName, payload.IssueID, decision.Type)
+				return result
+			}
+
+			// Guard: do not emit REWORK_DEFERRED for beads whose lifecycle has
+			// already ended. A closed/merged/deferred/blocked bead with a
+			// lingering Mayor decision is a stale decision; the rework attempt
+			// itself is likely from an old MR or fixture data (gastown-okmd0).
+			if status, ok := getBeadStatus(bdForMergeFailedStatus, workDir, payload.IssueID); ok && beadStatusPreventsReworkBlockedNotice(status) {
+				fmt.Fprintf(os.Stderr,
+					"witness: skipping REWORK_DEFERRED for %s/%s bead=%s (status=%s, Mayor %s decision is stale)\n",
+					rigName, payload.PolecatName, payload.IssueID, status, decision.Type)
+				result.Handled = true
+				result.Action = fmt.Sprintf("rework nudge for %s held: Mayor %s decision on %s is stale (status=%s, not nudged)",
+					payload.PolecatName, decision.Type, payload.IssueID, status)
+				return result
+			}
 			notifyMayorOfReworkBlocked(trRoot, rigName, payload.IssueID, payload.PolecatName,
 				"merge_failed", 0, decision, router)
 			result.Handled = true
@@ -2858,6 +2884,23 @@ var activeMayorDecisionForBead = func(townRoot, beadID string) (*mayor.Decision,
 	return state.ActiveDecision(beadID)
 }
 
+// bdForMergeFailedStatus is the BdCli used by HandleMergeFailed when it needs to
+// verify a bead is still open before emitting a REWORK_DEFERRED notice for a
+// stale Mayor decision. Tests override this to avoid subprocess calls.
+var bdForMergeFailedStatus = DefaultBdCli()
+
+// beadStatusPreventsReworkBlockedNotice reports whether a bead status means a
+// REWORK_DEFERRED notice should not be emitted. Closed or merged beads have
+// finished their lifecycle; a lingering Mayor decision on them is stale and
+// should not block rework notices (gastown-okmd0).
+func beadStatusPreventsReworkBlockedNotice(status string) bool {
+	switch status {
+	case "closed", "merged":
+		return true
+	}
+	return false
+}
+
 // formatReworkDeferredNotification composes the subject and body for a
 // REWORK_DEFERRED notice from the throttle decision and the surrounding
 // rework context. It is the single place that reads td.Record.SuppressedCount
@@ -3058,6 +3101,14 @@ func resetAbandonedBead(bd *BdCli, workDir, rigName, hookBead, polecatName strin
 	// surfaced to the Mayor. A newer explicit RESUME decision overrides the
 	// block and allows rework to resume.
 	if decision, err := activeMayorDecisionForBead(trRoot, hookBead); err == nil && decision != nil {
+		// Defense in depth: documented test/demo/fixture tuples must not reach
+		// the Mayor as live REWORK_DEFERRED notices (gastown-okmd0).
+		if IsReworkDeferredTestTuple(rigName, hookBead, polecatName) {
+			fmt.Fprintf(os.Stderr,
+				"witness: skipping REWORK_DEFERRED for test/demo tuple %s/%s bead=%s (Mayor %s decision, abandoned bead)\n",
+				rigName, polecatName, hookBead, decision.Type)
+			return false
+		}
 		notifyMayorOfReworkBlocked(trRoot, rigName, hookBead, polecatName, status, maxRespawns, decision, router)
 		return false
 	}

@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +45,53 @@ const (
 	// the counter.
 	ActionRollup ReworkDeferredAction = "rollup"
 )
+
+// ReworkDeferredFixtureBeads are acceptance-test fixture bead IDs that must
+// never be emitted as live REWORK_DEFERRED notices. They appear only in the
+// regression dry-runs (internal/witness/rework_deferred_*.go) and in
+// docs/cutover-pinned-1.2.0.md. If one of these IDs reaches the live emitter,
+// it is a test-data leak and is dropped rather than mailed to the Mayor.
+var ReworkDeferredFixtureBeads = map[string]bool{
+	"gt-hold1":   true,
+	"gt-park1":   true,
+	"gt-work999": true,
+}
+
+// ReworkDeferredTestRigs are rig names used only in tests/dry-runs that must
+// never appear in live REWORK_DEFERRED notices. The Mayor has observed notices
+// for "gt-work999/testrig alpha" (gastown-okmd0), which means test/demo rigs
+// are reaching the live emitter.
+var ReworkDeferredTestRigs = map[string]bool{
+	"testrig":         true,
+	"test-rig":        true,
+	"live-dryrun-rig": true,
+	"demo":            true,
+	"demo-rig":        true,
+}
+
+// IsReworkDeferredFixture reports whether beadID is a documented acceptance-test
+// fixture that must not be emitted as a live REWORK_DEFERRED notice.
+func IsReworkDeferredFixture(beadID string) bool {
+	return ReworkDeferredFixtureBeads[beadID]
+}
+
+// IsReworkDeferredTestTuple reports whether the entire (rig, bead, polecat)
+// tuple describes a test/demo fixture that must not be emitted as a live
+// REWORK_DEFERRED notice. This is the emitter-path guard for gastown-okmd0:
+// fixture bead IDs, test rig names, and dry-run polecat prefixes are all
+// dropped.
+func IsReworkDeferredTestTuple(rigName, beadID, polecatName string) bool {
+	if ReworkDeferredFixtureBeads[beadID] {
+		return true
+	}
+	if ReworkDeferredTestRigs[rigName] {
+		return true
+	}
+	if strings.HasPrefix(polecatName, "live-dryrun-") {
+		return true
+	}
+	return false
+}
 
 // ReworkDeferredRecord is the durable per-tuple bookkeeping for one
 // (rig, bead, polecat, decision, source status) tuple. It is keyed by a hash of
@@ -133,7 +181,8 @@ func loadReworkDeferredState(townRoot string) *ReworkDeferredState {
 
 func saveReworkDeferredState(townRoot string, state *ReworkDeferredState) error {
 	path := ReworkDeferredStateFile(townRoot)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("creating witness dir: %w", err)
 	}
 	state.LastUpdate = reworkDeferredNow().UTC()
@@ -141,17 +190,68 @@ func saveReworkDeferredState(townRoot string, state *ReworkDeferredState) error 
 	if err != nil {
 		return fmt.Errorf("marshaling rework-deferred throttle state: %w", err)
 	}
-	return os.WriteFile(path, data, 0600)
+
+	// Atomic write: write to a temp file in the same directory, fsync it,
+	// then rename into place. This prevents a crash mid-write from leaving the
+	// state file truncated or empty (gastown-okmd0: the live path must leave
+	// durable evidence even after a daemon restart).
+	tmpPath := path + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("creating temp throttle state file: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("writing temp throttle state file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("fsyncing temp throttle state file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("closing temp throttle state file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("renaming temp throttle state file: %w", err)
+	}
+	// Sync the directory so the rename is durably recorded.
+	dirFile, err := os.Open(dir)
+	if err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
+	return nil
 }
 
 // reworkDeferredKey builds a stable hash for the (rig, bead, polecat, decision,
 // source status) tuple. Empty fields are still part of the key so callers cannot
 // accidentally collapse distinct tuples.
+//
+// The strings are canonicalized (trimmed and lower-cased) so whitespace or case
+// differences in caller input do not split what is logically the same tuple
+// (gastown-okmd0).
 func reworkDeferredKey(rigName, beadID, polecatName string, decisionType mayor.DecisionType, sourceStatus string) string {
 	h := sha1.New() //nolint:gosec // non-cryptographic identifier
 	fmt.Fprintf(h, "rig=%s|bead=%s|polecat=%s|decision=%s|status=%s",
-		rigName, beadID, polecatName, decisionType, sourceStatus)
+		canonicalReworkDeferredString(rigName),
+		canonicalReworkDeferredString(beadID),
+		canonicalReworkDeferredString(polecatName),
+		decisionType,
+		canonicalReworkDeferredString(sourceStatus))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// canonicalReworkDeferredString trims surrounding whitespace from a tuple field
+// so equivalent strings produce the same throttle key. We deliberately do NOT
+// lower-case: bead IDs, rig names, and polecat names are case-sensitive in the
+// rest of the system, and folding case here would make audit records mismatch
+// the beads they describe (gastown-okmd0).
+func canonicalReworkDeferredString(s string) string {
+	return strings.TrimSpace(s)
 }
 
 // findReworkDeferredRecord looks up the record for the given key. The state
@@ -202,6 +302,13 @@ func EvaluateReworkDeferred(townRoot, rigName, beadID, polecatName, sourceStatus
 		// A non-positive window disables throttling entirely; emit every time.
 		return ReworkDeferredDecision{Action: ActionEmit, Window: window}
 	}
+
+	// Canonicalize caller input so the key and stored fields are stable across
+	// minor whitespace or case differences (gastown-okmd0).
+	rigName = canonicalReworkDeferredString(rigName)
+	beadID = canonicalReworkDeferredString(beadID)
+	polecatName = canonicalReworkDeferredString(polecatName)
+	sourceStatus = canonicalReworkDeferredString(sourceStatus)
 
 	reworkDeferredMu.Lock()
 	defer reworkDeferredMu.Unlock()
