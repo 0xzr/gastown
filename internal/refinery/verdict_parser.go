@@ -107,6 +107,14 @@ const (
 	VerdictSourceLogPartReviewFindingsRawOutput VerdictSource = "log_part_review_findings_raw_output"
 	VerdictSourceLogPartReviewVerdict           VerdictSource = "log_part_review_verdict"
 	VerdictSourceLogLooseFallback               VerdictSource = "log_loose_fallback"
+
+	// VerdictSourceAdapterPlanModeTrap labels the gastown-7xq2 incident class:
+	// a reviewer adapter (Opus/codex override) completed with prose or tool-call
+	// planning text inside a plan-mode harness instead of the required review-only
+	// JSON verdict. The verdict itself is empty (NO_VERDICT) — the gate fails
+	// closed — but the carrier is tagged so telemetry can classify the exact
+	// adapter failure rather than recording a generic "no verdict".
+	VerdictSourceAdapterPlanModeTrap VerdictSource = "adapter_plan_mode_trap"
 )
 
 // carrierPriority orders carrier fields from highest (lowest number) to lowest
@@ -181,6 +189,125 @@ var fenceRe = regexp.MustCompile("(?s)```(?:json)?\\s*(.*?)```")
 // verdictRe matches the case-insensitive "verdict":"PASS" or "verdict":"FAIL"
 // fallback. Used only as a last resort after structured parsing fails.
 var verdictRe = regexp.MustCompile(`(?i)"verdict"\s*:\s*"(PASS|FAIL)"`)
+
+// ReviewerAdapterFailure classifies the exact failure mode of a reviewer adapter
+// (Opus/codex override) that did not produce a parseable JSON verdict. It is the
+// gastown-7xq2 fix: the durable review gate already fails closed on a missing
+// verdict (ExtractVerdictFromText returns empty → NO_VERDICT → DEFER), but the
+// prior telemetry recorded a generic "no verdict" / exit-N reason that hid the
+// root cause. This classification lets the gate runner record a precise,
+// machine-readable adapter failure alongside the preserved commit/tree/MR
+// context, so an operator can distinguish "reviewer was unavailable" from
+// "reviewer was trapped in plan mode" from "reviewer exited with a real error".
+//
+// A zero-value ReviewerAdapterFailure (Kind == "") means no known adapter-failure
+// signature was recognized; callers must still treat a missing verdict as
+// NO_VERDICT/UNAVAILABLE per the fail-closed contract.
+type ReviewerAdapterFailure struct {
+	// Kind is the stable machine-readable failure key. Empty when no known
+	// signature matched.
+	Kind ReviewerAdapterFailureKind
+	// Source is the carrier label that would carry the verdict, tagged with
+	// VerdictSourceAdapterPlanModeTrap when the plan-mode trap is recognized.
+	Source VerdictSource
+	// Detail is a short human-readable diagnostic for telemetry.
+	Detail string
+}
+
+// ReviewerAdapterFailureKind enumerates the reviewer-adapter failure modes the
+// parser can recognize. The set is source-controlled so the durable review gate
+// telemetry and the live dropin agree on classification.
+type ReviewerAdapterFailureKind string
+
+const (
+	// AdapterFailureNone means no known adapter-failure signature matched.
+	AdapterFailureNone ReviewerAdapterFailureKind = ""
+
+	// AdapterFailurePlanModeTrap means the reviewer output requested plan-file
+	// writes or emitted tool-call planning prose instead of a review-only JSON
+	// verdict (gastown-7xq2: Opus override trapped in a plan-mode harness).
+	// Review tasks must never request plan-file writes; this is a prompt/harness
+	// defect, not a content verdict.
+	AdapterFailurePlanModeTrap ReviewerAdapterFailureKind = "plan_mode_trap"
+
+	// AdapterFailureNoVerdict means the adapter exited with prose/tool output
+	// that contains no parseable {verdict: PASS|FAIL} payload and no recognized
+	// plan-mode-trap signature. The reviewer produced no actionable verdict.
+	AdapterFailureNoVerdict ReviewerAdapterFailureKind = "no_verdict"
+)
+
+// planFileWriteRe detects plan-file write requests in reviewer output. A review
+// task must never write a plan file: the reviewer's contract is a review-only
+// JSON verdict. Plan-file writes (Claude's Write/Edit tools targeting a plan
+// file, or an explicit "write/update the plan" instruction) indicate the
+// reviewer was launched in a plan-mode harness that trapped it out of the
+// review-only path (gastown-7xq2).
+//
+// The regex is intentionally narrow: it matches the tool-call shapes Claude
+// emits when planning (Write/Edit tool names paired with a plan path) and the
+// prose forms "Write/update the plan", without matching incidental mentions of
+// the word "plan" in a reviewer's findings text.
+var planFileWriteRe = regexp.MustCompile(
+	`(?i)(?:^|\W)(?:write|update|create|edit)\s+(?:a\s+|the\s+)?plan(?:[-_ ]?file)?\b` +
+		`|(?:"name"\s*:\s*"(?:Write|Edit|MultiEdit)"[^}]*"file_path"\s*:\s*"[^"]*\bplan\b)` +
+		`|(?:\b(?:Write|Edit|MultiEdit)\b[^|]*\bplan[-_a-z0-9]*\.(?:md|txt)\b)`,
+)
+
+// toolCallPlanningRe detects pure tool-call planning prose — a reviewer that
+// spent its turn emitting TodoWrite/Task tool calls or narrating a plan instead
+// of producing a verdict. These are planning verbs, not review verdicts.
+var toolCallPlanningRe = regexp.MustCompile(
+	`(?i)\b(?:TodoWrite|Task(?:Create|Update|List)?)\b` +
+		`|(?:"name"\s*:\s*"(?:TodoWrite|Task)")`,
+)
+
+// ClassifyReviewerAdapterFailure inspects raw reviewer adapter output and, when
+// no parseable verdict is present, classifies why. It returns:
+//
+//   - AdapterFailurePlanModeTrap when the output requests plan-file writes or
+//     emits tool-call planning verbs — the gastown-7xq2 incident class. The
+//     reviewer was trapped in a plan-mode harness and never produced the
+//     required review-only JSON verdict.
+//   - AdapterFailureNoVerdict when the output is non-empty but contains no
+//     parseable {verdict: PASS|FAIL} payload and no recognized plan-mode-trap
+//     signature. The adapter produced no actionable verdict.
+//   - AdapterFailureNone (zero value) when the output is empty or when a
+//     parseable verdict IS present — in the latter case there is no adapter
+//     failure to classify; callers should honor the parsed verdict.
+//
+// Callers should run ExtractVerdictFromText first; if it returns a set verdict,
+// the adapter succeeded and there is nothing to classify. Classify only on the
+// empty-verdict path so a real PASS/FAIL is never reclassified as a failure.
+func ClassifyReviewerAdapterFailure(text string) ReviewerAdapterFailure {
+	if ExtractVerdictFromText(text).IsSet() {
+		return ReviewerAdapterFailure{Kind: AdapterFailureNone}
+	}
+	if strings.TrimSpace(text) == "" {
+		return ReviewerAdapterFailure{Kind: AdapterFailureNone}
+	}
+	if planFileWriteRe.MatchString(text) {
+		return ReviewerAdapterFailure{
+			Kind:   AdapterFailurePlanModeTrap,
+			Source: VerdictSourceAdapterPlanModeTrap,
+			Detail: "reviewer requested plan-file write / tool-call planning instead of review-only JSON verdict (plan-mode harness trap)",
+		}
+	}
+	if toolCallPlanningRe.MatchString(text) {
+		return ReviewerAdapterFailure{
+			Kind:   AdapterFailurePlanModeTrap,
+			Source: VerdictSourceAdapterPlanModeTrap,
+			Detail: "reviewer emitted tool-call planning (TodoWrite/Task) instead of review-only JSON verdict (plan-mode harness trap)",
+		}
+	}
+	return ReviewerAdapterFailure{
+		Kind:   AdapterFailureNoVerdict,
+		Source: VerdictSourceAdapterPlanModeTrap,
+		Detail: "reviewer adapter produced no parseable {verdict: PASS|FAIL} payload",
+	}
+}
+
+// IsSet reports whether a known adapter-failure kind was classified.
+func (f ReviewerAdapterFailure) IsSet() bool { return f.Kind != AdapterFailureNone }
 
 // ExtractVerdictFromText scans a single text blob for a {verdict: PASS|FAIL}
 // payload and reports which extraction step succeeded. The order of preference
