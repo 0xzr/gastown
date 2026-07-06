@@ -17,6 +17,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // extractJSON finds the first JSON object in output that may contain non-JSON warnings.
@@ -85,6 +88,10 @@ func createTrackedBeadsRepoWithIssues(t *testing.T, path, prefix string, numIssu
 	}
 	cmd := exec.Command("bd", bdInitArgs...)
 	cmd.Dir = path
+	// bd init --server may start a transient dolt sql-server. Put it in its own
+	// process group with Pdeathsig (Linux) so test interruption kills the child
+	// instead of stranding an orphan.
+	util.SetTestProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bd init failed: %v\nOutput: %s", err, output)
 	}
@@ -476,6 +483,10 @@ func createTrackedBeadsRepoWithNoIssues(t *testing.T, path, prefix string) {
 	}
 	cmd := exec.Command("bd", bdInitArgs2...)
 	cmd.Dir = path
+	// bd init --server may start a transient dolt sql-server. Put it in its own
+	// process group with Pdeathsig (Linux) so test interruption kills the child
+	// instead of stranding an orphan.
+	util.SetTestProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bd init failed: %v\nOutput: %s", err, output)
 	}

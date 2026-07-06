@@ -1,6 +1,7 @@
 package nudge
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -170,14 +171,16 @@ func TestBuildPollerCommand_UsesDetachedProcessGroup(t *testing.T) {
 	}
 }
 
-func TestSetProcessGroup_InstallsCancelHook(t *testing.T) {
+func TestSetProcessGroup_WrapsCancelHookForContextCommand(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("SetProcessGroup is a no-op on Windows")
 	}
-	cmd := exec.Command("true")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "true")
 	util.SetProcessGroup(cmd)
 
 	if cmd.Cancel == nil {
-		t.Fatal("SetProcessGroup() should install a cancel hook")
+		t.Fatal("SetProcessGroup() should wrap the existing cancel hook for CommandContext")
 	}
 }

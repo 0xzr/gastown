@@ -12,6 +12,8 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // TestDoneUsesResolveBeadsDir verifies that the done command correctly uses
@@ -381,9 +383,15 @@ func TestFindHookedBeadForAgent(t *testing.T) {
 			// Initialize the beads database
 			cmd := exec.Command("bd", "init", "--prefix", "test", "--quiet")
 			cmd.Dir = tmpDir
+			// bd init may start a transient dolt sql-server. Put it in its own
+			// process group with Pdeathsig (Linux) so test interruption kills the
+			// child instead of stranding an orphan.
+			util.SetTestProcessGroup(cmd)
 			if output, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("bd init: %v\n%s", err, output)
 			}
+			// Reap any local dolt sql-server that may have started on a random port.
+			testutil.ReapOwnedDoltOnCleanup(t, tmpDir)
 
 			// beads.New expects the .beads directory path
 			beadsDir := filepath.Join(tmpDir, ".beads")

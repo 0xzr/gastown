@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // routingTestCounter generates unique prefixes for each routing test to isolate
@@ -129,6 +131,11 @@ func setupRoutingTestTownWithPrefixes(t *testing.T, hqPrefix, gtPrefix, trPrefix
 		t.Fatalf("write crew redirect: %v", err)
 	}
 
+	// Reap any dolt sql-server that this test's bd init commands may have
+	// started on a random port. This complements the Pdeathsig/process-group
+	// discipline on the spawn commands for normal cleanup paths.
+	testutil.ReapOwnedDoltOnCleanup(t, townRoot)
+
 	return townRoot
 }
 
@@ -143,6 +150,10 @@ func initBeadsDBWithPrefix(t *testing.T, dir, prefix string) {
 	}
 	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
+	// bd init --server may start a transient dolt sql-server. Put it in its
+	// own process group with Pdeathsig (Linux) so test interruption kills the
+	// child instead of stranding an orphan.
+	util.SetTestProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bd init failed in %s: %v\n%s", dir, err, output)
 	}

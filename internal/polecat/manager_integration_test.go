@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 var polecatManagerIntegrationCounter atomic.Int32
@@ -26,6 +27,10 @@ func initBeadsDBWithPrefix(t *testing.T, dir, prefix string) {
 	args := []string{"init", "--quiet", "--prefix", prefix, "--server-port", testutil.DoltContainerPort()}
 	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
+	// bd init --server may start a transient dolt sql-server. Put it in its
+	// own process group with Pdeathsig (Linux) so test interruption kills the
+	// child instead of stranding an orphan.
+	util.SetTestProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bd init failed in %s: %v\n%s", dir, err, output)
 	}

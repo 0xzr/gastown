@@ -640,6 +640,10 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 			cmd := exec.Command("bd", initArgs...)
 			cmd.Dir = mayorRigPath
 			cmd.Env = sourceBdEnv
+			// bd init --server may start a transient dolt sql-server if the
+			// central server is not reachable. Put it in its own process group
+			// so signals don't strand an orphaned dolt child.
+			util.SetProcessGroup(cmd)
 			if output, err := cmd.CombinedOutput(); err != nil {
 				fmt.Printf("  Warning: Could not init bd database: %v (%s)\n", err, strings.TrimSpace(string(output)))
 			}
@@ -1202,6 +1206,10 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 	cmd := exec.Command("bd", initArgs...)
 	cmd.Dir = rigPath
 	cmd.Env = filteredEnv
+	// bd init --server may start a transient dolt sql-server if the central
+	// server is not reachable. Put it in its own process group so signals
+	// don't strand an orphaned dolt child.
+	util.SetProcessGroup(cmd)
 	_, bdInitErr := cmd.CombinedOutput()
 	if bdInitErr != nil {
 		// bd might not be installed or failed — the shared helper below will

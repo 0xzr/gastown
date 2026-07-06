@@ -1,6 +1,7 @@
 package util
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,6 +9,64 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestSetProcessGroup_SetsSysProcAttr(t *testing.T) {
+	cmd := exec.Command("true")
+	SetProcessGroup(cmd)
+	if cmd.SysProcAttr == nil {
+		t.Fatal("SetProcessGroup did not set SysProcAttr")
+	}
+}
+
+func TestSetProcessGroup_LeavesNilCancelForPlainCommand(t *testing.T) {
+	cmd := exec.Command("true")
+	SetProcessGroup(cmd)
+	if cmd.Cancel != nil {
+		t.Error("SetProcessGroup should not install Cancel for plain exec.Command")
+	}
+}
+
+func TestSetProcessGroup_WrapsCancelForContextCommand(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "true")
+	if cmd.Cancel == nil {
+		t.Fatal("CommandContext should install a Cancel hook")
+	}
+	SetProcessGroup(cmd)
+	if cmd.Cancel == nil {
+		t.Error("SetProcessGroup did not wrap Cancel hook for CommandContext")
+	}
+}
+
+func TestSetTestProcessGroup_SetsSysProcAttr(t *testing.T) {
+	cmd := exec.Command("true")
+	SetTestProcessGroup(cmd)
+	if cmd.SysProcAttr == nil {
+		t.Fatal("SetTestProcessGroup did not set SysProcAttr")
+	}
+}
+
+func TestSetTestProcessGroup_LeavesNilCancelForPlainCommand(t *testing.T) {
+	cmd := exec.Command("true")
+	SetTestProcessGroup(cmd)
+	if cmd.Cancel != nil {
+		t.Error("SetTestProcessGroup should not install Cancel for plain exec.Command")
+	}
+}
+
+func TestSetTestProcessGroup_WrapsCancelForContextCommand(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "true")
+	if cmd.Cancel == nil {
+		t.Fatal("CommandContext should install a Cancel hook")
+	}
+	SetTestProcessGroup(cmd)
+	if cmd.Cancel == nil {
+		t.Error("SetTestProcessGroup did not wrap Cancel hook for CommandContext")
+	}
+}
 
 func TestExecWithOutput(t *testing.T) {
 	// Test successful command

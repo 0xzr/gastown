@@ -27,6 +27,8 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
+	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // schedulerTestCounter generates unique prefixes for each test to isolate Dolt
@@ -51,6 +53,10 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	}
 	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
+	// bd init --server may start a transient dolt sql-server. Put it in its
+	// own process group with Pdeathsig (Linux) so test interruption kills the
+	// child instead of stranding an orphan.
+	util.SetTestProcessGroup(cmd)
 	out, err := cmd.CombinedOutput()
 	t.Logf("bd init --prefix %s in %s: exit=%v\n%s", prefix, dir, err, out)
 	if err != nil {
@@ -178,6 +184,11 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 			}
 		}
 	})
+
+	// Reap any local dolt sql-server that initBeadsDBForServer may have started
+	// on a random port if the shared container was unreachable. Complements the
+	// Pdeathsig/process-group discipline on the spawn commands.
+	testutil.ReapOwnedDoltOnCleanup(t, hqPath)
 
 	// Redirect: testrig/.beads/ → mayor/rig/.beads
 	// beadsSearchDirs scans townRoot/<dir>/.beads — the redirect lets bd commands

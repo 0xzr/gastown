@@ -17,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // hookTestCounter generates unique prefixes for each hook test to isolate
@@ -104,6 +105,10 @@ func setupHookTestTown(t *testing.T) (townRoot, polecatDir, rigPrefix string) {
 		t.Fatalf("write redirect: %v", err)
 	}
 
+	// Reap any local dolt sql-server that initBeadsDB may have started on a
+	// random port if the shared container was unreachable.
+	testutil.ReapOwnedDoltOnCleanup(t, townRoot)
+
 	return townRoot, polecatDir, rigPrefix
 }
 
@@ -114,6 +119,10 @@ func initBeadsDB(t *testing.T, dir string) {
 
 	cmd := exec.Command("bd", "init", "--server", "--server-port", testutil.DoltContainerPort())
 	cmd.Dir = dir
+	// bd init --server may start a transient dolt sql-server. Put it in its
+	// own process group with Pdeathsig (Linux) so test interruption kills the
+	// child instead of stranding an orphan.
+	util.SetTestProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bd init failed: %v\n%s", err, output)
 	}

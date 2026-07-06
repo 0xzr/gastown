@@ -16,6 +16,8 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // captureStdout redirects os.Stdout to a pipe, calls fn, then returns whatever
@@ -398,9 +400,15 @@ func TestDetectSessionState(t *testing.T) {
 		// Initialize beads database
 		initCmd := exec.Command("bd", "init", "--prefix=bd-")
 		initCmd.Dir = workDir
+		// bd init may start a transient dolt sql-server. Put it in its own
+		// process group with Pdeathsig (Linux) so test interruption kills the
+		// child instead of stranding an orphan.
+		util.SetTestProcessGroup(initCmd)
 		if output, err := initCmd.CombinedOutput(); err != nil {
 			t.Fatalf("bd init failed: %v\n%s", err, output)
 		}
+		// Reap any local dolt sql-server that may have started on a random port.
+		testutil.ReapOwnedDoltOnCleanup(t, townRoot)
 
 		// Write routes file
 		beadsDir := filepath.Join(workDir, ".beads")

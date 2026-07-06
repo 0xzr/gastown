@@ -19,6 +19,13 @@ func SetProcessGroup(cmd *exec.Cmd) {
 	}
 }
 
+// SetTestProcessGroup configures a command to run in its own process group
+// without a visible console window. On Windows there is no Pdeathsig equivalent;
+// CREATE_NEW_PROCESS_GROUP detaches the child from the parent's console.
+func SetTestProcessGroup(cmd *exec.Cmd) {
+	SetProcessGroup(cmd)
+}
+
 // SetDetachedProcessGroup is the same as SetProcessGroup on Windows.
 func SetDetachedProcessGroup(cmd *exec.Cmd) {
 	SetProcessGroup(cmd)

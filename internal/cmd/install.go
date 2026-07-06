@@ -28,6 +28,7 @@ import (
 	"github.com/steveyegge/gastown/internal/state"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/templates"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 	"github.com/steveyegge/gastown/internal/wrappers"
 )
@@ -704,6 +705,10 @@ func initTownBeads(townPath string) error {
 	cmd := exec.Command("bd", bdInitArgs...)
 	cmd.Dir = townPath
 	cmd.Env = withBeadsDirEnv(filepath.Join(townPath, ".beads"))
+	// bd init --server may start a transient dolt sql-server if the central
+	// server is not yet reachable. Put it in its own process group so signals
+	// don't strand an orphaned dolt child.
+	util.SetProcessGroup(cmd)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
