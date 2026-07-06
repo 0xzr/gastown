@@ -177,6 +177,15 @@ func polecatCapacitySnapshotForTownNoCleanup(townRoot string) (polecatCapacitySn
 		if _, err := os.Stat(rigPath); err != nil {
 			continue
 		}
+
+		// Lanes belonging to parked or docked rigs are intentionally offline and
+		// must not consume town-wide capacity slots. Without this exclusion,
+		// stopped polecats on a parked/docked rig hold recovery slots forever and
+		// starve dispatch across active rigs (gastown-67e8z).
+		if blocked, _ := IsRigParkedOrDocked(townRoot, rigName); blocked {
+			continue
+		}
+
 		polecatNames, err := listPolecatDirectoryNames(rigPath)
 		if err != nil {
 			return snapshot, fmt.Errorf("listing polecat dirs for %s capacity: %w", rigName, err)
