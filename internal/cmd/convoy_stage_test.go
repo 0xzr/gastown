@@ -1871,9 +1871,10 @@ func TestCreateStagedConvoy_CleanReady(t *testing.T) {
 	}
 
 	// Verify bd dep add was called for each slingable bead.
+	// Cross-rig tracking uses the external:<rig>:<id> form (town-routed).
 	for _, beadID := range []string{"gt-a", "gt-b", "gt-c"} {
-		if !strings.Contains(logContent, "dep add "+convoyID+" "+beadID) {
-			t.Errorf("bd.log should contain 'dep add %s %s', got:\n%s", convoyID, beadID, logContent)
+		if !strings.Contains(logContent, "dep add "+convoyID+" external:gt:"+beadID) {
+			t.Errorf("bd.log should contain 'dep add %s external:gt:%s', got:\n%s", convoyID, beadID, logContent)
 		}
 	}
 }
@@ -1918,10 +1919,10 @@ func TestCreateStagedConvoy_TracksOnlySlingable(t *testing.T) {
 	}
 	logContent := string(logBytes)
 
-	// Slingable beads (tasks and bugs) should be tracked.
+	// Slingable beads (tasks and bugs) should be tracked (cross-rig form).
 	for _, beadID := range []string{"gt-t1", "gt-b1", "gt-t2"} {
-		if !strings.Contains(logContent, "dep add "+convoyID+" "+beadID) {
-			t.Errorf("bd.log should contain 'dep add %s %s' for slingable bead, got:\n%s", convoyID, beadID, logContent)
+		if !strings.Contains(logContent, "dep add "+convoyID+" external:gt:"+beadID) {
+			t.Errorf("bd.log should contain 'dep add %s external:gt:%s' for slingable bead, got:\n%s", convoyID, beadID, logContent)
 		}
 	}
 
