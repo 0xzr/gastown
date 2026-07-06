@@ -195,6 +195,149 @@ func TestRunDurableReviewGate_MissingAttestationWritesTerminalRecord(t *testing.
 	}
 }
 
+// TestRunDurableReviewGate_ReviewerAdapterPlanModeTrap_ClassifiesFailureReason
+// proves the gastown-7xq2 fix: when a reviewer adapter (Opus/codex override)
+// exits rc=1 with plan-mode-trap output (requesting plan-file writes / tool-call
+// planning) and no parseable verdict, the terminal telemetry record carries the
+// precise adapter-failure reason (plan_mode_trap) — not a bare exit code — and
+// preserves the commit/tree/MR context (branch/target/writer). The gate fails
+// closed (status=defer); it never merges on an adapter no-verdict.
+func TestRunDurableReviewGate_ReviewerAdapterPlanModeTrap_ClassifiesFailureReason(t *testing.T) {
+	telemetryDir := t.TempDir()
+	t.Setenv("GT_REFINERY_TELEMETRY_DIR", telemetryDir)
+
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		HMACKeyPath: keyPath,
+		// Simulate the gastown-7xq2 Opus override harness: emit plan-mode-trap
+		// prose (a plan-file write request) and exit non-zero with no verdict.
+		Cmd: `printf '%s\n' "I will write the plan for this review before producing a verdict." ; exit 1`,
+	}
+
+	createFeatureBranch(t, workDir, "feat/adapter-plan-trap", "feature.txt", "feature content")
+
+	result := e.runDurableReviewGate(context.Background(), "feat/adapter-plan-trap", "main", nil, false, "main")
+	if result.Success {
+		t.Fatal("expected durable review gate to fail closed on plan-mode-trap adapter output")
+	}
+	if !result.TestsFailed {
+		t.Fatalf("expected TestsFailed=true (fail closed), got %+v", result)
+	}
+
+	record := requireDurableReviewTerminalRecord(t, telemetryDir, string(AdapterFailurePlanModeTrap))
+	if record.Status != "defer" {
+		t.Fatalf("terminal status = %q, want defer (fail closed, no merge)", record.Status)
+	}
+	if record.GateExit != "1" {
+		t.Fatalf("terminal gate_exit = %q, want 1 (adapter exited rc=1)", record.GateExit)
+	}
+	// Commit/tree/MR context must be preserved alongside the precise reason.
+	if record.Branch != "feat/adapter-plan-trap" {
+		t.Fatalf("terminal branch = %q, want feat/adapter-plan-trap (MR context preserved)", record.Branch)
+	}
+	if record.Target != "main" {
+		t.Fatalf("terminal target = %q, want main", record.Target)
+	}
+	if record.Writer == "" {
+		t.Fatalf("terminal writer is empty; MR context must be preserved: %+v", record)
+	}
+	if !strings.Contains(record.Error, "plan_mode_trap") && !strings.Contains(record.Error, "plan-mode") && !strings.Contains(record.Error, "adapter failure") {
+		t.Fatalf("terminal error = %q, want adapter-failure diagnostic", record.Error)
+	}
+	_ = g
+}
+
+// TestRunDurableReviewGate_ReviewerAdapterNoVerdict_ClassifiesFailureReason
+// proves the gastown-7xq2 fix for the no-verdict sibling: a reviewer adapter
+// that exits rc=1 with non-empty prose but no parseable verdict and no
+// plan-mode-trap signature is recorded with the no_verdict adapter-failure
+// reason, fail-closed, with context preserved.
+func TestRunDurableReviewGate_ReviewerAdapterNoVerdict_ClassifiesFailureReason(t *testing.T) {
+	telemetryDir := t.TempDir()
+	t.Setenv("GT_REFINERY_TELEMETRY_DIR", telemetryDir)
+
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		HMACKeyPath: keyPath,
+		// Adapter produced prose but no {verdict:...} payload, then exited 1.
+		Cmd: `printf '%s\n' "The change looks reasonable but the review did not complete." ; exit 1`,
+	}
+
+	createFeatureBranch(t, workDir, "feat/adapter-no-verdict", "feature.txt", "feature content")
+
+	result := e.runDurableReviewGate(context.Background(), "feat/adapter-no-verdict", "main", nil, false, "main")
+	if result.Success {
+		t.Fatal("expected durable review gate to fail closed on adapter no-verdict output")
+	}
+
+	record := requireDurableReviewTerminalRecord(t, telemetryDir, string(AdapterFailureNoVerdict))
+	if record.Status != "defer" {
+		t.Fatalf("terminal status = %q, want defer (fail closed)", record.Status)
+	}
+	if record.Branch != "feat/adapter-no-verdict" || record.Target != "main" {
+		t.Fatalf("terminal branch/target = %q/%q, want context preserved", record.Branch, record.Target)
+	}
+	_ = g
+}
+
+// TestRunDurableReviewGate_ReviewerAdapterParseableVerdictNotClassifiedAsFailure
+// proves the safety property: when the gate command exits non-zero BUT the
+// output contains a parseable verdict, the adapter succeeded and must NOT be
+// reclassified as an adapter failure. (A real FAIL verdict is honored as a
+// reviewer rejection, not a plan-mode trap.)
+func TestRunDurableReviewGate_ReviewerAdapterParseableVerdictNotClassifiedAsFailure(t *testing.T) {
+	telemetryDir := t.TempDir()
+	t.Setenv("GT_REFINERY_TELEMETRY_DIR", telemetryDir)
+
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		HMACKeyPath: keyPath,
+		// Adapter emitted a real FAIL verdict (no plan-mode trap), then exited 1.
+		Cmd: `printf '%s\n' '{"verdict":"FAIL","blockers":["missing test"]}' ; exit 1`,
+	}
+
+	createFeatureBranch(t, workDir, "feat/adapter-real-verdict", "feature.txt", "feature content")
+
+	result := e.runDurableReviewGate(context.Background(), "feat/adapter-real-verdict", "main", nil, false, "main")
+	if result.Success {
+		t.Fatal("expected durable review gate to fail on a real FAIL verdict")
+	}
+
+	records := readDurableReviewRunnerRecords(t, telemetryDir)
+	var terminal *durableReviewRunnerRecord
+	for i := range records {
+		if records[i].Event == durableReviewRunnerTerminalEvent && records[i].Terminal {
+			terminal = &records[i]
+		}
+	}
+	if terminal == nil {
+		t.Fatal("expected a terminal telemetry record")
+	}
+	// Must NOT be classified as plan_mode_trap or no_verdict — the verdict is real.
+	if terminal.Reason == string(AdapterFailurePlanModeTrap) || terminal.Reason == string(AdapterFailureNoVerdict) {
+		t.Fatalf("terminal reason = %q; a parseable verdict must not be reclassified as an adapter failure: %+v", terminal.Reason, terminal)
+	}
+	_ = g
+}
+
 func TestReconcileStaleDurableReviewGateRunWritesParentDeathTerminalRecord(t *testing.T) {
 	telemetryDir := t.TempDir()
 	t.Setenv("GT_REFINERY_TELEMETRY_DIR", telemetryDir)

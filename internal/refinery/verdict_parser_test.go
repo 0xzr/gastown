@@ -1088,3 +1088,97 @@ func TestPriorityOfSource(t *testing.T) {
 		}
 	}
 }
+
+// -----------------------------------------------------------------------------
+// gastown-7xq2: reviewer override harness plan-mode trap / no-verdict.
+// A reviewer adapter (Opus/codex override) must fail closed with clear
+// diagnostics and never request plan-file writes for review tasks.
+// -----------------------------------------------------------------------------
+
+func TestClassifyReviewerAdapterFailure_PlanFileWriteProse(t *testing.T) {
+	// Reviewer trapped in a plan-mode harness: it narrates "write the plan"
+	// instead of emitting the required review-only JSON verdict.
+	in := "I'll review this change. First, let me write the plan for the review."
+	af := ClassifyReviewerAdapterFailure(in)
+	if !af.IsSet() {
+		t.Fatalf("ClassifyReviewerAdapterFailure(plan-file prose) = %+v, want set", af)
+	}
+	if af.Kind != AdapterFailurePlanModeTrap {
+		t.Fatalf("kind = %q, want plan_mode_trap", af.Kind)
+	}
+	if af.Source != VerdictSourceAdapterPlanModeTrap {
+		t.Fatalf("source = %q, want adapter_plan_mode_trap", af.Source)
+	}
+	// The verdict itself must be empty (NO_VERDICT / fail closed).
+	if got := ExtractVerdictFromText(in); got.IsSet() {
+		t.Fatalf("ExtractVerdictFromText(plan-file prose) = %v, want empty (no verdict)", got)
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_PlanFileWriteToolCall(t *testing.T) {
+	// Tool-call shape: the reviewer invoked Write/Edit targeting a plan file.
+	in := `{"name":"Write","input":{"file_path":"/tmp/review-plan.md","content":"# plan"}}`
+	af := ClassifyReviewerAdapterFailure(in)
+	if af.Kind != AdapterFailurePlanModeTrap {
+		t.Fatalf("kind = %q, want plan_mode_trap", af.Kind)
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_ToolCallPlanning(t *testing.T) {
+	// Pure tool-call planning prose: TodoWrite/Task verbs, no verdict.
+	in := `{"name":"TodoWrite","input":{"todos":[{"content":"review diff"}]}}`
+	af := ClassifyReviewerAdapterFailure(in)
+	if af.Kind != AdapterFailurePlanModeTrap {
+		t.Fatalf("kind = %q, want plan_mode_trap", af.Kind)
+	}
+	if got := ExtractVerdictFromText(in); got.IsSet() {
+		t.Fatalf("ExtractVerdictFromText(tool-call planning) = %v, want empty", got)
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_NoVerdictProse(t *testing.T) {
+	// Non-empty prose with no parseable verdict and no plan-mode-trap signature.
+	in := "The change looks reasonable but I could not complete the review."
+	af := ClassifyReviewerAdapterFailure(in)
+	if af.Kind != AdapterFailureNoVerdict {
+		t.Fatalf("kind = %q, want no_verdict", af.Kind)
+	}
+	if got := ExtractVerdictFromText(in); got.IsSet() {
+		t.Fatalf("ExtractVerdictFromText(prose) = %v, want empty (no verdict)", got)
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_ParseableVerdictIsNotFailure(t *testing.T) {
+	// A real PASS/FAIL must never be reclassified as an adapter failure.
+	for _, in := range []string{
+		`{"verdict":"PASS","findings":[],"summary":"ok"}`,
+		`{"verdict":"FAIL","blockers":["x"]}`,
+		fencedJSONPassPayload,
+	} {
+		af := ClassifyReviewerAdapterFailure(in)
+		if af.IsSet() {
+			t.Fatalf("ClassifyReviewerAdapterFailure(%q) = %+v, want unset (verdict present)", in, af)
+		}
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_EmptyIsNotFailure(t *testing.T) {
+	// Empty / whitespace output is not an adapter failure to classify; the
+	// caller treats it as NO_VERDICT/UNAVAILABLE via the empty verdict.
+	for _, in := range []string{"", "   ", "\n\t"} {
+		af := ClassifyReviewerAdapterFailure(in)
+		if af.IsSet() {
+			t.Fatalf("ClassifyReviewerAdapterFailure(%q) = %+v, want unset (empty)", in, af)
+		}
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_PlanMentionInFindingsNotTrap(t *testing.T) {
+	// An incidental mention of "plan" inside a real verdict's findings text
+	// must NOT be misclassified as a plan-mode trap when a verdict is present.
+	in := `{"verdict":"PASS","findings":[{"explanation":"the migration plan is sound"}],"summary":"ok"}`
+	af := ClassifyReviewerAdapterFailure(in)
+	if af.IsSet() {
+		t.Fatalf("ClassifyReviewerAdapterFailure(verdict with plan mention) = %+v, want unset", af)
+	}
+}

@@ -2556,6 +2556,16 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 		if durableGateRejectReplay(output) {
 			status = "rework"
 			reason = "reject-replay"
+		} else if af := durableGateReviewerAdapterFailure(output); af.IsSet() {
+			// gastown-7xq2: a reviewer adapter (Opus/codex override) that
+			// exits rc=1 with no parseable verdict — possibly trapped in a
+			// plan-mode harness — must be recorded with a precise adapter-
+			// failure reason instead of a generic exit-N, so telemetry
+			// preserves the exact failure class alongside the commit/tree/MR
+			// context already on the record. The gate still fails closed
+			// (status=defer); only the classification is refined.
+			reason = string(af.Kind)
+			errMsg = fmt.Sprintf("%s — adapter failure: %s", errMsg, af.Detail)
 		}
 		if emitTerminal(runID, tree, attestationWriter, status, reason, gateExit, errMsg, output, elapsed, exitCode, signalName, timedOut) {
 			e.completeDurableReviewRunnerPending(pendingPath)
@@ -3258,6 +3268,20 @@ func durableGateRejectReplay(text string) bool {
 		strings.Contains(haystack, "rejectreplay") ||
 		strings.Contains(haystack, `"replayed":true`) ||
 		strings.Contains(haystack, "replay_count")
+}
+
+// durableGateReviewerAdapterFailure inspects durable review gate output for the
+// gastown-7xq2 reviewer-adapter failure signatures. When the gate command
+// exited non-zero with no parseable verdict, the raw output is classified so
+// the terminal telemetry record carries a precise adapter-failure reason
+// (plan_mode_trap / no_verdict) instead of a bare exit code.
+//
+// It returns a zero-value (unset) ReviewerAdapterFailure when the output
+// contains a parseable verdict (the adapter succeeded) or is empty, so a real
+// PASS/FAIL is never misclassified as an adapter failure. Callers must only
+// consult this on the failure path (runErr != nil).
+func durableGateReviewerAdapterFailure(text string) ReviewerAdapterFailure {
+	return ClassifyReviewerAdapterFailure(text)
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.
