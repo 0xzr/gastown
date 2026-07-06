@@ -2193,6 +2193,43 @@ func TestStashPop(t *testing.T) {
 	}
 }
 
+func TestStashDrop(t *testing.T) {
+	t.Parallel()
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+
+	// Create a stash
+	if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "add", ".")
+	cmd.Dir = dir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "stash", "push", "-m", "dropme")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git stash: %v", err)
+	}
+
+	count, _ := g.StashCount()
+	if count != 1 {
+		t.Fatalf("StashCount before drop = %d, want 1", count)
+	}
+
+	if err := g.StashDrop("stash@{0}"); err != nil {
+		t.Fatalf("StashDrop: %v", err)
+	}
+
+	count, _ = g.StashCount()
+	if count != 0 {
+		t.Errorf("StashCount after drop = %d, want 0", count)
+	}
+
+	if err := g.StashDrop(""); err == nil {
+		t.Error("StashDrop(\"\") should error")
+	}
+}
+
 func TestClearPushURL(t *testing.T) {
 	dir := initTestRepo(t)
 	g := NewGit(dir)

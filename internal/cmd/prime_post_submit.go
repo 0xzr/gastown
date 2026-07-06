@@ -5,6 +5,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
 )
 
@@ -51,7 +52,7 @@ func detectPostSubmitEmptyHook(ctx RoleContext) (*postSubmitEmptyHookState, bool
 // detectPostSubmitEmptyHookWithReaders is the testable implementation of
 // detectPostSubmitEmptyHook. It accepts interfaces for beads and git access so
 // unit tests do not need a live Dolt server or full git repository.
-func detectPostSubmitEmptyHookWithReaders(ctx RoleContext, agentBD issueShower, mrBD issueShower, g gitWorktreeChecker) (*postSubmitEmptyHookState, bool) {
+func detectPostSubmitEmptyHookWithReaders(ctx RoleContext, agentBD polecat.IssueReader, mrBD polecat.IssueReader, g gitWorktreeChecker) (*postSubmitEmptyHookState, bool) {
 	if ctx.Role != RolePolecat {
 		return nil, false
 	}

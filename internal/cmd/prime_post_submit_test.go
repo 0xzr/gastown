@@ -6,9 +6,10 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/polecat"
 )
 
-// fakePostSubmitIssueShower implements issueShower for tests.
+// fakePostSubmitIssueShower implements polecat.IssueReader for tests.
 type fakePostSubmitIssueShower struct {
 	issue *beads.Issue
 	err   error
@@ -88,8 +89,8 @@ active_mr: null
 	cases := []struct {
 		name      string
 		ctx       RoleContext
-		agentBD   issueShower
-		mrBD      issueShower
+		agentBD   polecat.IssueReader
+		mrBD      polecat.IssueReader
 		g         gitWorktreeChecker
 		wantMatch bool
 		wantState func(*postSubmitEmptyHookState) bool

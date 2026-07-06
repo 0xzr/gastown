@@ -440,7 +440,7 @@ func TestHookBeadSafeForCleanup(t *testing.T) {
 	tests := []struct {
 		name         string
 		hookBead     string
-		bd           issueShower
+		bd           polecat.IssueReader
 		wantSafe     bool
 		wantTerminal bool
 		wantBlocker  string
@@ -578,7 +578,7 @@ func TestActiveMRBlocker(t *testing.T) {
 		name       string
 		mrID       string
 		sourceHint string
-		bd         issueShower
+		bd         polecat.IssueReader
 		want       string
 	}{
 		{name: "empty", want: ""},
@@ -1166,5 +1166,121 @@ func TestRederiveDispositionAfterReconcile_NilArgs(t *testing.T) {
 	rederiveDispositionAfterReconcile(nil, status)
 	if status.Verdict != polecat.WorkstateVerdictSafeToNuke {
 		t.Fatalf("nil-input call mutated verdict: got %q", status.Verdict)
+	}
+}
+
+func TestSanitizeRefName(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", "gastown", "gastown"},
+		{"slash", "polecat/nux", "polecat_nux"},
+		{"at", "branch@mr9iyhvr", "branch_mr9iyhvr"},
+		{"mixed", "polybot/ov30", "polybot_ov30"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeRefName(tt.in); got != tt.want {
+				t.Errorf("sanitizeRefName(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPreserveAndDropBranchStashes(t *testing.T) {
+	repo := setupRecoveryGitRepo(t)
+
+	// Create a branch and stash something on it.
+	runGit(t, repo, "switch", "-c", "polecat/test")
+	writeRecoveryFile(t, filepath.Join(repo, "stash.txt"), "stashed content")
+	runGit(t, repo, "add", "stash.txt")
+	runGit(t, repo, "stash", "push", "-m", "branch stash")
+
+	refs, err := preserveAndDropBranchStashes(repo, "gastown", "nux", "polecat/test")
+	if err != nil {
+		t.Fatalf("preserveAndDropBranchStashes: %v", err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("preserved refs = %d, want 1: %v", len(refs), refs)
+	}
+	if !strings.HasPrefix(refs[0], "refs/polecat-recovery/gastown/nux/polecat_test/") {
+		t.Errorf("ref namespace = %q, want refs/polecat-recovery/gastown/nux/polecat_test/...", refs[0])
+	}
+
+	// Verify the recovery ref resolves.
+	out, err := exec.Command("git", "-C", repo, "rev-parse", refs[0]).Output()
+	if err != nil {
+		t.Fatalf("rev-parse recovery ref: %v", err)
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		t.Fatalf("recovery ref %s did not resolve to a commit", refs[0])
+	}
+
+	// Stash should be gone.
+	stashList, err := exec.Command("git", "-C", repo, "stash", "list").Output()
+	if err != nil {
+		t.Fatalf("stash list: %v", err)
+	}
+	if strings.TrimSpace(string(stashList)) != "" {
+		t.Errorf("stash list not empty after reconcile: %s", stashList)
+	}
+}
+
+func TestCanReconcileCleanStash(t *testing.T) {
+	repo := setupRecoveryGitRepo(t)
+	runGit(t, repo, "switch", "-c", "polecat/test")
+	writeRecoveryFile(t, filepath.Join(repo, "stash.txt"), "stashed")
+	runGit(t, repo, "add", "stash.txt")
+	runGit(t, repo, "stash", "push", "-m", "branch stash")
+
+	tests := []struct {
+		name   string
+		p      *polecat.Polecat
+		fields *beads.AgentFields
+		bd     polecat.IssueReader
+		want   bool
+	}{
+		{
+			name:   "idle polecat with stash",
+			p:      &polecat.Polecat{State: polecat.StateIdle, ClonePath: repo, Branch: "polecat/test"},
+			fields: &beads.AgentFields{AgentState: string(beads.AgentStateIdle)},
+			bd:     fakeIssueShower{issue: nil},
+			want:   true,
+		},
+		{
+			name:   "working polecat blocked",
+			p:      &polecat.Polecat{State: polecat.StateWorking, ClonePath: repo, Branch: "polecat/test"},
+			fields: &beads.AgentFields{AgentState: string(beads.AgentStateIdle)},
+			bd:     fakeIssueShower{issue: nil},
+			want:   false,
+		},
+		{
+			name:   "open hook bead blocked",
+			p:      &polecat.Polecat{State: polecat.StateIdle, ClonePath: repo, Branch: "polecat/test", Issue: "gt-abc"},
+			fields: &beads.AgentFields{AgentState: string(beads.AgentStateIdle), HookBead: "gt-abc"},
+			bd:     fakeIssueShower{issue: &beads.Issue{ID: "gt-abc", Status: "open"}},
+			want:   false,
+		},
+		{
+			name:   "pending active MR blocked",
+			p:      &polecat.Polecat{State: polecat.StateIdle, ClonePath: repo, Branch: "polecat/test"},
+			fields: &beads.AgentFields{AgentState: string(beads.AgentStateIdle), ActiveMR: "gt-wisp-open"},
+			bd:     fakeIssueShower{issue: &beads.Issue{ID: "gt-wisp-open", Status: "open"}},
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ok, reason, err := canReconcileCleanStash(tt.bd, tt.p, tt.fields, nil)
+			if err != nil {
+				t.Fatalf("canReconcileCleanStash error: %v", err)
+			}
+			if ok != tt.want {
+				t.Errorf("canReconcileCleanStash() = %v (reason=%q), want %v", ok, reason, tt.want)
+			}
+		})
 	}
 }

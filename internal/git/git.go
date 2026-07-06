@@ -2766,6 +2766,18 @@ func (g *Git) StashPop(ref string) error {
 	return nil
 }
 
+// StashDrop removes the given stash ref from the stash list. It is the caller's
+// responsibility to ensure the stash has been preserved elsewhere before dropping.
+func (g *Git) StashDrop(ref string) error {
+	if ref == "" {
+		return fmt.Errorf("stash ref required")
+	}
+	if _, err := g.run("stash", "drop", ref); err != nil {
+		return fmt.Errorf("git stash drop %s: %w", ref, err)
+	}
+	return nil
+}
+
 // UnpushedCommits returns the number of commits that are not pushed to the remote.
 // It prefers the exact remote branch when one exists, because polecat branches may
 // track origin/main while pushing work to origin/<current-branch>.

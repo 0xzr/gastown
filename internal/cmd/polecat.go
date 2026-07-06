@@ -167,6 +167,9 @@ var (
 	polecatNukeForce                     bool
 	polecatCheckRecoveryJSON             bool
 	polecatCheckRecoveryReconcileCleanup bool
+	polecatReconcileCleanJSON            bool
+	polecatReconcileCleanTargetIssue     string
+	polecatReconcileCleanDryRun          bool
 	polecatPoolInitDryRun                bool
 	polecatPoolInitSize                  int
 	polecatSetAgentForce                 bool
@@ -260,6 +263,32 @@ Examples:
   gt polecat check-recovery greenplace/Toast --json`,
 	Args: cobra.ExactArgs(1),
 	RunE: runPolecatCheckRecovery,
+}
+
+var polecatReconcileCleanCmd = &cobra.Command{
+	Use:   "reconcile-clean <rig>/<polecat>",
+	Short: "Preserve branch-owned stashes and reconcile cleanup metadata for one polecat",
+	Long: `Scoped recovery command for a single polecat that is blocked by branch-owned stashes.
+
+It performs the following steps, failing closed on any unsafe condition:
+  1. Verifies the polecat is idle and has no live work or pending MR.
+  2. Verifies the target issue matches when --target-issue is supplied.
+  3. Preserves each branch-owned stash entry to a durable recovery ref.
+  4. Drops the now-preserved branch-owned stash entries.
+  5. Reconciles stale cleanup_status and active_mr metadata when safe.
+  6. Reruns check-recovery and reports the final verdict.
+
+The command only mutates state when the polecat is provably safe to recycle
+after the stash is preserved. Unpushed commits, uncommitted work, a hooked
+issue, or a pending MR will cause the command to fail without dropping the
+stash.
+
+Examples:
+  gt polecat reconcile-clean gastown/nux
+  gt polecat reconcile-clean gastown/nux --target-issue gastown-9b6nh
+  gt polecat reconcile-clean gastown/nux --json`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPolecatReconcileClean,
 }
 
 var (
@@ -377,6 +406,11 @@ func init() {
 	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryJSON, "json", false, "Output as JSON")
 	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryReconcileCleanup, "reconcile-cleanup", false, "Safely rewrite stale dirty cleanup_status to clean when live recovery predicates prove no work is at risk")
 
+	// Reconcile-clean flags
+	polecatReconcileCleanCmd.Flags().BoolVar(&polecatReconcileCleanJSON, "json", false, "Output as JSON")
+	polecatReconcileCleanCmd.Flags().StringVar(&polecatReconcileCleanTargetIssue, "target-issue", "", "Verify the polecat is assigned to this issue before reconciling")
+	polecatReconcileCleanCmd.Flags().BoolVar(&polecatReconcileCleanDryRun, "dry-run", false, "Show what would be preserved without dropping stashes")
+
 	// Stale flags
 	polecatStaleCmd.Flags().BoolVar(&polecatStaleJSON, "json", false, "Output as JSON")
 	polecatStaleCmd.Flags().IntVar(&polecatStaleThreshold, "threshold", 20, "Commits behind main to consider stale")
@@ -399,6 +433,7 @@ func init() {
 	polecatCmd.AddCommand(polecatSetAgentCmd)
 	polecatCmd.AddCommand(polecatGitStateCmd)
 	polecatCmd.AddCommand(polecatCheckRecoveryCmd)
+	polecatCmd.AddCommand(polecatReconcileCleanCmd)
 	polecatCmd.AddCommand(polecatGCCmd)
 	polecatCmd.AddCommand(polecatNukeCmd)
 	polecatCmd.AddCommand(polecatStaleCmd)
@@ -1078,6 +1113,9 @@ type RecoveryStatus struct {
 	Diagnostics          []string              `json:"diagnostics,omitempty"`
 	RecoveryActions      []string              `json:"recovery_actions,omitempty"`
 	Reconciled           bool                  `json:"reconciled,omitempty"`
+	// PreservedStashRefs lists the recovery refs created by reconcile-clean for
+	// branch-owned stashes. Empty when no stash reconciliation occurred.
+	PreservedStashRefs []string `json:"preserved_stash_refs,omitempty"`
 	// Confidence reflects how much direct liveness evidence supported the verdict.
 	Confidence string `json:"confidence,omitempty"`
 	// Signals lists the liveness predicates that triggered the verdict.
@@ -1100,16 +1138,26 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-
-	mgr, r, err := getPolecatManager(rigName)
+	status, err := buildRecoveryStatus(rigName, polecatName, polecatCheckRecoveryReconcileCleanup)
 	if err != nil {
 		return err
+	}
+	return renderRecoveryStatus(status, polecatCheckRecoveryJSON)
+}
+
+// buildRecoveryStatus computes the recovery status for a polecat. When
+// reconcileCleanup is true, it also mutates durable metadata (cleanup_status,
+// active_mr) when the live predicates prove it is safe to do so.
+func buildRecoveryStatus(rigName, polecatName string, reconcileCleanup bool) (*RecoveryStatus, error) {
+	mgr, r, err := getPolecatManager(rigName)
+	if err != nil {
+		return nil, err
 	}
 
 	// Verify polecat exists and get info
 	p, err := mgr.Get(polecatName)
 	if err != nil {
-		return fmt.Errorf("polecat '%s' not found in rig '%s'", polecatName, rigName)
+		return nil, fmt.Errorf("polecat '%s' not found in rig '%s'", polecatName, rigName)
 	}
 
 	// Get cleanup_status from agent bead
@@ -1119,7 +1167,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
 	agentIssue, fields, err := bd.GetAgentBead(agentBeadID)
 
-	status := RecoveryStatus{
+	status := &RecoveryStatus{
 		Rig:     rigName,
 		Polecat: polecatName,
 		Branch:  p.Branch,
@@ -1245,9 +1293,9 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	status.CleanupStatus = input.CleanupStatus
-	applyMQFactsToWorkstateInput(&input, &status, bd, workTerminal, p.ClonePath, targetRefs, gitState, gitErr)
+	applyMQFactsToWorkstateInput(&input, status, bd, workTerminal, p.ClonePath, targetRefs, gitState, gitErr)
 	disposition := polecat.DecideWorkstate(input)
-	applyWorkstateDispositionToRecoveryStatus(&status, disposition)
+	applyWorkstateDispositionToRecoveryStatus(status, disposition)
 
 	// gastown-95y: evaluate the in-source recovery-guard predicate so the
 	// check-recovery output exposes the same verdict the external wrapper
@@ -1274,9 +1322,9 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if polecatCheckRecoveryReconcileCleanup {
-		reconcileCleanupStatusIfSafe(&status, bd, agentBeadID, p, fields)
-		reconcileActiveMRIfSafe(&status, bd, agentBeadID, fields)
+	if reconcileCleanup {
+		reconcileCleanupStatusIfSafe(status, bd, agentBeadID, p, fields)
+		reconcileActiveMRIfSafe(status, bd, agentBeadID, fields)
 		if status.Reconciled {
 			// Re-derive the verdict against the post-reconcile state (gastown-1gd).
 			// DecideWorkstate ran against the pre-reconcile snapshot of CleanupStatus
@@ -1286,19 +1334,23 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			// input, refresh MQ facts against the new branch state, and re-stamp
 			// disposition so JSON/human output reports SAFE_TO_NUKE rather than
 			// a verdict keyed off the just-cleared MR or stale cleanup status.
-			rederiveDispositionAfterReconcile(&input, &status)
+			rederiveDispositionAfterReconcile(&input, status)
 		}
 	}
 
+	return status, nil
+}
+
+func renderRecoveryStatus(status *RecoveryStatus, asJSON bool) error {
 	// JSON output
-	if polecatCheckRecoveryJSON {
+	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(status)
 	}
 
 	// Human-readable output
-	fmt.Printf("%s\n\n", style.Bold.Render(fmt.Sprintf("Recovery Status: %s/%s", rigName, polecatName)))
+	fmt.Printf("%s\n\n", style.Bold.Render(fmt.Sprintf("Recovery Status: %s/%s", status.Rig, status.Polecat)))
 	fmt.Printf("  Cleanup Status:  %s\n", status.CleanupStatus)
 	if status.Branch != "" {
 		fmt.Printf("  Branch:          %s\n", status.Branch)
@@ -1311,6 +1363,12 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 	if len(status.Diagnostics) > 0 {
 		fmt.Printf("  Diagnostics:     %s\n", strings.Join(status.Diagnostics, "; "))
+	}
+	if len(status.PreservedStashRefs) > 0 {
+		fmt.Printf("  Preserved Stashes:\n")
+		for _, ref := range status.PreservedStashRefs {
+			fmt.Printf("    - %s\n", ref)
+		}
 	}
 	fmt.Println()
 
@@ -1354,6 +1412,189 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func runPolecatReconcileClean(cmd *cobra.Command, args []string) error {
+	rigName, polecatName, err := parseAddress(args[0])
+	if err != nil {
+		return err
+	}
+
+	mgr, r, err := getPolecatManager(rigName)
+	if err != nil {
+		return err
+	}
+	p, err := mgr.Get(polecatName)
+	if err != nil {
+		return fmt.Errorf("polecat '%s' not found in rig '%s'", polecatName, rigName)
+	}
+
+	bd := beads.New(r.Path)
+	agentIssue, fields, err := bd.GetAgentBead(polecatBeadIDForRig(r, rigName, polecatName))
+
+	currentIssue := p.Issue
+	if currentIssue == "" && fields != nil {
+		currentIssue = agentSourceIssueHint(currentIssue, fields)
+	}
+
+	if polecatReconcileCleanTargetIssue != "" && currentIssue != "" && currentIssue != polecatReconcileCleanTargetIssue {
+		return fmt.Errorf("target issue mismatch: polecat assigned to %s, expected %s", currentIssue, polecatReconcileCleanTargetIssue)
+	}
+
+	if ok, reason, err := canReconcileCleanStash(bd, p, fields, agentIssue); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("reconcile-clean refused for %s/%s: %s", rigName, polecatName, reason)
+	}
+
+	g := git.NewGit(p.ClonePath)
+	entries, err := g.StashListForBranch()
+	if err != nil {
+		return fmt.Errorf("list branch stashes: %w", err)
+	}
+
+	if polecatReconcileCleanDryRun {
+		status, err := buildRecoveryStatus(rigName, polecatName, false)
+		if err != nil {
+			return err
+		}
+		status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("dry-run: would preserve %d branch-owned stash(es)", len(entries)))
+		return renderRecoveryStatus(status, polecatReconcileCleanJSON)
+	}
+
+	var preservedRefs []string
+	if len(entries) > 0 {
+		preservedRefs, err = preserveAndDropBranchStashes(p.ClonePath, rigName, polecatName, p.Branch)
+		if err != nil {
+			return fmt.Errorf("preserve and drop stashes: %w", err)
+		}
+	}
+
+	status, err := buildRecoveryStatus(rigName, polecatName, true)
+	if err != nil {
+		return err
+	}
+	status.PreservedStashRefs = preservedRefs
+
+	if status.Verdict != polecat.WorkstateVerdictSafeToNuke {
+		return fmt.Errorf("reconcile-clean failed: final status is %s (blockers=%v)", status.Verdict, status.Blockers)
+	}
+
+	return renderRecoveryStatus(status, polecatReconcileCleanJSON)
+}
+
+// canReconcileCleanStash verifies that a polecat is safe to run stash
+// reconciliation against. It fails closed on any condition that could lose work
+// or recycle a polecat that still has live work.
+func canReconcileCleanStash(bd polecat.IssueReader, p *polecat.Polecat, fields *beads.AgentFields, agentIssue *beads.Issue) (bool, string, error) {
+	if p == nil {
+		return false, "polecat info unavailable", nil
+	}
+	if p.State != polecat.StateIdle {
+		return false, fmt.Sprintf("polecat state is %s, not idle", p.State), nil
+	}
+	if fields != nil && beads.AgentState(fields.AgentState) != beads.AgentStateIdle {
+		return false, fmt.Sprintf("agent bead state is %s, not idle", fields.AgentState), nil
+	}
+
+	hookBead := agentHookBead(agentIssue, fields)
+	if hookSafe, _, blocker := hookBeadSafeForCleanup(bd, hookBead); !hookSafe {
+		return false, "hooked issue blocks: " + blocker, nil
+	}
+
+	g := git.NewGit(p.ClonePath)
+	workStatus, err := g.CheckUncommittedWork()
+	if err != nil {
+		return false, "", fmt.Errorf("check git state: %w", err)
+	}
+	if !workStatus.CleanExcludingRuntime() {
+		return false, "worktree has uncommitted changes", nil
+	}
+	if workStatus.UnpushedCommits > 0 {
+		return false, fmt.Sprintf("worktree has %d unpushed commit(s)", workStatus.UnpushedCommits), nil
+	}
+	if workStatus.StashCount == 0 {
+		return false, "no branch-owned stashes to reconcile", nil
+	}
+
+	if fields != nil && fields.ActiveMR != "" {
+		sourceHint := agentSourceIssueHint(p.Issue, fields)
+		gitSafe := activeMRGitSafeForWorktree(p.ClonePath)
+		assessment := polecat.AssessActiveMR(bd, polecat.ActiveMRInput{
+			ActiveMR:        fields.ActiveMR,
+			SourceIssueHint: sourceHint,
+			RequireGitSafe:  true,
+			GitSafe:         gitSafe,
+		})
+		if assessment.Pending {
+			return false, "active MR is pending: " + assessment.Reason, nil
+		}
+	}
+
+	return true, "", nil
+}
+
+// preserveAndDropBranchStashes creates durable recovery refs for each branch-owned
+// stash entry and then drops the stashes from the worktree. Refs are created in
+// reverse order so earlier indices remain valid, and stashes are dropped from
+// highest index to lowest for the same reason.
+func preserveAndDropBranchStashes(worktreePath, rigName, polecatName, branch string) ([]string, error) {
+	g := git.NewGit(worktreePath)
+	entries, err := g.StashListForBranch()
+	if err != nil {
+		return nil, fmt.Errorf("list branch stashes: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	timestamp := time.Now().UTC().Format("20060102T150405Z")
+	safeBranch := sanitizeRefName(branch)
+	if safeBranch == "" {
+		safeBranch = "detached"
+	}
+	baseRef := fmt.Sprintf("refs/polecat-recovery/%s/%s/%s/%s/stash",
+		sanitizeRefName(rigName), sanitizeRefName(polecatName), safeBranch, timestamp)
+
+	var refs []string
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
+		sha, err := g.Rev(entry.Ref)
+		if err != nil {
+			return refs, fmt.Errorf("resolve stash %s: %w", entry.Ref, err)
+		}
+		refName := fmt.Sprintf("%s/%d", baseRef, i)
+		if err := g.CreateRef(refName, sha); err != nil {
+			return refs, fmt.Errorf("create recovery ref %s: %w", refName, err)
+		}
+		if ok, err := g.RefExists(refName); err != nil || !ok {
+			return refs, fmt.Errorf("verify recovery ref %s: missing after create", refName)
+		}
+		refs = append(refs, refName)
+	}
+
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
+		if err := g.StashDrop(entry.Ref); err != nil {
+			return refs, fmt.Errorf("drop stash %s: %w", entry.Ref, err)
+		}
+	}
+
+	return refs, nil
+}
+
+// sanitizeRefName replaces characters that are not safe in git ref names with
+// underscores so that rig/polecat/branch names can be embedded in recovery refs.
+func sanitizeRefName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
 }
 
 func applyGitStateToWorkstateInput(input *polecat.WorkstateInput, worktreePath string, gitState *GitState, gitErr error) {
@@ -1439,10 +1680,6 @@ func rederiveDispositionAfterReconcile(input *polecat.WorkstateInput, status *Re
 	applyWorkstateDispositionToRecoveryStatus(status, disposition)
 }
 
-type issueShower interface {
-	Show(issueID string) (*beads.Issue, error)
-}
-
 func cleanupStatusBlocker(status polecat.CleanupStatus) string {
 	switch status {
 	case polecat.CleanupClean:
@@ -1503,7 +1740,7 @@ func activeMRGitCleanForWorktree(worktreePath string) bool {
 	return status.CleanExcludingRuntime() && status.StashCount == 0
 }
 
-func hookBeadSafeForCleanup(bd issueShower, hookBead string) (safe bool, terminal bool, blocker string) {
+func hookBeadSafeForCleanup(bd polecat.IssueReader, hookBead string) (safe bool, terminal bool, blocker string) {
 	if hookBead == "" {
 		return true, false, ""
 	}
@@ -1618,7 +1855,7 @@ func agentSourceIssueHint(currentIssue string, fields *beads.AgentFields) string
 	return fields.HookBead
 }
 
-func partialSpawnWithoutDurableHook(bd issueShower, fields *beads.AgentFields, assignee, currentIssue string) (bool, string) {
+func partialSpawnWithoutDurableHook(bd polecat.IssueReader, fields *beads.AgentFields, assignee, currentIssue string) (bool, string) {
 	if bd == nil || fields == nil || fields.AgentState != "spawning" || fields.HookBead == "" || currentIssue != "" {
 		return false, ""
 	}
@@ -1657,7 +1894,7 @@ func recoveryActionsForBlockers(blockers []string) []string {
 	return nil
 }
 
-func activeMRBlocker(bd issueShower, mrID, sourceHint string, requireGitSafe, gitSafe bool) string {
+func activeMRBlocker(bd polecat.IssueReader, mrID, sourceHint string, requireGitSafe, gitSafe bool) string {
 	assessment := polecat.AssessActiveMR(bd, polecat.ActiveMRInput{
 		ActiveMR:        mrID,
 		SourceIssueHint: sourceHint,
@@ -1880,7 +2117,7 @@ func isAssignedBeadTerminal(bd *beads.Beads, issueID string) bool {
 // isMQNotRequiredSource reports whether the source bead intentionally bypasses
 // the internal merge queue. The caller still gates this on SAFE_TO_NUKE so dirty
 // or unpushed local work is never hidden by source metadata.
-func isMQNotRequiredSource(bd issueShower, issueID string) bool {
+func isMQNotRequiredSource(bd polecat.IssueReader, issueID string) bool {
 	if issueID == "" || bd == nil {
 		return false
 	}
