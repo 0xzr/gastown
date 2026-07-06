@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
+	"github.com/steveyegge/gastown/internal/wisp"
 )
 
 func setupPolecatCapacityTestTown(t *testing.T, maxPolecats int) string {
@@ -424,6 +425,95 @@ func TestStandaloneFormulaRigTargetAcquiresSingleAdmission(t *testing.T) {
 	}
 	if admissions != 1 {
 		t.Fatalf("admissions = %d, want 1", admissions)
+	}
+}
+
+func TestCapacitySnapshotExcludesParkedRigPolecats(t *testing.T) {
+	townRoot := setupPolecatCapacityTestTown(t, 2)
+
+	rigsConfig := &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{
+			"active": {GitURL: "https://example.invalid/active.git"},
+			"parked": {GitURL: "https://example.invalid/parked.git"},
+		},
+	}
+	if err := config.SaveRigsConfig(filepath.Join(townRoot, "mayor", "rigs.json"), rigsConfig); err != nil {
+		t.Fatalf("SaveRigsConfig: %v", err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "parked", "polecats", "toast"), 0755); err != nil {
+		t.Fatalf("mkdir parked polecat: %v", err)
+	}
+
+	wispCfg := wisp.NewConfig(townRoot, "parked")
+	if err := wispCfg.Set(RigStatusKey, RigStatusParked); err != nil {
+		t.Fatalf("set parked wisp state: %v", err)
+	}
+
+	snapshot, err := polecatCapacitySnapshotForTown(townRoot)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if snapshot.Working != 0 || snapshot.RecoveryBlocked != 0 || snapshot.Free != 2 {
+		t.Fatalf("snapshot = %+v, want working=0 recovery_blocked=0 free=2", snapshot)
+	}
+}
+
+func TestCapacitySnapshotExcludesDockedRigPolecats(t *testing.T) {
+	townRoot := setupPolecatCapacityTestTown(t, 2)
+
+	rigsConfig := &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{
+			"active": {GitURL: "https://example.invalid/active.git"},
+			"docked": {GitURL: "https://example.invalid/docked.git"},
+		},
+	}
+	if err := config.SaveRigsConfig(filepath.Join(townRoot, "mayor", "rigs.json"), rigsConfig); err != nil {
+		t.Fatalf("SaveRigsConfig: %v", err)
+	}
+
+	rigName := "docked"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(filepath.Join(rigPath, "polecats", "toast"), 0755); err != nil {
+		t.Fatalf("mkdir docked polecat: %v", err)
+	}
+
+	prefix := randomTestPrefix(t)
+	rigCfg := &config.RigConfig{
+		Type:      "rig",
+		Version:   config.CurrentRigConfigVersion,
+		Name:      rigName,
+		GitURL:    "https://example.invalid/docked.git",
+		CreatedAt: time.Now(),
+		Beads:     &config.BeadsConfig{Prefix: prefix},
+	}
+	if err := config.SaveRigConfig(filepath.Join(rigPath, "config.json"), rigCfg); err != nil {
+		t.Fatalf("save rig config: %v", err)
+	}
+
+	b := setupRigBeadsDB(t, rigPath, prefix)
+	rigBead, err := b.EnsureRigBead(rigName, &beads.RigFields{
+		Repo:   rigCfg.GitURL,
+		Prefix: prefix,
+		State:  beads.RigStateActive,
+	})
+	if err != nil {
+		t.Fatalf("ensure rig bead: %v", err)
+	}
+	if err := b.Update(rigBead.ID, beads.UpdateOptions{
+		AddLabels: []string{RigDockedLabel},
+	}); err != nil {
+		t.Fatalf("set docked label: %v", err)
+	}
+
+	snapshot, err := polecatCapacitySnapshotForTown(townRoot)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if snapshot.Working != 0 || snapshot.RecoveryBlocked != 0 || snapshot.Free != 2 {
+		t.Fatalf("snapshot = %+v, want working=0 recovery_blocked=0 free=2", snapshot)
 	}
 }
 
