@@ -195,6 +195,150 @@ func TestRunDurableReviewGate_MissingAttestationWritesTerminalRecord(t *testing.
 	}
 }
 
+func TestRunDurableReviewGate_ReviewerAdapterPlanModeTrap_ClassifiesFailureReason(t *testing.T) {
+	telemetryDir := t.TempDir()
+	t.Setenv("GT_REFINERY_TELEMETRY_DIR", telemetryDir)
+
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		Cmd:         `printf '%s\n' "I will write the plan for this review before producing a verdict." ; exit 1`,
+		HMACKeyPath: keyPath,
+	}
+
+	createFeatureBranch(t, workDir, "feat/adapter-plan-trap", "feature.txt", "feature content")
+	expectedTree := run(t, workDir, "git", "rev-parse", "HEAD^{tree}")
+
+	result := e.runDurableReviewGate(context.Background(), "feat/adapter-plan-trap", "main", nil, false, "main")
+	if result.Success {
+		t.Fatal("expected durable review gate to fail closed on plan-mode-trap adapter output")
+	}
+	if !result.TestsFailed {
+		t.Fatalf("expected TestsFailed=true (fail closed), got %+v", result)
+	}
+	if !strings.Contains(result.Error, string(AdapterFailurePlanModeTrap)) {
+		t.Fatalf("result error = %q, want plan-mode adapter failure reason", result.Error)
+	}
+
+	record := requireDurableReviewTerminalRecord(t, telemetryDir, string(AdapterFailurePlanModeTrap))
+	if record.Status != "defer" {
+		t.Fatalf("terminal status = %q, want defer", record.Status)
+	}
+	if record.GateExit != "1" {
+		t.Fatalf("terminal gate_exit = %q, want 1", record.GateExit)
+	}
+	if record.Branch != "feat/adapter-plan-trap" {
+		t.Fatalf("terminal branch = %q, want feat/adapter-plan-trap", record.Branch)
+	}
+	if record.Target != "main" {
+		t.Fatalf("terminal target = %q, want main", record.Target)
+	}
+	if record.Tree != expectedTree {
+		t.Fatalf("terminal tree = %q, want %q", record.Tree, expectedTree)
+	}
+	if record.Writer == "" {
+		t.Fatalf("terminal writer is empty; context must be preserved: %+v", record)
+	}
+	if !strings.Contains(record.Error, string(AdapterFailurePlanModeTrap)) ||
+		!strings.Contains(record.Error, "adapter failure") {
+		t.Fatalf("terminal error = %q, want adapter-failure diagnostic", record.Error)
+	}
+}
+
+func TestRunDurableReviewGate_ReviewerAdapterNoVerdict_ClassifiesFailureReason(t *testing.T) {
+	telemetryDir := t.TempDir()
+	t.Setenv("GT_REFINERY_TELEMETRY_DIR", telemetryDir)
+
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		Cmd:         `printf '%s\n' "The change looks reasonable, but the review did not complete." ; exit 1`,
+		HMACKeyPath: keyPath,
+	}
+
+	createFeatureBranch(t, workDir, "feat/adapter-no-verdict", "feature.txt", "feature content")
+	expectedTree := run(t, workDir, "git", "rev-parse", "HEAD^{tree}")
+
+	result := e.runDurableReviewGate(context.Background(), "feat/adapter-no-verdict", "main", nil, false, "main")
+	if result.Success {
+		t.Fatal("expected durable review gate to fail closed on adapter no-verdict output")
+	}
+	if !result.TestsFailed {
+		t.Fatalf("expected TestsFailed=true (fail closed), got %+v", result)
+	}
+	if !strings.Contains(result.Error, string(AdapterFailureNoVerdict)) {
+		t.Fatalf("result error = %q, want no-verdict adapter failure reason", result.Error)
+	}
+
+	record := requireDurableReviewTerminalRecord(t, telemetryDir, string(AdapterFailureNoVerdict))
+	if record.Status != "defer" {
+		t.Fatalf("terminal status = %q, want defer", record.Status)
+	}
+	if record.Branch != "feat/adapter-no-verdict" || record.Target != "main" {
+		t.Fatalf("terminal branch/target = %q/%q, want context preserved", record.Branch, record.Target)
+	}
+	if record.Tree != expectedTree {
+		t.Fatalf("terminal tree = %q, want %q", record.Tree, expectedTree)
+	}
+	if record.Writer == "" {
+		t.Fatalf("terminal writer is empty; context must be preserved: %+v", record)
+	}
+	if !strings.Contains(record.Error, string(AdapterFailureNoVerdict)) {
+		t.Fatalf("terminal error = %q, want no-verdict diagnostic", record.Error)
+	}
+}
+
+func TestRunDurableReviewGate_ReviewerAdapterParseableVerdictNotClassifiedAsFailure(t *testing.T) {
+	telemetryDir := t.TempDir()
+	t.Setenv("GT_REFINERY_TELEMETRY_DIR", telemetryDir)
+
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.RunTests = false
+	e.config.AutoPush = false
+	e.config.Gates = nil
+	keyPath := writeTestHMACKey(t, workDir)
+	e.config.DurableReviewGate = &DurableReviewGateConfig{
+		Required:    true,
+		Cmd:         `printf '%s\n' 'I will write the plan first. {"verdict":"FAIL","blockers":["missing test"]}' ; exit 1`,
+		HMACKeyPath: keyPath,
+	}
+
+	createFeatureBranch(t, workDir, "feat/adapter-real-verdict", "feature.txt", "feature content")
+
+	result := e.runDurableReviewGate(context.Background(), "feat/adapter-real-verdict", "main", nil, false, "main")
+	if result.Success {
+		t.Fatal("expected durable review gate to fail closed on non-zero reviewer exit")
+	}
+
+	records := readDurableReviewRunnerRecords(t, telemetryDir)
+	var terminal *durableReviewRunnerRecord
+	for i := range records {
+		if records[i].Event == durableReviewRunnerTerminalEvent && records[i].Terminal {
+			terminal = &records[i]
+		}
+	}
+	if terminal == nil {
+		t.Fatal("expected a terminal telemetry record")
+	}
+	if terminal.Reason == string(AdapterFailurePlanModeTrap) || terminal.Reason == string(AdapterFailureNoVerdict) {
+		t.Fatalf("terminal reason = %q; parseable verdict must not be reclassified: %+v", terminal.Reason, terminal)
+	}
+	if terminal.Status != "defer" {
+		t.Fatalf("terminal status = %q, want defer", terminal.Status)
+	}
+}
+
 func TestReconcileStaleDurableReviewGateRunWritesParentDeathTerminalRecord(t *testing.T) {
 	telemetryDir := t.TempDir()
 	t.Setenv("GT_REFINERY_TELEMETRY_DIR", telemetryDir)

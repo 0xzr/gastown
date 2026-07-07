@@ -1088,3 +1088,98 @@ func TestPriorityOfSource(t *testing.T) {
 		}
 	}
 }
+
+func TestClassifyReviewerAdapterFailure_PlanFileWriteProse(t *testing.T) {
+	in := "I will write the plan for this review before producing a verdict."
+	af := ClassifyReviewerAdapterFailure(in)
+	if !af.IsSet() {
+		t.Fatalf("ClassifyReviewerAdapterFailure(plan-file prose) = %+v, want set", af)
+	}
+	if af.Kind != AdapterFailurePlanModeTrap {
+		t.Fatalf("kind = %q, want %q", af.Kind, AdapterFailurePlanModeTrap)
+	}
+	if af.Source != VerdictSourceAdapterPlanModeTrap {
+		t.Fatalf("source = %q, want %q", af.Source, VerdictSourceAdapterPlanModeTrap)
+	}
+	if got := ExtractVerdictFromText(in); got.IsSet() {
+		t.Fatalf("ExtractVerdictFromText(plan-file prose) = %+v, want empty", got)
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_PlanFileWriteToolCall(t *testing.T) {
+	in := `{"name":"Write","input":{"file_path":"/tmp/review-plan.md","content":"# plan"}}`
+	af := ClassifyReviewerAdapterFailure(in)
+	if af.Kind != AdapterFailurePlanModeTrap {
+		t.Fatalf("kind = %q, want %q", af.Kind, AdapterFailurePlanModeTrap)
+	}
+	if af.Source != VerdictSourceAdapterPlanModeTrap {
+		t.Fatalf("source = %q, want %q", af.Source, VerdictSourceAdapterPlanModeTrap)
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_ToolCallPlanning(t *testing.T) {
+	in := `{"name":"TodoWrite","input":{"todos":[{"content":"review diff"}]}}`
+	af := ClassifyReviewerAdapterFailure(in)
+	if af.Kind != AdapterFailurePlanModeTrap {
+		t.Fatalf("kind = %q, want %q", af.Kind, AdapterFailurePlanModeTrap)
+	}
+	if got := ExtractVerdictFromText(in); got.IsSet() {
+		t.Fatalf("ExtractVerdictFromText(tool-call planning) = %+v, want empty", got)
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_NoVerdictProse(t *testing.T) {
+	in := "The change looks reasonable, but the review did not complete."
+	af := ClassifyReviewerAdapterFailure(in)
+	if af.Kind != AdapterFailureNoVerdict {
+		t.Fatalf("kind = %q, want %q", af.Kind, AdapterFailureNoVerdict)
+	}
+	if af.Source != VerdictSourceAdapterNoVerdict {
+		t.Fatalf("source = %q, want %q", af.Source, VerdictSourceAdapterNoVerdict)
+	}
+	if got := ExtractVerdictFromText(in); got.IsSet() {
+		t.Fatalf("ExtractVerdictFromText(no-verdict prose) = %+v, want empty", got)
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_EmptyOutputIsUnset(t *testing.T) {
+	for _, in := range []string{"", "   ", "\n\t"} {
+		if af := ClassifyReviewerAdapterFailure(in); af.IsSet() {
+			t.Fatalf("ClassifyReviewerAdapterFailure(%q) = %+v, want unset", in, af)
+		}
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_PlanMentionWithoutWriteIsNoVerdict(t *testing.T) {
+	in := "The migration plan looks risky, but the review stopped before JSON output."
+	af := ClassifyReviewerAdapterFailure(in)
+	if af.Kind != AdapterFailureNoVerdict {
+		t.Fatalf("kind = %q, want %q for incidental plan mention", af.Kind, AdapterFailureNoVerdict)
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_TaskWordWithoutToolCallIsNoVerdict(t *testing.T) {
+	in := "The task failed before the reviewer emitted JSON."
+	af := ClassifyReviewerAdapterFailure(in)
+	if af.Kind != AdapterFailureNoVerdict {
+		t.Fatalf("kind = %q, want %q for ordinary task prose", af.Kind, AdapterFailureNoVerdict)
+	}
+}
+
+func TestClassifyReviewerAdapterFailure_ParseableVerdictIsNeverFailure(t *testing.T) {
+	cases := []string{
+		`{"verdict":"PASS","findings":[],"summary":"ok"}`,
+		`{"verdict":"FAIL","blockers":["missing test"]}`,
+		fencedJSONPassPayload,
+		`I will write the plan first. {"verdict":"FAIL","blockers":["real blocker"]}`,
+		`{"name":"TodoWrite","input":{"todos":[{"content":"review diff"}]}} {"verdict":"PASS","findings":[]}`,
+	}
+	for _, in := range cases {
+		if got := ExtractVerdictFromText(in); !got.IsSet() {
+			t.Fatalf("ExtractVerdictFromText(%q) = %+v, want verdict set", in, got)
+		}
+		if af := ClassifyReviewerAdapterFailure(in); af.IsSet() {
+			t.Fatalf("ClassifyReviewerAdapterFailure(%q) = %+v, want unset", in, af)
+		}
+	}
+}

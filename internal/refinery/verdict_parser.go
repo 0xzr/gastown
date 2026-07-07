@@ -107,6 +107,10 @@ const (
 	VerdictSourceLogPartReviewFindingsRawOutput VerdictSource = "log_part_review_findings_raw_output"
 	VerdictSourceLogPartReviewVerdict           VerdictSource = "log_part_review_verdict"
 	VerdictSourceLogLooseFallback               VerdictSource = "log_loose_fallback"
+
+	// Adapter-failure sources (ClassifyReviewerAdapterFailure).
+	VerdictSourceAdapterPlanModeTrap VerdictSource = "adapter_plan_mode_trap"
+	VerdictSourceAdapterNoVerdict    VerdictSource = "adapter_no_verdict"
 )
 
 // carrierPriority orders carrier fields from highest (lowest number) to lowest
@@ -181,6 +185,80 @@ var fenceRe = regexp.MustCompile("(?s)```(?:json)?\\s*(.*?)```")
 // verdictRe matches the case-insensitive "verdict":"PASS" or "verdict":"FAIL"
 // fallback. Used only as a last resort after structured parsing fails.
 var verdictRe = regexp.MustCompile(`(?i)"verdict"\s*:\s*"(PASS|FAIL)"`)
+
+// ReviewerAdapterFailure classifies reviewer-adapter output that failed to
+// produce a parseable review verdict. The durable review gate still fails
+// closed on these outputs; this type only names the failure mode for telemetry.
+type ReviewerAdapterFailure struct {
+	Kind   ReviewerAdapterFailureKind
+	Source VerdictSource
+	Detail string
+}
+
+// ReviewerAdapterFailureKind is the stable telemetry reason for a failed
+// reviewer adapter.
+type ReviewerAdapterFailureKind string
+
+const (
+	AdapterFailureNone         ReviewerAdapterFailureKind = ""
+	AdapterFailurePlanModeTrap ReviewerAdapterFailureKind = "plan_mode_trap"
+	AdapterFailureNoVerdict    ReviewerAdapterFailureKind = "no_verdict"
+)
+
+// planFileWriteRe detects the plan-mode trap observed in gastown-7xq2:
+// reviewer output requesting a plan-file write instead of emitting the
+// review-only JSON verdict. Keep this narrow; ordinary findings can mention a
+// plan without being a plan-mode harness failure.
+var planFileWriteRe = regexp.MustCompile(
+	`(?is)\b(?:i(?:'ll| will| need to| should)|let me|we(?:'ll| will| need to))\s+(?:now\s+)?(?:write|update|create|edit)\s+(?:a\s+|the\s+|this\s+)?(?:review\s+)?plan(?:[-_ ]?file)?\b` +
+		`|\b(?:write|update|create|edit)\s+(?:a\s+|the\s+|this\s+)?(?:review\s+)?plan[-_ ]?file\b` +
+		`|(?:"name"\s*:\s*"(?:Write|Edit|MultiEdit)"[\s\S]{0,1000}"file_path"\s*:\s*"[^"]*\bplan[-_a-z0-9]*\.(?:md|txt)")` +
+		`|(?:\b(?:Write|Edit|MultiEdit)\b[^\n]{0,400}\bplan[-_a-z0-9]*\.(?:md|txt)\b)`,
+)
+
+// toolCallPlanningRe detects tool-call planning output, not ordinary prose
+// containing the word "task". TodoWrite is distinctive enough to match as a
+// bare tool name; Task is only treated as planning when it appears as a JSON
+// tool-call name or as "Task tool" prose.
+var toolCallPlanningRe = regexp.MustCompile(
+	`(?is)"name"\s*:\s*"(?:TodoWrite|Task|TaskCreate|TaskUpdate|TaskList)"` +
+		`|(?:^|\W)(?:TodoWrite|TaskCreate|TaskUpdate|TaskList)\b` +
+		`|(?:^|\W)Task\s+tool\b`,
+)
+
+// ClassifyReviewerAdapterFailure inspects raw reviewer-adapter output after the
+// caller has failed to extract a verdict. It never reclassifies a parseable
+// PASS/FAIL as an adapter failure; parse-first is the safety property.
+func ClassifyReviewerAdapterFailure(text string) ReviewerAdapterFailure {
+	if ExtractVerdictFromText(text).IsSet() {
+		return ReviewerAdapterFailure{}
+	}
+	if strings.TrimSpace(text) == "" {
+		return ReviewerAdapterFailure{}
+	}
+	if planFileWriteRe.MatchString(text) {
+		return ReviewerAdapterFailure{
+			Kind:   AdapterFailurePlanModeTrap,
+			Source: VerdictSourceAdapterPlanModeTrap,
+			Detail: "reviewer requested a plan-file write instead of a review-only JSON verdict",
+		}
+	}
+	if toolCallPlanningRe.MatchString(text) {
+		return ReviewerAdapterFailure{
+			Kind:   AdapterFailurePlanModeTrap,
+			Source: VerdictSourceAdapterPlanModeTrap,
+			Detail: "reviewer emitted tool-call planning instead of a review-only JSON verdict",
+		}
+	}
+	return ReviewerAdapterFailure{
+		Kind:   AdapterFailureNoVerdict,
+		Source: VerdictSourceAdapterNoVerdict,
+		Detail: "reviewer adapter produced no parseable {verdict: PASS|FAIL} payload",
+	}
+}
+
+// IsSet reports whether a known adapter-failure kind was classified.
+func (f ReviewerAdapterFailure) IsSet() bool { return f.Kind != AdapterFailureNone }
 
 // ExtractVerdictFromText scans a single text blob for a {verdict: PASS|FAIL}
 // payload and reports which extraction step succeeded. The order of preference

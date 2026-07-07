@@ -2556,6 +2556,9 @@ func (e *Engineer) runDurableReviewGate(ctx context.Context, branch, target stri
 		if durableGateRejectReplay(output) {
 			status = "rework"
 			reason = "reject-replay"
+		} else if failure := durableGateReviewerAdapterFailure(output); failure.IsSet() {
+			reason = string(failure.Kind)
+			errMsg = fmt.Sprintf("%s; adapter failure %s: %s", errMsg, failure.Kind, failure.Detail)
 		}
 		if emitTerminal(runID, tree, attestationWriter, status, reason, gateExit, errMsg, output, elapsed, exitCode, signalName, timedOut) {
 			e.completeDurableReviewRunnerPending(pendingPath)
@@ -3258,6 +3261,10 @@ func durableGateRejectReplay(text string) bool {
 		strings.Contains(haystack, "rejectreplay") ||
 		strings.Contains(haystack, `"replayed":true`) ||
 		strings.Contains(haystack, "replay_count")
+}
+
+func durableGateReviewerAdapterFailure(text string) ReviewerAdapterFailure {
+	return ClassifyReviewerAdapterFailure(text)
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.
