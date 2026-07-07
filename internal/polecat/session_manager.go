@@ -566,8 +566,7 @@ func agentCapped(townRoot, agent string) (bool, string) {
 // resolveAgent), so a plain restart re-uses this pin and changing the rig/town
 // default does NOT re-model an existing lane. The new agent MUST resolve to a real
 // runtime config BEFORE we persist (the same resolution start uses), so a lane can
-// never be pinned to a retired/unknown model that would silently downgrade (the
-// persisted path warns + falls back) or hard-fail (an explicit --agent) its next
+// never be pinned to a retired/unknown model that would fail closed on its next
 // start. Returns the previous pin (may be empty). Does not touch a live session;
 // the change takes effect on the next start/restart.
 func (m *SessionManager) SetAssignedAgent(polecat, agent string, force bool) (string, error) {
@@ -638,6 +637,17 @@ func (m *SessionManager) readHookBead(polecat string) string {
 		return hookBead
 	}
 	return ""
+}
+
+func resolvePolecatRuntimeConfig(townRoot, rigPath, effectiveAgent string) (*config.RuntimeConfig, error) {
+	if effectiveAgent != "" {
+		rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, rigPath, effectiveAgent)
+		if err != nil {
+			return nil, fmt.Errorf("resolving agent config for %s: %w", effectiveAgent, err)
+		}
+		return rc, nil
+	}
+	return config.ResolveRoleAgentConfig("polecat", townRoot, rigPath), nil
 }
 
 // Start creates and starts a new session for a polecat.
@@ -711,22 +721,9 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 			effectiveAgent = persisted
 		}
 	}
-	if effectiveAgent != "" {
-		rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, effectiveAgent)
-		if err != nil {
-			// An invalid persisted agent must not wedge session start: fall back
-			// to the default role agent and warn so the operator can fix it.
-			if opts.Agent != "" {
-				return fmt.Errorf("resolving agent config for %s: %w", effectiveAgent, err)
-			}
-			style.PrintWarning("persisted assigned_agent %q could not be resolved, falling back to default: %v", effectiveAgent, err)
-			effectiveAgent = ""
-			runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
-		} else {
-			runtimeConfig = rc
-		}
-	} else {
-		runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
+	runtimeConfig, err = resolvePolecatRuntimeConfig(townRoot, m.rig.Path, effectiveAgent)
+	if err != nil {
+		return err
 	}
 
 	// Persist the agent this session is running so the next start/restart can

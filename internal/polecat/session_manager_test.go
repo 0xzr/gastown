@@ -1221,6 +1221,60 @@ func TestReadModelAssignment_MalformedJSONReturnsEmpty(t *testing.T) {
 	}
 }
 
+func TestResolvePolecatRuntimeConfig_UnresolvableAgentFailsClosed(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatalf("mkdir rig path: %v", err)
+	}
+
+	_, err := resolvePolecatRuntimeConfig(townRoot, rigPath, "codex-impl-xhigh")
+	if err == nil {
+		t.Fatal("unresolvable persisted agent should fail closed, got nil")
+	}
+	if !strings.Contains(err.Error(), "agent 'codex-impl-xhigh' not found") {
+		t.Fatalf("error = %q, want unresolved codex-impl-xhigh", err.Error())
+	}
+}
+
+func TestResolvePolecatRuntimeConfig_CustomXHighAgentResolves(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	settingsDir := filepath.Join(townRoot, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatalf("mkdir settings: %v", err)
+	}
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatalf("mkdir rig path: %v", err)
+	}
+	settings := `{
+		"type":"town-settings",
+		"version":1,
+		"default_agent":"umans-kimi",
+		"agents":{
+			"codex-impl-xhigh":{
+				"provider":"codex",
+				"command":"codex",
+				"args":["--dangerously-bypass-approvals-and-sandbox","-c","model_reasoning_effort=xhigh"]
+			}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), []byte(settings), 0644); err != nil {
+		t.Fatalf("write town settings: %v", err)
+	}
+
+	rc, err := resolvePolecatRuntimeConfig(townRoot, rigPath, "codex-impl-xhigh")
+	if err != nil {
+		t.Fatalf("resolve custom xhigh: %v", err)
+	}
+	if rc.ResolvedAgent != "codex-impl-xhigh" {
+		t.Fatalf("ResolvedAgent = %q, want codex-impl-xhigh", rc.ResolvedAgent)
+	}
+	if got := strings.Join(rc.Args, " "); !strings.Contains(got, "model_reasoning_effort=xhigh") {
+		t.Fatalf("args = %q, want xhigh effort", got)
+	}
+}
+
 // splitStoreFake is a beadsdk.Storage used to inject agent-bead and work-bead
 // lookups separately. The two factories on SessionManager (agentBeads /
 // workBeads) accept different Beads instances, so the test can model the
