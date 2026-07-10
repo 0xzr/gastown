@@ -360,6 +360,68 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 	}
 }
 
+// TestSchedulerRescheduleReplacesStaleAgent verifies that an explicit model
+// escalation updates an already-queued sling context instead of succeeding as
+// a no-op and later dispatching the stale/default agent.
+func TestSchedulerRescheduleReplacesStaleAgent(t *testing.T) {
+	hqPath, rigPath, gtBinary, env := setupSchedulerIntegrationTown(t)
+
+	beadID := createTestBead(t, rigPath, "Escalate stale GLM route")
+	rigBeads := beads.NewWithBeadsDir(rigPath, filepath.Join(rigPath, ".beads"))
+	ctxBead, err := rigBeads.CreateSlingContext("stale GLM route", beadID, &capacity.SlingContextFields{
+		Version:          1,
+		WorkBeadID:       beadID,
+		TargetRig:        "testrig",
+		HookRawBead:      true,
+		EnqueuedAt:       "2026-07-09T21:58:00Z",
+		Agent:            "umans-glm",
+		DispatchFailures: 3,
+		LastFailure:      "GLM 5.2 exhausted",
+	})
+	if err != nil {
+		t.Fatalf("CreateSlingContext: %v", err)
+	}
+
+	out := runGTCmdOutput(t, gtBinary, hqPath, env,
+		"sling", beadID, "testrig", "--hook-raw-bead", "--agent", "codex-impl-xhigh")
+	if !strings.Contains(out, "Updated scheduled bead") {
+		t.Fatalf("reschedule output did not report agent update:\n%s", out)
+	}
+
+	ctx, err := rigBeads.Show(ctxBead.ID)
+	if err != nil {
+		t.Fatalf("show sling context: %v", err)
+	}
+	fields := beads.ParseSlingContextFields(ctx.Description)
+	if fields == nil {
+		t.Fatalf("updated context has invalid fields: %q", ctx.Description)
+	}
+	if fields.Agent != "codex-impl-xhigh" {
+		t.Fatalf("agent = %q, want codex-impl-xhigh", fields.Agent)
+	}
+	if fields.DispatchFailures != 0 || fields.LastFailure != "" {
+		t.Fatalf("dispatch failure state = (%d, %q), want cleared", fields.DispatchFailures, fields.LastFailure)
+	}
+	if fields.EnqueuedAt != "2026-07-09T21:58:00Z" {
+		t.Fatalf("enqueued_at = %q, want original queue position preserved", fields.EnqueuedAt)
+	}
+
+	matchingContexts := 0
+	contexts, err := rigBeads.ListOpenSlingContexts()
+	if err != nil {
+		t.Fatalf("ListOpenSlingContexts: %v", err)
+	}
+	for _, candidate := range contexts {
+		candidateFields := beads.ParseSlingContextFields(candidate.Description)
+		if candidateFields != nil && candidateFields.WorkBeadID == beadID {
+			matchingContexts++
+		}
+	}
+	if matchingContexts != 1 {
+		t.Fatalf("matching open contexts = %d, want exactly one", matchingContexts)
+	}
+}
+
 // TestSchedulerBlockedStatusReporting verifies that scheduler list correctly reports
 // blocked:true/false and scheduler status reports correct queued_ready count.
 func TestSchedulerBlockedStatusReporting(t *testing.T) {

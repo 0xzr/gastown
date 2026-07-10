@@ -64,6 +64,45 @@ type ScheduleOptions struct {
 	Ralph        bool     // Ralph Wiggum loop mode
 }
 
+type slingContextFieldsUpdater interface {
+	UpdateSlingContextFields(contextID string, fields *capacity.SlingContextFields) error
+}
+
+// reconcileScheduledAgent updates the agent on an existing queued sling context.
+// A later explicit --agent is authoritative: model escalation can happen while a
+// bead is already queued, and treating that retry as a plain idempotent no-op
+// would dispatch the stale/default agent. Preserve queue position and all other
+// sling parameters, but clear dispatch failures from the superseded route so the
+// replacement agent gets a real dispatch attempt.
+func reconcileScheduledAgent(
+	updater slingContextFieldsUpdater,
+	contextID string,
+	fields *capacity.SlingContextFields,
+	requestedAgent string,
+) (previousAgent string, updated bool, err error) {
+	if requestedAgent == "" {
+		return "", false, nil
+	}
+	if fields == nil {
+		return "", false, fmt.Errorf("sling context %s has no parseable fields", contextID)
+	}
+	if fields.Agent == requestedAgent {
+		return fields.Agent, false, nil
+	}
+
+	previousAgent = fields.Agent
+	updatedFields := *fields
+	updatedFields.Agent = requestedAgent
+	updatedFields.DispatchFailures = 0
+	updatedFields.LastFailure = ""
+	if err := updater.UpdateSlingContextFields(contextID, &updatedFields); err != nil {
+		return previousAgent, false, fmt.Errorf("updating agent on sling context %s: %w", contextID, err)
+	}
+
+	*fields = updatedFields
+	return previousAgent, true, nil
+}
+
 // scheduleBead schedules a bead for deferred dispatch via the capacity scheduler.
 // Creates a sling context bead to hold scheduling state. The work bead is never modified.
 func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
@@ -102,11 +141,35 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 	// beads dir, which meant non-HQ rig witnesses never saw the context. (GH#3468)
 	rigBeadsDir := doltserver.FindRigBeadsDir(townRoot, rigName)
 	rigBeads := beads.NewWithBeadsDir(townRoot, rigBeadsDir)
-	existingCtx, _, findErr := rigBeads.FindOpenSlingContext(beadID)
+	existingCtx, existingFields, findErr := rigBeads.FindOpenSlingContext(beadID)
 	if findErr != nil {
 		return fmt.Errorf("checking for existing sling context: %w", findErr)
 	}
 	if existingCtx != nil {
+		if opts.DryRun && opts.Agent != "" && existingFields != nil && existingFields.Agent != opts.Agent {
+			previousLabel := existingFields.Agent
+			if previousLabel == "" {
+				previousLabel = "<default>"
+			}
+			fmt.Printf("Would update scheduled bead %s agent %s → %s (context: %s)\n",
+				beadID, previousLabel, opts.Agent, existingCtx.ID)
+			return nil
+		}
+		previousAgent, updated, updateErr := reconcileScheduledAgent(
+			rigBeads, existingCtx.ID, existingFields, opts.Agent,
+		)
+		if updateErr != nil {
+			return fmt.Errorf("bead %s is already scheduled but its requested agent could not be applied: %w", beadID, updateErr)
+		}
+		if updated {
+			previousLabel := previousAgent
+			if previousLabel == "" {
+				previousLabel = "<default>"
+			}
+			fmt.Printf("%s Updated scheduled bead %s agent %s → %s (context: %s)\n",
+				style.Bold.Render("✓"), beadID, previousLabel, opts.Agent, existingCtx.ID)
+			return nil
+		}
 		fmt.Printf("%s Bead %s is already scheduled (context: %s), no-op\n",
 			style.Dim.Render("○"), beadID, existingCtx.ID)
 		return nil
