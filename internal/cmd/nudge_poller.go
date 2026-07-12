@@ -130,6 +130,9 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			formatted := nudge.FormatForInjection(drained)
 			if err := t.NudgeSessionWithOpts(sessionName, formatted, nudgeOpts); err != nil {
 				fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
+				if requeueErr := nudge.Requeue(townRoot, sessionName, drained); requeueErr != nil {
+					fmt.Fprintf(os.Stderr, "nudge-poller: requeue error for %s: %v\n", sessionName, requeueErr)
+				}
 			}
 		}
 	}

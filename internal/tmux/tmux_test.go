@@ -1913,6 +1913,44 @@ func TestAdaptiveTextDelay(t *testing.T) {
 	}
 }
 
+func TestPromptContainsPendingMessage(t *testing.T) {
+	t.Parallel()
+	message := "<system-reminder>\nQUEUED NUDGE (1 message(s)):\n</system-reminder>"
+	tests := []struct {
+		name     string
+		snapshot string
+		want     bool
+	}{
+		{
+			name:     "message remains in composer while status animates",
+			snapshot: "tool output changed\n❯ <system-reminder>\n✢ Working… (2h)",
+			want:     true,
+		},
+		{
+			name:     "message accepted into Claude queue",
+			snapshot: "<system-reminder>\nQUEUED NUDGE\n❯ Press up to edit queued messages",
+			want:     false,
+		},
+		{
+			name:     "empty prompt after submission",
+			snapshot: "● Processing notification\n❯ ",
+			want:     false,
+		},
+		{
+			name:     "wrapped first line prefix",
+			snapshot: "❯ <system-remi\nnder>",
+			want:     true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := promptContainsPendingMessage(tt.snapshot, message); got != tt.want {
+				t.Fatalf("promptContainsPendingMessage() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestMatchesPromptPrefix verifies that prompt matching handles non-breaking
 // spaces (NBSP, U+00A0) correctly. Claude Code uses NBSP after its > prompt
 // character, but the default ReadyPromptPrefix uses a regular space.

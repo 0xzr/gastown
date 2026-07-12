@@ -338,6 +338,9 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 			formatted := nudge.FormatForInjection(drained)
 			if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
 				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
+				if requeueErr := nudge.Requeue(townRoot, sessionName, drained); requeueErr != nil {
+					fmt.Fprintf(os.Stderr, "idle-watcher: requeue for %s failed: %v\n", sessionName, requeueErr)
+				}
 			}
 			return
 		}

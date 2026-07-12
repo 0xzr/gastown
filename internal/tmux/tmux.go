@@ -1660,8 +1660,36 @@ func (t *Tmux) dismissRewindMode(target string) {
 	time.Sleep(300 * time.Millisecond)
 }
 
+// promptContainsPendingMessage reports whether a visible pane snapshot still
+// shows message in Claude's editable prompt. A background tool can animate the
+// status line, so a generic pane-content change is not proof that Enter worked.
+func promptContainsPendingMessage(snapshot, message string) bool {
+	firstLine := strings.TrimSpace(strings.SplitN(message, "\n", 2)[0])
+	if firstLine == "" {
+		return false
+	}
+	// A prefix survives terminal wrapping and is specific for structured
+	// nudges such as <system-reminder> and [from ...].
+	if len(firstLine) > 80 {
+		firstLine = firstLine[:80]
+	}
+	for _, line := range strings.Split(snapshot, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "❯") {
+			continue
+		}
+		promptText := strings.TrimSpace(strings.TrimPrefix(line, "❯"))
+		if strings.HasPrefix(promptText, firstLine) ||
+			(promptText != "" && strings.HasPrefix(firstLine, promptText)) {
+			return true
+		}
+	}
+	return false
+}
+
 // sendEnterVerified sends Enter to a tmux target and verifies it was processed
-// by checking that the pane content changes. Under load, tmux may buffer
+// by checking that the injected text leaves the editable prompt. Under load,
+// tmux may buffer
 // keystrokes, causing Enter to race with text delivery — Enter arrives while
 // tmux is still processing text/Escape and gets treated as part of the text
 // stream rather than a separate submit action.
@@ -1671,11 +1699,11 @@ func (t *Tmux) dismissRewindMode(target string) {
 // Max 3 retries before returning an error.
 //
 // Falls back to best-effort (no verification) if pane capture fails.
-func (t *Tmux) sendEnterVerified(target string) error {
+func (t *Tmux) sendEnterVerified(target, message string) error {
 	const (
 		maxRetries     = 3
 		initialBackoff = 500 * time.Millisecond
-		verifyLines    = 5 // capture last N lines for comparison
+		verifyLines    = 100 // include the start of large multi-line prompts
 	)
 
 	// Snapshot pane content before Enter so we can detect processing.
@@ -1701,8 +1729,12 @@ func (t *Tmux) sendEnterVerified(target string) error {
 			return nil
 		}
 
-		if postSnapshot != preSnapshot {
-			// Content changed — Enter was processed.
+		if promptContainsPendingMessage(preSnapshot, message) {
+			if !promptContainsPendingMessage(postSnapshot, message) {
+				return nil
+			}
+		} else if postSnapshot != preSnapshot {
+			// Unknown/non-Claude prompt: retain the legacy best-effort check.
 			return nil
 		}
 
@@ -1718,8 +1750,15 @@ func (t *Tmux) sendEnterVerified(target string) error {
 	// Final verification after last retry.
 	time.Sleep(500 * time.Millisecond)
 	postSnapshot, err := t.CapturePane(target, verifyLines)
-	if err != nil || postSnapshot != preSnapshot {
-		return nil // Can't verify or content changed — consider success.
+	if err != nil {
+		return nil // Capture unavailable: retain best-effort behavior.
+	}
+	if promptContainsPendingMessage(preSnapshot, message) {
+		if !promptContainsPendingMessage(postSnapshot, message) {
+			return nil
+		}
+	} else if postSnapshot != preSnapshot {
+		return nil
 	}
 
 	return fmt.Errorf("nudge Enter not processed after %d retries: pane content unchanged", maxRetries)
@@ -1976,7 +2015,7 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 
 	// 7. Send Enter with verification — polls pane content to confirm Enter
 	// was processed, retrying with exponential backoff under load. (GH#gt-0b5)
-	if err := t.sendEnterVerified(target); err != nil {
+	if err := t.sendEnterVerified(target, sanitized); err != nil {
 		return fmt.Errorf("nudge to session %q: %w", session, err)
 	}
 
@@ -2048,7 +2087,7 @@ func (t *Tmux) NudgePane(pane, message string) error {
 
 	// 7. Send Enter with verification — polls pane content to confirm Enter
 	// was processed, retrying with exponential backoff under load. (GH#gt-0b5)
-	if err := t.sendEnterVerified(pane); err != nil {
+	if err := t.sendEnterVerified(pane, sanitized); err != nil {
 		return fmt.Errorf("nudge to pane %q: %w", pane, err)
 	}
 
