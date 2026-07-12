@@ -1675,10 +1675,10 @@ func promptContainsPendingMessage(snapshot, message string) bool {
 	}
 	for _, line := range strings.Split(snapshot, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "❯") {
+		if !strings.HasPrefix(line, "❯") && !strings.HasPrefix(line, "›") {
 			continue
 		}
-		promptText := strings.TrimSpace(strings.TrimPrefix(line, "❯"))
+		promptText := strings.TrimSpace(strings.TrimLeft(line, "❯›"))
 		if strings.HasPrefix(promptText, firstLine) ||
 			(promptText != "" && strings.HasPrefix(firstLine, promptText)) {
 			return true

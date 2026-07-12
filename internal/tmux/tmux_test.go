@@ -1927,6 +1927,11 @@ func TestPromptContainsPendingMessage(t *testing.T) {
 			want:     true,
 		},
 		{
+			name:     "message remains in codex composer",
+			snapshot: "tool output changed\n› <system-reminder>\nWorking (2h)",
+			want:     true,
+		},
+		{
 			name:     "message accepted into Claude queue",
 			snapshot: "<system-reminder>\nQUEUED NUDGE\n❯ Press up to edit queued messages",
 			want:     false,
