@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -104,6 +106,15 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 				return nil // session gone, exit
 			}
 
+			// A Codex role session accepts injected input as a new turn, which
+			// terminates its in-flight tool subprocess. For Refinery that child is
+			// the durable gate (including the xhigh reviewer). Keep the nudge queued
+			// until the owner gate exits instead of converting our own SIGTERM into
+			// a misleading reviewer UNAVAILABLE result.
+			if activeRefineryGate(townRoot, sessionName) {
+				continue
+			}
+
 			// Check if there are queued nudges.
 			if n, _ := nudge.Pending(townRoot, sessionName); n == 0 {
 				continue
@@ -140,4 +151,28 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 
 func shouldSkipDrainUntilIdle(hasPromptDetection bool, waitErr error) bool {
 	return hasPromptDetection && waitErr != nil
+}
+
+func activeRefineryGate(townRoot, sessionName string) bool {
+	const suffix = "-refinery"
+	if !strings.HasSuffix(sessionName, suffix) {
+		return false
+	}
+	rig := strings.TrimSuffix(sessionName, suffix)
+	if rig == "" {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(townRoot, ".runtime", "gate-running", rig+".pid"))
+	if err != nil {
+		return false
+	}
+	var pid int
+	if _, err := fmt.Sscan(string(data), &pid); err != nil || pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
 }
