@@ -560,6 +560,14 @@ func checkStackedBranchForSubmit(g *git.Git, branch, target string) error {
 	return err
 }
 
+// checkDoneHeadForSubmitInfo verifies the exact commit gt done will advertise
+// as commit_sha. gt done can rewrite its publication branch name before that
+// ref exists locally, so checking the alias is both weaker and less reliable
+// than checking HEAD itself.
+func checkDoneHeadForSubmitInfo(g *git.Git, target string) (*StackedBranchInfo, error) {
+	return checkStackedBranchForSubmitInfo(g, "HEAD", target)
+}
+
 func checkStackedBranchForSubmitInfo(g *git.Git, branch, target string) (*StackedBranchInfo, error) {
 	if target == "" {
 		target = "main"
@@ -578,9 +586,7 @@ func checkStackedBranchForSubmitInfo(g *git.Git, branch, target string) (*Stacke
 	}
 	targetRef := "origin/" + strings.TrimPrefix(target, "origin/")
 	if _, err := g.Rev(targetRef); err != nil {
-		// Remote-tracking ref unresolvable (e.g. no remote) — fall back to the
-		// caller's target rather than failing the whole submit.
-		targetRef = target
+		return nil, fmt.Errorf("resolve refreshed submit target %s: %w", targetRef, err)
 	}
 	info, err := CheckStackedBranch(g, branch, targetRef)
 	if err != nil {
@@ -588,9 +594,10 @@ func checkStackedBranchForSubmitInfo(g *git.Git, branch, target string) (*Stacke
 		if errors.As(err, &stacked) {
 			return nil, err // Already actionable; bubble up.
 		}
-		// Non-stacked error (couldn't read git). Warn but don't block.
-		style.PrintWarning("could not run stacked-branch check against %s: %v (proceeding; refinery will catch real issues)", targetRef, err)
-		return nil, nil
+		// Packaging safety is not provable if either ref, merge-base, or commit
+		// count is unavailable. Refinery consumes only commit_sha, so warning
+		// and proceeding can silently truncate the submitted diff.
+		return nil, fmt.Errorf("verify single-commit packaging against %s: %w", targetRef, err)
 	}
 	return info, nil
 }

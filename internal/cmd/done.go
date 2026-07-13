@@ -1353,7 +1353,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// information to reconstruct the full diff, not just the tip SHA.
 		var stackedInfo *StackedBranchInfo
 		if !doneAllowStacked {
-			info, stackedErr := checkStackedBranchForSubmitInfo(g, branch, target)
+			// The MR branch may be rewritten during `gt done` (for example from
+			// an ephemeral @token name to a durable -rw1 name) before that new
+			// ref exists locally. Validate HEAD, which is the exact commit_sha we
+			// advertise below, rather than a not-yet-created branch alias. A
+			// missing alias previously made the helper warn and proceed, allowing
+			// a multi-commit MR whose tip silently omitted earlier commits.
+			info, stackedErr := checkDoneHeadForSubmitInfo(g, target)
 			if stackedErr != nil {
 				return stackedErr
 			}

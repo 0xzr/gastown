@@ -155,6 +155,47 @@ func TestCheckStackedBranchForSubmitUsesFreshOriginTarget(t *testing.T) {
 	}
 }
 
+func TestDoneStackedBranchGuardChecksAdvertisedHeadNotRewrittenAlias(t *testing.T) {
+	repo := setupStaleLocalMainRepo(t)
+	writeMRTestFile(t, repo, "feature.go", "package x\n// second dependent change\n")
+	runMRTestGit(t, repo, "add", "feature.go")
+	runMRTestGit(t, repo, "commit", "-m", "second dependent change")
+
+	// No local durable publication alias exists. This reproduces gt done
+	// rewriting an ephemeral work branch to ...-rw1 before creating that ref.
+	if err := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet",
+		"refs/heads/polecat/thunder/issue-rw1").Run(); err == nil {
+		t.Fatal("test setup unexpectedly created rewritten branch alias")
+	}
+
+	g := gitpkg.NewGit(repo)
+	info, err := checkDoneHeadForSubmitInfo(g, "main")
+	var stacked *ErrStackedBranch
+	if !errors.As(err, &stacked) {
+		t.Fatalf("gt done HEAD guard did not reject two advertised commits; info=%+v err=%v", info, err)
+	}
+	if stacked.Branch != "HEAD" {
+		t.Fatalf("guard checked %q, want exact advertised HEAD", stacked.Branch)
+	}
+	if stacked.CommitsAhead != 2 {
+		t.Fatalf("CommitsAhead=%d, want 2", stacked.CommitsAhead)
+	}
+}
+
+func TestStackedBranchSubmitGuardFailsClosedWhenBranchCannotResolve(t *testing.T) {
+	repo := setupStaleLocalMainRepo(t)
+	g := gitpkg.NewGit(repo)
+
+	info, err := checkStackedBranchForSubmitInfo(g, "missing-publication-alias", "main")
+	if err == nil {
+		t.Fatalf("unresolvable packaging ref proceeded with info=%+v", info)
+	}
+	if !strings.Contains(err.Error(), "verify single-commit packaging") ||
+		!strings.Contains(err.Error(), "missing-publication-alias") {
+		t.Fatalf("unresolvable-ref error is not actionable: %v", err)
+	}
+}
+
 // TestCheckStackedBranch_NoOpBranchPasses: if the branch tip is identical
 // to the merge-base (no new commits), it must NOT be flagged as stacked.
 // This is the "nothing to merge" case and should fall through cleanly.
