@@ -17,16 +17,25 @@ var spawnPolecatForSling = SpawnPolecatForSling
 // resolveTargetAgentFn is a seam for tests. Production uses resolveTargetAgent.
 var resolveTargetAgentFn = resolveTargetAgent
 
+// resolveTargetAgentIdentity resolves a target to its durable assignee identity
+// without requiring a live tmux pane. Commands that only mutate hook metadata
+// (notably unsling) must keep working after a worker session has stopped.
+func resolveTargetAgentIdentity(target string) (agentID string, sessionName string, err error) {
+	sessionName, err = resolveRoleToSession(target)
+	if err != nil {
+		return "", "", err
+	}
+	return sessionToAgentID(sessionName), sessionName, nil
+}
+
 // resolveTargetAgent converts a target spec to agent ID, pane, and hook root.
 func resolveTargetAgent(target string) (agentID string, pane string, hookRoot string, err error) {
-	// First resolve to session name
-	sessionName, err := resolveRoleToSession(target)
+	// First resolve the durable identity. This part intentionally does not need
+	// tmux; live-target callers continue with pane/workdir resolution below.
+	agentID, sessionName, err := resolveTargetAgentIdentity(target)
 	if err != nil {
 		return "", "", "", err
 	}
-
-	// Convert session name to agent ID format (this doesn't require tmux)
-	agentID = sessionToAgentID(sessionName)
 
 	// Get the pane for that session
 	pane, err = getSessionPane(sessionName)

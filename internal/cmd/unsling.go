@@ -81,7 +81,10 @@ func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error
 	var agentID string
 	var err error
 	if targetAgent != "" {
-		agentID, _, _, err = resolveTargetAgent(targetAgent)
+		// Unsling edits durable hook/bead metadata and does not need a live pane.
+		// Resolving through the normal sling target path made stopped/crashed
+		// polecats impossible to release precisely when recovery needed it most.
+		agentID, _, err = resolveTargetAgentIdentity(targetAgent)
 		if err != nil {
 			return fmt.Errorf("resolving target agent: %w", err)
 		}

@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 )
 
@@ -181,6 +182,26 @@ func TestSessionToAgentID_TownLevel(t *testing.T) {
 				t.Errorf("sessionToAgentID(%q) = %q, want %q", tt.session, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolveTargetAgentIdentityDoesNotRequireLivePane(t *testing.T) {
+	t.Setenv("TMUX_PANE", "")
+	priorRegistry := session.DefaultRegistry()
+	registry := session.NewPrefixRegistry()
+	registry.Register("polybot", "polybot")
+	session.SetDefaultRegistry(registry)
+	t.Cleanup(func() { session.SetDefaultRegistry(priorRegistry) })
+
+	agentID, sessionName, err := resolveTargetAgentIdentity("polybot/guzzle")
+	if err != nil {
+		t.Fatalf("resolveTargetAgentIdentity: %v", err)
+	}
+	if agentID != "polybot/polecats/guzzle" {
+		t.Fatalf("agentID = %q, want polybot/polecats/guzzle", agentID)
+	}
+	if sessionName != "polybot-guzzle" {
+		t.Fatalf("sessionName = %q, want polybot-guzzle", sessionName)
 	}
 }
 
