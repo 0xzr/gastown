@@ -149,6 +149,90 @@ func getACPSessionPIDs() map[int]bool {
 	return pids
 }
 
+// getDurableGatePIDs protects detached refinery gates and every reviewer they
+// spawn. Durable gates intentionally leave tmux via setsid/nohup, so TTY-based
+// orphan cleanup must recognize their pidfiles or it will SIGTERM a healthy
+// codex reviewer mid-verdict. Stale/reused pidfiles are harmless because the
+// recorded PID is accepted only when its current command line is still a gate.
+func getDurableGatePIDs() map[int]bool {
+	pids := make(map[int]bool)
+	childMap := buildChildMap()
+
+	// The process tree is authoritative. A gate can be launched manually, or it
+	// can be observed before/after its durable-recipe pidfile is written. In
+	// both cases the live gate command and all of its descendants must be
+	// protected: a TTY-less codex reviewer with a live gate ancestor is not an
+	// orphan. Keep pidfiles below as a cheap second source, not the sole source
+	// of truth.
+	if out, err := exec.Command("ps", "-eo", "pid=,args=").Output(); err == nil {
+		for _, pid := range durableGateRootPIDs(string(out)) {
+			protectDurableGatePID(pid, childMap, pids)
+		}
+	}
+
+	paths, _ := filepath.Glob(filepath.Join(os.TempDir(), "refinery-gate-*.pid"))
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil || pid <= 0 || !processExists(pid) {
+			_ = os.Remove(path)
+			continue
+		}
+		out, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid)).Output()
+		if err != nil || !isDurableGateCommandLine(string(out)) {
+			_ = os.Remove(path)
+			continue
+		}
+		protectDurableGatePID(pid, childMap, pids)
+	}
+	return pids
+}
+
+// durableGateRootPIDs extracts live refinery gate process roots from ps output.
+// The input format is "pid args" as emitted by `ps -eo pid=,args=`.
+func durableGateRootPIDs(psOutput string) []int {
+	var roots []int
+	for _, line := range strings.Split(psOutput, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 {
+			continue
+		}
+		args := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), fields[0]))
+		if isDurableGateCommandLine(args) {
+			roots = append(roots, pid)
+		}
+	}
+	return roots
+}
+
+func isDurableGateCommandLine(args string) bool {
+	return strings.Contains(args, "refinery-gate.sh") ||
+		strings.Contains(args, "/tmp/refinery-gate.exec.")
+}
+
+func protectDurableGatePID(pid int, childMap map[int][]int, pids map[int]bool) {
+	pids[pid] = true
+	addDescendants(pid, childMap, pids)
+}
+
+func getProtectedAgentPIDs() map[int]bool {
+	protected := getTmuxSessionPIDs()
+	for pid := range getACPSessionPIDs() {
+		protected[pid] = true
+	}
+	for pid := range getDurableGatePIDs() {
+		protected[pid] = true
+	}
+	return protected
+}
+
 // sigkillGracePeriod is how long (in seconds) we wait after sending SIGTERM
 // before escalating to SIGKILL. If a process was sent SIGTERM and is still
 // around after this period, we use SIGKILL on the next cleanup cycle.
@@ -440,14 +524,7 @@ type OrphanedProcess struct {
 func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
 	// Get PIDs belonging to valid Gas Town tmux sessions.
 	// These should not be killed even if they show TTY "?" during startup.
-	protectedPIDs := getTmuxSessionPIDs()
-
-	// Also protect ACP sessions (opencode agents running outside tmux)
-	// ACP sessions have their own lifecycle management and should not be killed
-	acpPIDs := getACPSessionPIDs()
-	for pid := range acpPIDs {
-		protectedPIDs[pid] = true
-	}
+	protectedPIDs := getProtectedAgentPIDs()
 
 	// Use ps to get PID, TTY, command, and elapsed time for all processes
 	// TTY "?" indicates no controlling terminal
@@ -550,14 +627,7 @@ type ZombieProcess struct {
 // are interactive terminal sessions, not zombies.
 func FindZombieClaudeProcesses() ([]ZombieProcess, error) {
 	// Get ALL valid PIDs (panes + their children) from active tmux sessions
-	validPIDs := getTmuxSessionPIDs()
-
-	// Also protect ACP sessions (opencode agents running outside tmux)
-	// ACP sessions have their own lifecycle management and should not be killed
-	acpPIDs := getACPSessionPIDs()
-	for pid := range acpPIDs {
-		validPIDs[pid] = true
-	}
+	validPIDs := getProtectedAgentPIDs()
 
 	// SAFETY CHECK: If no valid PIDs found, tmux might be down or no sessions exist.
 	// Returning empty is safer than marking all Claude processes as zombies.
@@ -900,6 +970,6 @@ func isProcessStillOrphaned(pid int) bool {
 	}
 
 	// Re-check against current tmux session PIDs
-	protectedPIDs := getTmuxSessionPIDs()
+	protectedPIDs := getProtectedAgentPIDs()
 	return !protectedPIDs[pid]
 }

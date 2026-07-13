@@ -77,9 +77,13 @@ GT_WRAPPER_PRESERVE_LOADED=1
 # too permissive (any text file passes) and relying on the file size is too
 # brittle (the wrapper is intentionally append-only).
 #
-# Keep this in sync with the header in ~/.local/bin/gt on the operational
-# host. If the wrapper is ever rewritten, update both sides.
-GT_WRAPPER_MARKER='gt wrapper — guarantees the current validation model-mix'
+# Match the stable wrapper identity, not a full policy sentence. The policy
+# header legitimately changed when routing moved from the legacy fixed mix to
+# the ledger-owned GLM/Luna ladder; requiring the old sentence caused `make
+# install` to classify the live wrapper as an arbitrary script and overwrite
+# it with the ELF. The shebang/first-byte check above plus this exact comment
+# prefix still rejects ordinary shell scripts.
+GT_WRAPPER_MARKER='# gt wrapper —'
 
 # --- install lock (gastown-cet.12.9) -------------------------------------
 # Concurrent installs of the pinned gt binary are the failure mode that can

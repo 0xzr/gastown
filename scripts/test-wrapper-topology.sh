@@ -126,12 +126,13 @@ scenario_wrapper_preserved() {
     local elf="$tmp/source-gt"
     make_elf_fixture "$elf" || return 0
 
-    # Plant a wrapper that looks like the operational one.
+    # Plant the current ledger-owned wrapper header. This exact policy-header
+    # change previously made the installer miss the wrapper and overwrite it
+    # with the ELF, silently bypassing model routing.
     cat > "$install_dir/gt" <<'WRAPPER'
 #!/usr/bin/env bash
-# gt wrapper — guarantees the current validation model-mix on `gt sling`. If a
-# sling has no explicit --agent, inject the next agent from the rotation
-# (2 umans-glm, 2 umans-kimi, 2 m3) and default --merge=mr.
+# gt wrapper — enforces the ledger-owned implementation ladder on `gt sling`.
+# Fresh work rotates across enabled GLM/Luna first-line capacity.
 WRAPPER_SENTINEL="WRAPPER_INTACT_42"
 WRAPPER
     chmod 0755 "$install_dir/gt"

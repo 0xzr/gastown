@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -365,5 +366,50 @@ func TestOrphanedProcess_TownRoot_Populated(t *testing.T) {
 				t.Errorf("PID %d: TownRoot %q does not exist on disk", o.PID, o.TownRoot)
 			}
 		}
+	}
+}
+
+func TestProtectDurableGatePIDIncludesReviewerDescendants(t *testing.T) {
+	children := map[int][]int{
+		100: {101, 102},
+		101: {103},
+	}
+	protected := make(map[int]bool)
+	protectDurableGatePID(100, children, protected)
+	for _, pid := range []int{100, 101, 102, 103} {
+		if !protected[pid] {
+			t.Fatalf("PID %d not protected: %#v", pid, protected)
+		}
+	}
+}
+
+func TestDurableGateCommandLineRejectsStalePIDReuse(t *testing.T) {
+	for _, tc := range []struct {
+		args string
+		want bool
+	}{
+		{"bash /home/ubuntu/gastown-spike/dropin/refinery-gate.sh --worktree /tmp/wt", true},
+		{"bash /tmp/refinery-gate.exec.ABC123.sh --worktree /tmp/wt", true},
+		{"codex exec --sandbox read-only", false},
+		{"bash unrelated-build.sh", false},
+	} {
+		if got := isDurableGateCommandLine(tc.args); got != tc.want {
+			t.Errorf("isDurableGateCommandLine(%q)=%v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
+
+func TestDurableGateRootPIDsFindsDetachedAndManualGates(t *testing.T) {
+	psOutput := `
+  100 bash /tmp/refinery-gate.exec.ABC123.sh --worktree /tmp/wt
+  101 timeout 2700 codex exec --sandbox read-only
+  200 bash -c gate=$1; "$gate" --worktree "$2" sh /opt/dropin/refinery-gate.sh /tmp/wt
+  300 codex exec --sandbox read-only
+  bad malformed
+`
+	got := durableGateRootPIDs(psOutput)
+	want := []int{100, 200}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("durableGateRootPIDs() = %v, want %v", got, want)
 	}
 }
